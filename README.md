@@ -28,6 +28,14 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
 - `retinue.worker` — the `process_prd` Arq task, the `gate_prd` opt-in gate, and
   `WorkerSettings`.
+- `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
+  channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
+  Every escalation in the retinue routes through it.
+- `retinue.slicer` — `slice_prd`: runs the headless Agent-SDK slicer over a PRD
+  body to produce vertical-slice issues labeled `ready-for-agent` + `Part of #<prd>`
+  with a resolved `## Blocked by` graph, reserving `hitl` for genuinely human-only
+  slices. A thin/malformed PRD escalates through `Notifier` instead of inventing
+  slices. The Agent-SDK call and the gh issue creation are injected seams.
 
 A validly signed `issues` webhook returns 202 and enqueues exactly one job; an
 invalid or missing signature returns 401 and enqueues nothing. Non-`issues` events
