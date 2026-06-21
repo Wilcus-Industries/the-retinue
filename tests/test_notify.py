@@ -107,3 +107,39 @@ async def test_notify_continues_when_push_sink_fails(
     assert len(sinks.comments) == 1
     assert len(sinks.labels) == 1
     assert "push" in caplog.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_notify_raises_when_comment_sink_fails() -> None:
+    """A failing comment sink must propagate — unlike push, it is not swallowed.
+
+    The comment is the durable, in-repo record of an escalation; losing it is a
+    real failure the caller must see. The label sink is irrelevant here.
+    """
+    sinks = _RecordingSinks()
+
+    async def failing_comment(request: CommentRequest) -> None:
+        raise RuntimeError("gh issue comment failed")
+
+    notifier = Notifier(push=sinks.push, comment=failing_comment, label=sinks.label)
+
+    with pytest.raises(RuntimeError, match="gh issue comment failed"):
+        await notifier.notify(_notification())
+
+
+@pytest.mark.asyncio
+async def test_notify_raises_when_label_sink_fails() -> None:
+    """A failing label sink must propagate — unlike push, it is not swallowed.
+
+    The label makes the escalated issue findable and routes the agent loop;
+    losing it is a real failure the caller must see.
+    """
+    sinks = _RecordingSinks()
+
+    async def failing_label(request: LabelRequest) -> None:
+        raise RuntimeError("gh issue edit failed")
+
+    notifier = Notifier(push=sinks.push, comment=sinks.comment, label=failing_label)
+
+    with pytest.raises(RuntimeError, match="gh issue edit failed"):
+        await notifier.notify(_notification())
