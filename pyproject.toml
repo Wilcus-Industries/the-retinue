@@ -1,14 +1,50 @@
 [project]
 name = "the-retinue"
 version = "0.1.0"
-description = "Add your description here"
+description = "A signed-webhook transport spine over an Arq/Redis queue and worker."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "arq>=0.26.0",
+    "fastapi>=0.115.0",
+    "pydantic-settings>=2.5.0",
+    "uvicorn[standard]>=0.30.0",
+]
 
 [dependency-groups]
 dev = [
+    "fakeredis>=2.25.0",
+    "httpx>=0.28.1",
     "mypy>=2.1.0",
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.0.0",
     "ruff>=0.15.18",
 ]
+
+[project.scripts]
+retinue-worker = "retinue.worker:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["retinue"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+exclude = ["\\.venv", "build", "dist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "strict"
+pythonpath = ["."]
