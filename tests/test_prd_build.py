@@ -214,6 +214,32 @@ async def test_blocked_slice_stops_its_dependents() -> None:
     assert 2 not in result.merged_issues
 
 
+@pytest.mark.asyncio
+async def test_transitively_blocked_slices_are_skipped_not_dropped() -> None:
+    """A subtree pruned by a red upstream slice is reported skipped, not silently lost."""
+    # 1 <- 2 <- 3, with slice 1 red. 2 (direct dependent) and 3 (transitive) can
+    # never become ready, so both must surface in the skipped bucket — not vanish.
+    slices = [
+        _prd_slice(1),
+        _prd_slice(2, blocked_by=[1]),
+        _prd_slice(3, blocked_by=[2]),
+    ]
+    runtime = FakeRuntime(results={"uv": RunResult(exit_code=1, stderr="boom")})
+
+    result = await _build_prd(slices, runtime=runtime)
+
+    assert result.blocked_issues == [1]
+    assert result.skipped_issues == [2, 3]
+    # Every input slice lands in exactly one bucket — none is dropped from all of them.
+    all_buckets = (
+        result.merged_issues
+        + result.blocked_issues
+        + result.escalated_issues
+        + result.skipped_issues
+    )
+    assert sorted(all_buckets) == [1, 2, 3]
+
+
 # --- merge conflict: resolve under done-check or escalate ------------------------
 
 
@@ -323,3 +349,4 @@ async def test_empty_prd_is_a_clean_noop() -> None:
     assert result.merged_issues == []
     assert result.blocked_issues == []
     assert result.escalated_issues == []
+    assert result.skipped_issues == []

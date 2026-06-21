@@ -304,6 +304,8 @@ class PrdSlice(Slice):
 class PrdBuildResult:
     """Outcome of a full-PRD build, partitioned by what happened to each slice.
 
+    Every input slice lands in exactly one bucket — none is dropped from all of them.
+
     Attributes:
         integration_branch: The integration branch every slice targeted.
         merged_issues: Issue numbers merged into the integration branch, in merge
@@ -312,12 +314,16 @@ class PrdBuildResult:
             merged.
         escalated_issues: Issue numbers whose merge hit a conflict that could not be
             resolved under the done-check.
+        skipped_issues: Issue numbers that never became ready because an upstream
+            slice they transitively depend on was blocked or escalated, pruning the
+            subtree. Reported here rather than silently dropped.
     """
 
     integration_branch: str
     merged_issues: list[int]
     blocked_issues: list[int]
     escalated_issues: list[int]
+    skipped_issues: list[int]
 
 
 async def build_prd(
@@ -361,7 +367,9 @@ async def build_prd(
         image: Container image the done-check runs in.
 
     Returns:
-        A :class:`PrdBuildResult` partitioning the slices into merged/blocked/escalated.
+        A :class:`PrdBuildResult` partitioning the slices into
+        merged/blocked/escalated/skipped — a subtree pruned by a failed upstream
+        slice lands in ``skipped``, so every slice is accounted for.
 
     Raises:
         OrchestratorBusyError: A run is already in flight (from the injected lock).
@@ -392,12 +400,16 @@ async def build_prd(
                 resolve_conflict=resolve_conflict,
                 state=state,
             )
+        # The ready set has drained; any still-pending slice was pruned by a failed
+        # upstream slice. Surface it as skipped rather than dropping it silently.
+        state.drain_skipped()
 
     return PrdBuildResult(
         integration_branch=branch,
         merged_issues=state.merged,
         blocked_issues=state.blocked,
         escalated_issues=state.escalated,
+        skipped_issues=state.skipped,
     )
 
 
@@ -407,7 +419,9 @@ class _PrdState:
     A slice is *ready* when it is still pending and every blocker is either merged
     this run or absent from the PRD's slice set (already merged/closed beforehand). A
     blocked or escalated slice is terminal: its dependents never become ready, so a
-    failure naturally prunes the subtree below it.
+    failure naturally prunes the subtree below it. That pruning is made observable —
+    once the ready set drains, every still-pending slice is recorded as *skipped* via
+    :meth:`drain_skipped`, so the abandoned subtree is reported, not silently dropped.
     """
 
     def __init__(self, slices: list[PrdSlice]) -> None:
@@ -416,6 +430,7 @@ class _PrdState:
         self.merged: list[int] = []
         self.blocked: list[int] = []
         self.escalated: list[int] = []
+        self.skipped: list[int] = []
 
     def ready_set(self) -> list[PrdSlice]:
         """Slices whose every blocker is merged (or was already merged/closed)."""
@@ -431,6 +446,17 @@ class _PrdState:
         """Move ``slice_`` out of pending into a terminal bucket."""
         self._pending.remove(slice_)
         bucket.append(slice_.issue_number)
+
+    def drain_skipped(self) -> None:
+        """Record every still-pending slice as skipped once no slice can become ready.
+
+        Called after the ready set drains: any slice still pending was pruned by a
+        blocked or escalated upstream slice and can never become ready. Recording it
+        here surfaces the abandoned subtree instead of letting it vanish from the
+        result. Issue order is preserved so the bucket is deterministic.
+        """
+        for slice_ in list(self._pending):
+            self.record(slice_, self.skipped)
 
 
 async def _build_round(
