@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     redis_url: str = Field(
         default="redis://localhost:6379", description="Redis connection URL"
     )
+    dedupe_db_path: str = Field(
+        default="retinue-dedupe.sqlite3",
+        description="Path to the SQLite file backing PRD-event deduplication",
+    )
 
     # extra="ignore": the .env may be shared with deployment tooling that carries
     # keys which are not Settings fields, so unknown keys are ignored rather than

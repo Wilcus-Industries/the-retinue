@@ -5,9 +5,11 @@ description = "A signed-webhook transport spine over an Arq/Redis queue and work
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "aiosqlite>=0.22.1",
     "arq>=0.26.0",
     "fastapi>=0.115.0",
     "pydantic-settings>=2.5.0",
+    "pyyaml>=6.0.3",
     "uvicorn[standard]>=0.30.0",
 ]
 
@@ -19,6 +21,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.0.0",
     "ruff>=0.15.18",
+    "types-pyyaml>=6.0.12.20260518",
 ]
 
 [project.scripts]
