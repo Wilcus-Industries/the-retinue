@@ -28,6 +28,12 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
 - `retinue.worker` — the `process_prd` Arq task, the `gate_prd` opt-in gate, and
   `WorkerSettings`.
+- `retinue.github_app` — `InstallationAuth`, the seam that mints a GitHub App
+  installation token (`InstallationToken`) the worker clones with.
+- `retinue.container` — `ContainerRuntime` / `Container`, the disposable-container
+  seam the done-check runs inside (real Docker lives behind it).
+- `retinue.done_check` — `run_done_check`, which runs an accepted repo's done-check in
+  a fresh container and reports the outcome.
 
 A validly signed `issues` webhook returns 202 and enqueues exactly one job; an
 invalid or missing signature returns 401 and enqueues nothing. Non-`issues` events
@@ -64,6 +70,25 @@ Unknown top-level keys are rejected (a typo'd field is a skip, not a silent drop
 
 > The GitHub fetch of `retinue.yml` is a later issue; the worker's `fetch_config`
 > seam currently treats every repo as not opted in until that lands.
+
+## Disposable-container done-check
+
+Once a PRD is accepted, the worker runs the repo's done-check in a fresh, throwaway
+container. `retinue.done_check.run_done_check` orchestrates, in order:
+
+1. **auth** — mint a GitHub App installation token (`retinue.github_app`),
+2. **clone** — clone the repo into the container over that token,
+3. **inject** — resolve the config's `secrets` block and place it in the container env;
+   a missing required secret escalates (an observable report) *before* any container
+   starts, so a doomed check never runs,
+4. **run** — run the done-check command read from the repo's `CLAUDE.md`,
+5. **report** — post the outcome to an observable sink (commit status / issue comment),
+6. **teardown** — destroy the container (guaranteed via `try/finally`, on every path).
+
+Auth, the container runtime, the secret resolver, and the report sink are all injected,
+so the orchestration is fully exercised without Docker or network; a real container is
+only touched in the manual smoke. The done-check command is parsed from the first fenced
+code block under a "Definition of done" heading in the repo's `CLAUDE.md`.
 
 ## Configuration
 
