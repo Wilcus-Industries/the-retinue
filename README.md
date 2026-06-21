@@ -118,6 +118,27 @@ The implementer spawn and the git operations (`GitOps`: ensure-branch + merge) a
 injected alongside the done-check seams, so the whole one-slice flow is exercised with
 no Agent SDK, no Docker, no gh, and no network.
 
+## Full-PRD orchestrator
+
+`retinue.orchestrator.build_prd` builds a whole PRD by wrapping the single-slice
+primitive, looping rounds until the ready set drains:
+
+1. **ready set** — pick every `PrdSlice` whose `blocked_by` refs are all merged this run
+   (or absent from the PRD's slice set, meaning already merged/closed before it began),
+2. **parallel fan-out** — spawn the round's implementers concurrently, bounded by the
+   config's `max_parallel` (unbounded when unset),
+3. **topological merge** — merge the green branches in dependency order under the
+   done-check; a red slice is **blocked** (and its dependents never become ready), a
+   merge conflict is handed to the injected `ConflictResolver` to resolve-and-retry or
+   **escalate** (unresolvable, no resolver, or a retry that still conflicts),
+4. **loop** — repeat until no ready slice remains.
+
+The run executes inside an injected single-run lock, so at most one orchestrator run is
+in flight at a time — a second entry raises `OrchestratorBusyError`. The lock, the
+conflict resolver, the implementer spawn, and the git operations are all injected
+alongside the done-check seams, so the whole parallel/topological flow is exercised with
+no Agent SDK, no Docker, no gh, no network, and no concurrency races.
+
 ## Configuration
 
 Set via environment variables or a `.env` file:

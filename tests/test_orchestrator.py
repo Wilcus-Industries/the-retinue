@@ -19,6 +19,7 @@ from retinue.orchestrator import (
     BuildOutcome,
     BuildResult,
     Implementer,
+    MergeConflict,
     Slice,
     build_slice,
     integration_branch,
@@ -75,13 +76,8 @@ class FakeGitOps:
         self.merges.append((source, into))
 
 
-class MergeConflictError(Exception):
-    """A merge could not complete because of a conflict."""
-
-    def __init__(self, source: str, into: str) -> None:
-        super().__init__(f"merge conflict merging {source} into {into}")
-        self.source = source
-        self.into = into
+class MergeConflictError(MergeConflict):
+    """A merge could not complete because of a conflict (a typed ``MergeConflict``)."""
 
 
 def _slice(issue_number: int = 7, prd_number: int = 1) -> Slice:
