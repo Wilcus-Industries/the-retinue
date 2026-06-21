@@ -34,6 +34,14 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   seam the done-check runs inside (real Docker lives behind it).
 - `retinue.done_check` — `run_done_check`, which runs an accepted repo's done-check in
   a fresh container and reports the outcome.
+- `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
+  channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
+  Every escalation in the retinue routes through it.
+- `retinue.slicer` — `slice_prd`: runs the headless Agent-SDK slicer over a PRD
+  body to produce vertical-slice issues labeled `ready-for-agent` + `Part of #<prd>`
+  with a resolved `## Blocked by` graph, reserving `hitl` for genuinely human-only
+  slices. A thin/malformed PRD escalates through `Notifier` instead of inventing
+  slices. The Agent-SDK call and the gh issue creation are injected seams.
 
 A validly signed `issues` webhook returns 202 and enqueues exactly one job; an
 invalid or missing signature returns 401 and enqueues nothing. Non-`issues` events
