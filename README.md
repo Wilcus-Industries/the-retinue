@@ -34,6 +34,9 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   seam the done-check runs inside (real Docker lives behind it).
 - `retinue.done_check` — `run_done_check`, which runs an accepted repo's done-check in
   a fresh container and reports the outcome.
+- `retinue.orchestrator` — `build_slice`, the single-slice orchestrator: spawn one
+  implementer subagent on an `issue-<N>` branch, gate on `run_done_check`, and merge
+  the green slice into the integration branch `retinue/prd-<n>` (a red check blocks it).
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
@@ -97,6 +100,23 @@ Auth, the container runtime, the secret resolver, and the report sink are all in
 so the orchestration is fully exercised without Docker or network; a real container is
 only touched in the manual smoke. The done-check command is parsed from the first fenced
 code block under a "Definition of done" heading in the repo's `CLAUDE.md`.
+
+## Single-slice orchestrator
+
+`retinue.orchestrator.build_slice` builds one ready slice end-to-end, in order:
+
+1. **spawn** — run one implementer subagent (the Agent SDK seam) in an isolated git
+   worktree inside the disposable container; it implements TDD-first and commits to the
+   slice's `issue-<N>` branch,
+2. **done-check** — run the repo's done-check via `run_done_check` (the gate),
+3. **merge** — only on a green done-check, ensure the integration branch
+   `retinue/prd-<n>` exists (created off the config's `staging_branch` when absent) and
+   merge `issue-<N>` into it. A red done-check **blocks** the merge: no failing slice is
+   ever integrated, and the integration branch is left untouched.
+
+The implementer spawn and the git operations (`GitOps`: ensure-branch + merge) are
+injected alongside the done-check seams, so the whole one-slice flow is exercised with
+no Agent SDK, no Docker, no gh, and no network.
 
 ## Configuration
 
