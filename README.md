@@ -245,6 +245,21 @@ The heimdall verdict, the gh issue creator (reused from the slicer), the
 rebuild-onto-same-branch trigger, the handoff, and the notifier sinks are all injected,
 so the loop is exercised with no real `gh`, heimdall, or network.
 
+## Convergence handoff + merge reap
+
+On convergence the loopback calls its `Handoff` seam, which `retinue.handoff` implements
+as **`announce_handoff`**: a single "test & merge" notification through the shared
+`Notifier` — a push heads-up plus a PR comment (and a findable `test-and-merge` label)
+telling a human the PR is clean and ready. **The retinue never merges**: there is no
+merge collaborator on the handoff, and a human performs the merge.
+
+When the human merges, **`reap_merged_pr`** reacts to the `pull_request` closed+merged
+signal: it closes the PR's slice issues, then *reaps* the PRD — closing it IFF every
+non-`hitl` child (issues carrying `Part of #<prd>`) is closed. An open `hitl` child (a
+deliberately human-only slice) does not block the reap; an open non-`hitl` child does.
+The gh issue-close and child-enumeration are a single injected `Handoff` gh seam (no
+merge method), so both flows run with no real `gh`, push service, or network.
+
 ## Configuration
 
 Set via environment variables or a `.env` file:
