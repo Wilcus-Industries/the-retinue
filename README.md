@@ -128,10 +128,17 @@ primitive, looping rounds until the ready set drains:
 2. **parallel fan-out** — spawn the round's implementers concurrently, bounded by the
    config's `max_parallel` (unbounded when unset),
 3. **topological merge** — merge the green branches in dependency order under the
-   done-check; a red slice is **blocked** (and its dependents never become ready), a
-   merge conflict is handed to the injected `ConflictResolver` to resolve-and-retry or
-   **escalate** (unresolvable, no resolver, or a retry that still conflicts),
-4. **loop** — repeat until no ready slice remains.
+   done-check; a red slice is **blocked**, a merge conflict is handed to the injected
+   `ConflictResolver` to resolve-and-retry or **escalate** (unresolvable, no resolver,
+   or a retry that still conflicts). A blocked or escalated slice is terminal, so its
+   dependents never become ready — that pruned subtree is reported as **skipped**, not
+   silently dropped,
+4. **loop** — repeat until no ready slice remains, then drain every still-pending slice
+   into `skipped`.
+
+The result is a `PrdBuildResult` that partitions every input slice into exactly one
+bucket — `merged`, `blocked`, `escalated`, or `skipped` — so no slice ever vanishes
+from the outcome.
 
 The run executes inside an injected single-run lock, so at most one orchestrator run is
 in flight at a time — a second entry raises `OrchestratorBusyError`. The lock, the
