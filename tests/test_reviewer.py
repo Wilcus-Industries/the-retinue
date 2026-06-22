@@ -22,12 +22,16 @@ from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
     AgentSdkReviewGenerator,
     EditBlockedByRequest,
+    GhCliBlockedByEditor,
+    GhCommandError,
+    GhResult,
     HttpResponse,
     ReviewFinding,
     ReviewGenerationError,
     ReviewInput,
     ReviewPlan,
     ReviewResult,
+    add_blocked_by,
     review_round,
 )
 from retinue.slicer import CreatedIssue, IssueDraft
@@ -352,3 +356,91 @@ async def test_real_generator_raises_when_findings_missing() -> None:
 
     with pytest.raises(ReviewGenerationError):
         await gen(_input(CLEAN_DIFF))
+
+
+# --- Real gh-cli BlockedByEditor: pure/parseable parts, no gh/network ---
+
+
+class _FakeGhRunner:
+    """Records each gh invocation and returns scripted results. No subprocess."""
+
+    def __init__(self, results: list[GhResult]) -> None:
+        self._results = list(results)
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
+        self.calls.append((list(args), dict(env)))
+        return self._results.pop(0)
+
+
+def _body_result(body: str) -> GhResult:
+    """A ``gh issue view --json body`` result carrying ``body``."""
+    import json as _json
+
+    return GhResult(exit_code=0, stdout=_json.dumps({"body": body}))
+
+
+def test_add_blocked_by_appends_block_when_absent() -> None:
+    """A body with no Blocked-by block grows one appended at the end."""
+    body = "Some finding.\n\nPart of #1"
+    assert add_blocked_by(body, 201) == "Some finding.\n\nPart of #1\n\n## Blocked by\n#201"
+
+
+def test_add_blocked_by_appends_to_existing_block() -> None:
+    """An existing Blocked-by block gains the new reference on its own line."""
+    body = "Body.\n\n## Blocked by\n#5"
+    assert add_blocked_by(body, 201) == "Body.\n\n## Blocked by\n#5\n#201"
+
+
+def test_add_blocked_by_is_idempotent() -> None:
+    """A blocker already listed leaves the body unchanged."""
+    body = "Body.\n\n## Blocked by\n#5\n#201"
+    assert add_blocked_by(body, 201) == body
+
+
+@pytest.mark.asyncio
+async def test_real_editor_reads_then_writes_with_added_blocker() -> None:
+    """The editor views the body, then edits it back with the new Blocked-by ref."""
+    runner = _FakeGhRunner([_body_result("Dependent body.\n\nPart of #1"), GhResult(0)])
+    editor = GhCliBlockedByEditor(runner=runner, token="ght_abc")
+
+    await editor(EditBlockedByRequest(repo_full_name=REPO, issue_number=3, add_blocker=201))
+
+    view_args, view_env = runner.calls[0]
+    assert view_args == ["issue", "view", "3", "--repo", REPO, "--json", "body"]
+    assert view_env == {"GH_TOKEN": "ght_abc"}
+    edit_args, _ = runner.calls[1]
+    assert edit_args[:5] == ["issue", "edit", "3", "--repo", REPO]
+    assert edit_args[5] == "--body"
+    assert "## Blocked by\n#201" in edit_args[6]
+
+
+@pytest.mark.asyncio
+async def test_real_editor_skips_edit_when_already_blocked() -> None:
+    """An already-present blocker reads the body but writes nothing back."""
+    runner = _FakeGhRunner([_body_result("Body.\n\n## Blocked by\n#201")])
+    editor = GhCliBlockedByEditor(runner=runner, token="ght_abc")
+
+    await editor(EditBlockedByRequest(repo_full_name=REPO, issue_number=3, add_blocker=201))
+
+    assert len(runner.calls) == 1  # view only, no edit
+
+
+@pytest.mark.asyncio
+async def test_real_editor_raises_on_gh_failure() -> None:
+    """A non-zero gh exit raises GhCommandError rather than silently dropping the wire."""
+    runner = _FakeGhRunner([GhResult(exit_code=1, stderr="not found")])
+    editor = GhCliBlockedByEditor(runner=runner, token="ght_abc")
+
+    with pytest.raises(GhCommandError):
+        await editor(
+            EditBlockedByRequest(repo_full_name=REPO, issue_number=3, add_blocker=201)
+        )
+
+
+def test_real_editor_raises_on_malformed_view_output() -> None:
+    """A view payload missing the body field fails loudly rather than clobbering it."""
+    from retinue.reviewer import _parse_issue_body
+
+    with pytest.raises(ValueError):
+        _parse_issue_body('{"oops": true}')

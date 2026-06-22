@@ -300,6 +300,210 @@ class ReviewGenerationError(RuntimeError):
     """The headless reviewer failed to produce a usable :class:`ReviewPlan`."""
 
 
+# ---------------------------------------------------------------------------
+# Real gh-cli BlockedByEditor (production adapter behind the BlockedByEditor seam).
+#
+# Wires a filed review-fix issue into a dependent's ``## Blocked by`` block by
+# editing the dependent's issue body via ``gh``. The flow is read-modify-write:
+# read the dependent's current body (``gh issue view --json body``), add the
+# ``#<fix>`` reference to its ``## Blocked by`` block (matching the slicer's block
+# shape), then write it back (``gh issue edit --body``). The process spawn is the
+# only side effect, taken behind the injected :class:`GhRunner` protocol so the
+# pure parts — auth-env build, command assembly, body parsing, block rendering —
+# are exercised without a live ``gh`` or network.
+#
+# gh is authenticated via ``GH_TOKEN`` in the environment (gh sends it as
+# ``Authorization: Bearer`` on every REST/GraphQL call), so the adapter never
+# assembles an auth header itself — it injects the token and lets gh own the wire.
+# ---------------------------------------------------------------------------
+
+_BLOCKED_BY_HEADING = "## Blocked by"
+
+
+@dataclass(frozen=True)
+class GhResult:
+    """Captured result of a single ``gh`` invocation.
+
+    Attributes:
+        exit_code: ``gh``'s process exit status; ``0`` means success.
+        stdout: Captured standard output (the issue body payload to parse).
+        stderr: Captured standard error (surfaced in the error on failure).
+    """
+
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """True when ``gh`` exited successfully (exit code 0)."""
+        return self.exit_code == 0
+
+
+class GhRunner(Protocol):
+    """Runs a single ``gh`` command. The process-spawn seam under the editor.
+
+    A production implementation spawns ``gh`` as a subprocess with ``env`` merged
+    into its environment (so ``GH_TOKEN`` authenticates the call) and returns the
+    captured :class:`GhResult`; tests inject a fake that records each ``(args, env)``
+    and returns a canned result. ``args`` never includes the leading ``"gh"`` — the
+    runner owns the executable name.
+    """
+
+    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
+        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
+        ...
+
+
+class GhCommandError(RuntimeError):
+    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
+
+    def __init__(self, command: list[str], result: GhResult) -> None:
+        self.command = command
+        self.result = result
+        super().__init__(
+            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
+        )
+
+
+def _gh_auth_env(token: str) -> dict[str, str]:
+    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
+
+    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on
+    every REST/GraphQL call, so the adapter injects the token here and lets ``gh``
+    own the wire format rather than assembling a header itself.
+    """
+    return {"GH_TOKEN": token}
+
+
+def _issue_view_args(repo_full_name: str, issue_number: int) -> list[str]:
+    """Assemble the ``gh issue view`` argv reading the dependent's body as JSON."""
+    return [
+        "issue",
+        "view",
+        str(issue_number),
+        "--repo",
+        repo_full_name,
+        "--json",
+        "body",
+    ]
+
+
+def _issue_edit_args(repo_full_name: str, issue_number: int, body: str) -> list[str]:
+    """Assemble the ``gh issue edit`` argv writing ``body`` back to the dependent."""
+    return [
+        "issue",
+        "edit",
+        str(issue_number),
+        "--repo",
+        repo_full_name,
+        "--body",
+        body,
+    ]
+
+
+def _parse_issue_body(stdout: str) -> str:
+    """Parse ``gh issue view --json body`` output into the issue body string.
+
+    ``gh`` emits ``{"body": "<str>"}``. Raises :class:`ValueError` when the payload
+    is not JSON or is missing the ``body`` field, so a malformed response fails
+    loudly rather than clobbering the dependent's body with junk.
+    """
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"gh issue view returned non-JSON output: {stdout!r}") from exc
+    if not isinstance(payload, dict) or "body" not in payload:
+        raise ValueError(f"gh issue view output missing body: {stdout!r}")
+    return str(payload["body"])
+
+
+def add_blocked_by(body: str, blocker: int) -> str:
+    """Return ``body`` with ``#<blocker>`` added to its ``## Blocked by`` block.
+
+    Matches the slicer's block shape: a ``## Blocked by`` heading followed by one
+    ``#N`` reference per line. The edit is idempotent — a blocker already listed
+    yields the body unchanged — and a body without the block grows one appended at
+    the end, so a dependent the slicer never gave a block still gets wired.
+    """
+    existing, prefix = _split_blocked_by(body)
+    if blocker in existing:
+        return body
+    refs = "\n".join(f"#{n}" for n in [*existing, blocker])
+    block = f"{_BLOCKED_BY_HEADING}\n{refs}"
+    return f"{prefix}\n\n{block}" if prefix else block
+
+
+def _split_blocked_by(body: str) -> tuple[list[int], str]:
+    """Split ``body`` into its existing blocker numbers and the text before the block.
+
+    Returns ``(blockers, prefix)`` where ``prefix`` is everything ahead of the
+    ``## Blocked by`` heading (the whole body, right-stripped, when there is no
+    block). Only well-formed ``#<int>`` lines inside the block are read as blockers;
+    a non-reference line ends the block so trailing prose is preserved in ``prefix``.
+    """
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == _BLOCKED_BY_HEADING:
+            blockers: list[int] = []
+            for ref in lines[index + 1 :]:
+                stripped = ref.strip()
+                if stripped.startswith("#") and stripped[1:].isdigit():
+                    blockers.append(int(stripped[1:]))
+                elif stripped:
+                    break
+            prefix = "\n".join(lines[:index]).rstrip()
+            return blockers, prefix
+    return [], body.rstrip()
+
+
+@dataclass(frozen=True)
+class GhCliBlockedByEditor:
+    """Real :data:`BlockedByEditor`: wire a review-fix into a dependent via ``gh``.
+
+    Satisfies the ``edit`` protocol ``(EditBlockedByRequest) -> Awaitable[None]`` by
+    calling itself: it reads the dependent issue's body, adds the ``#<fix>``
+    reference to its ``## Blocked by`` block (idempotently), and writes the body
+    back. The injected :class:`GhRunner` is the only side-effecting seam, so command
+    assembly and body rendering are unit-testable without a live ``gh`` or network.
+
+    Attributes:
+        runner: The process-spawn seam that runs each ``gh`` command.
+        token: The token ``gh`` authenticates with (sent as ``GH_TOKEN``).
+    """
+
+    runner: GhRunner
+    token: str
+
+    async def __call__(self, request: EditBlockedByRequest) -> None:
+        """Add ``request.add_blocker`` to the dependent's ``## Blocked by`` block."""
+        body = await self._read_body(request.repo_full_name, request.issue_number)
+        updated = add_blocked_by(body, request.add_blocker)
+        if updated == body:
+            logger.info(
+                "#%d already blocked by #%d in %s; no edit",
+                request.issue_number,
+                request.add_blocker,
+                request.repo_full_name,
+            )
+            return
+        await self._gh(
+            _issue_edit_args(request.repo_full_name, request.issue_number, updated)
+        )
+
+    async def _read_body(self, repo_full_name: str, issue_number: int) -> str:
+        """Read the dependent issue's current body via ``gh issue view``."""
+        result = await self._gh(_issue_view_args(repo_full_name, issue_number))
+        return _parse_issue_body(result.stdout)
+
+    async def _gh(self, args: list[str]) -> GhResult:
+        """Run one ``gh`` command authenticated with the token, raising on failure."""
+        result = await self.runner.run(args, env=_gh_auth_env(self.token))
+        if not result.ok:
+            raise GhCommandError(args, result)
+        return result
+
+
 async def review_round(
     review_input: ReviewInput,
     *,
