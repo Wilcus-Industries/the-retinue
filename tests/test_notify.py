@@ -18,6 +18,8 @@ from retinue.notify import (
     CommentDeliveryError,
     CommentRequest,
     GhCommentSink,
+    GhLabelSink,
+    LabelDeliveryError,
     LabelRequest,
     Notification,
     Notifier,
@@ -340,3 +342,97 @@ def test_comment_delivery_error_reports_argv_and_stderr() -> None:
     assert err.returncode == 1
     assert err.argv == ["issue", "comment", "42"]
     assert "gh: not found" in str(err)
+
+
+# --- Real label sink: gh issue edit --add-label (no subprocess) -------------
+
+
+def _label() -> LabelRequest:
+    return LabelRequest(
+        repo_full_name="owner/repo",
+        issue_number=42,
+        label="hitl",
+    )
+
+
+def test_gh_label_argv_assembles_issue_edit_command() -> None:
+    """The argv is ``issue edit <n> --repo <repo> --add-label <label>`` (no shell)."""
+    argv = GhLabelSink.build_argv(_label())
+
+    assert argv == [
+        "issue",
+        "edit",
+        "42",
+        "--repo",
+        "owner/repo",
+        "--add-label",
+        "hitl",
+    ]
+
+
+def test_gh_label_argv_carries_label_verbatim_without_shell_interpolation() -> None:
+    """A label with shell metacharacters rides as one --add-label arg, never a line."""
+    request = LabelRequest(
+        repo_full_name="owner/repo",
+        issue_number=7,
+        label="needs $(whoami) && `id`",
+    )
+
+    argv = GhLabelSink.build_argv(request)
+
+    assert argv[-2:] == ["--add-label", "needs $(whoami) && `id`"]
+
+
+def test_gh_label_auth_env_injects_token_as_gh_token() -> None:
+    """A configured token rides in the child env as ``GH_TOKEN``, not on the argv."""
+    sink = GhLabelSink(token="tk_secret")
+
+    env = sink.build_auth_env()
+
+    assert env == {"GH_TOKEN": "tk_secret"}
+    assert "tk_secret" not in GhLabelSink.build_argv(_label())
+
+
+def test_gh_label_auth_env_empty_without_token() -> None:
+    """With no token the auth env is empty, falling back to the host's gh auth."""
+    assert GhLabelSink().build_auth_env() == {}
+
+
+@pytest.mark.asyncio
+async def test_gh_label_sink_dispatches_argv_and_env_to_runner() -> None:
+    """Calling the sink hands the assembled argv + auth env to the injected runner."""
+    runner = _RecordingGhRunner()
+    sink = GhLabelSink(token="tk_secret", runner=runner)
+
+    await sink(_label())
+
+    assert len(runner.calls) == 1
+    argv, env = runner.calls[0]
+    assert argv == GhLabelSink.build_argv(_label())
+    assert env == {"GH_TOKEN": "tk_secret"}
+
+
+@pytest.mark.asyncio
+async def test_gh_label_sink_propagates_runner_failure() -> None:
+    """A failing gh runner propagates — a lost label is not swallowed."""
+
+    async def failing_runner(
+        argv: Sequence[str], env: Mapping[str, str]
+    ) -> None:
+        raise LabelDeliveryError(argv, returncode=1, stderr="label not found")
+
+    sink = GhLabelSink(runner=failing_runner)
+
+    with pytest.raises(LabelDeliveryError, match="label not found"):
+        await sink(_label())
+
+
+def test_label_delivery_error_reports_argv_and_stderr() -> None:
+    """The error surfaces the argv and stderr so a lost label is debuggable."""
+    err = LabelDeliveryError(
+        ["issue", "edit", "42"], returncode=1, stderr="gh: label not found\n"
+    )
+
+    assert err.returncode == 1
+    assert err.argv == ["issue", "edit", "42"]
+    assert "gh: label not found" in str(err)

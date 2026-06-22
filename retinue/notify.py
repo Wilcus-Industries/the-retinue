@@ -439,3 +439,127 @@ async def _run_gh_comment_subprocess(
             returncode=process.returncode or -1,
             stderr=stderr.decode(errors="replace"),
         )
+
+
+# --- Real label sink: gh issue edit --add-label ------------------------------
+#
+# This is the production adapter behind the ``LabelSink`` seam. It applies the
+# escalation's routing label by shelling out to ``gh issue edit --add-label``,
+# mirroring the comment sink above (and the rest of the retinue's gh-cli
+# adapters): the command-assembly and the auth-env build are pure and unit-tested
+# directly, and the one impure edge — the subprocess spawn — sits behind an
+# injected ``runner`` so the seam is exercisable without a real ``gh``, Docker, or
+# network. The label makes the escalated issue findable and routes the agent
+# loop, so a non-zero ``gh`` exit raises :class:`LabelDeliveryError` rather than
+# being swallowed.
+
+# An async runner for a ``gh`` argv, identical in shape to GhCommentRunner: given
+# the argv (no leading "gh") and the auth env, it runs the command and returns
+# nothing, raising on a non-zero exit. The default spawns a real ``gh`` child;
+# tests inject a fake to drive the pure command-assembly + auth-env.
+GhLabelRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[None]]
+
+
+class LabelDeliveryError(RuntimeError):
+    """A ``gh issue edit --add-label`` invocation failed (non-zero exit).
+
+    Carries the argv and captured stderr so a lost-label failure is debuggable
+    rather than a bare ``CalledProcessError``.
+    """
+
+    def __init__(self, argv: Sequence[str], *, returncode: int, stderr: str) -> None:
+        self.argv = list(argv)
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(
+            f"gh exited {returncode} for {' '.join(argv)}: {stderr.strip()}"
+        )
+
+
+class GhLabelSink:
+    """Real :data:`LabelSink`: applies a label via ``gh issue edit --add-label``.
+
+    Runs ``gh issue edit <number> --repo <owner/repo> --add-label <label>`` to make
+    the escalated issue findable and to route the agent loop. Authenticates by
+    injecting the GitHub token into the child env as ``GH_TOKEN`` (the variable
+    ``gh`` reads), so the token is never placed on the command line where a process
+    listing or log could leak it.
+
+    The command assembly (:meth:`build_argv`) and the auth env build
+    (:meth:`build_auth_env`) are pure and unit-tested directly. The subprocess
+    spawn is the one impure edge, factored behind the injected ``runner`` (default:
+    :func:`_run_gh_label_subprocess`) so the seam is exercisable without a real
+    ``gh``, Docker, or network.
+
+    Args:
+        token: The GitHub token ``gh`` authenticates with, placed in the child env
+            as ``GH_TOKEN``. ``None`` runs ``gh`` with the ambient auth (e.g. a
+            logged-in CLI), useful for local runs.
+        runner: The injected argv runner; defaults to the real subprocess spawn.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        runner: GhLabelRunner | None = None,
+    ) -> None:
+        self._token = token
+        self._runner = runner or _run_gh_label_subprocess
+
+    @staticmethod
+    def build_argv(request: LabelRequest) -> list[str]:
+        """Assemble the ``gh issue edit`` argv for ``request`` (no leading ``gh``).
+
+        The label rides as an ``--add-label`` value rather than being interpolated
+        into a shell, so a label containing shell metacharacters is applied verbatim.
+        """
+        return [
+            "issue",
+            "edit",
+            str(request.issue_number),
+            "--repo",
+            request.repo_full_name,
+            "--add-label",
+            request.label,
+        ]
+
+    def build_auth_env(self) -> dict[str, str]:
+        """The child env carrying the token as ``GH_TOKEN`` (just it when supplied).
+
+        The token goes in the env, never on the argv, so it never lands in a
+        process listing or a log of the command. With no token, an empty mapping
+        lets the runner fall back to the host's own ``gh`` auth.
+        """
+        return {"GH_TOKEN": self._token} if self._token else {}
+
+    async def __call__(self, request: LabelRequest) -> None:
+        """Apply ``request``'s label. Raises on a non-zero ``gh`` exit."""
+        await self._runner(self.build_argv(request), self.build_auth_env())
+
+
+async def _run_gh_label_subprocess(
+    argv: Sequence[str], env: Mapping[str, str]
+) -> None:
+    """Spawn ``gh`` with ``env`` layered over the ambient env; raise on failure.
+
+    The default :data:`GhLabelRunner`. Uses :func:`asyncio.create_subprocess_exec`
+    (an argv list, no shell, so the label and repo name are never interpolated into
+    a command line) and raises :class:`LabelDeliveryError` on a non-zero exit so a
+    lost label fails loudly — the label routes the agent loop and the caller must
+    not silently lose it.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "gh",
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **env},
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise LabelDeliveryError(
+            argv,
+            returncode=process.returncode or -1,
+            stderr=stderr.decode(errors="replace"),
+        )
