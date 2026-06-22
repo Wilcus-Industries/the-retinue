@@ -11,7 +11,8 @@ Two enforcement points:
 
 * **gate at run start** (:meth:`BudgetGovernor.gate`) — if the run's estimated charge
   would push the trailing-24h spend over the cap, the run is *deferred* until the window
-  frees (when the oldest in-window charge ages out).
+  frees enough room for that estimate (the charges expire oldest-first until the trailing
+  spend leaves room for the estimate under the cap).
 * **meter mid-run** (:meth:`BudgetGovernor.meter`) — a charge that would cross the cap
   *pauses* the run and checkpoints it (the owned slice set is recorded in the reconcile
   :class:`~retinue.reconcile.RunStateStore`). :meth:`BudgetGovernor.try_resume` resumes
@@ -64,7 +65,8 @@ CREATE TABLE IF NOT EXISTS spend_entries (
 _PAUSE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS budget_pauses (
     prd_key   TEXT PRIMARY KEY,
-    resume_at TEXT NOT NULL
+    resume_at TEXT NOT NULL,
+    amount    REAL NOT NULL DEFAULT 0
 )
 """
 
@@ -203,24 +205,44 @@ class BudgetLedger:
         """
         return (await self.trailing_24h_spend()) + amount > self.cap()
 
-    async def window_frees_at(self) -> datetime | None:
-        """Return when the oldest in-window charge ages out, freeing room.
+    async def window_frees_at(self, *, amount: float) -> datetime | None:
+        """Return when the window frees enough room to admit ``amount`` under the cap.
+
+        Walks the in-window charges oldest-first, accumulating the spend each one frees as
+        it ages out, and returns the ``spent_at + 24h`` of the charge whose expiry first
+        brings ``trailing_24h_spend - freed + amount`` to within the cap (i.e. the instant
+        :meth:`would_exceed` for ``amount`` flips to False). This is later than the oldest
+        charge's expiry whenever the oldest charge alone does not free enough room.
+
+        Args:
+            amount: The prospective charge the window must make room for.
 
         Returns:
-            The instant the oldest trailing-24h charge falls out of the window (its
-            timestamp + 24h), or ``None`` when no charge is currently in the window.
+            The instant the window frees enough for ``amount``, or ``None`` when no charge
+            is in the window (nothing to wait for).
         """
         cutoff = (self._clock.now() - _WINDOW).isoformat()
         async with self._connect() as db:
             await db.execute(_SCHEMA)
             async with db.execute(
-                "SELECT MIN(spent_at) FROM spend_entries WHERE spent_at > ?",
+                "SELECT spent_at, amount FROM spend_entries "
+                "WHERE spent_at > ? ORDER BY spent_at ASC",
                 (cutoff,),
             ) as cursor:
-                row = await cursor.fetchone()
-        if row is None or row[0] is None:
+                charges = await cursor.fetchall()
+        if not charges:
             return None
-        return datetime.fromisoformat(row[0]) + _WINDOW
+        trailing = sum(float(charge) for _, charge in charges)
+        freed = 0.0
+        last_spent_at = ""
+        for spent_at, charge in charges:
+            last_spent_at = spent_at
+            freed += float(charge)
+            if trailing - freed + amount <= self.cap():
+                return datetime.fromisoformat(spent_at) + _WINDOW
+        # Even with every in-window charge aged out, ``amount`` alone exceeds the cap; the
+        # last charge to expire is the earliest the window is as empty as it can get.
+        return datetime.fromisoformat(last_spent_at) + _WINDOW
 
     def _connect(self) -> aiosqlite.Connection:
         """Open a fresh DB connection, ensuring the parent dir exists first."""
@@ -297,7 +319,7 @@ class BudgetGovernor:
             would start the run over the cap, else an admitted decision.
         """
         if await self._ledger.would_exceed(amount=estimated_amount):
-            defer_until = await self._ledger.window_frees_at()
+            defer_until = await self._ledger.window_frees_at(amount=estimated_amount)
             logger.info(
                 "Budget gate deferring run: estimated %.4g would exceed the 24h cap "
                 "(%.4g); defer until %s",
@@ -338,12 +360,13 @@ class BudgetGovernor:
             await self._ledger.record_spend(amount=amount)
             return MeterDecision(paused=False, resume_at=None)
 
-        resume_at = await self._ledger.window_frees_at()
+        resume_at = await self._ledger.window_frees_at(amount=amount)
         await self._checkpoint(
             repo_full_name=repo_full_name,
             prd_number=prd_number,
             slices=slices,
             resume_at=resume_at,
+            amount=amount,
         )
         logger.info(
             "Budget meter pausing PRD #%d (%s): charge %.4g would cross the 24h cap "
@@ -366,10 +389,13 @@ class BudgetGovernor:
         """Resume a budget-paused run once the window frees, reusing reconcile.
 
         Returns ``None`` while the run is still paused before its ``resume_at`` (the
-        window has not freed). Once the clock passes ``resume_at`` the pause is cleared and
-        the checkpointed slice set is reconciled against GitHub via
-        :func:`~retinue.reconcile.reconcile_run`, so only the unfinished slices are rebuilt
-        — no duplicate issue, branch, or PR.
+        window has not freed). It also re-verifies the cap once the clock passes
+        ``resume_at``: if the window still has not freed enough for the paused charge
+        (:meth:`BudgetLedger.would_exceed` is still True), it returns ``None`` and leaves
+        the pause record intact rather than resuming over-cap. Only when the cap genuinely
+        has room is the pause cleared and the checkpointed slice set reconciled against
+        GitHub via :func:`~retinue.reconcile.reconcile_run`, so only the unfinished slices
+        are rebuilt — no duplicate issue, branch, or PR.
 
         Args:
             repo_full_name: The target repo, e.g. "owner/repo".
@@ -378,12 +404,18 @@ class BudgetGovernor:
 
         Returns:
             A :class:`~retinue.reconcile.ReconcileResult` to route the resumed run on, or
-            ``None`` when the run is not paused or the window has not freed yet.
+            ``None`` when the run is not paused or the window has not freed enough yet.
         """
-        resume_at = await self._resume_at(repo_full_name, prd_number)
-        if resume_at is None:
+        pause = await self._pause_record(repo_full_name, prd_number)
+        if pause is None:
             return None
+        resume_at, amount = pause
         if self._ledger._clock.now() < resume_at:
+            return None
+        # Re-verify the cap: a too-early resume_at (or any other in-window spend since the
+        # pause) could leave the window still over-cap. Stay paused rather than resume into
+        # an over-budget state.
+        if await self._ledger.would_exceed(amount=amount):
             return None
 
         slice_numbers = await self._run_state.slices_of(
@@ -417,8 +449,13 @@ class BudgetGovernor:
         prd_number: int,
         slices: list[PrdSlice],
         resume_at: datetime | None,
+        amount: float,
     ) -> None:
-        """Persist the paused run's slice set and resume time for a later resume."""
+        """Persist the paused run's slice set, resume time, and charge for a later resume.
+
+        The ``amount`` is stored so :meth:`try_resume` can re-verify the cap against the
+        paused charge before clearing the pause, never resuming into an over-cap window.
+        """
         await self._run_state.record_slices(
             repo_full_name=repo_full_name,
             prd_number=prd_number,
@@ -431,10 +468,11 @@ class BudgetGovernor:
             await db.execute(_PAUSE_SCHEMA)
             await db.execute(
                 """
-                INSERT INTO budget_pauses (prd_key, resume_at) VALUES (?, ?)
-                ON CONFLICT(prd_key) DO UPDATE SET resume_at = excluded.resume_at
+                INSERT INTO budget_pauses (prd_key, resume_at, amount) VALUES (?, ?, ?)
+                ON CONFLICT(prd_key) DO UPDATE SET
+                    resume_at = excluded.resume_at, amount = excluded.amount
                 """,
-                (key, stamp),
+                (key, stamp, amount),
             )
             await db.commit()
 
@@ -469,14 +507,23 @@ class BudgetGovernor:
 
     async def _resume_at(self, repo_full_name: str, prd_number: int) -> datetime | None:
         """Return the recorded resume time for a paused PRD, or None when not paused."""
+        pause = await self._pause_record(repo_full_name, prd_number)
+        return pause[0] if pause is not None else None
+
+    async def _pause_record(
+        self, repo_full_name: str, prd_number: int
+    ) -> tuple[datetime, float] | None:
+        """Return the paused PRD's (resume time, charge), or None when not paused."""
         key = run_state_key(repo_full_name, prd_number)
         async with self._connect() as db:
             await db.execute(_PAUSE_SCHEMA)
             async with db.execute(
-                "SELECT resume_at FROM budget_pauses WHERE prd_key = ?", (key,)
+                "SELECT resume_at, amount FROM budget_pauses WHERE prd_key = ?", (key,)
             ) as cursor:
                 row = await cursor.fetchone()
-        return datetime.fromisoformat(row[0]) if row is not None else None
+        if row is None:
+            return None
+        return datetime.fromisoformat(row[0]), float(row[1])
 
     async def _clear_pause(self, repo_full_name: str, prd_number: int) -> None:
         """Remove the pause record once a run resumes."""

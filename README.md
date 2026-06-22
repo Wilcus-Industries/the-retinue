@@ -281,11 +281,16 @@ charge, `trailing_24h_spend` sums only the charges inside the trailing 24h read 
 Metering is auth-aware: an API key meters **dollars** against a weekly-$ budget,
 subscription OAuth meters **tokens** against a weekly-token budget — same rolling math,
 different unit. **`BudgetGovernor`** enforces at two points: `gate` **defers** a run whose
-estimated charge would start it over the cap (until the window frees); `meter` **pauses +
-checkpoints** a run whose next charge would cross the cap. `try_resume` resumes a paused
-run once the window frees by reusing the reconcile machinery (`reconcile_run` over the
-checkpointed slice set), so only the unfinished slices rebuild — no duplicate issue,
-branch, or PR.
+estimated charge would start it over the cap; `meter` **pauses + checkpoints** a run whose
+next charge would cross the cap. The `defer_until` / `resume_at` is the instant the window
+frees enough room for that specific amount — `window_frees_at(amount)` walks the in-window
+charges oldest-first, accumulating freed spend, and returns the expiry of the charge that
+first brings the trailing spend back under the cap (not merely the oldest charge's expiry,
+which can be too early when the estimate exceeds the room it frees). `try_resume`
+re-verifies the cap before clearing the pause: past `resume_at` but still over cap, it
+returns `None` and leaves the run paused rather than resuming over-budget; once the window
+genuinely has room it reuses the reconcile machinery (`reconcile_run` over the checkpointed
+slice set), so only the unfinished slices rebuild — no duplicate issue, branch, or PR.
 
 ## Configuration
 

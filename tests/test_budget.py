@@ -197,6 +197,38 @@ async def test_defer_until_is_when_the_window_frees(db_path: Path) -> None:
     assert decision.defer_until == _T0 + timedelta(hours=24)
 
 
+@pytest.mark.asyncio
+async def test_defer_until_waits_until_window_frees_enough_for_the_amount(
+    db_path: Path,
+) -> None:
+    """When the oldest charge alone doesn't free enough, defer_until waits for more.
+
+    cap = 12. Record 1.0 at T0, then 11.0 at T0+1h (trailing = 12, full). A 5.0 estimate
+    needs more room than the 1.0 charge frees, so the defer time must be when the 11.0
+    charge ages out (T0+1h+24h), not when the oldest 1.0 charge does (T0+24h).
+    """
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=1.0)
+    clock.advance(timedelta(hours=1))
+    await ledger.record_spend(amount=11.0)
+    governor = BudgetGovernor(ledger)
+
+    decision = await governor.gate(estimated_amount=5.0)
+
+    assert decision.deferred is True
+    assert decision.defer_until is not None
+    # The 11.0 charge is the one whose expiry frees enough for a 5.0 estimate.
+    assert decision.defer_until == _T0 + timedelta(hours=1) + timedelta(hours=24)
+
+    # Re-gating at exactly defer_until is admitted: the window has genuinely freed.
+    clock._now = decision.defer_until
+    readmit = await governor.gate(estimated_amount=5.0)
+    assert readmit.deferred is False
+
+
 # --- meter mid-run: pause + checkpoint, then resume ------------------------------
 
 
@@ -317,4 +349,54 @@ async def test_pause_resume_is_observable_end_to_end(db_path: Path) -> None:
     )
     assert result is not None
     # Once resumed, the run is no longer paused.
+    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is False
+
+
+@pytest.mark.asyncio
+async def test_try_resume_stays_paused_when_still_over_cap(db_path: Path) -> None:
+    """Past the recorded resume_at but still over cap, try_resume keeps the run paused.
+
+    cap = 12. Record 1.0 at T0, then 11.0 at T0+1h (trailing = 12, full). A 5.0 charge
+    pauses the run with resume_at = T0+1h+24h. If the clock is advanced only past the
+    first (1.0) charge's expiry (T0+24h), the window has freed only 1.0 — trailing 11.0,
+    so 11+5 > 12 is still over cap. try_resume must return None and leave the pause intact
+    rather than resume the run over-budget.
+    """
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=1.0)
+    clock.advance(timedelta(hours=1))
+    await ledger.record_spend(amount=11.0)
+    governor = BudgetGovernor(ledger)
+    slices = [_prd_slice(2)]
+
+    paused = await governor.meter(
+        repo_full_name="owner/repo",
+        prd_number=1,
+        amount=5.0,
+        slices=slices,
+    )
+    assert paused.paused is True
+    assert paused.resume_at == _T0 + timedelta(hours=1) + timedelta(hours=24)
+
+    # Past T0+24h only the 1.0 charge has aged out; trailing is still 11.0, so 11+5 > 12.
+    clock._now = _T0 + timedelta(hours=24, minutes=1)
+    still_paused = await governor.try_resume(
+        repo_full_name="owner/repo",
+        prd_number=1,
+        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
+    )
+    assert still_paused is None
+    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
+
+    # Once the 11.0 charge also ages out, the cap genuinely has room and resume proceeds.
+    clock._now = _T0 + timedelta(hours=1) + timedelta(hours=24, minutes=1)
+    result = await governor.try_resume(
+        repo_full_name="owner/repo",
+        prd_number=1,
+        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
+    )
+    assert result is not None
     assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is False
