@@ -9,6 +9,7 @@ through here, so the contract is: all three sinks fire for one ``notify`` call.
 from __future__ import annotations
 
 import logging
+import urllib.parse
 
 import pytest
 
@@ -17,7 +18,11 @@ from retinue.notify import (
     LabelRequest,
     Notification,
     Notifier,
+    NtfyPushSink,
+    PushDeliveryError,
+    PushoverPushSink,
     PushRequest,
+    build_basic_auth_header,
 )
 
 
@@ -143,3 +148,86 @@ async def test_notify_raises_when_label_sink_fails() -> None:
 
     with pytest.raises(RuntimeError, match="gh issue edit failed"):
         await notifier.notify(_notification())
+
+
+# --- Real push sink: pure request-building / parsing (no network) -----------
+
+
+def _push() -> PushRequest:
+    return PushRequest(title="Retinue needs a human", body="PRD #42 is too thin.")
+
+
+def test_build_basic_auth_header_encodes_credentials() -> None:
+    """The Basic auth header base64-encodes ``user:password`` per RFC 7617."""
+    # "user:pass" -> base64 -> dXNlcjpwYXNz
+    assert build_basic_auth_header("user", "pass") == "Basic dXNlcjpwYXNz"
+
+
+def test_ntfy_request_assembly_carries_title_body_and_topic() -> None:
+    """ntfy posts the body to ``{base}/{topic}`` with the title in ``X-Title``."""
+    sink = NtfyPushSink(topic="retinue", base_url="https://ntfy.example.com/")
+
+    post = sink.build_request(_push())
+
+    assert post.url == "https://ntfy.example.com/retinue"
+    assert post.data == b"PRD #42 is too thin."
+    assert post.headers["X-Title"] == "Retinue needs a human"
+    # No token configured -> no Authorization header.
+    assert "Authorization" not in post.headers
+
+
+def test_ntfy_request_adds_bearer_token_when_configured() -> None:
+    """A configured ntfy token rides as a ``Bearer`` Authorization header."""
+    sink = NtfyPushSink(topic="retinue", token="tk_secret")
+
+    post = sink.build_request(_push())
+
+    assert post.url == "https://ntfy.sh/retinue"
+    assert post.headers["Authorization"] == "Bearer tk_secret"
+
+
+def test_ntfy_rejects_empty_topic() -> None:
+    """An empty topic is a misconfiguration, caught at construction."""
+    with pytest.raises(ValueError, match="topic"):
+        NtfyPushSink(topic="")
+
+
+def test_pushover_request_assembly_form_encodes_credentials_and_message() -> None:
+    """Pushover form-encodes token, user, title, and message into the POST body."""
+    sink = PushoverPushSink(token="app_tok", user="usr_key")
+
+    post = sink.build_request(_push())
+
+    assert post.url.endswith("/messages.json")
+    assert post.headers["Content-Type"] == "application/x-www-form-urlencoded"
+    fields = dict(urllib.parse.parse_qsl(post.data.decode("utf-8")))
+    assert fields == {
+        "token": "app_tok",
+        "user": "usr_key",
+        "title": "Retinue needs a human",
+        "message": "PRD #42 is too thin.",
+    }
+
+
+def test_pushover_requires_token_and_user() -> None:
+    """Both Pushover credentials are mandatory at construction."""
+    with pytest.raises(ValueError, match="token and user"):
+        PushoverPushSink(token="", user="usr")
+
+
+def test_pushover_parse_response_accepts_success_status() -> None:
+    """A ``status: 1`` response parses cleanly (no raise)."""
+    PushoverPushSink.parse_response(b'{"status": 1, "request": "abc"}')
+
+
+def test_pushover_parse_response_raises_on_rejected_status() -> None:
+    """A 200 with ``status: 0`` is still a delivery failure that must surface."""
+    payload = b'{"status": 0, "errors": ["user key is invalid"]}'
+    with pytest.raises(PushDeliveryError, match="user key is invalid"):
+        PushoverPushSink.parse_response(payload)
+
+
+def test_pushover_parse_response_raises_on_unparseable_body() -> None:
+    """A non-JSON body cannot be confirmed as delivered, so it raises."""
+    with pytest.raises(PushDeliveryError, match="unparseable"):
+        PushoverPushSink.parse_response(b"<html>502 Bad Gateway</html>")
