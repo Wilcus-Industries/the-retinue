@@ -50,6 +50,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.triage` — `triage_implementer` / `decide_triage`: reasons about an
   implementer failure or returned notes and decides retry / reslice / escalate,
   bounded by the persisted retry count.
+- `retinue.reviewer` — `review_round`: the internal reviewer that runs after a PRD
+  round merges, reviews the round's diff for correctness/stale docs, and files
+  `review-fix` follow-up issues (`ready-for-agent` + `Part of #<prd>`) wired into
+  dependents' `## Blocked by`. It never edits code. The Agent-SDK review, the gh
+  issue creation (reused from the slicer), and the gh issue-body edit are injected.
 
 A validly signed `issues` webhook returns 202 and enqueues exactly one job; an
 invalid or missing signature returns 401 and enqueues nothing. Non-`issues` events
@@ -174,6 +179,25 @@ The pure `decide_triage(failed, notes, attempts, cap)` returns the typed
 path reach it — notes are never silently dropped. The implementer, the notifier sinks,
 the gh issue creator, and the SQLite store are all injected, so the whole loop is
 exercised with no Agent SDK, no gh, no push service, and no network.
+
+## Internal reviewer
+
+After a PRD round merges (`build_prd`), `retinue.reviewer.review_round` reviews that
+round before the next one starts:
+
+1. **review** — run the headless Agent-SDK reviewer (the injected `generate` seam) over
+   the round's merged diff and merged issue numbers, surfacing correctness bugs and
+   stale docs as `ReviewFinding`s,
+2. **file** — for each finding, file a follow-up issue via the slicer's `create_issue`
+   seam, reusing the `ready-for-agent` + `Part of #<prd>` shape and adding a
+   `review-fix` label so the agent loop routes it as a fix,
+3. **wire** — append the new review-fix issue to the `## Blocked by` of each dependent
+   open issue it flags (the injected `edit_blocked_by` gh seam), so the fix builds in a
+   later round *before* the work layered on top of the defect.
+
+A clean review files nothing. The reviewer **never edits code** — it only files and
+wires issues. The Agent-SDK review, the gh issue creation, and the gh issue-body edit
+are all injected, so the flow is exercised with no Agent SDK, no gh, and no network.
 
 ## Configuration
 
