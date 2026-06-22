@@ -18,6 +18,8 @@ from retinue.done_check import DoneCheckReport
 from retinue.orchestrator import (
     BuildOutcome,
     BuildResult,
+    ContainerGitOps,
+    GitOpsError,
     Implementer,
     MergeConflict,
     Slice,
@@ -247,3 +249,139 @@ async def test_merge_conflict_propagates() -> None:
 
     with pytest.raises(MergeConflictError):
         await _build(runtime=FakeRuntime(), git=git)
+
+
+# --- real container-backed GitOps adapter ----------------------------------------
+#
+# Exercises the production ContainerGitOps over a scripted in-memory container: argv
+# assembly, the branch-exists shortcut, and classifying a failed merge as a conflict
+# (aborted + raised) vs. a hard git error. No live container/Docker/network.
+
+
+class ScriptedContainer:
+    """In-memory :class:`Container` returning canned results keyed by argv substring.
+
+    ``results`` maps a marker (a substring of the joined argv, matched in insertion
+    order) to the :class:`RunResult` to return; an unmatched command returns exit 0.
+    Every command is recorded in ``commands`` so argv assembly can be asserted.
+    """
+
+    def __init__(self, results: dict[str, RunResult] | None = None) -> None:
+        self._results = results or {}
+        self.commands: list[list[str]] = []
+
+    async def run_command(self, command: list[str]) -> RunResult:
+        self.commands.append(command)
+        joined = " ".join(command)
+        for marker, result in self._results.items():
+            if marker in joined:
+                return result
+        return RunResult(exit_code=0)
+
+    async def destroy(self) -> None:  # pragma: no cover - unused by GitOps
+        pass
+
+
+def _joined(container: ScriptedContainer) -> list[str]:
+    return [" ".join(cmd) for cmd in container.commands]
+
+
+@pytest.mark.asyncio
+async def test_ensure_branch_reuses_existing_without_creating() -> None:
+    """When rev-parse confirms the branch exists, no fetch/checkout is issued."""
+    container = ScriptedContainer()  # rev-parse returns exit 0 -> branch exists
+    git = ContainerGitOps(container)
+
+    await git.ensure_integration_branch(branch="retinue/prd-1", base="main")
+
+    cmds = _joined(container)
+    assert cmds == ["git rev-parse --verify --quiet refs/heads/retinue/prd-1"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_branch_creates_off_origin_base_when_absent() -> None:
+    """An absent branch is fetched and checked out (-B) off ``origin/<base>``."""
+    container = ScriptedContainer(
+        {"rev-parse": RunResult(exit_code=1)}  # branch missing
+    )
+    git = ContainerGitOps(container)
+
+    await git.ensure_integration_branch(branch="retinue/prd-1", base="staging")
+
+    cmds = _joined(container)
+    assert "git fetch origin staging" in cmds
+    assert "git checkout -B retinue/prd-1 origin/staging" in cmds
+
+
+@pytest.mark.asyncio
+async def test_ensure_branch_raises_gitops_error_on_checkout_failure() -> None:
+    """A hard git failure while creating the branch is a GitOpsError, not silent."""
+    container = ScriptedContainer(
+        {
+            "rev-parse": RunResult(exit_code=1),
+            "checkout": RunResult(exit_code=128, stderr="fatal: bad object"),
+        }
+    )
+    git = ContainerGitOps(container)
+
+    with pytest.raises(GitOpsError):
+        await git.ensure_integration_branch(branch="retinue/prd-1", base="main")
+
+
+@pytest.mark.asyncio
+async def test_merge_assembles_checkout_fetch_merge_argv() -> None:
+    """A clean merge checks out the target, fetches the source, then merges its tip."""
+    container = ScriptedContainer()  # all exit 0 -> clean merge
+    git = ContainerGitOps(container)
+
+    await git.merge(source="issue-7", into="retinue/prd-1")
+
+    cmds = _joined(container)
+    assert cmds[0] == "git checkout retinue/prd-1"
+    assert cmds[1] == "git fetch origin issue-7"
+    # The merge is a no-ff, no-edit commit under a fixed committer identity.
+    merge_cmd = cmds[2]
+    assert "merge --no-ff --no-edit origin/issue-7" in merge_cmd
+    assert "user.name=" in merge_cmd
+    assert "user.email=" in merge_cmd
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_is_aborted_and_raised() -> None:
+    """A content conflict aborts the merge (clean workspace) and raises MergeConflict."""
+    container = ScriptedContainer(
+        {
+            "merge --no-ff": RunResult(
+                exit_code=1,
+                stdout="Auto-merging x\nCONFLICT (content): Merge conflict in x",
+                stderr="Automatic merge failed; fix conflicts and then commit",
+            )
+        }
+    )
+    git = ContainerGitOps(container)
+
+    with pytest.raises(MergeConflict) as excinfo:
+        await git.merge(source="issue-7", into="retinue/prd-1")
+
+    assert excinfo.value.source == "issue-7"
+    assert excinfo.value.into == "retinue/prd-1"
+    assert "git merge --abort" in _joined(container)
+
+
+@pytest.mark.asyncio
+async def test_merge_hard_error_is_gitops_error_not_conflict() -> None:
+    """A non-conflict merge failure (e.g. unknown ref) is a GitOpsError, not a conflict."""
+    container = ScriptedContainer(
+        {
+            "merge --no-ff": RunResult(
+                exit_code=128,
+                stderr="merge: origin/issue-7 - not something we can merge",
+            )
+        }
+    )
+    git = ContainerGitOps(container)
+
+    with pytest.raises(GitOpsError):
+        await git.merge(source="issue-7", into="retinue/prd-1")
+    # A hard error must not leave a phantom --abort claiming a conflict was handled.
+    assert "git merge --abort" not in _joined(container)

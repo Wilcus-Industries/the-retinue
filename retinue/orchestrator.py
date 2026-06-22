@@ -35,8 +35,13 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from retinue.container import ContainerRuntime
-from retinue.done_check import DEFAULT_IMAGE, ReportSink, SecretResolver, run_done_check
+from retinue.container import Container, ContainerRuntime, RunResult
+from retinue.done_check import (
+    DEFAULT_IMAGE,
+    ReportSink,
+    SecretResolver,
+    run_done_check,
+)
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
 
@@ -117,6 +122,159 @@ class GitOps(Protocol):
     async def merge(self, *, source: str, into: str) -> None:
         """Merge ``source`` into ``into``; raise :class:`MergeConflict` on a conflict."""
         ...
+
+
+# --- real container-backed GitOps adapter ----------------------------------------
+#
+# The production seam runs ``git`` inside the disposable container that already holds
+# the cloned repo (the same workspace ``build_slice``/``build_prd`` clone into). No git
+# SDK and no network of its own: ``external_dep none`` — the only collaborator is the
+# already-injected :class:`~retinue.container.Container`. The bug-prone, pure parts —
+# argv assembly and classifying a failed merge as a conflict vs. a hard git error — are
+# factored into the free functions below so they are tested without a live container.
+
+# Identity used for the merge commit ``git`` records. Merges are non-interactive, so a
+# committer identity must be configured or ``git commit`` refuses to run; it is set
+# per-command via ``-c`` rather than mutating global config in the shared workspace.
+_GIT_AUTHOR_NAME = "the-retinue"
+_GIT_AUTHOR_EMAIL = "retinue@users.noreply.github.com"
+_GIT_IDENTITY_FLAGS = [
+    "-c",
+    f"user.name={_GIT_AUTHOR_NAME}",
+    "-c",
+    f"user.email={_GIT_AUTHOR_EMAIL}",
+]
+
+# Substrings git prints to stdout/stderr when a merge stops on a content conflict, as
+# opposed to a hard error (unknown ref, not a repo, …). Matched case-insensitively.
+_CONFLICT_MARKERS = (
+    "conflict",
+    "automatic merge failed",
+    "fix conflicts and then commit",
+)
+
+
+def _branch_exists_command(branch: str) -> list[str]:
+    """Argv that exits 0 iff local ``branch`` already exists in the workspace."""
+    return ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]
+
+
+def _create_branch_commands(branch: str, base: str) -> list[list[str]]:
+    """Argv list that creates ``branch`` off ``base`` and checks it out.
+
+    ``base`` is referenced via ``origin/<base>`` so the branch is rooted on the freshly
+    cloned remote tip rather than whatever happens to be checked out, then a local
+    ``branch`` is created at that point and made current.
+    """
+    return [
+        ["git", "fetch", "origin", base],
+        ["git", "checkout", "-B", branch, f"origin/{base}"],
+    ]
+
+
+def _merge_commands(source: str, into: str) -> list[list[str]]:
+    """Argv list that checks out ``into`` and merges ``source`` into it.
+
+    The merge is a non-fast-forward, no-edit commit (``--no-ff --no-edit``) under a
+    fixed committer identity, so every integration is an explicit, attributable merge
+    commit. ``source`` is taken from the remote (``origin/<source>``) to merge the tip
+    the implementer pushed.
+    """
+    return [
+        ["git", "checkout", into],
+        ["git", "fetch", "origin", source],
+        [
+            "git",
+            *_GIT_IDENTITY_FLAGS,
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            f"origin/{source}",
+        ],
+    ]
+
+
+_ABORT_MERGE_COMMAND = ["git", "merge", "--abort"]
+
+
+def _is_merge_conflict(result: RunResult) -> bool:
+    """Whether a failed ``git merge`` stopped on a content conflict (vs. a hard error).
+
+    A conflict is recoverable by the resolver; a hard error (bad ref, not a repo) is
+    not. Git signals a conflict with exit code 1 *and* a conflict marker in its output,
+    so both are required — a different non-zero exit, or a code-1 failure without a
+    marker, is treated as a hard error and surfaced as such rather than as a conflict.
+    """
+    if result.exit_code != 1:
+        return False
+    blob = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in blob for marker in _CONFLICT_MARKERS)
+
+
+class ContainerGitOps:
+    """Production :class:`GitOps` that runs ``git`` in the cloned-repo container.
+
+    The integration-branch merges happen inside the same disposable container the
+    done-check cloned the repo into, so this seam has no external dependency of its own
+    beyond the injected :class:`~retinue.container.Container`. A merge that stops on a
+    content conflict is aborted (to leave the workspace clean for the resolver) and
+    surfaced as :class:`MergeConflict`; any other ``git`` failure is a hard
+    :class:`GitOpsError`, never silently swallowed.
+    """
+
+    def __init__(self, container: Container) -> None:
+        self._container = container
+
+    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
+        """Ensure ``branch`` exists locally, creating it off ``origin/<base>`` if absent."""
+        exists = await self._container.run_command(_branch_exists_command(branch))
+        if exists.ok:
+            logger.info("Integration branch %s already exists", branch)
+            return
+        for command in _create_branch_commands(branch, base):
+            await self._run_checked(command, action=f"create {branch} off {base}")
+        logger.info("Created integration branch %s off %s", branch, base)
+
+    async def merge(self, *, source: str, into: str) -> None:
+        """Merge ``source`` into ``into``; raise :class:`MergeConflict` on a conflict.
+
+        Runs checkout + fetch + merge. A merge that stops on a content conflict is
+        aborted to leave the workspace clean, then raised as :class:`MergeConflict`; any
+        other non-zero ``git`` exit is a :class:`GitOpsError`.
+        """
+        commands = _merge_commands(source, into)
+        for command in commands[:-1]:
+            await self._run_checked(command, action=f"prepare merge of {source}")
+        result = await self._container.run_command(commands[-1])
+        if result.ok:
+            logger.info("Merged %s into %s", source, into)
+            return
+        if _is_merge_conflict(result):
+            await self._container.run_command(_ABORT_MERGE_COMMAND)
+            raise MergeConflict(source=source, into=into)
+        raise GitOpsError(
+            f"git merge of {source} into {into} failed "
+            f"(exit {result.exit_code}): {result.stderr}"
+        )
+
+    async def _run_checked(self, command: list[str], *, action: str) -> RunResult:
+        """Run ``command`` in the container; raise :class:`GitOpsError` on failure."""
+        result = await self._container.run_command(command)
+        if not result.ok:
+            raise GitOpsError(
+                f"git failed to {action} (exit {result.exit_code}): {result.stderr}"
+            )
+        return result
+
+
+class GitOpsError(RuntimeError):
+    """A ``git`` command failed for a reason other than a recoverable merge conflict.
+
+    Distinct from :class:`MergeConflict`: a conflict is handed to the resolver, but a
+    hard error (unknown ref, not a repository, checkout failure) means the integration
+    branch could not be advanced at all, so it propagates rather than masquerading as a
+    conflict the resolver could fix.
+    """
 
 
 class ConflictResolution(enum.Enum):
