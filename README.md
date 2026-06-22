@@ -59,6 +59,15 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   `review-fix` follow-up issues (`ready-for-agent` + `Part of #<prd>`) wired into
   dependents' `## Blocked by`. It never edits code. The Agent-SDK review, the gh
   issue creation (reused from the slicer), and the gh issue-body edit are injected.
+- `retinue.reconcile` — `reconcile_run` / `ResumePhase` / `RunStateStore`: on worker
+  restart, reconciles an in-flight PRD round against GitHub (the source of truth —
+  which slice issues are closed, which `issue-<N>` branches are merged, whether the
+  `retinue/prd-<n>` → staging PR exists) plus the SQLite run-state, and picks the phase
+  to resume at (`BUILD` finishes only the unfinished slices, `PR_OPEN`, `LOOPBACK`, or
+  `DONE`) so no duplicate issue, branch, or PR is produced. A slice is finished when
+  EITHER its issue is closed OR its branch is merged, so a crash between the two still
+  resumes correctly. The gh queries are injected seams; `RunStateStore` is the durable
+  secondary ledger (owned-slice set + PR↔PRD mapping), mirroring `PrdDedupeStore`.
 
 A validly signed `issues` webhook returns 202 and enqueues exactly one job; an
 invalid or missing signature returns 401 and enqueues nothing. Non-`issues` events
