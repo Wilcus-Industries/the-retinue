@@ -1,0 +1,252 @@
+"""Cron backlog drainer: drain loose ``backlog`` issues one at a time (issue #15).
+
+A scheduled lane drains the loose ``backlog`` issues — the non-blocking heimdall nits
+filed by :mod:`retinue.loopback` — one per tick, alongside the orchestrator's PRD builds.
+The :mod:`retinue.lane` classifier routes work between the two lanes; this module is the
+cron lane's per-tick driver.
+
+Each :func:`run_cron_tick`:
+
+1. runs under an injected single-run **lock** so at most one cron run executes at a time,
+   mirroring the orchestrator's :class:`retinue.orchestrator.OrchestratorBusyError` guard;
+2. **gates** on the shared :class:`retinue.budget.BudgetGovernor` — the *same*
+   service-level governor the orchestrator shares — and **defers** when the budget is
+   spent, picking nothing and running no downstream;
+3. **picks** the next backlog issue by a weighted score (priority + age), except on every
+   ``quota_every``-th tick where a **quota floor** takes the oldest low-priority issue so
+   the low items provably drain rather than starving behind a steady high-priority stream;
+4. runs the same downstream the orchestrator drives (build -> PR -> heimdall loopback ->
+   notify) via a single injected :data:`CronBuild` callable.
+
+The clock is injected (:class:`retinue.budget.Clock`) for age-weighting and the tick
+counter is passed in, so nothing reads the wall clock. The gh backlog query, the budget
+governor, the single-run lock, and the downstream build are all injected and faked, so a
+tick runs with no real ``gh``, no Docker, and no network.
+"""
+
+from __future__ import annotations
+
+import enum
+import logging
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Protocol
+
+from retinue.budget import BudgetGovernor, Clock
+from retinue.loopback import Severity
+
+logger = logging.getLogger(__name__)
+
+_PRIORITY_LABEL_PREFIX = "priority:"
+
+# A day's age is worth this much weighted score; one severity step is worth a day's worth
+# multiplied by this lever. Keeping a severity step strictly larger than any realistic age
+# contribution makes priority dominate, while age still breaks ties within a severity. The
+# quota floor (below) is what stops a low item from starving when priority always wins.
+_AGE_WEIGHT_PER_DAY = 1.0
+_PRIORITY_WEIGHT = 10_000.0
+
+# A backlog issue with no parsable ``priority:*`` label is scored as LOW so it still ranks
+# and is still swept up by the low-priority quota floor.
+_DEFAULT_SEVERITY = Severity.LOW
+
+# Below this severity an issue is "low priority" for the quota floor — the items the
+# every-Nth tick deliberately drains so they never starve behind higher-priority work.
+_LOW_PRIORITY_CEILING = Severity.MEDIUM
+
+
+class CronBusyError(Exception):
+    """A second cron tick was attempted while one is already in flight.
+
+    The single-run guarantee: :func:`run_cron_tick` runs inside an injected lock that
+    rejects a concurrent holder rather than blocking, so the "at most one cron run at a
+    time" contract is observable to the caller. Mirrors
+    :class:`retinue.orchestrator.OrchestratorBusyError`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("a cron tick is already in flight")
+
+
+@dataclass(frozen=True)
+class BacklogIssue:
+    """One loose ``backlog`` issue, as reported by the backlog gh seam.
+
+    Attributes:
+        number: The issue number.
+        labels: The issue's label names (carries ``backlog`` and a ``priority:<severity>``).
+        created_at: When the issue was opened; the age input to the weighted score.
+    """
+
+    number: int
+    labels: list[str]
+    created_at: datetime
+
+    def severity(self) -> Severity:
+        """The issue's ``priority:<severity>`` as a :class:`Severity` (LOW when absent)."""
+        for label in self.labels:
+            if label.startswith(_PRIORITY_LABEL_PREFIX):
+                name = label[len(_PRIORITY_LABEL_PREFIX) :].upper()
+                try:
+                    return Severity[name]
+                except KeyError:
+                    continue
+        return _DEFAULT_SEVERITY
+
+
+class CronGh(Protocol):
+    """The gh query behind the backlog drain. The cron lane's gh seam.
+
+    A production implementation runs ``gh issue list --label backlog`` (with each issue's
+    labels and ``createdAt``); tests inject a fake that returns scripted issues. Modeled
+    as a protocol so the whole tick injects through a single collaborator, mirroring the
+    gh-seam style of :mod:`retinue.reconcile` / :mod:`retinue.handoff`.
+    """
+
+    async def list_backlog(self, *, repo_full_name: str) -> list[BacklogIssue]:
+        """Return the repo's open ``backlog`` issues with their labels and ages."""
+        ...
+
+
+# The downstream a cron tick drives for the picked issue: the same build -> PR ->
+# heimdall loopback -> notify chain the orchestrator runs, behind one injected callable so
+# the tick is exercised without Docker, gh, or network. Production wires it to the
+# orchestrator build + pr_opener + loopback + handoff chain.
+CronBuild = Callable[..., Awaitable[None]]
+
+
+class CronOutcome(enum.Enum):
+    """Why a cron tick ran a build, deferred, or found nothing to do."""
+
+    RAN = "ran"
+    DEFERRED = "deferred"
+    IDLE = "idle"
+
+
+@dataclass(frozen=True)
+class CronTickResult:
+    """Outcome of one cron tick.
+
+    Attributes:
+        outcome: ``RAN`` when an issue was picked and its downstream ran; ``DEFERRED``
+            when the shared budget was spent; ``IDLE`` when the backlog was empty.
+        issue_number: The drained issue on ``RAN``; ``None`` otherwise.
+        defer_until: When the budget window frees on ``DEFERRED``; ``None`` otherwise.
+    """
+
+    outcome: CronOutcome
+    issue_number: int | None = None
+    defer_until: datetime | None = None
+
+
+async def run_cron_tick(
+    *,
+    repo_full_name: str,
+    gh: CronGh,
+    governor: BudgetGovernor,
+    clock: Clock,
+    build: CronBuild,
+    tick_number: int,
+    estimated_amount: float,
+    lock: AbstractAsyncContextManager[object],
+    quota_every: int = 5,
+) -> CronTickResult:
+    """Drain one backlog issue: gate on budget, pick by score/quota, run the downstream.
+
+    Runs under ``lock`` so at most one cron tick executes at a time. Gates on the shared
+    ``governor`` first and **defers** (picking nothing, running nothing) when the budget
+    is spent. Otherwise picks the next backlog issue — the highest weighted score
+    (priority + age), except on every ``quota_every``-th tick where the oldest low-priority
+    issue is taken so low items provably drain — and runs its downstream ``build``.
+
+    Args:
+        repo_full_name: The target repo, e.g. "owner/repo".
+        gh: The backlog gh seam (lists ``backlog`` issues with labels + ages).
+        governor: The shared service-level budget governor; its ``gate`` defers the tick.
+        clock: The injected time source for age-weighting (no wall-clock).
+        build: The downstream chain run for the picked issue (build -> PR -> loopback ->
+            notify), injected so the tick runs with no Docker, gh, or network.
+        tick_number: This tick's sequence number; ``tick_number % quota_every == 0`` is a
+            quota tick that forces the oldest low-priority issue through.
+        estimated_amount: The tick's estimated charge, gated against the rolling-24h cap.
+        lock: The single-run lock; entering it raises :class:`CronBusyError` when a tick
+            is already in flight.
+        quota_every: Take the oldest low-priority issue on every Nth tick (default 5).
+
+    Returns:
+        A :class:`CronTickResult`: ``RAN`` with the drained issue, ``DEFERRED`` with a
+        ``defer_until``, or ``IDLE`` when the backlog is empty.
+
+    Raises:
+        CronBusyError: A tick is already in flight (from the injected lock).
+    """
+    async with lock:
+        gate = await governor.gate(estimated_amount=estimated_amount)
+        if gate.deferred:
+            logger.info(
+                "Cron tick %d deferred: budget spent, defer until %s",
+                tick_number,
+                gate.defer_until,
+            )
+            return CronTickResult(
+                outcome=CronOutcome.DEFERRED, defer_until=gate.defer_until
+            )
+
+        issues = await gh.list_backlog(repo_full_name=repo_full_name)
+        if not issues:
+            logger.info("Cron tick %d idle: no backlog issues", tick_number)
+            return CronTickResult(outcome=CronOutcome.IDLE)
+
+        picked = _pick_issue(
+            issues, now=clock.now(), tick_number=tick_number, quota_every=quota_every
+        )
+        logger.info(
+            "Cron tick %d draining backlog issue #%d (%s)",
+            tick_number,
+            picked.number,
+            repo_full_name,
+        )
+        await build(repo_full_name=repo_full_name, issue_number=picked.number)
+        return CronTickResult(outcome=CronOutcome.RAN, issue_number=picked.number)
+
+
+def _pick_issue(
+    issues: list[BacklogIssue],
+    *,
+    now: datetime,
+    tick_number: int,
+    quota_every: int,
+) -> BacklogIssue:
+    """Pick the backlog issue this tick drains: the quota floor or the weighted score.
+
+    On a quota tick (``tick_number`` is a positive multiple of ``quota_every``) the oldest
+    low-priority issue is taken so the low backlog provably drains rather than starving
+    behind higher-priority work. When there is no low-priority issue, the quota tick falls
+    back to the ordinary weighted-score pick.
+    """
+    if quota_every > 0 and tick_number > 0 and tick_number % quota_every == 0:
+        floor = _oldest_low_priority(issues)
+        if floor is not None:
+            return floor
+    return max(issues, key=lambda issue: _weighted_score(issue, now=now))
+
+
+def _oldest_low_priority(issues: list[BacklogIssue]) -> BacklogIssue | None:
+    """The oldest issue below the low-priority ceiling, or ``None`` when there is none."""
+    low = [issue for issue in issues if issue.severity() < _LOW_PRIORITY_CEILING]
+    if not low:
+        return None
+    return min(low, key=lambda issue: issue.created_at)
+
+
+def _weighted_score(issue: BacklogIssue, *, now: datetime) -> float:
+    """The issue's selection score: priority dominates, age breaks ties within a priority.
+
+    A severity step is worth far more than any realistic age contribution, so a more
+    severe issue always outranks a less severe one; among equal-severity issues the older
+    one (more accumulated age) scores higher.
+    """
+    age_days = max((now - issue.created_at) / timedelta(days=1), 0.0)
+    return issue.severity() * _PRIORITY_WEIGHT + age_days * _AGE_WEIGHT_PER_DAY

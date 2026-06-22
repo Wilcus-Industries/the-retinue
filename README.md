@@ -297,6 +297,33 @@ returns `None` and leaves the run paused rather than resuming over-budget; once 
 genuinely has room it reuses the reconcile machinery (`reconcile_run` over the checkpointed
 slice set), so only the unfinished slices rebuild — no duplicate issue, branch, or PR.
 
+## Lane classifier + cron backlog drainer
+
+`retinue.lane.classify` routes a GitHub issue to one of two lanes from its labels and
+body: a `ready-for-agent` slice carrying a `Part of #<prd>` link goes to the
+**orchestrator** lane (built by `build_prd`); a loose `backlog` issue goes to the **cron**
+lane. PRD work runs first by default, but a *standalone* `priority:critical` /
+`priority:high` issue **preempts** that ordering onto the orchestrator lane — a critical
+must not wait its turn in the slow backlog drain. The classifier is pure (labels + body
+only, no `gh`) and reuses the same `priority:<severity>` vocabulary loopback emits.
+
+`retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
+loose `backlog` issues **one at a time**. Each tick runs under an injected single-run
+**lock** (mirroring the orchestrator's `OrchestratorBusyError` guard, here `CronBusyError`)
+so at most one cron run executes alongside at most one orchestrator run. It then **gates**
+on the *same shared* service-level `BudgetGovernor` and **defers** (picking nothing,
+running nothing) when the budget is spent. Otherwise it **picks** the next backlog issue by
+a weighted score (priority dominates, age breaks ties within a priority), except on every
+Nth tick where a **quota floor** takes the oldest low-priority issue so the low items
+provably drain rather than starving behind a steady high-priority stream. The picked issue
+runs the same downstream the orchestrator drives (build -> PR -> heimdall loopback ->
+notify) via one injected build callable.
+
+The clock is injected (age-weighting) and the tick counter is passed in (the quota floor),
+so nothing reads the wall clock. The backlog `gh` query, the budget governor, the
+single-run lock, and the downstream build are all injected and faked, so a tick runs with
+no real `gh`, no Docker, and no network.
+
 ## Configuration
 
 Set via environment variables or a `.env` file:

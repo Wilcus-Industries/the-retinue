@@ -1,0 +1,140 @@
+"""Lane classifier: route an issue to the orchestrator lane or the cron lane (issue #15).
+
+The retinue has two work lanes:
+
+* the **orchestrator** lane — PRD slices, filed by the slicer with ``ready-for-agent``
+  and a ``Part of #<prd>`` body link (:mod:`retinue.slicer`), built by
+  :func:`retinue.orchestrator.build_prd`,
+* the **cron** lane — loose ``backlog`` issues (the non-blocking heimdall nits filed by
+  :mod:`retinue.loopback`), drained one at a time by :mod:`retinue.cron`.
+
+PRD work runs first by default, but a **standalone** ``priority:critical`` /
+``priority:high`` issue *preempts* that ordering onto the orchestrator lane — it must not
+wait its turn in the slow backlog drain. The classifier is pure: it reads only the
+issue's labels and body (the ``Part of #<prd>`` link), with no ``gh`` and no network, so
+it is exhaustively unit-tested. The priority vocabulary is the same
+``priority:<severity>`` labels :func:`retinue.loopback.priority_label` emits.
+"""
+
+from __future__ import annotations
+
+import enum
+import re
+from dataclasses import dataclass, field
+
+from retinue.loopback import BACKLOG_LABEL, Severity
+from retinue.slicer import READY_LABEL
+
+# A backlog nit (or any preempting standalone) carries its severity as the
+# ``priority:<severity>`` label loopback emits. Parsed back into a Severity here so the
+# preemption threshold is a comparison rather than a string check.
+_PRIORITY_LABEL_PREFIX = "priority:"
+
+# The slicer renders the parent link as ``Part of #<prd>`` in the issue body. Matched
+# loosely (any line, surrounding text tolerated) so a real body with extra prose routes.
+_PART_OF_RE = re.compile(r"Part of #(\d+)")
+
+# At or above this severity, a standalone (non-slice) issue preempts the PRD-first order.
+_PREEMPT_THRESHOLD = Severity.HIGH
+
+
+class Lane(enum.Enum):
+    """Which work lane an issue is routed to.
+
+    ``ORCHESTRATOR`` is the PRD-build lane; ``CRON`` is the backlog drainer lane;
+    ``NONE`` means the issue carries no routing signal the retinue acts on.
+    """
+
+    ORCHESTRATOR = "orchestrator"
+    CRON = "cron"
+    NONE = "none"
+
+
+@dataclass(frozen=True)
+class IssueFacts:
+    """The routing-relevant facts of one GitHub issue.
+
+    Attributes:
+        labels: The issue's label names (e.g. ``ready-for-agent``, ``backlog``,
+            ``priority:critical``).
+        body: The issue body, scanned for the slicer's ``Part of #<prd>`` link.
+    """
+
+    labels: list[str] = field(default_factory=list)
+    body: str = ""
+
+    def has_label(self, label: str) -> bool:
+        """Whether the issue carries ``label``."""
+        return label in self.labels
+
+    def prd_link(self) -> int | None:
+        """The PRD number from a ``Part of #<prd>`` body link, or ``None`` when absent."""
+        match = _PART_OF_RE.search(self.body)
+        return int(match.group(1)) if match else None
+
+    def priority(self) -> Severity | None:
+        """The issue's ``priority:<severity>`` as a :class:`Severity`, or ``None``.
+
+        Unknown ``priority:*`` values are ignored (treated as no priority) rather than
+        raising, so a stray label never breaks routing.
+        """
+        for label in self.labels:
+            if label.startswith(_PRIORITY_LABEL_PREFIX):
+                name = label[len(_PRIORITY_LABEL_PREFIX) :].upper()
+                try:
+                    return Severity[name]
+                except KeyError:
+                    continue
+        return None
+
+
+@dataclass(frozen=True)
+class LaneDecision:
+    """The classifier's verdict for one issue.
+
+    Attributes:
+        lane: The routed lane.
+        preempts: True when a standalone ``priority:critical``/``high`` issue jumped the
+            PRD-first ordering onto the orchestrator lane.
+        prd_number: The parent PRD number for an orchestrator-lane slice, else ``None``.
+    """
+
+    lane: Lane
+    preempts: bool = False
+    prd_number: int | None = None
+
+
+def classify(facts: IssueFacts) -> LaneDecision:
+    """Route an issue to a lane from its labels and ``Part of #<prd>`` link.
+
+    Order of precedence:
+
+    1. **preempt** — a standalone ``priority:critical``/``high`` issue (at or above the
+       :data:`_PREEMPT_THRESHOLD`) jumps onto the orchestrator lane regardless of any
+       ``backlog`` label, so a critical never waits its turn in the slow cron drain.
+    2. **PRD slice** — ``ready-for-agent`` plus a ``Part of #<prd>`` body link routes to
+       the orchestrator lane.
+    3. **backlog** — a loose ``backlog`` issue routes to the cron lane.
+    4. otherwise ``Lane.NONE``.
+
+    Args:
+        facts: The routing-relevant facts of the issue.
+
+    Returns:
+        A :class:`LaneDecision` carrying the lane, whether it preempted, and the parent
+        PRD number for an orchestrator-lane slice.
+    """
+    priority = facts.priority()
+    if priority is not None and priority >= _PREEMPT_THRESHOLD:
+        return LaneDecision(
+            lane=Lane.ORCHESTRATOR, preempts=True, prd_number=facts.prd_link()
+        )
+
+    prd_number = facts.prd_link()
+    if facts.has_label(READY_LABEL) and prd_number is not None:
+        return LaneDecision(lane=Lane.ORCHESTRATOR, prd_number=prd_number)
+
+    if facts.has_label(BACKLOG_LABEL):
+        return LaneDecision(lane=Lane.CRON)
+
+    return LaneDecision(lane=Lane.NONE)
