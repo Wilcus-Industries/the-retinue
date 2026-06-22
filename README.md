@@ -40,6 +40,10 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
+- `retinue.pr_opener` — `open_staging_pr`: once a PRD's ready set drains, prechecks
+  heimdall is installed and the staging branch exists, then brings `retinue/prd-<n>`
+  up to date with staging and opens exactly one PR into it; a failed precheck escalates
+  through `Notifier` and opens no PR. The gh operations are injected seams.
 - `retinue.slicer` — `slice_prd`: runs the headless Agent-SDK slicer over a PRD
   body to produce vertical-slice issues labeled `ready-for-agent` + `Part of #<prd>`
   with a resolved `## Blocked by` graph, reserving `hitl` for genuinely human-only
@@ -198,6 +202,25 @@ round before the next one starts:
 A clean review files nothing. The reviewer **never edits code** — it only files and
 wires issues. The Agent-SDK review, the gh issue creation, and the gh issue-body edit
 are all injected, so the flow is exercised with no Agent SDK, no gh, and no network.
+
+## Staging PR + heimdall precheck
+
+Once a PRD's ready set drains (the full-PRD build completes), `retinue.pr_opener.open_staging_pr`
+lands the work by opening a PR into `staging`, behind two prechecks applied in order:
+
+1. **heimdall installed** — the repo must have the heimdall check installed. A repo
+   without it escalates through the shared `Notifier` (push + comment + label) and opens
+   no PR — landing into `staging` without the gate is unsafe.
+2. **staging exists** — the target `staging` branch (`config.staging_branch`) must
+   exist. A missing one escalates on its own path and opens no PR.
+
+When both pass, the integration branch `retinue/prd-<n>` is brought up to date with the
+staging branch and **exactly one** PR `retinue/prd-<n>` -> `staging` is opened. The four
+gh operations — the heimdall precheck, the staging-branch existence check, the
+bring-up-to-date, and the open-PR — are a single injected `PrOps` seam, so the whole
+flow is exercised with no real `gh` and no network. The result is a `PrOpenResult`
+whose outcome is `OPENED` (with the created PR), `HEIMDALL_MISSING`, or
+`STAGING_MISSING`.
 
 ## Configuration
 
