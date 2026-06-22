@@ -79,6 +79,32 @@ CREATE TABLE IF NOT EXISTS budget_pauses (
 )
 """
 
+# The ledger is a durable, service-level store: a DB file created before issue #21 holds
+# the original two-column budget_pauses table (prd_key, resume_at). CREATE TABLE IF NOT
+# EXISTS is a no-op against it, so the #21 ``amount`` column never lands and every read
+# that selects it raises. Detecting the missing column and ALTER-ing it in lets the same
+# schema-ensure path heal both fresh and legacy DBs (issue #23).
+_PAUSE_AMOUNT_MIGRATION = (
+    "ALTER TABLE budget_pauses ADD COLUMN amount REAL NOT NULL DEFAULT 0"
+)
+
+
+async def _ensure_pause_schema(db: aiosqlite.Connection) -> None:
+    """Ensure budget_pauses exists and carries the ``amount`` column, migrating in place.
+
+    Creates the table when absent, then adds the issue-#21 ``amount`` column to a legacy
+    two-column table that predates it. Idempotent: ``CREATE TABLE IF NOT EXISTS`` plus a
+    PRAGMA-guarded ALTER, so re-running against an already-migrated DB is a no-op. Must be
+    called outside any started transaction (this issues DDL) so it never deadlocks the
+    ``BEGIN IMMEDIATE`` check-and-record path (issue #22).
+    """
+    await db.execute(_PAUSE_SCHEMA)
+    async with db.execute("PRAGMA table_info(budget_pauses)") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    if "amount" not in columns:
+        await db.execute(_PAUSE_AMOUNT_MIGRATION)
+        await db.commit()
+
 
 class AuthMode(enum.Enum):
     """The metering unit a run's spend is charged in, selected by the auth mode.
@@ -475,7 +501,7 @@ class BudgetGovernor:
         # Re-verify the cap: a too-early resume_at (or any other in-window spend since the
         # pause) could leave the window still over-cap. Stay paused rather than resume into
         # an over-budget state.
-        if await self._ledger.would_exceed(amount=amount):
+        if await self._ledger.would_exceed(amount=self._recheck_charge(amount)):
             return None
 
         slice_numbers = await self._run_state.slices_of(
@@ -525,7 +551,7 @@ class BudgetGovernor:
         key = run_state_key(repo_full_name, prd_number)
         stamp = (resume_at or self._ledger._clock.now()).isoformat()
         async with self._connect() as db:
-            await db.execute(_PAUSE_SCHEMA)
+            await _ensure_pause_schema(db)
             await db.execute(
                 """
                 INSERT INTO budget_pauses (prd_key, resume_at, amount) VALUES (?, ?, ?)
@@ -565,6 +591,19 @@ class BudgetGovernor:
             for number in slice_numbers
         ]
 
+    def _recheck_charge(self, amount: float) -> float:
+        """The charge :meth:`try_resume` re-verifies the cap against before resuming.
+
+        A pause recorded by issue #21 onward carries the real paused charge. A legacy row
+        migrated in by issue #23 has no recorded charge (its ``amount`` defaults to 0 from
+        the migration's column DEFAULT); trusting that 0 would let ``would_exceed`` pass
+        the instant trailing merely dips to the cap, reintroducing the over-cap resume #21
+        fixed. So a non-positive (legacy/unknown) charge is treated conservatively as a
+        full ``cap()`` — the pause holds until the window has genuine headroom for a whole
+        cap's worth, i.e. is essentially empty, rather than resuming over-budget.
+        """
+        return amount if amount > 0 else self._ledger.cap()
+
     async def _resume_at(self, repo_full_name: str, prd_number: int) -> datetime | None:
         """Return the recorded resume time for a paused PRD, or None when not paused."""
         pause = await self._pause_record(repo_full_name, prd_number)
@@ -576,7 +615,7 @@ class BudgetGovernor:
         """Return the paused PRD's (resume time, charge), or None when not paused."""
         key = run_state_key(repo_full_name, prd_number)
         async with self._connect() as db:
-            await db.execute(_PAUSE_SCHEMA)
+            await _ensure_pause_schema(db)
             async with db.execute(
                 "SELECT resume_at, amount FROM budget_pauses WHERE prd_key = ?", (key,)
             ) as cursor:
@@ -589,7 +628,7 @@ class BudgetGovernor:
         """Remove the pause record once a run resumes."""
         key = run_state_key(repo_full_name, prd_number)
         async with self._connect() as db:
-            await db.execute(_PAUSE_SCHEMA)
+            await _ensure_pause_schema(db)
             await db.execute("DELETE FROM budget_pauses WHERE prd_key = ?", (key,))
             await db.commit()
 

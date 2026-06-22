@@ -17,6 +17,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from retinue.budget import (
@@ -482,3 +483,130 @@ async def test_try_resume_stays_paused_when_still_over_cap(db_path: Path) -> Non
     )
     assert result is not None
     assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is False
+
+
+# --- legacy-DB migration: the amount column must be added in place (issue #23) ----
+
+
+async def _seed_legacy_pause(
+    db_path: Path, *, prd_key: str, resume_at: datetime
+) -> None:
+    """Create the original issue-#14 two-column budget_pauses table + a paused row.
+
+    This is the schema that shipped before issue #21 added the ``amount`` column, so it
+    reproduces a durable DB file upgraded in place: ``CREATE TABLE IF NOT EXISTS`` is a
+    no-op against this pre-existing table, so the column is missing until migrated.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "CREATE TABLE budget_pauses (prd_key TEXT PRIMARY KEY, resume_at TEXT NOT NULL)"
+        )
+        await db.execute(
+            "INSERT INTO budget_pauses (prd_key, resume_at) VALUES (?, ?)",
+            (prd_key, resume_at.isoformat()),
+        )
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_legacy_pause_table_is_migrated_so_reads_do_not_raise(
+    db_path: Path,
+) -> None:
+    """A legacy two-column budget_pauses table is migrated in place on first use.
+
+    Before the fix, ``_pause_record`` selects ``amount`` and raises OperationalError
+    against the legacy table, breaking both try_resume and is_paused. The migration adds
+    the column transparently so both read paths succeed.
+    """
+    clock = FakeClock()
+    # The recorded resume_at is already in the past, so the only thing keeping the run
+    # paused is the cap recheck — not the resume_at gate.
+    await _seed_legacy_pause(
+        db_path, prd_key="owner/repo#1", resume_at=_T0 - timedelta(hours=1)
+    )
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    governor = BudgetGovernor(ledger)
+
+    # Neither read path raises OperationalError against the migrated legacy table.
+    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
+    resumed = await governor.try_resume(
+        repo_full_name="owner/repo",
+        prd_number=1,
+        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
+    )
+    # With an empty window the cap has room, so the migrated legacy row can resume.
+    assert resumed is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_pause_row_does_not_resume_into_over_cap_window(
+    db_path: Path,
+) -> None:
+    """A migrated legacy row (amount defaulting to 0) must not resume over-cap.
+
+    cap = 12. A legacy pause row carries no recorded charge, so the recheck cannot trust
+    ``amount`` (a literal 0 would let ``would_exceed`` pass the instant trailing dips to
+    the cap, reintroducing the over-cap resume #21 fixed). The conservative legacy
+    semantic holds the pause while the window has no real headroom: with trailing at the
+    cap, try_resume stays paused; only once the window genuinely frees does it resume.
+    """
+    clock = FakeClock()
+    await _seed_legacy_pause(
+        db_path, prd_key="owner/repo#1", resume_at=_T0 - timedelta(hours=1)
+    )
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=12.0)  # window full at the cap
+    governor = BudgetGovernor(ledger)
+
+    # Past resume_at, but the window is full: a legacy amount=0 would wrongly resume here.
+    still_paused = await governor.try_resume(
+        repo_full_name="owner/repo",
+        prd_number=1,
+        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
+    )
+    assert still_paused is None
+    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
+
+    # Once the charge ages out and the window is empty, the conservative recheck clears.
+    clock.advance(timedelta(hours=25))
+    resumed = await governor.try_resume(
+        repo_full_name="owner/repo",
+        prd_number=1,
+        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
+    )
+    assert resumed is not None
+    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is False
+
+
+@pytest.mark.asyncio
+async def test_pause_schema_migration_is_idempotent(db_path: Path) -> None:
+    """Running the migration repeatedly against an already-migrated DB is a no-op.
+
+    Re-opening the governor (each read path re-runs the schema-ensure) must not fail or
+    duplicate the column. A fresh DB and a once-migrated DB converge on the same schema.
+    """
+    clock = FakeClock()
+    await _seed_legacy_pause(
+        db_path, prd_key="owner/repo#1", resume_at=_T0 - timedelta(hours=1)
+    )
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    governor = BudgetGovernor(ledger)
+
+    # Each call re-runs the schema-ensure + migration on a fresh connection.
+    for _ in range(3):
+        assert (
+            await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
+        )
+
+    async with (
+        aiosqlite.connect(db_path) as db,
+        db.execute("PRAGMA table_info(budget_pauses)") as cursor,
+    ):
+        columns = [row[1] for row in await cursor.fetchall()]
+    assert columns.count("amount") == 1
