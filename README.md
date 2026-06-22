@@ -269,15 +269,37 @@ deliberately human-only slice) does not block the reap; an open non-`hitl` child
 The gh issue-close and child-enumeration are a single injected `Handoff` gh seam (no
 merge method), so both flows run with no real `gh`, push service, or network.
 
+## Budget governor
+
+`retinue.budget` meters agent token spend against a **service-level** weekly budget (one
+ledger shared across the orchestrator and cron lanes) and enforces a per-rolling-24h-window
+ceiling — by default 12% of the weekly budget (`cap()`). The **`BudgetLedger`** is an
+aiosqlite spend ledger in the `PrdDedupeStore` style: `record_spend` appends a timestamped
+charge, `trailing_24h_spend` sums only the charges inside the trailing 24h read off an
+**injected `Clock`** (no wall-clock, so the window is deterministic in tests).
+
+Metering is auth-aware: an API key meters **dollars** against a weekly-$ budget,
+subscription OAuth meters **tokens** against a weekly-token budget — same rolling math,
+different unit. **`BudgetGovernor`** enforces at two points: `gate` **defers** a run whose
+estimated charge would start it over the cap (until the window frees); `meter` **pauses +
+checkpoints** a run whose next charge would cross the cap. `try_resume` resumes a paused
+run once the window frees by reusing the reconcile machinery (`reconcile_run` over the
+checkpointed slice set), so only the unfinished slices rebuild — no duplicate issue,
+branch, or PR.
+
 ## Configuration
 
 Set via environment variables or a `.env` file:
 
-| Variable         | Required | Default                   | Description                       |
-| ---------------- | -------- | ------------------------- | --------------------------------- |
-| `WEBHOOK_SECRET` | yes      | —                         | GitHub webhook HMAC secret        |
-| `REDIS_URL`      | no       | `redis://localhost:6379`  | Redis connection URL              |
-| `DEDUPE_DB_PATH` | no       | `retinue-dedupe.sqlite3`  | SQLite file backing PRD dedupe    |
+| Variable                     | Required | Default                   | Description                                          |
+| ---------------------------- | -------- | ------------------------- | ---------------------------------------------------- |
+| `WEBHOOK_SECRET`             | yes      | —                         | GitHub webhook HMAC secret                           |
+| `REDIS_URL`                  | no       | `redis://localhost:6379`  | Redis connection URL                                 |
+| `DEDUPE_DB_PATH`             | no       | `retinue-dedupe.sqlite3`  | SQLite file backing PRD dedupe                       |
+| `AUTH_MODE`                  | no       | `api_key`                 | Metering unit: `api_key` (dollars) or `subscription` (tokens) |
+| `WEEKLY_BUDGET`              | no       | `0`                       | Service-level weekly budget (dollars or tokens)      |
+| `BUDGET_DB_PATH`             | no       | `retinue-budget.sqlite3`  | SQLite file backing the rolling-24h spend ledger     |
+| `BUDGET_DAILY_CAP_FRACTION`  | no       | `0.12`                    | Fraction of the weekly budget spendable per 24h      |
 
 ## Running
 

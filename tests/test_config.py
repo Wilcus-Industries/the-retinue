@@ -44,3 +44,23 @@ def test_missing_webhook_secret_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
     with pytest.raises(ValueError):
         Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_budget_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The service-level budget settings carry sensible defaults (api_key, 12% cap)."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.auth_mode == "api_key"
+    assert settings.weekly_budget == 0.0
+    assert settings.budget_db_path == "retinue-budget.sqlite3"
+    assert settings.budget_daily_cap_fraction == 0.12
+
+
+def test_budget_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The budget settings load from the environment (subscription/token mode)."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("AUTH_MODE", "subscription")
+    monkeypatch.setenv("WEEKLY_BUDGET", "1000000")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.auth_mode == "subscription"
+    assert settings.weekly_budget == 1_000_000.0
