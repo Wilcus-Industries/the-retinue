@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import AsyncIterator
+from typing import cast
 
 import pytest
 
@@ -20,6 +22,7 @@ from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport
 from retinue.orchestrator import (
     AgentSdkConflictResolver,
+    AgentSdkImplementer,
     AnthropicResponse,
     BuildOutcome,
     BuildResult,
@@ -28,10 +31,15 @@ from retinue.orchestrator import (
     ContainerGitOps,
     GitOpsError,
     Implementer,
+    ImplementError,
     MergeConflict,
+    QuerySeam,
     Slice,
     _conflicted_paths,
     _ConflictedFile,
+    _implement_env,
+    _implement_prompt,
+    _is_result_message,
     _parse_resolution,
     _resolve_headers,
     _resolve_payload,
@@ -586,3 +594,165 @@ async def test_resolver_escalates_on_non_200_status() -> None:
     # argv element here, so matching the token avoids the ``--no-commit`` recreate flag.
     assert not any("commit" in cmd for cmd in container.commands)
     assert not any("add" in cmd for cmd in container.commands)
+
+
+# --- real Agent-SDK implementer --------------------------------------------------
+#
+# Exercises the production AgentSdkImplementer's pure/parseable parts (prompt assembly,
+# env-routed auth, result-message detection) and its collaboration with the injected
+# Agent-SDK ``query`` seam over a scripted async message stream. No live model, SDK,
+# Docker, gh, or clone.
+
+
+class _FakeResultMessage:
+    """Stand-in for the SDK ``ResultMessage``: carries ``is_error`` like the real type."""
+
+    def __init__(self, *, is_error: bool = False, result: str | None = None) -> None:
+        self.is_error = is_error
+        self.result = result
+
+
+class _FakeAssistantMessage:
+    """A non-terminal SDK message: no ``is_error``, so the result reader ignores it."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _SpyOptions:
+    """A passthrough options factory: captures the built kwargs as attributes (no SDK)."""
+
+    def __init__(
+        self,
+        *,
+        cwd: str,
+        model: str,
+        system_prompt: str,
+        permission_mode: str,
+        env: dict[str, str],
+    ) -> None:
+        self.cwd = cwd
+        self.model = model
+        self.system_prompt = system_prompt
+        self.permission_mode = permission_mode
+        self.env = env
+
+
+class RecordingQuery:
+    """Records the spawn (prompt + options) and replays a scripted message stream."""
+
+    def __init__(self, messages: list[object]) -> None:
+        self._messages = messages
+        self.calls: list[tuple[str, _SpyOptions]] = []
+
+    def __call__(
+        self, *, prompt: str, options: _SpyOptions
+    ) -> AsyncIterator[object]:
+        self.calls.append((prompt, options))
+
+        async def _stream() -> AsyncIterator[object]:
+            for message in self._messages:
+                yield message
+
+        return _stream()
+
+
+def _implementer(query: RecordingQuery, **kwargs: object) -> AgentSdkImplementer:
+    """Build an AgentSdkImplementer wired to the spy options factory (no live SDK)."""
+    return AgentSdkImplementer(
+        query=cast(QuerySeam, query),
+        options_factory=_SpyOptions,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_implement_prompt_names_issue_repo_and_branch() -> None:
+    """The per-slice prompt names the issue, repo, and the issue-<N> commit branch."""
+    prompt = _implement_prompt(_slice(issue_number=7, prd_number=1))
+
+    assert "#7" in prompt
+    assert "owner/repo" in prompt
+    assert "issue-7" in prompt
+
+
+def test_implement_env_api_key_mode_uses_anthropic_api_key() -> None:
+    """api_key mode threads the credential to the spawned CLI as ANTHROPIC_API_KEY."""
+    env = _implement_env("sk-ant-api03-secret", "api_key")
+
+    assert env == {"ANTHROPIC_API_KEY": "sk-ant-api03-secret"}
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+
+def test_implement_env_subscription_mode_uses_oauth_token() -> None:
+    """subscription mode threads the credential as CLAUDE_CODE_OAUTH_TOKEN."""
+    env = _implement_env("sk-ant-oat01-secret", "subscription")
+
+    assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-secret"}
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_is_result_message_detects_terminal_result_only() -> None:
+    """Only a message carrying ``is_error`` (the ResultMessage) is the terminal result."""
+    assert _is_result_message(_FakeResultMessage()) is True
+    assert _is_result_message(_FakeAssistantMessage("working...")) is False
+
+
+@pytest.mark.asyncio
+async def test_implementer_spawns_query_with_prompt_and_options() -> None:
+    """A clean spawn drives ``query`` with the per-slice prompt and built options."""
+    query = RecordingQuery([_FakeAssistantMessage("done"), _FakeResultMessage()])
+    implementer = _implementer(query, credential="sk-ant-api03-k", workspace="/work")
+
+    await implementer.implement(_slice(issue_number=7))
+
+    assert len(query.calls) == 1
+    prompt, options = query.calls[0]
+    assert "issue-7" in prompt
+    # Options run in the cloned-repo workspace, pin the model, and carry the env credential.
+    assert options.cwd == "/work"
+    assert options.model == "claude-opus-4-8"
+    assert options.env == {"ANTHROPIC_API_KEY": "sk-ant-api03-k"}
+
+
+@pytest.mark.asyncio
+async def test_implementer_subscription_mode_threads_oauth_token() -> None:
+    """In subscription mode the built options carry the OAuth token env var."""
+    query = RecordingQuery([_FakeResultMessage()])
+    implementer = _implementer(
+        query, credential="sk-ant-oat01-k", auth_mode="subscription"
+    )
+
+    await implementer.implement(_slice())
+
+    _, options = query.calls[0]
+    assert options.env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-k"}
+
+
+@pytest.mark.asyncio
+async def test_implementer_raises_on_errored_result() -> None:
+    """An SDK result reporting is_error surfaces as ImplementError, not a clean build."""
+    query = RecordingQuery([_FakeResultMessage(is_error=True, result="boom")])
+    implementer = _implementer(query, credential="k")
+
+    with pytest.raises(ImplementError):
+        await implementer.implement(_slice())
+
+
+@pytest.mark.asyncio
+async def test_implementer_clean_when_no_error_result() -> None:
+    """A stream with no errored result completes cleanly (returns None, no raise)."""
+    query = RecordingQuery([_FakeAssistantMessage("x"), _FakeResultMessage(is_error=False)])
+    implementer = _implementer(query, credential="k")
+
+    # A non-errored result stream returns cleanly (no ImplementError raised).
+    await implementer.implement(_slice())
+    assert len(query.calls) == 1
+
+
+def test_agent_sdk_implementer_satisfies_implementer_protocol() -> None:
+    """AgentSdkImplementer is usable wherever the Implementer protocol is expected."""
+    implementer: Implementer = AgentSdkImplementer(
+        credential="k", query=cast(QuerySeam, RecordingQuery([]))
+    )
+
+    assert hasattr(implementer, "implement")

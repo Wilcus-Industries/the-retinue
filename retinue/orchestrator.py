@@ -33,9 +33,10 @@ import base64
 import enum
 import json
 import logging
+from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from retinue.container import Container, ContainerRuntime, RunResult
 from retinue.done_check import (
@@ -91,6 +92,202 @@ class Implementer(Protocol):
     async def implement(self, slice_: Slice) -> None:
         """Build ``slice_``, committing the work to its ``issue-<N>`` branch."""
         ...
+
+
+# --- real Agent-SDK implementer (production adapter behind the Implementer seam) ---
+#
+# The production :class:`Implementer` spawns a Claude Agent-SDK subagent (the headless
+# ``claude`` CLI the SDK drives) inside the already-cloned repo and lets it implement the
+# slice TDD-first, edit files, and commit to the ``issue-<N>`` branch. The one side effect
+# is the spawn, so it is taken behind the injected ``query`` seam (default:
+# ``claude_agent_sdk.query``) exactly as the slicer/reviewer/resolver inject their model
+# boundary — tests script the message stream without a live model, the SDK, Docker, gh, or
+# network. The bug-prone pure parts — prompt assembly, option construction (cwd, model, and
+# the api_key-vs-subscription env auth routing), and reading the terminal result — are
+# factored into the free functions/methods below so they are unit-tested in isolation.
+#
+# Auth mirrors :class:`retinue.config.Settings`: ``auth_mode="api_key"`` threads the
+# credential to the spawned CLI as ``ANTHROPIC_API_KEY``; ``auth_mode="subscription"``
+# threads it as ``CLAUDE_CODE_OAUTH_TOKEN`` (the subscription OAuth env var). The contract
+# is the commit on ``slice.branch``; the orchestrator gates on the done-check that follows,
+# so a run the subagent finishes "successfully" but that fails to satisfy the repo is still
+# caught downstream. A spawn that the SDK reports as errored raises :class:`ImplementError`.
+
+_IMPLEMENT_MODEL = "claude-opus-4-8"
+# The cloned-repo directory the done-check clones into and the implementer commits within;
+# matches :data:`retinue.container.WORKSPACE_DIR` so the subagent runs over the same tree.
+_IMPLEMENT_WORKSPACE = "/workspace"
+
+# The implementer's brief. Frozen (no per-slice interpolation) so the spawned subagent's
+# system prefix is stable; the slice specifics ride in the per-slice prompt.
+_IMPLEMENT_SYSTEM = (
+    "You are an autonomous implementer. Build the requested GitHub issue inside the "
+    "repository you are running in, test-driven: write or update a failing test first, "
+    "then write code until it passes and the repo's own checks are green. Make the "
+    "smallest change that satisfies the issue; do not refactor unrelated code. When the "
+    "work is complete and committed to the issue's branch, stop."
+)
+
+
+def _implement_prompt(slice_: Slice) -> str:
+    """Assemble the per-slice prompt: which issue to build, on which branch.
+
+    Names the target repo, the issue number to implement, and the ``issue-<N>`` branch the
+    work must be committed to, so the spawned subagent commits where the orchestrator's
+    merge seam expects to find it.
+    """
+    return (
+        f"Implement issue #{slice_.issue_number} of {slice_.repo_full_name}. "
+        f"Commit your work to the '{slice_.branch}' branch (create it off the current "
+        "checkout if it does not exist). Implement test-driven and ensure the repo's "
+        "checks pass before committing."
+    )
+
+
+def _implement_env(credential: str, auth_mode: str) -> dict[str, str]:
+    """Build the env the spawned CLI authenticates with, routing the credential by mode.
+
+    ``api_key`` mode threads the credential as ``ANTHROPIC_API_KEY``; ``subscription`` mode
+    threads it as ``CLAUDE_CODE_OAUTH_TOKEN`` (the Claude subscription OAuth env var the
+    headless CLI reads). Only the credential env var is set here — the SDK merges it onto
+    the parent environment when it spawns the CLI.
+    """
+    if auth_mode == "subscription":
+        return {"CLAUDE_CODE_OAUTH_TOKEN": credential}
+    return {"ANTHROPIC_API_KEY": credential}
+
+
+class ImplementError(RuntimeError):
+    """The Agent-SDK implementer spawn ended in an error rather than a clean build.
+
+    Distinct from a *clean-but-insufficient* build, which the orchestrator catches via the
+    done-check that follows: this is the SDK reporting the run itself failed (a
+    ``ResultMessage`` with ``is_error``), so the slice surfaces the failure rather than
+    proceeding to a done-check over a half-built tree.
+    """
+
+
+# The injected spawn seam: ``claude_agent_sdk.query(prompt=..., options=...)`` returns an
+# async iterator of SDK messages. Kept narrow so the implement flow is exercisable without
+# the SDK, a live model, or a real clone; production binds the real ``query``.
+QuerySeam = Callable[..., AsyncIterator[Any]]
+# Builds the SDK ``ClaudeAgentOptions`` from the assembled kwargs. Injected alongside the
+# ``query`` seam so the option-kwargs assembly is tested without the SDK installed; the
+# default lazily constructs the real ``ClaudeAgentOptions``.
+OptionsFactory = Callable[..., Any]
+
+
+def _implement_option_kwargs(
+    *, credential: str, auth_mode: str, model: str, workspace: str
+) -> dict[str, Any]:
+    """Assemble the ``ClaudeAgentOptions`` kwargs for one spawn — the pure, testable core.
+
+    Runs the subagent in the cloned-repo ``workspace`` (so edits and the commit land in the
+    tree the done-check clones), pins the implementing ``model``, leads with the frozen
+    implementer brief, accepts edits non-interactively (no human approves the autonomous
+    run), and threads the credential to the spawned CLI via the env var its ``auth_mode``
+    selects.
+    """
+    return {
+        "cwd": workspace,
+        "model": model,
+        "system_prompt": _IMPLEMENT_SYSTEM,
+        "permission_mode": "acceptEdits",
+        "env": _implement_env(credential, auth_mode),
+    }
+
+
+@dataclass(frozen=True)
+class AgentSdkImplementer:
+    """Real :class:`Implementer`: build a slice by spawning a Claude Agent-SDK subagent.
+
+    Satisfies the implementer protocol ``implement(slice_) -> None`` so it drops in where
+    the fake implementer sits in tests and at the wiring site. It spawns the headless
+    ``claude`` CLI (via the injected ``query`` seam) inside the cloned repo, hands it the
+    per-slice prompt, and lets it implement TDD-first and commit to ``slice.branch``. The
+    orchestrator gates on the done-check that follows, so the contract here is only that the
+    spawn ran and committed; a run the SDK reports as errored raises :class:`ImplementError`.
+
+    Attributes:
+        credential: The Anthropic credential (API key or subscription OAuth token).
+        auth_mode: ``"api_key"`` (credential rides ``ANTHROPIC_API_KEY``) or
+            ``"subscription"`` (credential rides ``CLAUDE_CODE_OAUTH_TOKEN``).
+        query: The Agent-SDK spawn seam; defaults to ``claude_agent_sdk.query``.
+        options_factory: Builds the SDK options from the assembled kwargs; defaults to the
+            real ``ClaudeAgentOptions``. Injected so the spawn runs without the SDK in tests.
+        model: The implementing model id; defaults to Opus 4.8.
+        workspace: The cloned-repo directory the subagent runs in; the SDK's ``cwd``.
+    """
+
+    credential: str
+    auth_mode: str = "api_key"
+    query: QuerySeam | None = None
+    options_factory: OptionsFactory | None = None
+    model: str = _IMPLEMENT_MODEL
+    workspace: str = _IMPLEMENT_WORKSPACE
+
+    async def implement(self, slice_: Slice) -> None:
+        """Spawn the subagent to build ``slice_``; raise on an errored run."""
+        query = self._resolve_query()
+        options = self._build_options()
+        result = None
+        async for message in query(prompt=_implement_prompt(slice_), options=options):
+            if _is_result_message(message):
+                result = message
+        if result is not None and getattr(result, "is_error", False):
+            raise ImplementError(
+                f"implementer spawn for {slice_.branch} ended in error: "
+                f"{getattr(result, 'result', None)}"
+            )
+        logger.info("Implementer spawn for %s completed", slice_.branch)
+
+    def _resolve_query(self) -> QuerySeam:
+        """The injected spawn seam, or the real ``claude_agent_sdk.query`` lazily imported.
+
+        The lazy import keeps the module (and the unit tests over the pure prompt/option
+        helpers) import-clean without the Agent SDK installed; type-ignored because the SDK
+        is an optional runtime dependency.
+        """
+        if self.query is not None:
+            return self.query
+        from claude_agent_sdk import query  # type: ignore[import-not-found,unused-ignore]
+
+        return cast(QuerySeam, query)
+
+    def _build_options(self) -> Any:
+        """Build the SDK options object from the assembled kwargs via the options factory.
+
+        The kwargs are assembled by the pure :func:`_implement_option_kwargs`; the factory
+        (default: the real ``ClaudeAgentOptions``, lazily imported) turns them into the SDK
+        object. Tests inject a passthrough factory so the kwargs are asserted without the SDK.
+        """
+        kwargs = _implement_option_kwargs(
+            credential=self.credential,
+            auth_mode=self.auth_mode,
+            model=self.model,
+            workspace=self.workspace,
+        )
+        factory = self.options_factory or self._default_options_factory()
+        return factory(**kwargs)
+
+    @staticmethod
+    def _default_options_factory() -> OptionsFactory:
+        """Lazily import the real ``ClaudeAgentOptions`` as the default options factory."""
+        from claude_agent_sdk import (  # type: ignore[import-not-found,unused-ignore]
+            ClaudeAgentOptions,
+        )
+
+        return cast(OptionsFactory, ClaudeAgentOptions)
+
+
+def _is_result_message(message: Any) -> bool:
+    """Whether an SDK message is the terminal ``ResultMessage`` carrying ``is_error``.
+
+    Matched structurally (the message exposes ``is_error``) rather than by importing the
+    SDK type, so the result-reading path is unit-testable with a plain stand-in and the
+    module imports without the SDK present.
+    """
+    return hasattr(message, "is_error")
 
 
 class MergeConflict(Exception):
