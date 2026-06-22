@@ -20,9 +20,11 @@ without the Agent SDK, gh, or network.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from retinue.slicer import READY_LABEL, CreatedIssue, IssueCreator, IssueDraft
 
@@ -107,6 +109,195 @@ class ReviewResult:
 # async and faked in tests — no Agent SDK, gh, or network.
 ReviewGenerator = Callable[[ReviewInput], Awaitable[ReviewPlan]]
 BlockedByEditor = Callable[[EditBlockedByRequest], Awaitable[None]]
+
+
+# ---------------------------------------------------------------------------
+# Real Agent-SDK reviewer (production adapter behind the ReviewGenerator seam).
+#
+# Drives the Anthropic Messages API headless to review a round's merged diff and
+# emit structured findings. The HTTP call is the only side effect, so it is taken
+# behind the injected :class:`HttpTransport` protocol: production wires a concrete
+# httpx-style client, tests inject a fake. The pure parts — auth header build,
+# request payload assembly, and response parsing — are exercised without network.
+#
+# SDK conventions match the slicer: Opus 4.8 is the default model; a subscription
+# OAuth token goes on ``Authorization: Bearer`` with the ``oauth-2025-04-20`` beta
+# header, while a raw API key goes on ``x-api-key``; ``anthropic-version`` is
+# always sent. The model must return only the JSON object matching the schema.
+# ---------------------------------------------------------------------------
+
+_REVIEW_MODEL = "claude-opus-4-8"
+_ANTHROPIC_VERSION = "2023-06-01"
+_OAUTH_BETA = "oauth-2025-04-20"
+_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+_MAX_TOKENS = 16_000
+
+# Strict JSON schema the headless reviewer must emit: an ordered list of findings,
+# each with the dependent issue numbers (from the round) whose work is layered on
+# the defect. ``blocks_issues`` is empty for a standalone fix (e.g. a stale doc).
+_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "blocks_issues": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["title", "body", "blocks_issues"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["findings"],
+    "additionalProperties": False,
+}
+
+# The headless reviewer's brief. Frozen (no per-request interpolation) so the
+# request prefix is cacheable across rounds; the diff and issue list ride in the
+# user message.
+_REVIEW_SYSTEM = (
+    "You review a merged pull-request diff for genuine defects: correctness bugs "
+    "introduced by the diff and documentation the diff made stale. Report only "
+    "real, actionable findings — never style nits or speculation; a clean diff "
+    "yields an empty 'findings' list. For each finding, list in 'blocks_issues' "
+    "the issue numbers (drawn only from the round's merged issues) whose work is "
+    "layered on the defect, so the fix builds first; leave it empty for a "
+    "standalone fix nothing depends on. Return only the JSON object matching the "
+    "schema; no prose."
+)
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    """The slice of an HTTP response the reviewer reads: status and JSON body."""
+
+    status_code: int
+    body: dict[str, Any]
+
+
+class HttpTransport(Protocol):
+    """Async HTTP POST seam (httpx-style). The network edge of the reviewer.
+
+    A production implementation wraps an httpx client; tests inject a fake that
+    returns a canned :class:`HttpResponse`. Kept narrow — one POST — so the real
+    review flow is exercisable without network.
+    """
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
+    ) -> HttpResponse:
+        """POST ``json`` to ``url`` with ``headers`` and return the response."""
+        ...
+
+
+@dataclass(frozen=True)
+class AgentSdkReviewGenerator:
+    """Real :data:`ReviewGenerator`: review a round's diff via the Messages API.
+
+    Satisfies the ``generate`` protocol ``(ReviewInput) -> Awaitable[ReviewPlan]``
+    by calling itself. Holds the credential and the HTTP transport; everything
+    that can be tested offline — :meth:`_headers`, :meth:`_payload`,
+    :meth:`_parse` — is a pure method.
+
+    Attributes:
+        credential: The Anthropic credential. An OAuth subscription token
+            (``sk-ant-oat...``) is sent as ``Authorization: Bearer`` with the
+            OAuth beta header; any other value is treated as a raw API key on
+            ``x-api-key``.
+        transport: The injected HTTP POST seam.
+        model: The reviewing model id; defaults to Opus 4.8.
+    """
+
+    credential: str
+    transport: HttpTransport
+    model: str = _REVIEW_MODEL
+
+    async def __call__(self, review_input: ReviewInput) -> ReviewPlan:
+        """Review ``review_input``'s diff and return the parsed :class:`ReviewPlan`."""
+        response = await self.transport.post(
+            _MESSAGES_URL,
+            headers=self._headers(),
+            json=self._payload(review_input),
+        )
+        if response.status_code != 200:
+            raise ReviewGenerationError(
+                f"Anthropic Messages API returned {response.status_code}"
+            )
+        return self._parse(response.body)
+
+    def _headers(self) -> dict[str, str]:
+        """Build the request headers, routing the credential to its auth scheme."""
+        headers = {
+            "anthropic-version": _ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+        if self.credential.startswith("sk-ant-oat"):
+            headers["authorization"] = f"Bearer {self.credential}"
+            headers["anthropic-beta"] = _OAUTH_BETA
+        else:
+            headers["x-api-key"] = self.credential
+        return headers
+
+    def _payload(self, review_input: ReviewInput) -> dict[str, Any]:
+        """Assemble the Messages API request body for one round's review."""
+        merged = ", ".join(f"#{n}" for n in review_input.merged_issues) or "(none)"
+        user = (
+            f"Merged round of PRD #{review_input.prd_number} in "
+            f"{review_input.repo_full_name}.\n"
+            f"Merged issues, in merge order: {merged}.\n"
+            "Review the following merged diff and emit findings as JSON matching "
+            "the schema:\n\n"
+            f"{review_input.diff}"
+        )
+        return {
+            "model": self.model,
+            "max_tokens": _MAX_TOKENS,
+            "system": _REVIEW_SYSTEM,
+            "messages": [{"role": "user", "content": user}],
+            "response_format": {"type": "json_schema", "json_schema": _REVIEW_SCHEMA},
+        }
+
+    def _parse(self, body: dict[str, Any]) -> ReviewPlan:
+        """Parse a Messages API response body into a :class:`ReviewPlan`.
+
+        Reads the concatenated ``text`` content blocks, loads them as the schema
+        JSON, and builds one :class:`ReviewFinding` per entry. A response missing
+        text, or carrying malformed JSON or a non-list ``findings``, raises
+        :class:`ReviewGenerationError` rather than silently filing nothing.
+        """
+        text = "".join(
+            block.get("text", "")
+            for block in body.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        if not text.strip():
+            raise ReviewGenerationError("Messages API response carried no text content")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ReviewGenerationError(f"Reviewer emitted invalid JSON: {exc}") from exc
+
+        raw_findings = parsed.get("findings")
+        if not isinstance(raw_findings, list):
+            raise ReviewGenerationError("Reviewer JSON missing a 'findings' list")
+
+        findings = [
+            ReviewFinding(
+                title=str(item["title"]),
+                body=str(item["body"]),
+                blocks_issues=[int(n) for n in item.get("blocks_issues", [])],
+            )
+            for item in raw_findings
+        ]
+        return ReviewPlan(findings=findings)
+
+
+class ReviewGenerationError(RuntimeError):
+    """The headless reviewer failed to produce a usable :class:`ReviewPlan`."""
 
 
 async def review_round(

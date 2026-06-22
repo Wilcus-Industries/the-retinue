@@ -20,8 +20,11 @@ import pytest
 from retinue.orchestrator import PrdBuildResult, PrdSlice, build_prd
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
+    AgentSdkReviewGenerator,
     EditBlockedByRequest,
+    HttpResponse,
     ReviewFinding,
+    ReviewGenerationError,
     ReviewInput,
     ReviewPlan,
     ReviewResult,
@@ -200,3 +203,152 @@ async def test_review_fix_issue_is_built_in_a_subsequent_round() -> None:
 
     assert result.merged_issues == [fix_number]
     assert (f"issue-{fix_number}", "retinue/prd-1") in git.merges
+
+
+# --- Real Agent-SDK ReviewGenerator: pure/parseable parts, no network ---
+
+
+class _FakeTransport:
+    """Records the one POST and returns a canned response. No network."""
+
+    def __init__(self, response: HttpResponse) -> None:
+        self._response = response
+        self.calls: list[tuple[str, dict[str, str], dict[str, object]]] = []
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, object]
+    ) -> HttpResponse:
+        self.calls.append((url, headers, json))
+        return self._response
+
+
+def _text_response(payload: object, *, status_code: int = 200) -> HttpResponse:
+    """A Messages API response whose single text block is ``payload`` as JSON."""
+    import json as _json
+
+    return HttpResponse(
+        status_code=status_code,
+        body={"content": [{"type": "text", "text": _json.dumps(payload)}]},
+    )
+
+
+def test_headers_oauth_token_uses_bearer_and_beta() -> None:
+    """An OAuth subscription token rides Authorization: Bearer + the oauth beta."""
+    gen = AgentSdkReviewGenerator(
+        credential="sk-ant-oat-abc",
+        transport=_FakeTransport(_text_response({"findings": []})),
+    )
+    headers = gen._headers()
+
+    assert headers["authorization"] == "Bearer sk-ant-oat-abc"
+    assert headers["anthropic-beta"] == "oauth-2025-04-20"
+    assert headers["anthropic-version"] == "2023-06-01"
+    assert "x-api-key" not in headers
+
+
+def test_headers_api_key_uses_x_api_key() -> None:
+    """A raw API key rides x-api-key, with no bearer/oauth-beta header."""
+    gen = AgentSdkReviewGenerator(
+        credential="sk-ant-api-xyz",
+        transport=_FakeTransport(_text_response({"findings": []})),
+    )
+    headers = gen._headers()
+
+    assert headers["x-api-key"] == "sk-ant-api-xyz"
+    assert "authorization" not in headers
+    assert "anthropic-beta" not in headers
+
+
+def test_payload_carries_model_schema_diff_and_merged_issues() -> None:
+    """The request body assembles model, schema, and the diff + merged issues."""
+    gen = AgentSdkReviewGenerator(
+        credential="k", transport=_FakeTransport(_text_response({"findings": []}))
+    )
+    payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
+
+    assert payload["model"] == "claude-opus-4-8"
+    assert payload["response_format"]["type"] == "json_schema"
+    user = payload["messages"][0]["content"]
+    assert "#2, #3" in user
+    assert "off-by-one planted defect" in user
+    assert f"PRD #{PRD_NUMBER}" in user
+
+
+@pytest.mark.asyncio
+async def test_real_generator_parses_findings_from_response() -> None:
+    """A response with findings parses into a ReviewPlan of ReviewFindings."""
+    transport = _FakeTransport(
+        _text_response(
+            {
+                "findings": [
+                    {
+                        "title": "Fix off-by-one in total()",
+                        "body": "total() adds a stray +1.",
+                        "blocks_issues": [3],
+                    }
+                ]
+            }
+        )
+    )
+    gen = AgentSdkReviewGenerator(credential="sk-ant-oat-1", transport=transport)
+
+    plan = await gen(_input(PLANTED_DEFECT_DIFF))
+
+    assert plan == ReviewPlan(
+        findings=[
+            ReviewFinding(
+                title="Fix off-by-one in total()",
+                body="total() adds a stray +1.",
+                blocks_issues=[3],
+            )
+        ]
+    )
+    # It POSTed exactly once to the Messages endpoint.
+    assert transport.calls[0][0] == "https://api.anthropic.com/v1/messages"
+
+
+@pytest.mark.asyncio
+async def test_real_generator_clean_review_parses_empty_plan() -> None:
+    """An empty findings list parses into a clean ReviewPlan."""
+    gen = AgentSdkReviewGenerator(
+        credential="k", transport=_FakeTransport(_text_response({"findings": []}))
+    )
+
+    plan = await gen(_input(CLEAN_DIFF))
+
+    assert plan == ReviewPlan(findings=[])
+
+
+@pytest.mark.asyncio
+async def test_real_generator_raises_on_non_200() -> None:
+    """A non-200 from the API raises rather than filing a phantom clean review."""
+    gen = AgentSdkReviewGenerator(
+        credential="k",
+        transport=_FakeTransport(_text_response({"findings": []}, status_code=429)),
+    )
+
+    with pytest.raises(ReviewGenerationError):
+        await gen(_input(CLEAN_DIFF))
+
+
+@pytest.mark.asyncio
+async def test_real_generator_raises_on_malformed_json() -> None:
+    """A text block that is not valid JSON raises ReviewGenerationError."""
+    bad = HttpResponse(
+        status_code=200, body={"content": [{"type": "text", "text": "not json {"}]}
+    )
+    gen = AgentSdkReviewGenerator(credential="k", transport=_FakeTransport(bad))
+
+    with pytest.raises(ReviewGenerationError):
+        await gen(_input(CLEAN_DIFF))
+
+
+@pytest.mark.asyncio
+async def test_real_generator_raises_when_findings_missing() -> None:
+    """JSON without a 'findings' list raises rather than silently producing none."""
+    gen = AgentSdkReviewGenerator(
+        credential="k", transport=_FakeTransport(_text_response({"oops": True}))
+    )
+
+    with pytest.raises(ReviewGenerationError):
+        await gen(_input(CLEAN_DIFF))
