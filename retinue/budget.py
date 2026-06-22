@@ -18,7 +18,10 @@ Two enforcement points:
   :class:`~retinue.reconcile.RunStateStore`). :meth:`BudgetGovernor.try_resume` resumes
   it once the window frees by reusing the reconciliation machinery
   (:func:`~retinue.reconcile.reconcile_run`), so only the unfinished slices rebuild — no
-  duplicate issue, branch, or PR.
+  duplicate issue, branch, or PR. The check-and-record is atomic
+  (:meth:`BudgetLedger.try_record_if_within_cap`, a ``BEGIN IMMEDIATE`` transaction), so
+  two lanes metering concurrently against the shared ledger serialize on the write lock
+  and the second sees the first's charge before deciding — the cap can't be overshot.
 
 Auth-aware metering: an API key meters dollars against a weekly-$ budget; subscription
 OAuth meters tokens against a weekly-token budget. The math is identical; only the unit
@@ -53,6 +56,12 @@ from retinue.reconcile import (
 logger = logging.getLogger(__name__)
 
 _WINDOW = timedelta(hours=24)
+
+# How long a writer waits for the ledger's write lock before giving up. The check-and-
+# record path opens its transaction with BEGIN IMMEDIATE, so a second concurrent writer
+# blocks here until the first commits, then re-reads the updated trailing total. Generous
+# enough that lanes serialize rather than spuriously error under contention.
+_BUSY_TIMEOUT_MS = 30_000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS spend_entries (
@@ -184,15 +193,64 @@ class BudgetLedger:
         Charges older than 24h are excluded — the window rolls forward with the clock, so
         spend frees up as old charges age out.
         """
-        cutoff = (self._clock.now() - _WINDOW).isoformat()
         async with self._connect() as db:
             await db.execute(_SCHEMA)
-            async with db.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM spend_entries WHERE spent_at > ?",
-                (cutoff,),
-            ) as cursor:
-                row = await cursor.fetchone()
+            return await self._trailing_within(db)
+
+    async def _trailing_within(self, db: aiosqlite.Connection) -> float:
+        """Sum the trailing-24h spend using an already-open connection.
+
+        Shared by :meth:`trailing_24h_spend` and the atomic check-and-record path so the
+        in-transaction re-read uses the identical window query.
+        """
+        cutoff = (self._clock.now() - _WINDOW).isoformat()
+        async with db.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM spend_entries WHERE spent_at > ?",
+            (cutoff,),
+        ) as cursor:
+            row = await cursor.fetchone()
         return float(row[0]) if row is not None else 0.0
+
+    async def try_record_if_within_cap(self, *, amount: float) -> bool:
+        """Atomically record ``amount`` iff it still fits under the cap; return success.
+
+        Check-and-record is performed inside one ``BEGIN IMMEDIATE`` transaction so a
+        second concurrent writer serializes behind the first: it blocks on the write lock,
+        then re-reads the (now updated) trailing-24h total before deciding. This closes the
+        time-of-check-to-time-of-use gap between :meth:`would_exceed` and
+        :meth:`record_spend` — two lanes that would jointly cross the cap can never both
+        record. The charge is stamped at the clock's current instant, like
+        :meth:`record_spend`.
+
+        Args:
+            amount: The prospective charge in the ledger's unit.
+
+        Returns:
+            True when the charge fit under the cap and was recorded; False when the live
+            trailing total (re-read under the write lock) leaves no room, in which case
+            nothing is written.
+        """
+        stamp = self._clock.now().isoformat()
+        async with self._connect() as db:
+            await db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            await db.execute(_SCHEMA)
+            # BEGIN IMMEDIATE takes the write lock up front, so the re-read below reflects
+            # any concurrent writer that committed first; aiosqlite's autocommit must be
+            # off for the explicit transaction to span the read and the insert.
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                if (await self._trailing_within(db)) + amount > self.cap():
+                    await db.rollback()
+                    return False
+                await db.execute(
+                    "INSERT INTO spend_entries (spent_at, amount) VALUES (?, ?)",
+                    (stamp, amount),
+                )
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return True
 
     async def would_exceed(self, *, amount: float) -> bool:
         """Whether charging ``amount`` now would push the trailing-24h spend over the cap.
@@ -356,8 +414,10 @@ class BudgetGovernor:
             A :class:`MeterDecision`: ``paused`` with a ``resume_at`` when the charge
             would cross the cap, else a metered-through decision.
         """
-        if not await self._ledger.would_exceed(amount=amount):
-            await self._ledger.record_spend(amount=amount)
+        # Atomic check-and-record: a second lane metering concurrently serializes behind
+        # this one on the ledger's write lock and re-reads the updated trailing total, so
+        # two charges that would jointly cross the cap can never both record (issue #22).
+        if await self._ledger.try_record_if_within_cap(amount=amount):
             return MeterDecision(paused=False, resume_at=None)
 
         resume_at = await self._ledger.window_frees_at(amount=amount)

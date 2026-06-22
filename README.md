@@ -282,7 +282,12 @@ Metering is auth-aware: an API key meters **dollars** against a weekly-$ budget,
 subscription OAuth meters **tokens** against a weekly-token budget — same rolling math,
 different unit. **`BudgetGovernor`** enforces at two points: `gate` **defers** a run whose
 estimated charge would start it over the cap; `meter` **pauses + checkpoints** a run whose
-next charge would cross the cap. The `defer_until` / `resume_at` is the instant the window
+next charge would cross the cap. Because the two lanes meter against one shared ledger
+file, `meter` records through `try_record_if_within_cap`, which performs the cap check and
+the insert inside a single `BEGIN IMMEDIATE` transaction: a second concurrent lane
+serializes on the SQLite write lock, re-reads the updated trailing total, and pauses
+instead of recording — so two charges that would jointly cross the cap can never both
+land (no overshoot). The `defer_until` / `resume_at` is the instant the window
 frees enough room for that specific amount — `window_frees_at(amount)` walks the in-window
 charges oldest-first, accumulating freed spend, and returns the expiry of the charge that
 first brings the trailing spend back under the cap (not merely the oldest charge's expiry,

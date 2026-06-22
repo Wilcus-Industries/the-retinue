@@ -13,6 +13,7 @@ the faked gh seam from the reconcile tests — no real ``gh``, no network.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -147,6 +148,87 @@ async def test_ledger_is_shared_across_lanes(db_path: Path) -> None:
     assert await cron_lane.trailing_24h_spend() == pytest.approx(11.0)
     # The shared ledger means the cron lane sees it is already near the cap.
     assert await cron_lane.would_exceed(amount=2.0) is True
+
+
+# --- concurrent check-and-record: the cap must not be overshot -------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_meters_do_not_both_record_over_cap(db_path: Path) -> None:
+    """Two overlapping meter calls that jointly exceed the cap must not both record.
+
+    cap = 12, trailing already 11 (1.0 of room). Two lanes meter 1.0 each at the same
+    instant via asyncio.gather. A single 1.0 charge fits inclusively (11+1=12 == cap),
+    but the two together (11+1+1=13) overshoot. Without an atomic check-and-record both
+    observe 11 under the cap and both record, pushing trailing to 13. The fix serializes
+    the check-and-record: the second lane must see the first's write (or its lock) and
+    pause instead. Exactly one records; trailing-24h never exceeds the cap.
+    """
+    clock = FakeClock()
+    # Two separate governors on the SAME service-level DB file, as the orchestrator and
+    # cron lanes would each hold their own object over the shared ledger.
+    orchestrator_lane = BudgetGovernor(
+        BudgetLedger(
+            db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+        )
+    )
+    cron_lane = BudgetGovernor(
+        BudgetLedger(
+            db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+        )
+    )
+    # Fill the window to 11.0 of the 12.0 cap: only one 2.0 charge can ever fit.
+    await orchestrator_lane._ledger.record_spend(amount=11.0)
+
+    decisions = await asyncio.gather(
+        orchestrator_lane.meter(
+            repo_full_name="owner/repo",
+            prd_number=1,
+            amount=1.0,
+            slices=[_prd_slice(2)],
+        ),
+        cron_lane.meter(
+            repo_full_name="owner/repo",
+            prd_number=2,
+            amount=1.0,
+            slices=[_prd_slice(3)],
+        ),
+    )
+
+    # Exactly one lane recorded; the other saw the first's write and paused.
+    paused = [d.paused for d in decisions]
+    assert sorted(paused) == [False, True]
+    # The cap is never overshot: only the single 1.0 charge that fit was recorded.
+    trailing = await orchestrator_lane._ledger.trailing_24h_spend()
+    assert trailing == pytest.approx(12.0)
+    assert trailing <= orchestrator_lane._ledger.cap()
+
+
+@pytest.mark.asyncio
+async def test_try_record_if_within_cap_is_atomic_under_concurrency(
+    db_path: Path,
+) -> None:
+    """The atomic primitive records only while the charge still fits, re-read live.
+
+    Two concurrent calls for the only remaining room return [True, False] in some order:
+    the second re-reads the first's committed write under the write lock and declines.
+    """
+    clock = FakeClock()
+    ledger_a = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    ledger_b = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger_a.record_spend(amount=11.0)  # cap 12.0, 1.0 of room
+
+    recorded = await asyncio.gather(
+        ledger_a.try_record_if_within_cap(amount=1.0),
+        ledger_b.try_record_if_within_cap(amount=1.0),
+    )
+
+    assert sorted(recorded) == [False, True]
+    assert await ledger_a.trailing_24h_spend() == pytest.approx(12.0)
 
 
 # --- gate at run start -----------------------------------------------------------
