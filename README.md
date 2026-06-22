@@ -45,6 +45,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   with a resolved `## Blocked by` graph, reserving `hitl` for genuinely human-only
   slices. A thin/malformed PRD escalates through `Notifier` instead of inventing
   slices. The Agent-SDK call and the gh issue creation are injected seams.
+- `retinue.reviewer` — `review_round`: the internal reviewer that runs after a PRD
+  round merges, reviews the round's diff for correctness/stale docs, and files
+  `review-fix` follow-up issues (`ready-for-agent` + `Part of #<prd>`) wired into
+  dependents' `## Blocked by`. It never edits code. The Agent-SDK review, the gh
+  issue creation (reused from the slicer), and the gh issue-body edit are injected.
 
 A validly signed `issues` webhook returns 202 and enqueues exactly one job; an
 invalid or missing signature returns 401 and enqueues nothing. Non-`issues` events
@@ -145,6 +150,25 @@ in flight at a time — a second entry raises `OrchestratorBusyError`. The lock,
 conflict resolver, the implementer spawn, and the git operations are all injected
 alongside the done-check seams, so the whole parallel/topological flow is exercised with
 no Agent SDK, no Docker, no gh, no network, and no concurrency races.
+
+## Internal reviewer
+
+After a PRD round merges (`build_prd`), `retinue.reviewer.review_round` reviews that
+round before the next one starts:
+
+1. **review** — run the headless Agent-SDK reviewer (the injected `generate` seam) over
+   the round's merged diff and merged issue numbers, surfacing correctness bugs and
+   stale docs as `ReviewFinding`s,
+2. **file** — for each finding, file a follow-up issue via the slicer's `create_issue`
+   seam, reusing the `ready-for-agent` + `Part of #<prd>` shape and adding a
+   `review-fix` label so the agent loop routes it as a fix,
+3. **wire** — append the new review-fix issue to the `## Blocked by` of each dependent
+   open issue it flags (the injected `edit_blocked_by` gh seam), so the fix builds in a
+   later round *before* the work layered on top of the defect.
+
+A clean review files nothing. The reviewer **never edits code** — it only files and
+wires issues. The Agent-SDK review, the gh issue creation, and the gh issue-body edit
+are all injected, so the flow is exercised with no Agent SDK, no gh, and no network.
 
 ## Configuration
 
