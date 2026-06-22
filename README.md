@@ -222,6 +222,29 @@ flow is exercised with no real `gh` and no network. The result is a `PrOpenResul
 whose outcome is `OPENED` (with the created PR), `HEIMDALL_MISSING`, or
 `STAGING_MISSING`.
 
+## Heimdall verdict loopback
+
+Once the staging PR is open, heimdall posts a bot review on it.
+`retinue.loopback.process_review` reads that verdict and reasons about it plus a
+*persisted* per-PR rebuild-round count (`HeimdallRoundStore`, an aiosqlite counter in
+the `ImplRetryStore` style), via the pure `decide_verdict`:
+
+1. **rebuild** — heimdall raised **blocking** findings (severity at/above the `high`
+   threshold) and the round count is below `RepoConfig.retry_cap` (3). Each blocking
+   finding becomes a fix-issue (`ready-for-agent` + `Part of #<prd>`) that rebuilds onto
+   the **same** `retinue/prd-<n>` branch and re-triggers heimdall review; the round is
+   persisted so the loop survives a restart and is bounded at the cap.
+2. **converge** — heimdall raised **no** blocking findings. The flow proceeds to handoff.
+   Any non-blocking nits are filed as `backlog` issues carrying heimdall severity mapped
+   1:1 to a `priority:<severity>` label.
+3. **escalate** — the round budget is spent while still blocked. The flow stops: it
+   comments the PRD, applies `hitl`, and notifies through the shared `Notifier`, leaving
+   the PR open for a human.
+
+The heimdall verdict, the gh issue creator (reused from the slicer), the
+rebuild-onto-same-branch trigger, the handoff, and the notifier sinks are all injected,
+so the loop is exercised with no real `gh`, heimdall, or network.
+
 ## Configuration
 
 Set via environment variables or a `.env` file:
