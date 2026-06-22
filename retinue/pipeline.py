@@ -21,11 +21,11 @@ to :meth:`Pipeline.process_review` (:func:`retinue.loopback.process_review`) and
 merged ``pull_request`` to :meth:`Pipeline.reap_pr` (:func:`retinue.handoff.reap_merged_pr`).
 A worker restart resumes through :meth:`Pipeline.reconcile` (:func:`reconcile_run`).
 
-Because there is no in-repo implementer-spawn adapter (the Agent-SDK subagent is owned
-by a separate layer), the orchestrator ``build_prd`` call is itself an injected seam —
-production binds it to the real :func:`retinue.orchestrator.build_prd` once an
-``Implementer`` is provided. Every other side-effecting collaborator is a real adapter
-wired in :func:`build_pipeline_factory`.
+The orchestrator ``build_prd`` call is an injected seam (so a fake drops in for tests),
+but production now binds it to the real, budget-gated, triaged build over the
+:class:`~retinue.orchestrator.AgentSdkImplementer` per repo inside
+:func:`build_pipeline_factory` — every side-effecting collaborator, the build lane
+included, is a real adapter wired there.
 """
 
 from __future__ import annotations
@@ -46,6 +46,14 @@ from retinue.budget import (
     BudgetGovernor,
     BudgetLedger,
     SystemClock,
+)
+from retinue.container import Container, ContainerRuntime, DockerRuntime
+from retinue.done_check import (
+    DEFAULT_IMAGE,
+    EnvSecretResolver,
+    GhReportSink,
+    ReportSink,
+    SecretResolver,
 )
 from retinue.handoff import (
     Handoff,
@@ -72,7 +80,12 @@ from retinue.notify import (
     PushRequest,
     PushSink,
 )
-from retinue.orchestrator import PrdBuildResult, PrdSlice
+from retinue.orchestrator import (
+    AgentSdkImplementer,
+    ContainerGitOps,
+    PrdBuildResult,
+    PrdSlice,
+)
 from retinue.pr_opener import GhCliPrOps, PrOpenResult, PrOps, open_staging_pr
 from retinue.reconcile import (
     GhCliReconcile,
@@ -90,6 +103,7 @@ from retinue.slicer import (
     SliceOutcome,
     slice_prd,
 )
+from retinue.wiring import BoundBuildResult, bind_build_prd
 
 if TYPE_CHECKING:
     from retinue.config import Settings
@@ -97,9 +111,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The orchestrator build seam. Bound to :func:`retinue.orchestrator.build_prd` in
-# production once an Implementer is supplied; injected as a fake in tests. Returns the
-# per-slice build outcome the PR-opener gates on.
+# The orchestrator build seam. Bound to the real budget-gated build over
+# :func:`retinue.orchestrator.build_prd` in production (per repo in the factory); injected
+# as a fake in tests. Returns the per-slice build outcome the PR-opener gates on.
 BuildPrd = Callable[..., Awaitable[PrdBuildResult]]
 
 # The handoff seam invoked when heimdall converges (the loopback's Handoff shape). Bound
@@ -131,8 +145,8 @@ class Pipeline:
     The collaborators are the already-built real adapters (or recording fakes in a
     test); the SQLite-backed stores are constructed lazily from their paths so one
     pipeline owns one durable file per concern. The orchestrator build and the handoff
-    are injected seams (``build_prd`` / ``handoff``) because the implementer-spawn
-    adapter lives in a separate layer.
+    are injected seams (``build_prd`` / ``handoff``) so a fake drops in for tests; the
+    factory binds ``build_prd`` to the real budget-gated build in production.
 
     Attributes:
         config: The accepted repo config gating every step (staging branch, retry cap).
@@ -335,8 +349,9 @@ class Pipeline:
 class PipelineNotWiredError(RuntimeError):
     """A pipeline step was reached without its collaborator wired in.
 
-    Raised rather than silently no-oping so a misconfigured deployment fails loudly at
-    the first use of the missing seam (e.g. ``build_prd`` with no Implementer wired).
+    Raised rather than silently no-oping so a pipeline reached through a step whose
+    optional seam was never injected (e.g. a fake pipeline with no ``rebuild`` or
+    ``reconcile_gh``) fails loudly at first use instead of misbehaving silently.
     """
 
     def __init__(self, seam: str) -> None:
@@ -452,29 +467,119 @@ def _build_push_sink(settings: Settings) -> PushSink:
     return _noop
 
 
+# The orchestrator build's estimated charge, gated against the rolling-24h budget cap.
+# The build's true cost is only known after the implementer/done-check runs, so the gate
+# uses a conservative fixed estimate; the meter (the governor's mid-run pause/resume)
+# tracks the real spend once the run is underway. Kept here (not a Settings field) so the
+# public config schema is unchanged.
+_BUILD_ESTIMATED_AMOUNT = 1.0
+
+
+class _MergeContainerGitOps:
+    """A :class:`GitOps` that lazily starts its own merge container, then delegates.
+
+    The orchestrator's merge phase runs ``git`` inside a container holding a clone of the
+    repo, but ``build_prd`` starts no such container — the done-check's per-slice
+    containers are created and destroyed inside the build round, before any merge. This
+    adapter closes that gap: on the first branch/merge call it starts a fresh container
+    via the injected :class:`ContainerRuntime`, clones the repo over the installation
+    token, and wraps it in :class:`ContainerGitOps`; every later call within the same
+    build reuses that one container (so the integration branch persists across the
+    round's merges). :meth:`aclose` destroys it, and the build seam wrapper calls it in a
+    ``finally`` so the container is never leaked.
+
+    Args:
+        repo_full_name: The repo to clone for the merges, e.g. "owner/repo".
+        auth: Mints the installation token whose URL the clone authenticates with.
+        runtime: Spawns the disposable merge container (the Docker seam).
+        image: The container image the merges run in; defaults to the done-check image.
+    """
+
+    def __init__(
+        self,
+        *,
+        repo_full_name: str,
+        auth: InstallationAuth,
+        runtime: ContainerRuntime,
+        image: str = DEFAULT_IMAGE,
+    ) -> None:
+        self._repo_full_name = repo_full_name
+        self._auth = auth
+        self._runtime = runtime
+        self._image = image
+        self._container: Container | None = None
+        self._delegate: ContainerGitOps | None = None
+
+    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
+        """Ensure ``branch`` exists in the (lazily started) merge container."""
+        delegate = await self._ensure_delegate()
+        await delegate.ensure_integration_branch(branch=branch, base=base)
+
+    async def merge(self, *, source: str, into: str) -> None:
+        """Merge ``source`` into ``into`` in the (lazily started) merge container."""
+        delegate = await self._ensure_delegate()
+        await delegate.merge(source=source, into=into)
+
+    async def _ensure_delegate(self) -> ContainerGitOps:
+        """Start + clone the merge container on first use; reuse it thereafter."""
+        if self._delegate is not None:
+            return self._delegate
+        token = await self._auth.installation_token(self._repo_full_name)
+        container = await self._runtime.start(image=self._image, env={})
+        result = await container.run_command(["git", "clone", token.clone_url, "."])
+        if not result.ok:
+            await container.destroy()
+            raise GitOpsCloneError(
+                f"clone of {self._repo_full_name} for merge failed "
+                f"(exit {result.exit_code}): {result.stderr}"
+            )
+        self._container = container
+        self._delegate = ContainerGitOps(container)
+        return self._delegate
+
+    async def aclose(self) -> None:
+        """Destroy the merge container if one was started. Idempotent."""
+        container, self._container, self._delegate = self._container, None, None
+        if container is not None:
+            await container.destroy()
+
+
+class GitOpsCloneError(RuntimeError):
+    """The merge container could not clone the repo, so no merge can run.
+
+    Raised rather than returning a sentinel so a doomed merge round fails loudly instead
+    of silently reporting an empty integration branch.
+    """
+
+
 def build_pipeline_factory(
     settings: Settings,
     auth: InstallationAuth,
     *,
     build_prd: BuildPrd | None = None,
+    fetch_claude_md: ClaudeMdFetcher | None = None,
 ) -> Callable[[str, RepoConfig], Awaitable[Pipeline]]:
     """Build the production pipeline factory over the real adapters.
 
     Returns an async ``(repo_full_name, config) -> Pipeline`` that mints a per-repo
-    installation token, then constructs every gh/Anthropic/push adapter against it: the
-    slicer's gh issue creator and Agent-SDK generator, the PR-opener gh ops, the reap and
-    reconcile gh seams, the heimdall rebuilder, the shared notifier (push + comment +
-    label), and the shared budget governor.
+    installation token, then constructs every gh/Anthropic/push/build adapter against it:
+    the slicer's gh issue creator and Agent-SDK generator, the PR-opener gh ops, the reap
+    and reconcile gh seams, the heimdall rebuilder, the shared notifier (push + comment +
+    label), the shared budget governor, and the orchestrator build lane.
 
-    The orchestrator ``build_prd`` seam is supplied by the caller — bind it with
-    :func:`retinue.wiring.bind_build_prd` once an implementer-spawn adapter (owned by a
-    separate layer) is available. Left unset, the build step raises
-    :class:`PipelineNotWiredError` while every other step is fully wired.
+    The orchestrator ``build_prd`` seam defaults to the real budget-gated, triaged build
+    bound per repo via :func:`retinue.wiring.bind_build_prd` over the real
+    :class:`~retinue.orchestrator.AgentSdkImplementer`, container/git/secret/report
+    adapters — so a constructed :class:`Pipeline` has a live build lane. A caller may pass
+    a ``build_prd`` to override it (a fake in tests); passing one skips the per-repo bind.
 
     Args:
         settings: The runtime settings carrying budget, Anthropic, and push config.
         auth: The GitHub App installation auth used to mint per-repo tokens.
-        build_prd: The bound orchestrator build seam, or ``None`` to leave it unwired.
+        build_prd: An explicit build seam overriding the real per-repo bind (e.g. a fake).
+        fetch_claude_md: Reads the target repo's ``CLAUDE.md`` text (the done-check
+            command source); ``None`` falls back to empty text, which the done-check
+            reads as no recognisable command. Production injects the contents-API fetcher.
 
     Returns:
         An async pipeline factory keyed by repo and config.
@@ -490,6 +595,7 @@ def build_pipeline_factory(
     )
     push = _build_push_sink(settings)
     state_dir = _state_dir(settings)
+    retry_store_path = state_dir / "impl-retries.sqlite3"
     # One subprocess runner per module's own GhResult (structurally identical), so each
     # adapter's runner Protocol is satisfied by the same real ``gh`` spawn.
     slicer_runner = SubprocessGhRunner(_slicer_gh.GhResult)
@@ -517,9 +623,19 @@ def build_pipeline_factory(
         reconcile_gh = GhCliReconcile(
             _ReconcileGhRunner(token), merge_base=config.staging_branch
         )
+        bound_build_prd = build_prd or _bind_build_prd_for_repo(
+            settings,
+            auth,
+            repo_full_name=repo_full_name,
+            token=token,
+            governor=governor,
+            notifier=notifier,
+            create_issue=create_issue,
+            retry_store_path=retry_store_path,
+        )
         return Pipeline(
             config=config,
-            claude_md="",
+            claude_md=await _fetch_claude_md(fetch_claude_md, repo_full_name),
             governor=governor,
             notifier=notifier,
             create_issue=create_issue,
@@ -527,14 +643,120 @@ def build_pipeline_factory(
             pr_ops=pr_ops,
             reap_gh=reap_gh,
             round_store_path=state_dir / "heimdall-rounds.sqlite3",
-            retry_store_path=state_dir / "impl-retries.sqlite3",
+            retry_store_path=retry_store_path,
             run_state_path=state_dir / "run-state.sqlite3",
-            build_prd=build_prd,
+            build_prd=bound_build_prd,
             rebuild=rebuild,
             reconcile_gh=reconcile_gh,
         )
 
     return factory
+
+
+# Reads the target repo's ``CLAUDE.md`` text given its full name. Injected (over the
+# GitHub contents API in production) so the build's done-check command is parsed from the
+# real repo text rather than an empty string; absent, the factory falls back to "".
+ClaudeMdFetcher = Callable[[str], Awaitable[str]]
+
+
+async def _fetch_claude_md(
+    fetch_claude_md: ClaudeMdFetcher | None, repo_full_name: str
+) -> str:
+    """Read the target repo's ``CLAUDE.md`` text, or "" when no fetcher is wired."""
+    if fetch_claude_md is None:
+        return ""
+    return await fetch_claude_md(repo_full_name)
+
+
+def _bind_build_prd_for_repo(
+    settings: Settings,
+    auth: InstallationAuth,
+    *,
+    repo_full_name: str,
+    token: str,
+    governor: BudgetGovernor,
+    notifier: Notifier,
+    create_issue: IssueCreator,
+    retry_store_path: Path,
+) -> BuildPrd:
+    """Bind the real budget-gated, triaged orchestrator build for one repo.
+
+    Constructs the build lane's real adapters — the Agent-SDK implementer, the Docker
+    runtime, the lazy merge-container git ops, the env secret resolver, and the gh report
+    sink — then binds them through :func:`retinue.wiring.bind_build_prd`. The merge
+    container the lazy git ops starts is destroyed after each build in a ``finally``, so a
+    long-lived worker never leaks a container across PRD runs.
+
+    Args:
+        settings: Carries the Anthropic credential/auth mode and budget config.
+        auth: Mints the installation token the clone authenticates with (the done-check
+            clones over its URL); also passed through to the orchestrator build.
+        repo_full_name: The target repo the build runs against.
+        token: The minted installation token the gh report sink authenticates with.
+        governor: The shared service-level budget governor (gate + meter).
+        notifier: The escalation fan-out used by triage's escalate path.
+        create_issue: The gh issue creator used by triage's reslice path.
+        retry_store_path: SQLite file backing the persisted per-slice retry counter.
+
+    Returns:
+        The bound ``build_prd`` seam the pipeline drives.
+    """
+    runtime = DockerRuntime()
+    git = _MergeContainerGitOps(
+        repo_full_name=repo_full_name, auth=auth, runtime=runtime
+    )
+    implementer = AgentSdkImplementer(
+        credential=settings.anthropic_credential, auth_mode=settings.auth_mode
+    )
+    resolve_secret: SecretResolver = EnvSecretResolver()
+    report: ReportSink = GhReportSink(token=token)
+    bound = bind_build_prd(
+        implementer=implementer,
+        governor=governor,
+        notifier=notifier,
+        create_issue=create_issue,
+        retry_store_path=retry_store_path,
+        estimated_amount=_BUILD_ESTIMATED_AMOUNT,
+        git=git,
+        auth=auth,
+        runtime=runtime,
+        resolve_secret=resolve_secret,
+        report=report,
+    )
+
+    async def run(**kwargs: object) -> PrdBuildResult:
+        try:
+            result = await bound(**kwargs)
+        finally:
+            await git.aclose()
+        return _prd_build_from_bound(result, prd_number=kwargs.get("prd_number"))
+
+    return run
+
+
+def _prd_build_from_bound(
+    result: BoundBuildResult, *, prd_number: object
+) -> PrdBuildResult:
+    """Adapt a :class:`BoundBuildResult` to the pipeline's :class:`PrdBuildResult` seam.
+
+    ``bind_build_prd`` returns the budget-gate-aware :class:`BoundBuildResult`, but the
+    pipeline's ``build_prd`` seam is a :class:`PrdBuildResult` (nothing in the pipeline
+    consumes the deferral flag). A run that built yields its inner ``prd_build``; a run the
+    budget gate *deferred* yields an empty build on the integration branch — honest: the
+    deferred PRD merged nothing — so the staging-PR step sees no merged slices.
+    """
+    from retinue.orchestrator import integration_branch
+
+    if result.prd_build is not None:
+        return result.prd_build
+    number = prd_number if isinstance(prd_number, int) else 0
+    return PrdBuildResult(
+        integration_branch=integration_branch(number),
+        merged_issues=[],
+        blocked_issues=[],
+        escalated_issues=[],
+        skipped_issues=[],
+    )
 
 
 def _state_dir(settings: Settings) -> Path:

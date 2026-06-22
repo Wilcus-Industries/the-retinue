@@ -32,7 +32,7 @@ from retinue.loopback import (
     ReviewState,
     Severity,
 )
-from retinue.pipeline import Pipeline, build_pipeline_factory
+from retinue.pipeline import ClaudeMdFetcher, Pipeline, build_pipeline_factory
 from retinue.queue import PrdJob
 from retinue.repo_config import RepoConfig, load_repo_config
 
@@ -55,6 +55,9 @@ IssueBodyFetcher = Callable[[str, int], Awaitable[str]]
 
 # Path of the opt-in config file inside each repo, fetched over the contents API.
 RETINUE_CONFIG_PATH = ".github/retinue.yml"
+# Path of the repo's CLAUDE.md, fetched over the contents API to source the done-check
+# command the build gates on (a missing file reads as empty text).
+CLAUDE_MD_PATH = "CLAUDE.md"
 GITHUB_API_BASE_URL = "https://api.github.com"
 
 
@@ -404,9 +407,14 @@ def _configure_logging() -> None:
     )
 
 
+def _repo_contents_url(repo_full_name: str, path: str) -> str:
+    """Build the GitHub contents-API URL for a file at ``path`` in a repo."""
+    return f"{GITHUB_API_BASE_URL}/repos/{repo_full_name}/contents/{path}"
+
+
 def _contents_url(repo_full_name: str) -> str:
     """Build the GitHub contents-API URL for a repo's ``.github/retinue.yml``."""
-    return f"{GITHUB_API_BASE_URL}/repos/{repo_full_name}/contents/{RETINUE_CONFIG_PATH}"
+    return _repo_contents_url(repo_full_name, RETINUE_CONFIG_PATH)
 
 
 def _auth_headers(token: str) -> dict[str, str]:
@@ -511,11 +519,50 @@ def _github_issue_body_fetcher(
     return fetch
 
 
+def _github_claude_md_fetcher(
+    auth: InstallationAuth, client: httpx.AsyncClient
+) -> ClaudeMdFetcher:
+    """Build the production ``CLAUDE.md`` fetcher backed by the GitHub contents API.
+
+    Returns an async ``(repo) -> claude_md`` that mints an installation token and reads
+    the target repo's root ``CLAUDE.md`` so the build's done-check command is parsed from
+    the *real* repo text (not an empty default). A repo with no ``CLAUDE.md`` (404) reads
+    as empty text — the done-check then finds no command and escalates rather than running
+    a phantom gate. Any other HTTP error is raised so the job retries rather than building
+    against a degraded, empty done-check spec.
+
+    Args:
+        auth: Mints an installation token scoped to the target repo.
+        client: A shared httpx client used for the contents read.
+
+    Returns:
+        A :data:`~retinue.pipeline.ClaudeMdFetcher` returning the ``CLAUDE.md`` text.
+    """
+
+    async def fetch(repo_full_name: str) -> str:
+        installation = await auth.installation_token(repo_full_name)
+        response = await client.get(
+            _repo_contents_url(repo_full_name, CLAUDE_MD_PATH),
+            headers=_auth_headers(installation.token),
+        )
+        if response.status_code == httpx.codes.NOT_FOUND:
+            return ""
+        response.raise_for_status()
+        return _decode_contents_payload(response.json())
+
+    return fetch
+
+
 async def on_startup(ctx: dict[str, Any]) -> None:
-    """Populate the worker context with the PRD gate's collaborators.
+    """Populate the worker context with the gate's collaborators and the live pipeline.
 
     Installs the config fetcher and the SQLite-backed dedupe store onto ``ctx`` so
-    :func:`process_prd` can gate each dequeued PRD on opt-in, validity, and novelty.
+    :func:`process_prd` can gate each dequeued PRD on opt-in, validity, and novelty. When
+    GitHub App auth resolves (:func:`_load_github_client`), it also installs the real
+    PRD-body fetcher and a ``pipeline_factory`` over the production adapters — the factory
+    sources each repo's ``CLAUDE.md`` (the done-check command) and binds the live build
+    lane — so an accepted PRD drives the real slice -> build -> staging-PR pipeline. With
+    no auth wired, the fetcher defaults to not-opted-in and no pipeline is installed.
     """
     global settings
     if settings is None:
@@ -532,7 +579,9 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         ctx["github_client"] = client
         ctx["fetch_config"] = github_config_fetcher(auth, client)
         ctx["fetch_prd_body"] = _github_issue_body_fetcher(auth, client)
-        ctx["pipeline_factory"] = build_pipeline_factory(settings, auth)
+        ctx["pipeline_factory"] = build_pipeline_factory(
+            settings, auth, fetch_claude_md=_github_claude_md_fetcher(auth, client)
+        )
     ctx["dedupe"] = PrdDedupeStore(settings.dedupe_db_path)
 
 

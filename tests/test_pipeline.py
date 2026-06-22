@@ -287,7 +287,12 @@ def _settings(tmp_path: Path, **extra: object) -> object:
 
 @pytest.mark.asyncio
 async def test_build_pipeline_factory_wires_a_pipeline(tmp_path: Path) -> None:
-    """The production factory mints a token and builds a fully-wired Pipeline."""
+    """The production factory mints a token and builds a fully-wired Pipeline.
+
+    The build lane is now bound by default: the factory binds the real
+    budget-gated/triaged ``build_prd`` (over the Agent-SDK implementer + container/git/
+    secret/report adapters) per repo, so the produced pipeline has a live build seam.
+    """
     from retinue.pipeline import build_pipeline_factory
 
     settings = _settings(tmp_path, ntfy_topic="alerts")
@@ -296,8 +301,31 @@ async def test_build_pipeline_factory_wires_a_pipeline(tmp_path: Path) -> None:
 
     assert pipeline.rebuild is not None
     assert pipeline.reconcile_gh is not None
-    # build_prd is intentionally unbound (no implementer adapter in-repo).
-    assert pipeline.build_prd is None
+    # The build lane is wired: an accepted PRD reaches a real, budget-gated build.
+    assert pipeline.build_prd is not None
+
+
+@pytest.mark.asyncio
+async def test_build_pipeline_factory_sources_claude_md(tmp_path: Path) -> None:
+    """The factory sources each repo's CLAUDE.md (the done-check command) via the fetcher."""
+    from retinue.pipeline import build_pipeline_factory
+
+    fetched: list[str] = []
+
+    async def fetch_claude_md(repo_full_name: str) -> str:
+        fetched.append(repo_full_name)
+        return "## Definition of done\n```\nuv run pytest\n```\n"
+
+    settings = _settings(tmp_path, ntfy_topic="alerts")
+    factory = build_pipeline_factory(
+        settings,  # type: ignore[arg-type]
+        _FakeAuth(),  # type: ignore[arg-type]
+        fetch_claude_md=fetch_claude_md,
+    )
+    pipeline = await factory("owner/repo", _config())
+
+    assert fetched == ["owner/repo"]
+    assert "uv run pytest" in pipeline.claude_md
 
 
 def test_build_push_sink_picks_pushover_when_no_ntfy(tmp_path: Path) -> None:

@@ -7,15 +7,25 @@ webhook: `tunnel` (local, ephemeral URL) and `edge` (VPS, your own domain + TLS)
 
 This runbook takes you from a fresh GitHub App to a live deployment. Follow it in order.
 
-> **Honest state of the pipeline.** The worker drives the real pipeline (slice → build →
-> open staging PR, plus the heimdall loopback and merge reap) once GitHub App auth is
-> configured: `on_startup` then wires the real `fetch_config`, the PRD-body fetcher, and
-> the `pipeline_factory`. Without GitHub App credentials the `fetch_config` seam treats
-> every repo as *not opted in*, so a delivered event is logged as a SKIP — still proving
-> the webhook auth + transport + queue + worker path end to end. The one remaining
-> injected seam is the orchestrator `build_prd` (the implementer-spawn adapter), bound via
-> `retinue.wiring.bind_build_prd` once that layer lands; until then the build step is the
-> only part that is not yet executable.
+> **Honest state of the pipeline.** The worker drives the **real, end-to-end** pipeline
+> (slice → build → open staging PR, plus the heimdall loopback and merge reap) once
+> GitHub App auth is configured: `on_startup` wires the real `fetch_config`, the PRD-body
+> fetcher, and a `pipeline_factory` that — per repo — sources the target's `CLAUDE.md`
+> (the done-check command) and binds the live orchestrator build lane (the Agent-SDK
+> implementer behind the budget gate + triage, the disposable done-check container, and
+> the integration-branch merge). An issue event on an opted-in repo now slices the PRD,
+> builds the slices, and opens the staging PR — it is no longer a skip.
+>
+> Without GitHub App credentials the `fetch_config` seam treats every repo as *not opted
+> in*, so a delivered event is logged as a SKIP — still proving the webhook auth +
+> transport + queue + worker path end to end, but doing no real work.
+>
+> **The full pipeline spends real money and needs Docker.** The build lane spawns the
+> Agent SDK (real Anthropic token spend, metered against `WEEKLY_BUDGET`) and runs the
+> done-check inside a disposable container, so the worker needs the **Docker socket**
+> mounted and a funded `WEEKLY_BUDGET`. A full live smoke (the #17 end-to-end run) will
+> therefore spend real Anthropic tokens and exercise Docker — keep that in mind before
+> opening an issue on an opted-in repo.
 
 ---
 
@@ -59,14 +69,17 @@ cp .env.example .env
 - Fill `WEBHOOK_SECRET` with the exact secret you set on the App in step (a).
 - Set `WEEKLY_BUDGET` to a real cap before going live (it defaults to `0`).
 - Drop the private key from step (a) at the path the worker expects. The intended mount
-  is `/secrets/app.pem` (see `GITHUB_APP_PRIVATE_KEY_PATH` in `.env.example`); that mount
-  is wired in the Build phase when the GitHub-App adapter lands.
+  is `/secrets/app.pem` (see `GITHUB_APP_PRIVATE_KEY_PATH` in `.env.example`). The
+  GitHub-App adapter reads this PEM at startup to mint installation tokens, so the worker
+  will not do real work without it.
+- Set the Anthropic credential the build lane spends: `ANTHROPIC_API_KEY` (api_key mode)
+  or `CLAUDE_CODE_OAUTH_TOKEN` (subscription mode), matching `AUTH_MODE`.
 
 `.env` is **gitignored — NEVER commit it.** Same for the `.pem`.
 
 ## d. Notifications
 
-Pick one notification transport (consumed once the notify adapter lands):
+Pick one notification transport (the notify adapter publishes escalations to it):
 
 - **ntfy:** choose a hard-to-guess topic name, subscribe to it in the ntfy app, and set
   `NTFY_TOPIC` in `.env`.
@@ -90,16 +103,25 @@ https://<random>.trycloudflare.com/webhook
 > and you must re-paste it into the App. For a stable URL, switch to a named tunnel
 > (`CLOUDFLARE_TUNNEL_TOKEN`) or use the VPS `edge` profile (step g).
 
-## f. Verify the transport
+## f. Verify the transport (and, on an opted-in repo, the pipeline)
 
 1. Open an issue on the test repo.
 2. GitHub delivers the webhook; **web** verifies the HMAC and returns **202**, enqueuing
    the event (check the App's webhook "Recent Deliveries" tab for the 202).
 3. The **worker** logs that it received the event.
 
-As noted above, the worker currently logs a **"not opted in" SKIP** because
-`fetch_config` returns `None` until the adapters land — that is the expected result and
-still confirms auth + transport + queue + worker are all wired correctly.
+What happens next depends on the repo's opt-in:
+
+- **No `.github/retinue.yml`** (or no GitHub App auth): the worker logs a **"not opted in"
+  SKIP** — `fetch_config` returns `None`, nothing downstream runs. This still confirms
+  auth + transport + queue + worker are wired, doing no real work. Use this as the safe
+  transport-only check.
+- **Opted in** (the `.github/retinue.yml` from step (b)): the worker drives the **real
+  pipeline** — it slices the PRD into issues, runs the build lane (Agent-SDK implementer
+  → done-check container → integration-branch merge), and opens the staging PR. This is
+  the full #17 smoke: it **spends real Anthropic tokens** (metered against
+  `WEEKLY_BUDGET`) and **requires the Docker socket** mounted for the done-check
+  container. Only open an issue on an opted-in repo once you are ready for that.
 
 ## g. Deploy to a VPS (edge profile)
 
@@ -123,6 +145,8 @@ Re-run the step (f) verification against the live domain.
 
 The worker's SQLite state — the dedupe ledger (`DEDUPE_DB_PATH`) and the budget ledger
 (`BUDGET_DB_PATH`) — is pinned to `/data` on the **worker-data** named volume so it
-survives restarts. As the orchestrator, loopback, and reconcile seams are wired, **their
-SQLite paths must ALSO land on `worker-data`** (`/data/...`), and the corresponding
-`Settings` fields get added in the Build phase that implements each adapter.
+survives restarts. The pipeline's own durable stores (the heimdall round counter, the
+per-slice implementer-retry counter, and the per-PRD run-state) are **co-located next to
+the dedupe DB automatically** — the factory derives their directory from
+`DEDUPE_DB_PATH`'s parent — so keeping `DEDUPE_DB_PATH` under `/data` lands all of them on
+`worker-data` with no extra `Settings` fields to configure.

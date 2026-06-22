@@ -14,7 +14,10 @@ from typing import Any
 
 import pytest
 
+import retinue.github_app as github_app
+import retinue.worker as worker
 from retinue.dedupe import PrdDedupeStore
+from retinue.github_app import InstallationToken
 from retinue.handoff import MergedPullRequest, ReapOutcome, ReapResult
 from retinue.loopback import (
     HeimdallReview,
@@ -26,6 +29,8 @@ from retinue.loopback import (
 from retinue.pipeline import PrdJobResult
 from retinue.repo_config import RepoConfig
 from retinue.worker import (
+    on_shutdown,
+    on_startup,
     parse_heimdall_review,
     process_prd,
     process_review_job,
@@ -213,3 +218,87 @@ def test_parse_heimdall_review_unknown_state_is_commented() -> None:
     )
     assert review.state is ReviewState.COMMENTED
     assert review.findings == []
+
+
+# --- on_startup: the production wiring path -------------------------------------
+
+
+class _FakeAuth:
+    """A stand-in :class:`InstallationAuth` that mints a canned token without network."""
+
+    async def installation_token(self, repo_full_name: str) -> InstallationToken:
+        return InstallationToken(token="ghs_x", clone_url="https://x/y.git")
+
+
+async def _fake_claude_md(repo_full_name: str) -> str:
+    """Canned CLAUDE.md text standing in for the contents-API fetch (no network)."""
+    return "## Definition of done\n```\nuv run pytest\n```\n"
+
+
+def _worker_settings(tmp_path: Path) -> object:
+    from retinue.config import Settings
+
+    return Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        webhook_secret="s",
+        dedupe_db_path=str(tmp_path / "dedupe.sqlite3"),
+        budget_db_path=str(tmp_path / "budget.sqlite3"),
+        weekly_budget=1000.0,
+        ntfy_topic="alerts",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_startup_wires_a_live_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """on_startup takes the auth branch and produces a pipeline with a live build lane.
+
+    With GitHub App auth resolvable, on_startup must install the config fetcher, the
+    PRD-body fetcher, and the pipeline_factory — and the factory must yield a Pipeline
+    whose build lane is bound (not the dead ``build_prd is None`` of the unwired path).
+    No network, Docker, or model: the auth is faked and adapter construction is pure.
+    """
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+    monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
+    # The factory sources CLAUDE.md per repo over the contents API; stub that fetcher so
+    # the wiring is exercised without a live GitHub read.
+    monkeypatch.setattr(
+        worker,
+        "_github_claude_md_fetcher",
+        lambda auth, client: _fake_claude_md,
+    )
+
+    ctx: dict[str, Any] = {}
+    try:
+        await on_startup(ctx)
+
+        # Took the auth branch: all three downstream seams are installed.
+        assert ctx["github_client"] is not None
+        assert callable(ctx["fetch_config"])
+        assert callable(ctx["fetch_prd_body"])
+        assert callable(ctx["pipeline_factory"])
+
+        # The produced pipeline has a live build lane (the wiring blocker is closed).
+        pipeline = await ctx["pipeline_factory"](
+            "owner/repo", RepoConfig(staging_branch="staging", retry_cap=2)
+        )
+        assert pipeline.build_prd is not None
+    finally:
+        await on_shutdown(ctx)
+
+
+@pytest.mark.asyncio
+async def test_on_startup_without_auth_installs_no_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no GitHub App auth builder, on_startup falls back to the safe not-opted path."""
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+    monkeypatch.delattr(github_app, "build_installation_auth", raising=False)
+
+    ctx: dict[str, Any] = {}
+    await on_startup(ctx)
+
+    # No auth -> no pipeline; the fetcher is the not-opted-in fallback.
+    assert "pipeline_factory" not in ctx
+    assert await ctx["fetch_config"]("owner/repo") is None
