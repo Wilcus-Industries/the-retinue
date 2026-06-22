@@ -11,18 +11,31 @@ A green done-check merges ``issue-<N>`` into the integration branch ``retinue/pr
 
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport
 from retinue.orchestrator import (
+    AgentSdkConflictResolver,
+    AnthropicResponse,
     BuildOutcome,
     BuildResult,
+    ConflictResolution,
+    ConflictResolutionError,
     ContainerGitOps,
     GitOpsError,
     Implementer,
     MergeConflict,
     Slice,
+    _conflicted_paths,
+    _ConflictedFile,
+    _parse_resolution,
+    _resolve_headers,
+    _resolve_payload,
+    _write_file_command,
     build_slice,
     integration_branch,
 )
@@ -385,3 +398,191 @@ async def test_merge_hard_error_is_gitops_error_not_conflict() -> None:
         await git.merge(source="issue-7", into="retinue/prd-1")
     # A hard error must not leave a phantom --abort claiming a conflict was handled.
     assert "git merge --abort" not in _joined(container)
+
+
+# --- real Agent-SDK conflict resolver --------------------------------------------
+#
+# Exercises the production AgentSdkConflictResolver's pure/parseable parts (auth header,
+# request payload, response parsing, conflicted-path + write-file argv) and its
+# container/transport collaboration over an in-memory container + fake transport. No
+# live container/Docker/Claude/network.
+
+
+class FakeAnthropicTransport:
+    """Records the POST and returns a canned :class:`AnthropicResponse`."""
+
+    def __init__(self, response: AnthropicResponse) -> None:
+        self._response = response
+        self.calls: list[tuple[str, dict[str, str], dict[str, object]]] = []
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, object]
+    ) -> AnthropicResponse:
+        self.calls.append((url, headers, json))
+        return self._response
+
+
+def _text_response(payload: dict[str, object], *, status: int = 200) -> AnthropicResponse:
+    """An Anthropic response whose single text block carries ``payload`` as JSON."""
+    return AnthropicResponse(
+        status_code=status,
+        body={"content": [{"type": "text", "text": json.dumps(payload)}]},
+    )
+
+
+def test_resolve_headers_routes_oauth_token_to_bearer() -> None:
+    """An OAuth subscription token rides Authorization: Bearer + the OAuth beta header."""
+    headers = _resolve_headers("sk-ant-oat01-secret")
+
+    assert headers["authorization"] == "Bearer sk-ant-oat01-secret"
+    assert headers["anthropic-beta"] == "oauth-2025-04-20"
+    assert headers["anthropic-version"] == "2023-06-01"
+    assert "x-api-key" not in headers
+
+
+def test_resolve_headers_routes_api_key_to_x_api_key() -> None:
+    """A raw API key rides x-api-key with no OAuth beta header."""
+    headers = _resolve_headers("sk-ant-api03-secret")
+
+    assert headers["x-api-key"] == "sk-ant-api03-secret"
+    assert "authorization" not in headers
+    assert "anthropic-beta" not in headers
+
+
+def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
+    """The request payload fences each conflicted file and forces the strict schema."""
+    files = [
+        _ConflictedFile(path="a.py", content="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"),
+        _ConflictedFile(path="b.py", content="conflict-b"),
+    ]
+    payload = _resolve_payload(files, source="issue-7", into="retinue/prd-1", model="m")
+
+    assert payload["model"] == "m"
+    assert payload["response_format"]["type"] == "json_schema"
+    user = payload["messages"][0]["content"]
+    # Both paths and both blobs ride in the user message, fenced by path.
+    assert "### a.py" in user and "### b.py" in user
+    assert "<<<<<<< ours" in user and "conflict-b" in user
+    assert "issue-7" in user and "retinue/prd-1" in user
+
+
+def test_parse_resolution_maps_paths_to_resolved_bodies() -> None:
+    """A well-formed response yields a {path: resolved_content} map."""
+    response_body = {
+        "content": [
+            {
+                "type": "text",
+                "text": '{"resolved": ['
+                '{"path": "a.py", "content": "merged-a"},'
+                '{"path": "b.py", "content": "merged-b"}]}',
+            }
+        ]
+    }
+
+    resolutions = _parse_resolution(response_body)
+
+    assert resolutions == {"a.py": "merged-a", "b.py": "merged-b"}
+
+
+def test_parse_resolution_raises_on_missing_text() -> None:
+    """A response with no text block escalates rather than resolving nothing."""
+    with pytest.raises(ConflictResolutionError):
+        _parse_resolution({"content": []})
+
+
+def test_parse_resolution_raises_on_invalid_json() -> None:
+    """A non-JSON text body is a hard resolver error, not a silent empty resolution."""
+    with pytest.raises(ConflictResolutionError):
+        _parse_resolution({"content": [{"type": "text", "text": "not json"}]})
+
+
+def test_parse_resolution_raises_on_non_list_resolved() -> None:
+    """A payload missing the 'resolved' list fails loudly."""
+    with pytest.raises(ConflictResolutionError):
+        _parse_resolution({"content": [{"type": "text", "text": '{"resolved": {}}'}]})
+
+
+def test_conflicted_paths_parses_one_path_per_nonblank_line() -> None:
+    """``git diff --name-only --diff-filter=U`` output splits into trimmed paths."""
+    assert _conflicted_paths("a.py\n  b/c.py  \n\n") == ["a.py", "b/c.py"]
+    assert _conflicted_paths("") == []
+
+
+def test_write_file_command_round_trips_arbitrary_content() -> None:
+    """The write-file argv carries content base64-encoded as a positional arg, byte-exact."""
+    content = '<<<<<<< ours\n"x" & $y\n=======\nz\n>>>>>>> theirs\n'
+    argv = _write_file_command("dir/f.py", content)
+
+    # No shell interpolation: the body is a base64 positional arg, the path another.
+    assert argv[0] == "sh" and argv[-1] == "dir/f.py"
+    blob = argv[-2]
+    assert base64.b64decode(blob).decode() == content
+
+
+@pytest.mark.asyncio
+async def test_resolver_recreates_merge_resolves_and_commits() -> None:
+    """A conflict is recreated, resolved via Claude, written back, staged, and committed."""
+    container = ScriptedContainer(
+        {
+            "diff --name-only": RunResult(exit_code=1, stdout="a.py\n"),
+            "cat a.py": RunResult(
+                exit_code=0, stdout="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"
+            ),
+        }
+    )
+    transport = FakeAnthropicTransport(
+        _text_response({"resolved": [{"path": "a.py", "content": "merged"}]})
+    )
+    resolver = AgentSdkConflictResolver(
+        container=container, transport=transport, credential="sk-ant-api03-k"
+    )
+
+    result = await resolver(source="issue-7", into="retinue/prd-1")
+
+    assert result is ConflictResolution.RESOLVED
+    cmds = _joined(container)
+    # The merge is recreated no-commit, the resolved blob is written + staged, committed.
+    assert any("merge --no-ff --no-commit --no-edit origin/issue-7" in c for c in cmds)
+    assert "git add a.py" in cmds
+    assert any(c.startswith("git ") and "commit --no-edit" in c for c in cmds)
+    # The resolved body was written byte-exact via the base64 round-trip.
+    write = next(cmd for cmd in container.commands if cmd[0] == "sh")
+    assert base64.b64decode(write[-2]).decode() == "merged"
+
+
+@pytest.mark.asyncio
+async def test_resolver_unresolved_when_no_conflicted_paths() -> None:
+    """No conflicted paths means nothing to fix: UNRESOLVED, no Claude call, no commit."""
+    container = ScriptedContainer({"diff --name-only": RunResult(exit_code=0, stdout="")})
+    transport = FakeAnthropicTransport(_text_response({"resolved": []}))
+    resolver = AgentSdkConflictResolver(
+        container=container, transport=transport, credential="k"
+    )
+
+    result = await resolver(source="issue-7", into="retinue/prd-1")
+
+    assert result is ConflictResolution.UNRESOLVED
+    assert transport.calls == []
+    assert "git commit --no-edit" not in " ".join(_joined(container))
+
+
+@pytest.mark.asyncio
+async def test_resolver_escalates_on_non_200_status() -> None:
+    """A non-200 Messages API response is a hard error: escalate, don't commit junk."""
+    container = ScriptedContainer(
+        {
+            "diff --name-only": RunResult(exit_code=1, stdout="a.py\n"),
+            "cat a.py": RunResult(exit_code=0, stdout="conflict"),
+        }
+    )
+    transport = FakeAnthropicTransport(_text_response({"resolved": []}, status=500))
+    resolver = AgentSdkConflictResolver(
+        container=container, transport=transport, credential="k"
+    )
+
+    with pytest.raises(ConflictResolutionError):
+        await resolver(source="issue-7", into="retinue/prd-1")
+    # No commit and no staging happened on a failed resolution. ``commit`` is a discrete
+    # argv element here, so matching the token avoids the ``--no-commit`` recreate flag.
+    assert not any("commit" in cmd for cmd in container.commands)
+    assert not any("add" in cmd for cmd in container.commands)

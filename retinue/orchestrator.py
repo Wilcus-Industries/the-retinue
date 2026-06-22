@@ -29,11 +29,13 @@ with no Agent SDK, no Docker, no gh, no network, and no concurrency races.
 from __future__ import annotations
 
 import asyncio
+import base64
 import enum
+import json
 import logging
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 from retinue.container import Container, ContainerRuntime, RunResult
 from retinue.done_check import (
@@ -298,6 +300,296 @@ class ConflictResolver(Protocol):
     async def __call__(self, *, source: str, into: str) -> ConflictResolution:
         """Attempt to resolve the conflict merging ``source`` into ``into``."""
         ...
+
+
+# --- real Agent-SDK conflict resolver --------------------------------------------
+#
+# The production :class:`ConflictResolver` re-runs the failed merge inside the same
+# disposable container ``build_prd`` already cloned into (the merge was aborted before
+# :class:`MergeConflict` surfaced, so the conflict must be recreated), reads the
+# conflicted blobs, drives Claude over the Messages API to emit a full resolution for
+# each one, writes them back, and stages + commits the merge. Two collaborators are
+# injected — the already-present :class:`~retinue.container.Container` (the only git/FS
+# side effect) and an HTTP transport for the one Anthropic call — so the bug-prone pure
+# parts (auth-header routing, request payload assembly, response parsing, and reading
+# the conflicted-path list out of git) are unit-tested without a live container, Docker,
+# gh, Claude, or network. The retried merge in ``build_prd`` is the real gate, so a
+# resolver that produces an incomplete or wrong resolution still escalates rather than
+# merging a broken tree.
+#
+# SDK conventions match the slicer/reviewer: Opus 4.8 is the default model; an OAuth
+# subscription token (``sk-ant-oat...``) rides ``Authorization: Bearer`` with the
+# ``oauth-2025-04-20`` beta header, any other credential is a raw API key on
+# ``x-api-key``; ``anthropic-version`` is always sent. The model must return only the
+# JSON object matching the schema — one resolved full-file body per conflicted path.
+
+_RESOLVE_MODEL = "claude-opus-4-8"
+_ANTHROPIC_VERSION = "2023-06-01"
+_RESOLVE_OAUTH_BETA = "oauth-2025-04-20"
+_ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+_RESOLVE_MAX_TOKENS = 32_000
+
+# Re-runs the merge (no auto-commit) so the working tree carries the conflict markers
+# the resolver reads; ``--no-commit`` keeps it stopped at the conflict even when git
+# could otherwise auto-resolve, so the agent always sees the full picture.
+_RESOLVE_MERGE_COMMAND = ["git", "merge", "--no-ff", "--no-commit", "--no-edit"]
+# Lists every path with a merge conflict (``U`` in either status column).
+_CONFLICTED_PATHS_COMMAND = ["git", "diff", "--name-only", "--diff-filter=U"]
+
+# Strict JSON schema the resolver must emit: one entry per conflicted path carrying the
+# complete resolved file body. ``resolved`` lists exactly the paths it fixed; the caller
+# stages those and lets the retried merge verify nothing was left conflicted.
+_RESOLVE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "resolved": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["resolved"],
+    "additionalProperties": False,
+}
+
+# The resolver's brief. Frozen (no per-request interpolation) so the request prefix is
+# cacheable across conflicts; the conflicted blobs ride in the user message.
+_RESOLVE_SYSTEM = (
+    "You resolve git merge conflicts. Each file below contains conflict markers "
+    "(<<<<<<<, =======, >>>>>>>). For every file, return its complete resolved "
+    "content with all markers removed, integrating both sides faithfully so the "
+    "result is correct and compiles — never drop one side's changes wholesale. "
+    "Return only the JSON object matching the schema; emit one 'resolved' entry per "
+    "input file, each with the file's full post-resolution body. No prose."
+)
+
+
+@dataclass(frozen=True)
+class AnthropicResponse:
+    """The slice of an Anthropic Messages API response the resolver reads."""
+
+    status_code: int
+    body: dict[str, Any]
+
+
+class AnthropicTransport(Protocol):
+    """Async HTTP POST seam (httpx-style). The network edge of the resolver.
+
+    A production implementation wraps an httpx client; tests inject a fake returning a
+    canned :class:`AnthropicResponse`. Kept narrow — one POST — so the resolution flow
+    is exercisable without network.
+    """
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
+    ) -> AnthropicResponse:
+        """POST ``json`` to ``url`` with ``headers`` and return the response."""
+        ...
+
+
+class ConflictResolutionError(RuntimeError):
+    """The resolver could not obtain a usable resolution (bad API status / payload).
+
+    Distinct from a *claimed-but-wrong* resolution, which is caught downstream by the
+    retried merge: this is a hard failure to even produce a candidate (non-200 API
+    response, unparseable body), so the conflict escalates rather than silently merging.
+    """
+
+
+@dataclass(frozen=True)
+class _ConflictedFile:
+    """One conflicted path and its working-tree blob (with conflict markers)."""
+
+    path: str
+    content: str
+
+
+def _write_file_command(path: str, content: str) -> list[str]:
+    """Argv that writes ``content`` to ``path`` inside the container, byte-exact.
+
+    ``run_command`` execs the argv directly (no shell, no stdin), so arbitrary file
+    bodies can't be passed as a here-doc or piped. The content is base64-encoded and
+    decoded in-container via positional args (``$1``/``$2``) — never interpolated into
+    the command string — so conflict markers, quotes, and newlines survive untouched and
+    nothing in the file body is interpreted as shell syntax.
+    """
+    blob = base64.b64encode(content.encode()).decode()
+    script = 'printf %s "$1" | base64 -d > "$2"'
+    return ["sh", "-c", script, "sh", blob, path]
+
+
+def _conflicted_paths(stdout: str) -> list[str]:
+    """Parse ``git diff --name-only --diff-filter=U`` output into a path list.
+
+    One path per non-blank line; surrounding whitespace is trimmed. An empty result
+    means git reported no conflicted paths, which the caller treats as nothing to do.
+    """
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+
+def _resolve_headers(credential: str) -> dict[str, str]:
+    """Build the Messages API request headers, routing the credential to its scheme.
+
+    An OAuth subscription token (``sk-ant-oat...``) is sent as ``Authorization: Bearer``
+    with the OAuth beta header; any other value is treated as a raw API key on
+    ``x-api-key``. ``anthropic-version`` is always sent.
+    """
+    headers = {
+        "anthropic-version": _ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    if credential.startswith("sk-ant-oat"):
+        headers["authorization"] = f"Bearer {credential}"
+        headers["anthropic-beta"] = _RESOLVE_OAUTH_BETA
+    else:
+        headers["x-api-key"] = credential
+    return headers
+
+
+def _resolve_payload(
+    files: list[_ConflictedFile], *, source: str, into: str, model: str
+) -> dict[str, Any]:
+    """Assemble the Messages API request body for one conflict resolution.
+
+    The frozen system brief leads; the user message carries the merge context plus each
+    conflicted file's full marked-up body, fenced by path so the model can address each
+    one. The strict schema forces a per-file resolved body back.
+    """
+    blocks = "\n\n".join(
+        f"### {file.path}\n```\n{file.content}\n```" for file in files
+    )
+    user = (
+        f"Merging branch '{source}' into '{into}' hit conflicts in "
+        f"{len(files)} file(s). Resolve each and return the full resolved body:\n\n"
+        f"{blocks}"
+    )
+    return {
+        "model": model,
+        "max_tokens": _RESOLVE_MAX_TOKENS,
+        "system": _RESOLVE_SYSTEM,
+        "messages": [{"role": "user", "content": user}],
+        "response_format": {"type": "json_schema", "json_schema": _RESOLVE_SCHEMA},
+    }
+
+
+def _parse_resolution(body: dict[str, Any]) -> dict[str, str]:
+    """Parse a Messages API response body into a ``{path: resolved_content}`` map.
+
+    Reads the concatenated ``text`` content blocks, loads them as the schema JSON, and
+    maps each entry's path to its resolved body. A response missing text, carrying
+    malformed JSON, or a non-list ``resolved`` raises :class:`ConflictResolutionError`
+    rather than silently resolving nothing (which would let the retried merge merge an
+    unresolved tree only if git could auto-resolve — never on a real conflict).
+    """
+    text = "".join(
+        block.get("text", "")
+        for block in body.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    if not text.strip():
+        raise ConflictResolutionError("resolver response carried no text content")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConflictResolutionError(f"resolver emitted invalid JSON: {exc}") from exc
+    raw = parsed.get("resolved")
+    if not isinstance(raw, list):
+        raise ConflictResolutionError("resolver JSON missing a 'resolved' list")
+    return {str(item["path"]): str(item["content"]) for item in raw}
+
+
+@dataclass(frozen=True)
+class AgentSdkConflictResolver:
+    """Real :class:`ConflictResolver`: resolve a merge conflict via the Agent SDK.
+
+    Satisfies the resolver protocol ``(*, source, into) -> ConflictResolution`` via
+    :meth:`__call__`, so it drops in where the fake resolver sits in tests and at the
+    wiring site. It recreates the aborted merge in the injected container, reads the
+    conflicted blobs, calls Claude once to resolve them, writes each resolution back,
+    and stages + commits the merge — then returns ``RESOLVED``. With no conflicts to
+    find it returns ``UNRESOLVED`` (nothing to fix); a hard API/parse failure raises
+    :class:`ConflictResolutionError`. The retried merge in ``build_prd`` is the real
+    gate, so an incomplete resolution still escalates rather than merging a broken tree.
+
+    Attributes:
+        container: The cloned-repo container the merge/resolution runs in.
+        transport: The injected Anthropic HTTP POST seam.
+        credential: The Anthropic credential (OAuth subscription token or API key).
+        model: The resolving model id; defaults to Opus 4.8.
+    """
+
+    container: Container
+    transport: AnthropicTransport
+    credential: str
+    model: str = _RESOLVE_MODEL
+
+    async def __call__(self, *, source: str, into: str) -> ConflictResolution:
+        """Resolve the conflict merging ``source`` into ``into``; stage and commit it."""
+        files = await self._recreate_and_read(source)
+        if not files:
+            logger.warning("No conflicted paths found resolving %s into %s", source, into)
+            return ConflictResolution.UNRESOLVED
+        resolutions = await self._ask_claude(files, source=source, into=into)
+        await self._apply(files, resolutions)
+        logger.info("Resolved %d conflicted file(s) merging %s into %s", len(files), source, into)
+        return ConflictResolution.RESOLVED
+
+    async def _recreate_and_read(self, source: str) -> list[_ConflictedFile]:
+        """Re-run the aborted merge to surface the conflict, then read each blob.
+
+        The merge is expected to fail (that is the conflict being resolved), so its exit
+        is not checked; the conflicted-path listing is the source of truth. Each path's
+        working-tree content (carrying the conflict markers) is read back for the agent.
+        """
+        await self.container.run_command([*_RESOLVE_MERGE_COMMAND, f"origin/{source}"])
+        listing = await self.container.run_command(_CONFLICTED_PATHS_COMMAND)
+        files: list[_ConflictedFile] = []
+        for path in _conflicted_paths(listing.stdout):
+            blob = await self.container.run_command(["cat", path])
+            files.append(_ConflictedFile(path=path, content=blob.stdout))
+        return files
+
+    async def _ask_claude(
+        self, files: list[_ConflictedFile], *, source: str, into: str
+    ) -> dict[str, str]:
+        """Call the Messages API once and parse the per-path resolution map."""
+        response = await self.transport.post(
+            _ANTHROPIC_MESSAGES_URL,
+            headers=_resolve_headers(self.credential),
+            json=_resolve_payload(files, source=source, into=into, model=self.model),
+        )
+        if response.status_code != 200:
+            raise ConflictResolutionError(
+                f"Anthropic Messages API returned {response.status_code}"
+            )
+        return _parse_resolution(response.body)
+
+    async def _apply(
+        self, files: list[_ConflictedFile], resolutions: dict[str, str]
+    ) -> None:
+        """Write each resolved body back, stage it, then commit the merge.
+
+        Only the paths the resolver actually returned are written and staged; any
+        conflicted path it omitted is left unresolved, so the retried merge catches the
+        gap and the slice escalates rather than committing a partial resolution.
+        """
+        for file in files:
+            content = resolutions.get(file.path)
+            if content is None:
+                logger.warning("Resolver omitted conflicted path %s", file.path)
+                continue
+            await self.container.run_command(_write_file_command(file.path, content))
+            await self.container.run_command(["git", "add", file.path])
+        await self.container.run_command(
+            ["git", *_GIT_IDENTITY_FLAGS, "commit", "--no-edit"]
+        )
 
 
 class BuildOutcome(enum.Enum):
