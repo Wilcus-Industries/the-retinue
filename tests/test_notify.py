@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import logging
 import urllib.parse
+from collections.abc import Mapping, Sequence
 
 import pytest
 
 from retinue.notify import (
+    CommentDeliveryError,
     CommentRequest,
+    GhCommentSink,
     LabelRequest,
     Notification,
     Notifier,
@@ -231,3 +234,109 @@ def test_pushover_parse_response_raises_on_unparseable_body() -> None:
     """A non-JSON body cannot be confirmed as delivered, so it raises."""
     with pytest.raises(PushDeliveryError, match="unparseable"):
         PushoverPushSink.parse_response(b"<html>502 Bad Gateway</html>")
+
+
+# --- Real comment sink: gh issue comment (no subprocess) --------------------
+
+
+class _RecordingGhRunner:
+    """Captures the argv + env handed to the gh runner; never spawns a process."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    async def __call__(
+        self, argv: Sequence[str], env: Mapping[str, str]
+    ) -> None:
+        self.calls.append((list(argv), dict(env)))
+
+
+def _comment() -> CommentRequest:
+    return CommentRequest(
+        repo_full_name="owner/repo",
+        issue_number=42,
+        body="PRD #42 is too thin to slice.",
+    )
+
+
+def test_gh_comment_argv_assembles_issue_comment_command() -> None:
+    """The argv is ``issue comment <n> --repo <repo> --body <body>`` (no shell)."""
+    argv = GhCommentSink.build_argv(_comment())
+
+    assert argv == [
+        "issue",
+        "comment",
+        "42",
+        "--repo",
+        "owner/repo",
+        "--body",
+        "PRD #42 is too thin to slice.",
+    ]
+
+
+def test_gh_comment_argv_carries_body_verbatim_without_shell_interpolation() -> None:
+    """A body with shell metacharacters rides as one --body arg, never a shell line."""
+    request = CommentRequest(
+        repo_full_name="owner/repo",
+        issue_number=7,
+        body="watch out: `rm -rf /` && $(whoami)",
+    )
+
+    argv = GhCommentSink.build_argv(request)
+
+    assert argv[-2:] == ["--body", "watch out: `rm -rf /` && $(whoami)"]
+
+
+def test_gh_comment_auth_env_injects_token_as_gh_token() -> None:
+    """A configured token rides in the child env as ``GH_TOKEN``, not on the argv."""
+    sink = GhCommentSink(token="tk_secret")
+
+    env = sink.build_auth_env()
+
+    assert env == {"GH_TOKEN": "tk_secret"}
+    assert "tk_secret" not in GhCommentSink.build_argv(_comment())
+
+
+def test_gh_comment_auth_env_empty_without_token() -> None:
+    """With no token the auth env is empty, falling back to the host's gh auth."""
+    assert GhCommentSink().build_auth_env() == {}
+
+
+@pytest.mark.asyncio
+async def test_gh_comment_sink_dispatches_argv_and_env_to_runner() -> None:
+    """Calling the sink hands the assembled argv + auth env to the injected runner."""
+    runner = _RecordingGhRunner()
+    sink = GhCommentSink(token="tk_secret", runner=runner)
+
+    await sink(_comment())
+
+    assert len(runner.calls) == 1
+    argv, env = runner.calls[0]
+    assert argv == GhCommentSink.build_argv(_comment())
+    assert env == {"GH_TOKEN": "tk_secret"}
+
+
+@pytest.mark.asyncio
+async def test_gh_comment_sink_propagates_runner_failure() -> None:
+    """A failing gh runner propagates — a lost comment is not swallowed."""
+
+    async def failing_runner(
+        argv: Sequence[str], env: Mapping[str, str]
+    ) -> None:
+        raise CommentDeliveryError(argv, returncode=1, stderr="not found")
+
+    sink = GhCommentSink(runner=failing_runner)
+
+    with pytest.raises(CommentDeliveryError, match="not found"):
+        await sink(_comment())
+
+
+def test_comment_delivery_error_reports_argv_and_stderr() -> None:
+    """The error surfaces the argv and stderr so a lost comment is debuggable."""
+    err = CommentDeliveryError(
+        ["issue", "comment", "42"], returncode=1, stderr="gh: not found\n"
+    )
+
+    assert err.returncode == 1
+    assert err.argv == ["issue", "comment", "42"]
+    assert "gh: not found" in str(err)

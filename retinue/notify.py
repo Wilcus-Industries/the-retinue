@@ -20,9 +20,10 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
@@ -315,3 +316,126 @@ def _post_sync(post: _HttpPost, timeout: float) -> bytes:
         raise PushDeliveryError(f"push HTTP {exc.code} from {post.url}") from exc
     except urllib.error.URLError as exc:
         raise PushDeliveryError(f"push transport error to {post.url}: {exc}") from exc
+
+
+# --- Real comment sink: gh issue comment ------------------------------------
+#
+# This is the production adapter behind the ``CommentSink`` seam. It posts the
+# escalation's durable in-repo record by shelling out to ``gh issue comment``,
+# mirroring the rest of the retinue's gh-cli adapters (cron.GhCli,
+# handoff.HandoffGh): the command-assembly and the auth-env build are pure and
+# unit-tested directly, and the one impure edge — the subprocess spawn — sits
+# behind an injected ``runner`` so the seam is exercisable without a real ``gh``,
+# Docker, or network. A failing comment is a lost in-repo record, so a non-zero
+# ``gh`` exit raises :class:`CommentDeliveryError` rather than being swallowed.
+
+# An async runner for a ``gh`` argv: given the argv (no leading "gh") and the auth
+# env, it runs the command and returns nothing, raising on a non-zero exit. The
+# default spawns a real ``gh`` child; tests inject a fake to drive the pure
+# command-assembly + auth-env without a process.
+GhCommentRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[None]]
+
+
+class CommentDeliveryError(RuntimeError):
+    """A ``gh issue comment`` invocation failed (non-zero exit).
+
+    Carries the argv and captured stderr so a lost-comment failure is debuggable
+    rather than a bare ``CalledProcessError``.
+    """
+
+    def __init__(self, argv: Sequence[str], *, returncode: int, stderr: str) -> None:
+        self.argv = list(argv)
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(
+            f"gh exited {returncode} for {' '.join(argv)}: {stderr.strip()}"
+        )
+
+
+class GhCommentSink:
+    """Real :data:`CommentSink`: posts an issue comment via ``gh issue comment``.
+
+    Runs ``gh issue comment <number> --repo <owner/repo> --body <body>`` to write
+    the durable, in-repo record of an escalation. Authenticates by injecting the
+    GitHub token into the child env as ``GH_TOKEN`` (the variable ``gh`` reads), so
+    the token is never placed on the command line where a process listing or log
+    could leak it.
+
+    The command assembly (:meth:`build_argv`) and the auth env build
+    (:meth:`build_auth_env`) are pure and unit-tested directly. The subprocess
+    spawn is the one impure edge, factored behind the injected ``runner`` (default:
+    :func:`_run_gh_comment_subprocess`) so the seam is exercisable without a real
+    ``gh``, Docker, or network.
+
+    Args:
+        token: The GitHub token ``gh`` authenticates with, placed in the child env
+            as ``GH_TOKEN``. ``None`` runs ``gh`` with the ambient auth (e.g. a
+            logged-in CLI), useful for local runs.
+        runner: The injected argv runner; defaults to the real subprocess spawn.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        runner: GhCommentRunner | None = None,
+    ) -> None:
+        self._token = token
+        self._runner = runner or _run_gh_comment_subprocess
+
+    @staticmethod
+    def build_argv(request: CommentRequest) -> list[str]:
+        """Assemble the ``gh issue comment`` argv for ``request`` (no leading ``gh``).
+
+        The body rides as a ``--body`` value rather than being interpolated into a
+        shell, so a comment containing shell metacharacters is posted verbatim.
+        """
+        return [
+            "issue",
+            "comment",
+            str(request.issue_number),
+            "--repo",
+            request.repo_full_name,
+            "--body",
+            request.body,
+        ]
+
+    def build_auth_env(self) -> dict[str, str]:
+        """The child env carrying the token as ``GH_TOKEN`` (just it when supplied).
+
+        The token goes in the env, never on the argv, so it never lands in a
+        process listing or a log of the command. With no token, an empty mapping
+        lets the runner fall back to the host's own ``gh`` auth.
+        """
+        return {"GH_TOKEN": self._token} if self._token else {}
+
+    async def __call__(self, request: CommentRequest) -> None:
+        """Post ``request`` as an issue comment. Raises on a non-zero ``gh`` exit."""
+        await self._runner(self.build_argv(request), self.build_auth_env())
+
+
+async def _run_gh_comment_subprocess(
+    argv: Sequence[str], env: Mapping[str, str]
+) -> None:
+    """Spawn ``gh`` with ``env`` layered over the ambient env; raise on failure.
+
+    The default :data:`GhCommentRunner`. Uses :func:`asyncio.create_subprocess_exec`
+    (an argv list, no shell, so the body and repo name are never interpolated into a
+    command line) and raises :class:`CommentDeliveryError` on a non-zero exit so a
+    lost comment fails loudly — the comment is the durable record the caller must
+    not silently lose.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "gh",
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **env},
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise CommentDeliveryError(
+            argv,
+            returncode=process.returncode or -1,
+            stderr=stderr.decode(errors="replace"),
+        )
