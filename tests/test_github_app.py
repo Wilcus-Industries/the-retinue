@@ -11,6 +11,7 @@ this adapter must satisfy.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from retinue.github_app import (
     _parse_access_token_response,
     _parse_installation_id,
     _token_header,
+    build_installation_auth,
 )
 
 # --- pure helpers: claims, headers, URLs --------------------------------------------
@@ -249,3 +251,28 @@ async def test_signer_failure_propagates_as_auth_error() -> None:
     )
     with pytest.raises(InstallationAuthError, match="cryptography"):
         await auth.installation_token("owner/repo")
+
+
+# --- the production factory: reads config + PEM, returns a wired adapter -------------
+
+
+def test_build_installation_auth_reads_pem_and_carries_app_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The factory loads the PEM from the configured path and wires the app id in.
+
+    Settings is fed from env (a tmp PEM file, no network); the returned adapter must be
+    a real ``GitHubInstallationAuth`` whose credentials carry the configured app_id and
+    the PEM text read off disk. ``httpx_edges`` is built but fires no request here.
+    """
+    pem = tmp_path / "app.pem"
+    pem.write_text("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----")
+    monkeypatch.setenv("WEBHOOK_SECRET", "irrelevant")
+    monkeypatch.setenv("GITHUB_APP_ID", "246810")
+    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", str(pem))
+
+    auth = build_installation_auth()
+
+    assert isinstance(auth, GitHubInstallationAuth)
+    assert auth._credentials.app_id == "246810"
+    assert auth._credentials.private_key == pem.read_text()

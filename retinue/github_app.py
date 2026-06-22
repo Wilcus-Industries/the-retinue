@@ -23,6 +23,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol, TypedDict
 
 
@@ -356,3 +357,49 @@ def httpx_edges(
         return response.status_code, _parse_body(response)
 
     return http_get, http_post
+
+
+def build_installation_auth() -> GitHubInstallationAuth:
+    """Construct the production :class:`GitHubInstallationAuth` from :class:`Settings`.
+
+    The worker calls this with no arguments to obtain the real auth seam, so the factory
+    reads its own config: it loads :class:`~retinue.config.Settings` lazily (matching
+    ``worker._load_settings``), reads the app id and the PEM from the configured private
+    key *path* (the key is never inlined into env — only its path is), assembles
+    :class:`GitHubAppCredentials`, and wires the httpx-backed HTTP edges via
+    :func:`httpx_edges`. The real RSA signer (:func:`sign_app_jwt`) is the adapter's
+    default, so no signer is passed.
+
+    Construction is pure-ish: reading the PEM file is the only side effect. No network
+    request fires here — :func:`httpx_edges` only builds the request callables, and the
+    first GitHub call is deferred until ``installation_token`` is awaited.
+
+    Raises:
+        InstallationAuthError: The app id or private-key path is unconfigured, or the
+            PEM file cannot be read.
+    """
+    from retinue.config import Settings  # local: avoid importing config at module load
+
+    # pydantic-settings fills required fields from env at runtime, but mypy reads them
+    # as required constructor args; ignore as worker._load_settings does.
+    settings = Settings()  # type: ignore[call-arg]
+    app_id = settings.github_app_id
+    key_path = settings.github_app_private_key_path
+    if not app_id or not key_path:
+        raise InstallationAuthError(
+            "GitHub App auth is unconfigured: set github_app_id and "
+            "github_app_private_key_path"
+        )
+
+    try:
+        private_key = Path(key_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise InstallationAuthError(
+            f"failed to read GitHub App private key from {key_path!r}: {exc}"
+        ) from exc
+
+    credentials = GitHubAppCredentials(app_id=app_id, private_key=private_key)
+    http_get, http_post = httpx_edges()
+    return GitHubInstallationAuth(
+        credentials, http_get=http_get, http_post=http_post
+    )
