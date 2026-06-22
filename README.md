@@ -45,6 +45,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   with a resolved `## Blocked by` graph, reserving `hitl` for genuinely human-only
   slices. A thin/malformed PRD escalates through `Notifier` instead of inventing
   slices. The Agent-SDK call and the gh issue creation are injected seams.
+- `retinue.impl_retry` — `ImplRetryStore`, the SQLite-backed per-slice
+  implementer-attempt counter that persists the retry budget across worker restarts.
+- `retinue.triage` — `triage_implementer` / `decide_triage`: reasons about an
+  implementer failure or returned notes and decides retry / reslice / escalate,
+  bounded by the persisted retry count.
 
 A validly signed `issues` webhook returns 202 and enqueues exactly one job; an
 invalid or missing signature returns 401 and enqueues nothing. Non-`issues` events
@@ -145,6 +150,30 @@ in flight at a time — a second entry raises `OrchestratorBusyError`. The lock,
 conflict resolver, the implementer spawn, and the git operations are all injected
 alongside the done-check seams, so the whole parallel/topological flow is exercised with
 no Agent SDK, no Docker, no gh, no network, and no concurrency races.
+
+## Reasoning failure triage
+
+The implementer subagent does not always cleanly build a slice — it can fail (raise)
+or return *notes* explaining that it could not finish or that the slice is mis-scoped.
+`retinue.triage.triage_implementer` refuses to blind-loop on this: it reasons about the
+signal plus how many attempts it has already spent, then carries out one decision.
+
+1. **retry** — re-run the implementer while the *persisted* attempt count is below the
+   config's `retry_cap` (default `3`; `0` means no retries). The bound is persisted in
+   `retinue.impl_retry.ImplRetryStore` (a SQLite counter keyed by `owner/repo#issue`),
+   so a doomed slice cannot retry forever and a slice that already spent its budget in
+   an earlier run escalates without burning another attempt,
+2. **reslice** — when the notes say the slice is mis-scoped, file an adjusted slice
+   through the gh issue-creation seam (reusing the slicer's `create_issue`), carrying
+   the implementer's reasoning into the new issue body,
+3. **escalate** — hand the slice to a human by fanning a `Notification` out through the
+   shared `Notifier` (push + comment + the `hitl` label).
+
+The pure `decide_triage(failed, notes, attempts, cap)` returns the typed
+`RETRY` / `RESLICE` / `ESCALATE` decision; both the failure path and the returned-notes
+path reach it — notes are never silently dropped. The implementer, the notifier sinks,
+the gh issue creator, and the SQLite store are all injected, so the whole loop is
+exercised with no Agent SDK, no gh, no push service, and no network.
 
 ## Configuration
 
