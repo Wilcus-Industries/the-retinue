@@ -23,7 +23,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from retinue.notify import Notification, Notifier
 
@@ -410,3 +410,168 @@ def _resolve_blocked_by(blocked_by: list[int], created_numbers: list[int]) -> li
                 len(created_numbers),
             )
     return resolved
+
+
+# --- production gh-cli IssueCreator ------------------------------------------------
+#
+# :func:`slice_prd` (and the review flows that reuse this seam) depend only on the
+# :data:`IssueCreator` protocol. Production wires the concrete
+# :class:`GhCliIssueCreator` below; tests inject a fake that records create calls and
+# returns canned numbers. ``GhCliIssueCreator`` itself does not shell out — it assembles
+# the ``gh issue create`` argv and parses gh's output, delegating the actual process
+# spawn to an injected :class:`GhRunner`. That keeps every pure/parseable part (auth-env
+# build, command assembly, URL parsing) testable with a recording fake runner, never a
+# live ``gh``/network. The local :class:`GhRunner`/:class:`GhResult` mirror the gh-seam
+# shape used in :mod:`retinue.pr_opener` / :mod:`retinue.reconcile`; each module keeps its
+# own copy so the layers stay edit-isolated.
+
+
+@dataclass(frozen=True)
+class GhResult:
+    """Captured result of a single ``gh`` invocation.
+
+    Attributes:
+        exit_code: ``gh``'s process exit status; ``0`` means success.
+        stdout: Captured standard output (the issue URL ``GhCliIssueCreator`` parses).
+        stderr: Captured standard error (surfaced in the error on failure).
+    """
+
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """True when ``gh`` exited successfully (exit code 0)."""
+        return self.exit_code == 0
+
+
+class GhRunner(Protocol):
+    """Runs a single ``gh`` command. The process-spawn seam under :class:`GhCliIssueCreator`.
+
+    A production implementation spawns ``gh`` as a subprocess with ``env`` merged into
+    its environment (so ``GH_TOKEN`` authenticates the call) and returns the captured
+    :class:`GhResult`; tests inject a fake that records each ``(args, env)`` and returns a
+    canned result. ``args`` never includes the leading ``"gh"`` — the runner owns the
+    executable name.
+    """
+
+    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
+        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
+        ...
+
+
+class GhCommandError(RuntimeError):
+    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
+
+    def __init__(self, command: list[str], result: GhResult) -> None:
+        self.command = command
+        self.result = result
+        super().__init__(
+            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
+        )
+
+
+def _auth_env(token: str) -> dict[str, str]:
+    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
+
+    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on every
+    REST/GraphQL call, so the adapter never assembles a header itself — it injects the
+    token here and lets ``gh`` own the wire format.
+    """
+    return {"GH_TOKEN": token}
+
+
+def _issue_create_args(
+    draft: IssueDraft, repo_full_name: str, blocked_by_numbers: list[int]
+) -> list[str]:
+    """Assemble the ``gh issue create`` argv for ``draft`` (no leading ``"gh"``).
+
+    Each of the draft's labels rides its own ``--label`` flag, and every resolved
+    ``Blocked by`` number rides its own ``--blocked-by`` flag so gh records the native
+    dependency link in addition to the ``## Blocked by`` block already rendered into the
+    body. The body is passed verbatim — the slicer finalized it before calling this seam.
+    """
+    args = [
+        "issue",
+        "create",
+        "--repo",
+        repo_full_name,
+        "--title",
+        draft.title,
+        "--body",
+        draft.body,
+    ]
+    for label in draft.labels:
+        args += ["--label", label]
+    for number in blocked_by_numbers:
+        args += ["--blocked-by", str(number)]
+    return args
+
+
+def _parse_issue_number(stdout: str) -> int:
+    """Parse the issue number from ``gh issue create``'s output.
+
+    ``gh issue create`` prints the created issue's URL (e.g.
+    ``https://github.com/owner/repo/issues/123``) to stdout. The number is the trailing
+    path segment. Raises :class:`ValueError` when the output has no trailing integer, so a
+    malformed response fails loudly rather than yielding a bogus issue number.
+    """
+    tail = stdout.strip().rstrip("/").rsplit("/", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError as exc:
+        raise ValueError(f"gh issue create returned no issue number: {stdout!r}") from exc
+
+
+def _blocked_by_numbers(body: str) -> list[int]:
+    """Pull the resolved ``#<n>`` refs out of a finalized draft's ``## Blocked by`` block.
+
+    :func:`_finalize_draft` renders dependencies as a trailing ``## Blocked by`` section of
+    ``#<n>`` lines (real, already-created issue numbers). This reads them back so the gh
+    create call can also carry native ``--blocked-by`` links. A draft with no such section
+    yields an empty list.
+    """
+    _, _, block = body.partition("## Blocked by")
+    if not block:
+        return []
+    numbers: list[int] = []
+    for line in block.splitlines():
+        ref = line.strip()
+        if ref.startswith("#") and ref[1:].isdigit():
+            numbers.append(int(ref[1:]))
+    return numbers
+
+
+class GhCliIssueCreator:
+    """Production :data:`IssueCreator`: files one slice issue via ``gh issue create``.
+
+    An instance is callable as ``await creator(draft)`` — it satisfies the
+    :data:`IssueCreator` protocol via :meth:`__call__`, so it drops straight in where the
+    fake issue creator sits in tests and at the wiring site (``slice_prd`` and the review
+    flows that reuse this seam). It assembles the ``gh issue create`` argv (labels +
+    native ``--blocked-by`` links read back from the finalized body) and dispatches it
+    through the injected :class:`GhRunner`, authenticated with a ``GH_TOKEN`` bearer (see
+    :func:`_auth_env`). The runner is the only side-effecting seam, which keeps command
+    assembly and number parsing unit-testable with no live ``gh``/network.
+
+    Args:
+        runner: The process-spawn seam that runs each ``gh`` command.
+        token: The installation/access token ``gh`` authenticates with.
+        repo_full_name: The repo the slice issues are filed against, e.g. "owner/repo".
+    """
+
+    def __init__(self, runner: GhRunner, *, token: str, repo_full_name: str) -> None:
+        self._runner = runner
+        self._token = token
+        self._repo_full_name = repo_full_name
+
+    async def __call__(self, draft: IssueDraft) -> CreatedIssue:
+        """File ``draft`` via ``gh issue create`` and return the parsed issue number."""
+        args = _issue_create_args(
+            draft, self._repo_full_name, _blocked_by_numbers(draft.body)
+        )
+        result = await self._runner.run(args, env=_auth_env(self._token))
+        if not result.ok:
+            raise GhCommandError(args, result)
+        return CreatedIssue(issue_number=_parse_issue_number(result.stdout))

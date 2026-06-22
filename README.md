@@ -14,20 +14,35 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
         │  202 Accepted                              │
                                                      ▼
                                   Worker (retinue.worker.process_prd)
-                                  gates on opt-in + validity + novelty, then processes
+                                  gates on opt-in + validity + novelty, then drives the
+                                  pipeline: slice → build → open the staging PR
 ```
 
 - `retinue.config` — `Settings` loaded from env / `.env` (`WEBHOOK_SECRET`, `REDIS_URL`,
-  `DEDUPE_DB_PATH`).
-- `retinue.webhook` — HMAC verification, `issues`-event filtering, enqueue, 202 ack.
-- `retinue.queue` — the `PrdJob` model and `enqueue_prd`.
+  `DEDUPE_DB_PATH`, the GitHub App / Anthropic / push-channel credentials).
+- `retinue.webhook` — HMAC verification then event dispatch: an `issues` event enqueues a
+  PRD job, a merged `pull_request` (closed + merged) enqueues the reap, and a
+  `pull_request_review` enqueues the heimdall loopback. Same 401/204/202 contract for all.
+- `retinue.queue` — the `PrdJob` / `ReviewJob` / `MergedPrJob` models and their
+  `enqueue_prd` / `enqueue_review` / `enqueue_merged_pr` helpers.
+- `retinue.pipeline` — `Pipeline`, the orchestration object the worker drives once a PRD
+  is accepted: slice → build → open the staging PR, plus the `process_review` /
+  `reap_pr` / `reconcile` entry points the webhook events and a restart route into.
+  `build_pipeline_factory` wires it over the real adapters (the orchestrator `build_prd`
+  seam stays injected, pending the implementer-spawn adapter).
+- `retinue.wiring` — `bind_build_prd` (budget-gate + triage glue around the orchestrator
+  build) and `bind_cron_tick` (the cron backlog lane over its real collaborators). Both
+  take the implementer-spawn seam as their one injected dependency and share the
+  service-level `BudgetGovernor`.
 - `retinue.app` — FastAPI factory; an Arq Redis pool is created in the lifespan and
   stored on `app.state.arq_pool`.
 - `retinue.repo_config` — the per-repo `.github/retinue.yml` schema (`RepoConfig`) and
   `load_repo_config`, which never raises on bad input.
 - `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
-- `retinue.worker` — the `process_prd` Arq task, the `gate_prd` opt-in gate, and
-  `WorkerSettings`.
+- `retinue.worker` — the `process_prd` Arq task (gate → drive the pipeline), the
+  `process_review_job` / `reap_pr_job` tasks the webhook events enqueue, the `gate_prd`
+  opt-in gate, and `WorkerSettings`. `on_startup` wires the real `fetch_config`, PRD-body
+  fetcher, and `pipeline_factory` onto the Arq context.
 - `retinue.github_app` — `InstallationAuth`, the seam that mints a GitHub App
   installation token (`InstallationToken`) the worker clones with.
 - `retinue.container` — `ContainerRuntime` / `Container`, the disposable-container
@@ -102,8 +117,9 @@ secrets:                       # optional inline secrets + external refs
 
 Unknown top-level keys are rejected (a typo'd field is a skip, not a silent drop).
 
-> The GitHub fetch of `retinue.yml` is a later issue; the worker's `fetch_config`
-> seam currently treats every repo as not opted in until that lands.
+> The worker's `fetch_config` seam reads `retinue.yml` over the GitHub contents API
+> (`github_config_fetcher`) once GitHub App auth is wired; absent that auth it falls back
+> to treating every repo as not opted in.
 
 ## Disposable-container done-check
 
@@ -337,6 +353,24 @@ Set via environment variables or a `.env` file:
 | `WEEKLY_BUDGET`              | no       | `0`                       | Service-level weekly budget (dollars or tokens)      |
 | `BUDGET_DB_PATH`             | no       | `retinue-budget.sqlite3`  | SQLite file backing the rolling-24h spend ledger     |
 | `BUDGET_DAILY_CAP_FRACTION`  | no       | `0.12`                    | Fraction of the weekly budget spendable per 24h      |
+| `GITHUB_APP_ID`              | no\*     | —                         | GitHub App numeric id (the JWT `iss` claim)          |
+| `GITHUB_APP_PRIVATE_KEY_PATH`| no\*     | —                         | Path to the App RSA private key (PEM) signing app JWTs |
+| `ANTHROPIC_API_KEY`          | no\*     | —                         | Anthropic API key — used in `api_key` auth mode      |
+| `CLAUDE_CODE_OAUTH_TOKEN`    | no\*     | —                         | Claude subscription OAuth token (`sk-ant-oat…`) — used in `subscription` auth mode |
+| `NTFY_TOPIC`                 | no\*\*   | —                         | ntfy topic for the push sink (ntfy backend)          |
+| `NTFY_TOKEN`                 | no       | —                         | ntfy access token for a protected topic              |
+| `PUSHOVER_TOKEN`             | no\*\*   | —                         | Pushover application API token (Pushover backend)    |
+| `PUSHOVER_USER`              | no\*\*   | —                         | Pushover user/group key (Pushover backend)           |
+
+\* Required once the worker drives the real pipeline: the GitHub App credentials mint
+the per-repo tokens the gh adapters use, and the Anthropic credential for the active
+`AUTH_MODE` (`ANTHROPIC_API_KEY` for `api_key`, `CLAUDE_CODE_OAUTH_TOKEN` for
+`subscription`) authenticates the Agent-SDK calls. Without GitHub App auth the worker
+falls back to the safe not-opted-in default and drives nothing.
+
+\*\* Push channel: configure **either** ntfy (`NTFY_TOPIC`) **or** Pushover
+(`PUSHOVER_TOKEN` + `PUSHOVER_USER`). With neither set the push heads-up is a logged
+no-op; the issue comment + label (the durable escalation record) still land.
 
 ## Running
 

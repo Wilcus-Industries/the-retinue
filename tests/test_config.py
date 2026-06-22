@@ -64,3 +64,51 @@ def test_budget_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.auth_mode == "subscription"
     assert settings.weekly_budget == 1_000_000.0
+
+
+def test_adapter_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The new adapter wiring fields default to empty (opt-in, never required)."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.github_app_id == ""
+    assert settings.github_app_private_key_path == ""
+    assert settings.anthropic_api_key == ""
+    assert settings.anthropic_oauth_token == ""
+    assert settings.ntfy_topic == ""
+    assert settings.pushover_token == ""
+    assert settings.pushover_user == ""
+
+
+def test_adapter_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GitHub App, Anthropic, and push channel settings load from the environment."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("GITHUB_APP_ID", "123456")
+    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", "/secrets/app.pem")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-xxx")
+    monkeypatch.setenv("NTFY_TOPIC", "retinue-alerts")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.github_app_id == "123456"
+    assert settings.github_app_private_key_path == "/secrets/app.pem"
+    assert settings.anthropic_api_key == "sk-ant-api-xxx"
+    assert settings.ntfy_topic == "retinue-alerts"
+
+
+def test_oauth_token_reads_claude_code_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The subscription OAuth token reads the conventional CLAUDE_CODE_OAUTH_TOKEN."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-yyy")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.anthropic_oauth_token == "sk-ant-oat-yyy"
+
+
+def test_anthropic_credential_follows_auth_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``anthropic_credential`` resolves the key/token the active auth mode uses."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-xxx")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-yyy")
+
+    monkeypatch.setenv("AUTH_MODE", "api_key")
+    assert Settings(_env_file=None).anthropic_credential == "sk-ant-api-xxx"  # type: ignore[call-arg]
+
+    monkeypatch.setenv("AUTH_MODE", "subscription")
+    assert Settings(_env_file=None).anthropic_credential == "sk-ant-oat-yyy"  # type: ignore[call-arg]

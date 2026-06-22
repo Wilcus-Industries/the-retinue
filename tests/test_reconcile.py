@@ -19,9 +19,11 @@ import pytest
 
 from retinue.orchestrator import PrdSlice
 from retinue.reconcile import (
+    GhCliReconcile,
     ReconcileResult,
     ResumePhase,
     RunStateStore,
+    gh_env,
     reconcile_run,
 )
 
@@ -144,6 +146,29 @@ async def test_unseen_prd_has_no_pr(db_path: Path) -> None:
     """A PRD with no recorded PR reports None, not an error."""
     store = RunStateStore(db_path)
     assert await store.pr_of(repo_full_name="owner/repo", prd_number=9) is None
+
+
+@pytest.mark.asyncio
+async def test_round_for_pr_reverse_lookup(db_path: Path) -> None:
+    """round_for_pr maps a PR number back to its PRD and owned slice set."""
+    store = RunStateStore(db_path)
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
+    )
+    await store.record_pr(repo_full_name="owner/repo", prd_number=7, pr_number=99)
+
+    assert await store.round_for_pr(repo_full_name="owner/repo", pr_number=99) == (
+        7,
+        [100, 101],
+    )
+
+
+@pytest.mark.asyncio
+async def test_round_for_pr_unknown_pr_is_none(db_path: Path) -> None:
+    """A PR number the store never recorded reverse-resolves to None."""
+    store = RunStateStore(db_path)
+    await store.record_pr(repo_full_name="owner/repo", prd_number=7, pr_number=99)
+    assert await store.round_for_pr(repo_full_name="owner/repo", pr_number=5) is None
 
 
 @pytest.mark.asyncio
@@ -321,3 +346,162 @@ async def test_unfinished_slices_keep_their_blocked_by_graph() -> None:
     by_number = {s.issue_number: s for s in result.unfinished_slices}
     assert by_number[4].blocked_by == [3]
     assert by_number[3].blocked_by == [2]
+
+
+# --- real gh-cli adapter: pure command-assembly + payload-parsing -----------------
+#
+# These exercise the production GhCliReconcile against a recording fake runner that
+# returns canned `gh` JSON stdout — no subprocess, no gh, no network.
+
+
+class RecordingRunner:
+    """A fake :class:`GhRunner`: returns a canned stdout and records the argv it ran."""
+
+    def __init__(self, stdout: str = "") -> None:
+        self._stdout = stdout
+        self.calls: list[list[str]] = []
+
+    async def __call__(self, argv: list[str]) -> str:
+        self.calls.append(argv)
+        return self._stdout
+
+
+def test_gh_env_carries_the_token_and_disables_prompts() -> None:
+    """The gh child env authenticates via GH_TOKEN and never prompts interactively."""
+    env = gh_env("ghs_secret", {"PATH": "/usr/bin", "GH_TOKEN": "stale"})
+
+    assert env["GH_TOKEN"] == "ghs_secret"  # the auth credential gh sends as Bearer
+    assert env["GH_PROMPT_DISABLED"] == "1"
+    assert env["PATH"] == "/usr/bin"  # base env preserved
+
+
+def test_gh_env_does_not_mutate_the_base_env() -> None:
+    """Building the gh env copies rather than mutating the caller's environment."""
+    base = {"PATH": "/usr/bin"}
+    gh_env("tok", base)
+    assert "GH_TOKEN" not in base
+
+
+@pytest.mark.asyncio
+async def test_issue_closed_assembles_the_issue_api_call_and_parses_state() -> None:
+    """issue_closed reads the issue state via gh api and maps 'closed' to True."""
+    runner = RecordingRunner('{"state": "closed"}')
+    gh = GhCliReconcile(runner)
+
+    closed = await gh.issue_closed(repo_full_name="owner/repo", issue_number=7)
+
+    assert closed is True
+    assert runner.calls == [
+        ["api", "repos/owner/repo/issues/7", "--jq", "{state: .state}"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_issue_closed_maps_open_state_to_false() -> None:
+    """An issue GitHub reports 'open' is not finished."""
+    gh = GhCliReconcile(RecordingRunner('{"state": "open"}'))
+    assert await gh.issue_closed(repo_full_name="owner/repo", issue_number=7) is False
+
+
+@pytest.mark.asyncio
+async def test_branch_merged_compares_against_the_merge_base() -> None:
+    """branch_merged asks 'does the merge base contain this branch' via a compare."""
+    runner = RecordingRunner('{"ahead_by": 0, "status": "identical"}')
+    gh = GhCliReconcile(runner, merge_base="staging")
+
+    merged = await gh.branch_merged(repo_full_name="owner/repo", branch="issue-7")
+
+    # ahead_by 0 means every commit on issue-7 already landed on staging.
+    assert merged is True
+    assert runner.calls == [
+        [
+            "api",
+            "repos/owner/repo/compare/staging...issue-7",
+            "--jq",
+            "{ahead_by: .ahead_by, status: .status}",
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_branch_with_unique_commits_is_not_merged() -> None:
+    """A branch still ahead of the merge base has unlanded work — not merged."""
+    gh = GhCliReconcile(RecordingRunner('{"ahead_by": 3, "status": "ahead"}'))
+    assert (
+        await gh.branch_merged(repo_full_name="owner/repo", branch="issue-7") is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_branch_merged_uses_the_configured_merge_base() -> None:
+    """A non-default merge base is the compare base."""
+    runner = RecordingRunner('{"ahead_by": 0}')
+    gh = GhCliReconcile(runner, merge_base="main")
+
+    await gh.branch_merged(repo_full_name="owner/repo", branch="issue-7")
+
+    assert runner.calls[0][1] == "repos/owner/repo/compare/main...issue-7"
+
+
+@pytest.mark.asyncio
+async def test_staging_pr_lists_the_integration_to_staging_pr_and_parses_number() -> (
+    None
+):
+    """staging_pr lists the open retinue/prd-<n> -> staging PR and returns its number."""
+    runner = RecordingRunner('[{"number": 101}]')
+    gh = GhCliReconcile(runner, merge_base="staging")
+
+    number = await gh.staging_pr(repo_full_name="owner/repo", prd_number=5)
+
+    assert number == 101
+    assert runner.calls == [
+        [
+            "pr",
+            "list",
+            "--repo",
+            "owner/repo",
+            "--head",
+            "retinue/prd-5",
+            "--base",
+            "staging",
+            "--state",
+            "open",
+            "--json",
+            "number",
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_staging_pr_returns_none_when_no_pr_is_open() -> None:
+    """An empty pr-list payload means no staging PR is open."""
+    gh = GhCliReconcile(RecordingRunner("[]"))
+    assert await gh.staging_pr(repo_full_name="owner/repo", prd_number=5) is None
+
+
+@pytest.mark.asyncio
+async def test_real_adapter_drives_reconcile_run_against_canned_gh() -> None:
+    """End-to-end: reconcile_run routes on the real adapter reading canned gh JSON.
+
+    A canned empty pr-list (no PR) plus a closed-issue state lands the round at PR_OPEN
+    without a live gh or network — proving the adapter satisfies the ReconcileGh seam.
+    """
+
+    class ScriptedRunner:
+        async def __call__(self, argv: list[str]) -> str:
+            if argv[0] == "pr":
+                return "[]"
+            if "compare" in argv[1]:
+                return '{"ahead_by": 0}'
+            return '{"state": "closed"}'
+
+    gh = GhCliReconcile(ScriptedRunner())
+    result = await reconcile_run(
+        repo_full_name="owner/repo",
+        prd_number=5,
+        slices=[_prd_slice(2), _prd_slice(3)],
+        gh=gh,
+    )
+
+    assert result.phase is ResumePhase.PR_OPEN
+    assert result.finished_issues == [2, 3]

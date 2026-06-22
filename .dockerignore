@@ -1,0 +1,12 @@
+.venv
+__pycache__
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.git
+.worktrees
+*.sqlite3
+.claude
+plans
+dist
+build

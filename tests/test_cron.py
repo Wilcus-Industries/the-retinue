@@ -19,8 +19,11 @@ so the whole flow runs with no real ``gh``, no Docker, and no wall-clock.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -30,8 +33,13 @@ from retinue.cron import (
     CronBusyError,
     CronOutcome,
     CronTickResult,
+    GhCli,
+    SliceBuilder,
     run_cron_tick,
 )
+from retinue.loopback import Severity
+from retinue.orchestrator import BuildOutcome, BuildResult, Slice, integration_branch
+from retinue.repo_config import RepoConfig
 
 
 class FakeClock:
@@ -338,3 +346,222 @@ async def test_second_concurrent_tick_is_rejected(tmp_path: Path) -> None:
             build=RecordingBuild(),
             lock=lock,
         )
+
+
+# --- real GhCli: command assembly, auth env, payload parsing ----------------------
+#
+# These exercise the production CronGh's pure/parseable edges through an injected argv
+# runner — no real gh, Docker, or network. The runner captures the argv + env so the
+# command assembly and auth header (GH_TOKEN) are asserted, and returns canned gh JSON
+# so the payload parsing into BacklogIssue is asserted.
+
+
+class CapturingGhRunner:
+    """Records the argv + env it was called with and returns a canned stdout payload."""
+
+    def __init__(self, stdout: bytes = b"[]") -> None:
+        self._stdout = stdout
+        self.argv: Sequence[str] | None = None
+        self.env: Mapping[str, str] | None = None
+
+    async def __call__(
+        self, argv: Sequence[str], env: Mapping[str, str]
+    ) -> bytes:
+        self.argv = argv
+        self.env = env
+        return self._stdout
+
+
+@pytest.mark.asyncio
+async def test_ghcli_assembles_the_backlog_list_command() -> None:
+    """GhCli runs ``gh issue list`` scoped to the repo's open ``backlog`` issues."""
+    runner = CapturingGhRunner()
+    gh = GhCli(token="t0ken", runner=runner, list_limit=50)
+
+    await gh.list_backlog(repo_full_name="owner/repo")
+
+    argv = list(runner.argv or [])
+    assert argv[:3] == ["gh", "issue", "list"]
+    assert "--repo" in argv and argv[argv.index("--repo") + 1] == "owner/repo"
+    assert "--label" in argv and argv[argv.index("--label") + 1] == "backlog"
+    assert "--state" in argv and argv[argv.index("--state") + 1] == "open"
+    assert "--limit" in argv and argv[argv.index("--limit") + 1] == "50"
+    # The JSON fields requested are exactly what BacklogIssue needs.
+    assert argv[argv.index("--json") + 1] == "number,labels,createdAt"
+
+
+@pytest.mark.asyncio
+async def test_ghcli_puts_the_token_in_the_env_not_the_argv() -> None:
+    """The token authenticates via GH_TOKEN in the child env, never on the command line."""
+    runner = CapturingGhRunner()
+    gh = GhCli(token="s3cret", runner=runner)
+
+    await gh.list_backlog(repo_full_name="owner/repo")
+
+    assert (runner.env or {}).get("GH_TOKEN") == "s3cret"
+    assert "s3cret" not in list(runner.argv or [])
+
+
+@pytest.mark.asyncio
+async def test_ghcli_omits_the_auth_env_when_no_token() -> None:
+    """With no token GhCli leaves the auth env empty, deferring to gh's ambient auth."""
+    runner = CapturingGhRunner()
+    gh = GhCli(token=None, runner=runner)
+
+    await gh.list_backlog(repo_full_name="owner/repo")
+
+    assert "GH_TOKEN" not in (runner.env or {})
+
+
+@pytest.mark.asyncio
+async def test_ghcli_parses_the_gh_json_payload() -> None:
+    """GhCli parses gh's JSON listing into BacklogIssue objects with labels + ages."""
+    payload = json.dumps(
+        [
+            {
+                "number": 7,
+                "createdAt": "2026-06-01T12:00:00Z",
+                "labels": [{"name": "backlog"}, {"name": "priority:high"}],
+            },
+            {
+                "number": 9,
+                "createdAt": "2026-05-20T00:00:00Z",
+                "labels": [{"name": "backlog"}],
+            },
+        ]
+    ).encode()
+    gh = GhCli(runner=CapturingGhRunner(stdout=payload))
+
+    issues = await gh.list_backlog(repo_full_name="owner/repo")
+
+    assert [issue.number for issue in issues] == [7, 9]
+    assert issues[0].labels == ["backlog", "priority:high"]
+    assert issues[0].severity() is Severity.HIGH
+    assert issues[0].created_at == datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    # A backlog issue with no priority label defaults to LOW (the quota-floor sweep).
+    assert issues[1].severity() is Severity.LOW
+
+
+@pytest.mark.asyncio
+async def test_ghcli_empty_listing_is_an_empty_backlog() -> None:
+    """An empty gh array parses to an empty backlog (the IDLE-tick input)."""
+    gh = GhCli(runner=CapturingGhRunner(stdout=b"[]"))
+
+    assert await gh.list_backlog(repo_full_name="owner/repo") == []
+
+
+@pytest.mark.asyncio
+async def test_ghcli_rejects_non_json_output() -> None:
+    """Non-JSON gh output is a hard error, not a silently-empty backlog."""
+    gh = GhCli(runner=CapturingGhRunner(stdout=b"not json"))
+
+    with pytest.raises(ValueError):
+        await gh.list_backlog(repo_full_name="owner/repo")
+
+
+@pytest.mark.asyncio
+async def test_ghcli_rejects_a_malformed_issue_entry() -> None:
+    """A payload missing a required field fails loudly rather than dropping the issue."""
+    payload = json.dumps([{"number": 1, "labels": [{"name": "backlog"}]}]).encode()
+    gh = GhCli(runner=CapturingGhRunner(stdout=payload))
+
+    with pytest.raises(ValueError):
+        await gh.list_backlog(repo_full_name="owner/repo")
+
+
+# --- real SliceBuilder (CronBuild): slice assembly + downstream wiring -------------
+#
+# The production CronBuild assembles the standalone Slice for the picked backlog nit and
+# drives the orchestrator's build_slice downstream. These exercise that assembly + the
+# decision (which integration target a loose nit drains onto) through an injected slice
+# runner — no Agent SDK, Docker, gh, or network. The runner captures the assembled Slice
+# and returns a canned BuildResult, so the slice it builds is asserted directly.
+
+
+class CapturingSliceRunner:
+    """Records the assembled Slice it was handed and returns a canned BuildResult."""
+
+    def __init__(self, result: BuildResult | None = None) -> None:
+        self._result = result or BuildResult(
+            outcome=BuildOutcome.MERGED, integration_branch="retinue/prd-0"
+        )
+        self.slices: list[Slice] = []
+
+    async def __call__(self, slice_: Slice) -> BuildResult:
+        self.slices.append(slice_)
+        return self._result
+
+
+def _slice_builder(runner: CapturingSliceRunner) -> SliceBuilder:
+    """A SliceBuilder whose downstream is the injected runner.
+
+    The orchestrator collaborators are inert sentinels: with ``runner`` injected the real
+    ``build_slice`` edge is never touched, so the test stays free of the Agent SDK,
+    Docker, gh, and network.
+    """
+    sentinel = cast(Any, object())
+    return SliceBuilder(
+        config=RepoConfig(),
+        claude_md="# CLAUDE.md",
+        implementer=sentinel,
+        git=sentinel,
+        auth=sentinel,
+        runtime=sentinel,
+        resolve_secret=sentinel,
+        report=sentinel,
+        runner=runner,
+    )
+
+
+@pytest.mark.asyncio
+async def test_slice_builder_assembles_a_slice_for_the_backlog_issue() -> None:
+    """The builder turns the picked backlog issue into a Slice for that repo + issue."""
+    runner = CapturingSliceRunner()
+    build = _slice_builder(runner)
+
+    await build(repo_full_name="owner/repo", issue_number=42)
+
+    assert len(runner.slices) == 1
+    built = runner.slices[0]
+    assert built.repo_full_name == "owner/repo"
+    assert built.issue_number == 42
+
+
+@pytest.mark.asyncio
+async def test_slice_builder_drains_a_loose_nit_onto_its_own_integration_branch() -> None:
+    """A loose nit has no parent PRD, so it drains onto ``retinue/prd-<issue>``."""
+    runner = CapturingSliceRunner()
+    build = _slice_builder(runner)
+
+    await build(repo_full_name="owner/repo", issue_number=42)
+
+    built = runner.slices[0]
+    # The per-issue PRD number is the issue number, giving a dedicated integration target.
+    assert built.prd_number == 42
+    assert integration_branch(built.prd_number) == "retinue/prd-42"
+    # The implementer commits to the issue-<N> branch derived from the issue number.
+    assert built.branch == "issue-42"
+
+
+@pytest.mark.asyncio
+async def test_slice_builder_satisfies_the_cron_build_protocol(tmp_path: Path) -> None:
+    """The builder is a drop-in CronBuild: run_cron_tick drives it end to end."""
+    runner = CapturingSliceRunner()
+    build = _slice_builder(runner)
+    clock = FakeClock()
+
+    result = await run_cron_tick(
+        repo_full_name="owner/repo",
+        gh=FakeCronGh([_issue(7, priority="high", age_days=1)]),
+        governor=_governor(tmp_path, clock),
+        clock=clock,
+        build=build,
+        tick_number=1,
+        estimated_amount=1.0,
+        lock=OneAtATimeLock(),
+    )
+
+    assert result.outcome is CronOutcome.RAN
+    assert result.issue_number == 7
+    # The tick drove the real builder, which assembled and ran the slice for issue 7.
+    assert [s.issue_number for s in runner.slices] == [7]

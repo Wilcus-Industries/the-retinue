@@ -32,6 +32,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 import aiosqlite
 
@@ -469,3 +470,197 @@ async def _file_backlog_nits(
         created = await create_issue(draft)
         filed.append(created.issue_number)
     return filed
+
+
+# --- production gh-cli Rebuilder --------------------------------------------------
+#
+# :func:`process_review` depends only on the :data:`Rebuilder` protocol. Production wires
+# the concrete :class:`GhCliRebuilder` below; tests inject a fake that records the
+# :class:`RebuildRequest`. On a review loopback the rebuild has two side effects, both
+# behind already-injected seams so this adapter carries ``external_dep none``:
+#
+# 1. it reconstructs the round's rebuild plan from the request and *(re)files* each
+#    fix-issue as a ``ready-for-agent`` slice linked to the PRD onto the SAME integration
+#    branch, reusing the injected :data:`IssueCreator` (the slicer's gh create seam), and
+# 2. it re-triggers heimdall's bot review on the same PR by re-requesting review through
+#    an injected :class:`GhRunner` (the only process-spawn seam), authenticated with a
+#    ``GH_TOKEN`` bearer.
+#
+# The adapter never shells out itself: every pure/parseable part — the auth-env build, the
+# ``gh pr edit --add-reviewer`` command assembly, and parsing the re-review payload — is a
+# free function tested with a recording fake runner, never a live ``gh``/heimdall/network.
+# The local :class:`GhRunner`/:class:`GhResult` mirror the gh-seam shape used in
+# :mod:`retinue.slicer` / :mod:`retinue.pr_opener`; each module keeps its own copy so the
+# layers stay edit-isolated.
+
+# The bot login heimdall reviews under. Re-requesting it as a reviewer on the PR is what
+# re-triggers a fresh heimdall bot review of the just-rebuilt integration branch.
+_HEIMDALL_REVIEWER = "heimdall[bot]"
+
+
+@dataclass(frozen=True)
+class GhResult:
+    """Captured result of a single ``gh`` invocation.
+
+    Attributes:
+        exit_code: ``gh``'s process exit status; ``0`` means success.
+        stdout: Captured standard output (the re-review payload parsed below).
+        stderr: Captured standard error (surfaced in the error on failure).
+    """
+
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """True when ``gh`` exited successfully (exit code 0)."""
+        return self.exit_code == 0
+
+
+class GhRunner(Protocol):
+    """Runs a single ``gh`` command. The process-spawn seam under :class:`GhCliRebuilder`.
+
+    A production implementation spawns ``gh`` as a subprocess with ``env`` merged into its
+    environment (so ``GH_TOKEN`` authenticates the call) and returns the captured
+    :class:`GhResult`; tests inject a fake that records each ``(args, env)`` and returns a
+    canned result. ``args`` never includes the leading ``"gh"`` — the runner owns the
+    executable name.
+    """
+
+    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
+        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
+        ...
+
+
+class GhCommandError(RuntimeError):
+    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
+
+    def __init__(self, command: list[str], result: GhResult) -> None:
+        self.command = command
+        self.result = result
+        super().__init__(
+            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
+        )
+
+
+def _auth_env(token: str) -> dict[str, str]:
+    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
+
+    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on every
+    REST/GraphQL call, so the adapter never assembles a header itself — it injects the
+    token here and lets ``gh`` own the wire format.
+    """
+    return {"GH_TOKEN": token}
+
+
+def _re_review_args(request: RebuildRequest) -> list[str]:
+    """Assemble the ``gh pr edit`` argv that re-requests a heimdall review (no ``"gh"``).
+
+    Re-adding the heimdall bot as a reviewer on the rebuilt PR is what re-triggers a fresh
+    bot review of the integration branch the fix-issues were just built onto. ``--repo``
+    targets the request's repo and the trailing positional is the PR number. The argv is
+    assembled purely so it is unit-testable without a live ``gh``.
+    """
+    return [
+        "pr",
+        "edit",
+        str(request.pr_number),
+        "--repo",
+        request.repo_full_name,
+        "--add-reviewer",
+        _HEIMDALL_REVIEWER,
+    ]
+
+
+def _parse_review_requested(stdout: str) -> int:
+    """Parse the PR number back from ``gh pr edit``'s re-review payload.
+
+    ``gh pr edit`` echoes the edited PR's URL (e.g.
+    ``https://github.com/owner/repo/pull/42``) on success. The number is the trailing path
+    segment; it is read back as a confirmation that the review re-request landed on the
+    expected PR. Raises :class:`ValueError` when the output carries no trailing integer, so
+    a malformed response fails loudly rather than silently dropping the re-review.
+    """
+    tail = stdout.strip().rstrip("/").rsplit("/", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError as exc:
+        raise ValueError(f"gh pr edit returned no PR number: {stdout!r}") from exc
+
+
+def _refile_drafts(request: RebuildRequest) -> list[IssueDraft]:
+    """Reconstruct the round's rebuild plan as one ``ready-for-agent`` draft per fix-issue.
+
+    The request carries the fix-issue numbers filed for this round; each is re-materialized
+    as a PRD-linked, ``ready-for-agent`` slice that builds onto the SAME integration branch
+    (named in the body so the build targets it, not a fresh one). Pure assembly — no gh,
+    Docker, or network — so the rebuild plan is unit-testable in isolation.
+    """
+    return [
+        IssueDraft(
+            title=f"Heimdall rebuild: fix-issue #{number}",
+            body=(
+                f"Rebuilding fix-issue #{number} onto {request.integration_branch} "
+                f"(PR #{request.pr_number}).\n\nPart of #{request.prd_number}"
+            ),
+            labels=[READY_LABEL],
+        )
+        for number in request.fix_issues
+    ]
+
+
+class GhCliRebuilder:
+    """Production :data:`Rebuilder`: (re)files the fix-issues and re-triggers heimdall.
+
+    An instance is callable as ``await rebuilder(request)`` — it satisfies the
+    :data:`Rebuilder` protocol via :meth:`__call__`, so it drops straight in where the fake
+    rebuilder sits in tests and at the wiring site (``process_review``). On a rebuild it:
+
+    1. reconstructs the round's rebuild plan (:func:`_refile_drafts`) and *(re)files* each
+       fix-issue as a ``ready-for-agent`` slice onto the same integration branch through
+       the injected :data:`IssueCreator` (the slicer's gh create seam), then
+    2. re-requests the heimdall bot review on the same PR by dispatching the assembled
+       ``gh pr edit`` argv (:func:`_re_review_args`) through the injected
+       :class:`GhRunner`, authenticated with a ``GH_TOKEN`` bearer (:func:`_auth_env`), and
+       confirms the PR number echoed back (:func:`_parse_review_requested`).
+
+    The runner and the issue creator are the only side-effecting seams, which keeps the
+    rebuild-plan assembly, command assembly, and payload parsing unit-testable with no live
+    ``gh``/heimdall/network (``external_dep none``).
+
+    Args:
+        runner: The process-spawn seam that runs each ``gh`` command.
+        create_issue: The slicer's gh create seam used to (re)file the fix-issue slices.
+        token: The installation/access token ``gh`` authenticates with.
+    """
+
+    def __init__(
+        self,
+        runner: GhRunner,
+        *,
+        create_issue: IssueCreator,
+        token: str,
+    ) -> None:
+        self._runner = runner
+        self._create_issue = create_issue
+        self._token = token
+
+    async def __call__(self, request: RebuildRequest) -> None:
+        """(Re)file the fix-issue slices, then re-request the heimdall review on the PR."""
+        for draft in _refile_drafts(request):
+            await self._create_issue(draft)
+
+        args = _re_review_args(request)
+        result = await self._runner.run(args, env=_auth_env(self._token))
+        if not result.ok:
+            raise GhCommandError(args, result)
+        pr_number = _parse_review_requested(result.stdout)
+        logger.info(
+            "Re-requested heimdall review on PR #%d (%s) after rebuilding %d fix-issue(s) "
+            "onto %s",
+            pr_number,
+            request.repo_full_name,
+            len(request.fix_issues),
+            request.integration_branch,
+        )

@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from retinue.app import create_app
 from retinue.config import Settings
-from retinue.queue import PrdJob
+from retinue.queue import MergedPrJob, PrdJob, ReviewJob
 from retinue.webhook import compute_signature, verify_signature
 
 _SECRET = "test-webhook-secret"
@@ -42,6 +42,40 @@ def _issues_payload(
     }
 
 
+def _pull_request_payload(
+    action: str = "closed", *, merged: bool = True, number: int = 42
+) -> dict:  # type: ignore[type-arg]
+    return {
+        "action": action,
+        "pull_request": {"number": number, "merged": merged},
+        "repository": {"full_name": "owner/repo"},
+    }
+
+
+def _review_payload(
+    *, number: int = 42, state: str = "changes_requested", body: str = "blocking: x"
+) -> dict:  # type: ignore[type-arg]
+    return {
+        "action": "submitted",
+        "review": {"state": state, "body": body},
+        "pull_request": {"number": number},
+        "repository": {"full_name": "owner/repo"},
+    }
+
+
+def _post(client: TestClient, event: str, payload: dict):  # type: ignore[type-arg, no-untyped-def]
+    body = json.dumps(payload).encode()
+    return client.post(
+        "/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Event": event,
+            "X-Hub-Signature-256": _sign(body, _SECRET),
+            "Content-Type": "application/json",
+        },
+    )
+
+
 @pytest.fixture()
 def app_client() -> Iterator[tuple[TestClient, MagicMock]]:
     """Yield (TestClient, mock_enqueue) with the patch active for the whole test."""
@@ -51,6 +85,23 @@ def app_client() -> Iterator[tuple[TestClient, MagicMock]]:
         app = create_app(settings)
         client = TestClient(app, raise_server_exceptions=True)
         yield client, mock_enqueue
+
+
+@pytest.fixture()
+def dispatch_client() -> Iterator[tuple[TestClient, MagicMock, MagicMock, MagicMock]]:
+    """Yield the client with all three enqueue seams patched and recording."""
+    settings = _make_settings()
+    enqueue_prd = AsyncMock(return_value="jid-prd")
+    enqueue_review = AsyncMock(return_value="jid-review")
+    enqueue_merged = AsyncMock(return_value="jid-merge")
+    with (
+        patch("retinue.webhook.enqueue_prd", enqueue_prd),
+        patch("retinue.webhook.enqueue_review", enqueue_review),
+        patch("retinue.webhook.enqueue_merged_pr", enqueue_merged),
+    ):
+        app = create_app(settings)
+        client = TestClient(app, raise_server_exceptions=True)
+        yield client, enqueue_prd, enqueue_review, enqueue_merged
 
 
 # --- signature helpers ------------------------------------------------------
@@ -163,6 +214,89 @@ def test_enqueue_failure_returns_5xx(
         response = client.post("/webhook", content=payload, headers=headers)
     assert response.status_code >= 500
     failing_enqueue.assert_called_once()
+
+
+# --- pull_request / pull_request_review dispatch ----------------------------
+
+
+def test_merged_pull_request_enqueues_reap(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """A closed+merged pull_request returns 202 and enqueues exactly one reap job."""
+    client, enqueue_prd, enqueue_review, enqueue_merged = dispatch_client
+    response = _post(client, "pull_request", _pull_request_payload(number=42))
+    assert response.status_code == 202
+    enqueue_merged.assert_awaited_once()
+    assert enqueue_merged.call_args[0][1] == MergedPrJob(
+        repo_full_name="owner/repo", pr_number=42
+    )
+    enqueue_prd.assert_not_called()
+    enqueue_review.assert_not_called()
+
+
+def test_closed_unmerged_pull_request_is_ignored(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """A closed-but-not-merged pull_request is acked 204 and reaps nothing."""
+    client, _prd, _review, enqueue_merged = dispatch_client
+    response = _post(
+        client, "pull_request", _pull_request_payload(action="closed", merged=False)
+    )
+    assert response.status_code == 204
+    enqueue_merged.assert_not_called()
+
+
+def test_opened_pull_request_is_ignored(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """A non-close pull_request action (opened) is acked 204 and reaps nothing."""
+    client, _prd, _review, enqueue_merged = dispatch_client
+    response = _post(
+        client, "pull_request", _pull_request_payload(action="opened", merged=False)
+    )
+    assert response.status_code == 204
+    enqueue_merged.assert_not_called()
+
+
+def test_pull_request_review_enqueues_loopback(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """A pull_request_review returns 202 and enqueues the loopback with its state/body."""
+    client, enqueue_prd, enqueue_review, enqueue_merged = dispatch_client
+    response = _post(
+        client,
+        "pull_request_review",
+        _review_payload(number=42, state="changes_requested", body="blocking nit"),
+    )
+    assert response.status_code == 202
+    enqueue_review.assert_awaited_once()
+    assert enqueue_review.call_args[0][1] == ReviewJob(
+        repo_full_name="owner/repo",
+        pr_number=42,
+        review_state="changes_requested",
+        review_body="blocking nit",
+    )
+    enqueue_prd.assert_not_called()
+    enqueue_merged.assert_not_called()
+
+
+def test_unsigned_pull_request_returns_401(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """The HMAC contract is identical for the new events: a bad signature is 401."""
+    client, _prd, _review, enqueue_merged = dispatch_client
+    body = json.dumps(_pull_request_payload()).encode()
+    response = client.post(
+        "/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-Hub-Signature-256": "sha256=bad",
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 401
+    enqueue_merged.assert_not_called()
 
 
 # --- lifespan / pool wiring -------------------------------------------------
