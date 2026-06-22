@@ -19,9 +19,11 @@ injected so the slicer is unit-testable without network, Agent SDK, or gh.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from retinue.notify import Notification, Notifier
 
@@ -29,6 +31,49 @@ logger = logging.getLogger(__name__)
 
 READY_LABEL = "ready-for-agent"
 HITL_LABEL = "hitl"
+
+# The Agent-SDK model that does the slicing, and the OAuth beta header that a
+# subscription token requires. See the claude-api skill: Opus 4.8 is the default
+# model, OAuth tokens go on Authorization: Bearer with the oauth beta header.
+_SLICE_MODEL = "claude-opus-4-8"
+_OAUTH_BETA = "oauth-2025-04-20"
+_MAX_TOKENS = 16_000
+
+# Strict JSON schema the headless slicer must emit: an ordered list of vertical
+# slices, each with its 1-based intra-PRD blocked_by indices and a hitl flag.
+_SLICE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "slices": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "blocked_by": {"type": "array", "items": {"type": "integer"}},
+                    "hitl": {"type": "boolean"},
+                },
+                "required": ["title", "body", "blocked_by", "hitl"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["slices"],
+    "additionalProperties": False,
+}
+
+# The headless slicer's brief. Kept frozen (no per-request interpolation) so the
+# request prefix is cacheable across PRDs.
+_SLICE_SYSTEM = (
+    "You slice a Product Requirements Doc into tracer-bullet vertical slices. "
+    "Each slice cuts every layer and is demoable on its own. Emit them in "
+    "dependency order — a slice may only depend on earlier ones. Reference an "
+    "earlier slice via its 1-based index in 'blocked_by'. Set 'hitl' true only "
+    "for a genuinely human-only slice (a secret, an external account, or a "
+    "design call) the agent loop must not attempt. Return only the JSON object "
+    "matching the schema; no prose."
+)
 
 # A PRD body shorter than this (after stripping) is too thin to slice responsibly.
 _MIN_PRD_BODY_CHARS = 40
@@ -101,6 +146,130 @@ class SliceResult:
 # body; ``create_issue`` files one issue via gh. Both are async and faked in tests.
 SliceGenerator = Callable[[str], Awaitable[SlicePlan]]
 IssueCreator = Callable[[IssueDraft], Awaitable[CreatedIssue]]
+
+
+@dataclass(frozen=True)
+class ClaudeSliceGenerator:
+    """Real :data:`SliceGenerator`: slice a PRD with the Agent SDK (Anthropic API).
+
+    An instance is callable as ``await generator(prd_body)`` — it satisfies the
+    :data:`SliceGenerator` protocol via :meth:`generate`, so it drops straight in
+    where the fake generator sits in tests and at the wiring site.
+
+    The dollar/token metering split mirrors :class:`retinue.config.Settings`:
+    ``auth_mode="api_key"`` authenticates with an ``ANTHROPIC_API_KEY`` (the
+    ``x-api-key`` header the SDK builds from ``api_key``); ``auth_mode=
+    "subscription"`` authenticates with a short-lived OAuth token on
+    ``Authorization: Bearer`` plus the ``oauth-2025-04-20`` beta header.
+
+    The Anthropic SDK is imported lazily inside :meth:`generate` so the module —
+    and the unit tests over the pure header/request/parse helpers — import with
+    no SDK or network present.
+
+    Attributes:
+        token: The API key (``api_key`` mode) or OAuth bearer token
+            (``subscription`` mode).
+        auth_mode: ``"api_key"`` or ``"subscription"``.
+        model: The model the headless slicer runs on.
+    """
+
+    token: str
+    auth_mode: str = "api_key"
+    model: str = _SLICE_MODEL
+
+    async def generate(self, prd_body: str) -> SlicePlan:
+        """Run the headless slicer over ``prd_body`` and return its :class:`SlicePlan`.
+
+        Streams the request (large ``max_tokens``) and parses the strict-schema
+        JSON payload into ordered :class:`IssueDraft` slices. Raises on a response
+        the slicer can't parse; an empty plan is a valid result the caller escalates.
+        """
+        # Lazy import keeps the module (and its unit tests) import-clean without the
+        # SDK installed; type-ignored because ``anthropic`` is an optional runtime dep.
+        from anthropic import AsyncAnthropic  # type: ignore[import-not-found]
+
+        client = AsyncAnthropic(**self._client_kwargs())
+        async with client.messages.stream(**self._build_request_kwargs(prd_body)) as stream:
+            message = await stream.get_final_message()
+        return self._parse_plan(_first_text(message.content))
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        """Client constructor kwargs: the key/token and any OAuth default headers.
+
+        In ``api_key`` mode the token rides ``api_key=`` (the SDK renders the
+        ``x-api-key`` header). In ``subscription`` mode it rides ``auth_token=``
+        (rendered as ``Authorization: Bearer``) and the OAuth beta header is added
+        as a default header so it is sent on every request.
+        """
+        if self.auth_mode == "subscription":
+            return {
+                "auth_token": self.token,
+                "default_headers": self._build_auth_headers(),
+            }
+        return {"api_key": self.token}
+
+    def _build_auth_headers(self) -> dict[str, str]:
+        """Extra headers required by the auth mode.
+
+        ``subscription`` (OAuth) must carry ``anthropic-beta: oauth-2025-04-20``;
+        ``api_key`` needs no extra header (the ``x-api-key`` header is built from
+        the key by the SDK).
+        """
+        if self.auth_mode == "subscription":
+            return {"anthropic-beta": _OAUTH_BETA}
+        return {}
+
+    def _build_request_kwargs(self, prd_body: str) -> dict[str, Any]:
+        """Assemble the streaming-request kwargs for one PRD slice run."""
+        return {
+            "model": self.model,
+            "max_tokens": _MAX_TOKENS,
+            "system": _SLICE_SYSTEM,
+            "output_config": {"format": {"type": "json_schema", "schema": _SLICE_SCHEMA}},
+            "messages": [{"role": "user", "content": prd_body}],
+        }
+
+    @staticmethod
+    def _parse_plan(payload: str) -> SlicePlan:
+        """Parse the strict-schema JSON ``payload`` into an ordered :class:`SlicePlan`.
+
+        ``blocked_by`` and ``hitl`` are optional in a malformed-but-parseable
+        payload and default to the empty list / ``False``; ``title`` and ``body``
+        are required. Raises :class:`ValueError` if the payload isn't the expected
+        object shape so the caller fails loudly rather than filing junk issues.
+        """
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"slicer returned non-JSON payload: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("slices"), list):
+            raise ValueError("slicer payload missing a 'slices' array")
+
+        slices: list[IssueDraft] = []
+        for raw in data["slices"]:
+            if not isinstance(raw, dict) or "title" not in raw or "body" not in raw:
+                raise ValueError(f"slice is missing title/body: {raw!r}")
+            slices.append(
+                IssueDraft(
+                    title=str(raw["title"]),
+                    body=str(raw["body"]),
+                    blocked_by=[int(i) for i in raw.get("blocked_by", [])],
+                    hitl=bool(raw.get("hitl", False)),
+                )
+            )
+        return SlicePlan(slices=slices)
+
+
+def _first_text(content: list[Any]) -> str:
+    """Return the first text block's text from a message's content blocks.
+
+    ``output_config.format`` guarantees the JSON arrives as a single leading text
+    block; an empty content array means the model produced nothing to parse.
+    """
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            return str(block.text)
+    raise ValueError("slicer response carried no text block")
 
 
 async def slice_prd(

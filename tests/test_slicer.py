@@ -9,6 +9,8 @@ no slices. No real network, Agent SDK, or gh is touched.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from retinue.notify import (
@@ -18,6 +20,7 @@ from retinue.notify import (
     PushRequest,
 )
 from retinue.slicer import (
+    ClaudeSliceGenerator,
     CreatedIssue,
     IssueDraft,
     SliceOutcome,
@@ -209,3 +212,90 @@ async def test_empty_generated_plan_escalates() -> None:
     assert result.outcome is SliceOutcome.ESCALATED
     assert rec.created == []
     assert len(rec.comments) == 1
+
+
+# --- Real Agent-SDK generator: pure/parseable parts (no network, SDK, or gh) ---
+
+
+def test_api_key_mode_builds_no_extra_headers_and_uses_x_api_key() -> None:
+    """api_key mode passes the key as api_key= and adds no OAuth beta header."""
+    gen = ClaudeSliceGenerator(token="sk-ant-123", auth_mode="api_key")
+
+    assert gen._build_auth_headers() == {}
+    assert gen._client_kwargs() == {"api_key": "sk-ant-123"}
+
+
+def test_subscription_mode_uses_bearer_token_and_oauth_beta_header() -> None:
+    """subscription mode sends the OAuth token as auth_token= with the oauth beta header."""
+    gen = ClaudeSliceGenerator(token="oauth-tok", auth_mode="subscription")
+
+    assert gen._build_auth_headers() == {"anthropic-beta": "oauth-2025-04-20"}
+    assert gen._client_kwargs() == {
+        "auth_token": "oauth-tok",
+        "default_headers": {"anthropic-beta": "oauth-2025-04-20"},
+    }
+
+
+def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:
+    """The assembled request pins the model, the PRD body, and a strict JSON schema."""
+    gen = ClaudeSliceGenerator(token="sk-ant-123", model="claude-opus-4-8")
+
+    kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
+
+    assert kwargs["model"] == "claude-opus-4-8"
+    assert kwargs["messages"] == [
+        {"role": "user", "content": "Slice this PRD into vertical slices."}
+    ]
+    fmt = kwargs["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"]["properties"]["slices"]["type"] == "array"
+    assert kwargs["max_tokens"] > 0
+
+
+def test_parse_plan_maps_payload_to_ordered_drafts() -> None:
+    """A well-formed payload parses into ordered drafts preserving blocked_by + hitl."""
+    payload = json.dumps(
+        {
+            "slices": [
+                {"title": "Spine", "body": "webhook + queue", "blocked_by": [], "hitl": False},
+                {"title": "Gate", "body": "gate the PRD", "blocked_by": [1], "hitl": False},
+                {"title": "Provision", "body": "prod account", "blocked_by": [], "hitl": True},
+            ]
+        }
+    )
+
+    plan = ClaudeSliceGenerator._parse_plan(payload)
+
+    assert [d.title for d in plan.slices] == ["Spine", "Gate", "Provision"]
+    assert plan.slices[1].blocked_by == [1]
+    assert plan.slices[2].hitl is True
+
+
+def test_parse_plan_defaults_optional_fields() -> None:
+    """blocked_by and hitl default when absent; title and body are kept."""
+    plan = ClaudeSliceGenerator._parse_plan(json.dumps({"slices": [{"title": "T", "body": "B"}]}))
+
+    assert plan.slices[0].blocked_by == []
+    assert plan.slices[0].hitl is False
+
+
+def test_parse_plan_empty_slices_is_a_valid_empty_plan() -> None:
+    """An empty slices array parses to an empty plan (the caller escalates it)."""
+    plan = ClaudeSliceGenerator._parse_plan(json.dumps({"slices": []}))
+
+    assert plan.slices == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json at all",
+        json.dumps({"slices": "nope"}),
+        json.dumps({"wrong": []}),
+        json.dumps({"slices": [{"title": "no body"}]}),
+    ],
+)
+def test_parse_plan_rejects_malformed_payloads(payload: str) -> None:
+    """A non-object / missing-array / missing-field payload raises rather than filing junk."""
+    with pytest.raises(ValueError):
+        ClaudeSliceGenerator._parse_plan(payload)
