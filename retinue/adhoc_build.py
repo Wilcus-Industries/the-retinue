@@ -16,7 +16,8 @@ from. The whole build runs in **one disposable container** that is destroyed on 
    one file the implementer reads, so the plan crosses from the read-only planner to the
    write-capable implementer through the workspace rather than a second model call,
 4. **implement** — the same implementer the PRD lane uses (Sonnet/high on the in-container
-   CLI) implements TDD-first and commits to the ``issue-<N>`` branch,
+   CLI) is pointed at :data:`PLAN_FILE` via its ``plan_path`` and told to read the plan
+   before building, then implements TDD-first and commits to the ``issue-<N>`` branch,
 5. **done-check** — the repo's done-check runs in the *same* container over the real
    changes, and the outcome is posted to the report sink,
 6. **push** — only on a green done-check is ``issue-<N>`` pushed to origin; a red check
@@ -27,7 +28,8 @@ container runtime, the auth, the secret resolver, and the report sink — is inj
 the whole flow is exercised in tests with no Agent SDK, no Docker, no gh, and no network.
 The container/git/done-check/credential mechanics are reused wholesale from
 :mod:`retinue.orchestrator` and :mod:`retinue.done_check`; this module only adds the
-planner seam, the plan materialization, and the no-merge plan->execute ordering.
+planner seam, the plan materialization, threading :data:`PLAN_FILE` into the implementer
+as its ``plan_path``, and the no-merge plan->execute ordering.
 """
 
 from __future__ import annotations
@@ -220,7 +222,8 @@ async def build_adhoc_issue(
     3. clone the repo and check out a fresh ``issue-<N>`` branch off ``config.staging_branch``,
     4. run the read-only planner to produce a plan, captured from its output,
     5. materialize the plan into :data:`PLAN_FILE` for the implementer to read,
-    6. exec the implementer to build and commit the issue on ``issue-<N>``,
+    6. exec the implementer — pointed at :data:`PLAN_FILE` via ``plan_path`` so it reads
+       the plan first — to build and commit the issue on ``issue-<N>``,
     7. run the done-check over the real changes and post the outcome,
     8. push ``issue-<N>`` to origin only when the done-check is green (a red build pushes
        nothing).
@@ -267,7 +270,9 @@ async def build_adhoc_issue(
         )
         plan = await planner.plan(issue, container=container)
         await _materialize_plan(container, plan)
-        await implementer.implement(_slice_for_issue(issue), container=container)
+        await implementer.implement(
+            _slice_for_issue(issue), container=container, plan_path=PLAN_FILE
+        )
         passed, detail = await run_done_check_commands(container, commands)
         if passed:
             await _push_branch(container, issue.branch)

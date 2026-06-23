@@ -68,7 +68,9 @@ class FakeImplementer:
     def __init__(self) -> None:
         self.built: list[Slice] = []
 
-    async def implement(self, slice_: Slice, *, container: Container) -> None:
+    async def implement(
+        self, slice_: Slice, *, container: Container, plan_path: str | None = None
+    ) -> None:
         self.built.append(slice_)
         await container.run_command(["implement", slice_.branch])
 
@@ -800,6 +802,19 @@ def test_implement_prompt_names_issue_repo_and_branch() -> None:
     assert "#7" in prompt
     assert "owner/repo" in prompt
     assert "issue-7" in prompt
+
+
+def test_implement_prompt_injects_no_plan_file_for_the_prd_lane() -> None:
+    """With no plan_path (the PRD lane), the prompt carries no plan-file instruction.
+
+    The plan file is an ad-hoc-lane concern (#37); ``build_slice``/``build_prd`` must be
+    unaffected, so the default-path prompt names no ``.retinue/plan.md`` and no read-plan
+    preamble.
+    """
+    prompt = _implement_prompt(_slice(issue_number=7, prd_number=1))
+
+    assert ".retinue/plan.md" not in prompt
+    assert not prompt.startswith("Read the implementation plan")
 
 
 def test_implement_env_api_key_mode_uses_anthropic_api_key() -> None:
