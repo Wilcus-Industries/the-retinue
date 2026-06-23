@@ -93,6 +93,15 @@ def _build_job(body: dict[str, Any]) -> PrdJob:
     )
 
 
+def _review_author_login(body: dict[str, Any]) -> str:
+    """The login of the account that submitted a ``pull_request_review``.
+
+    GitHub puts the reviewing account under ``review.user.login``; an empty string is
+    returned when the shape is missing so a malformed payload reads as "not heimdall".
+    """
+    return str(body.get("review", {}).get("user", {}).get("login") or "")
+
+
 def _build_review_job(body: dict[str, Any]) -> ReviewJob:
     """Build a :class:`ReviewJob` from a ``pull_request_review`` payload.
 
@@ -129,7 +138,7 @@ def _is_merge_event(body: dict[str, Any]) -> bool:
     )
 
 
-def make_webhook_router(*, webhook_secret: str) -> APIRouter:
+def make_webhook_router(*, webhook_secret: str, heimdall_bot_login: str) -> APIRouter:
     """Return a configured APIRouter with the ``/webhook`` POST endpoint.
 
     The handler reads the Arq pool from ``request.app.state.arq_pool`` at request
@@ -138,6 +147,9 @@ def make_webhook_router(*, webhook_secret: str) -> APIRouter:
 
     Args:
         webhook_secret: The HMAC secret to verify incoming requests against.
+        heimdall_bot_login: The bot login a ``pull_request_review`` must be authored by
+            for the loopback to be enqueued; any other reviewer is acked 204 and dropped,
+            so only heimdall's verdict drives a rebuild/converge round.
     """
     router = APIRouter()
 
@@ -199,8 +211,15 @@ def make_webhook_router(*, webhook_secret: str) -> APIRouter:
         return Response(status_code=202)
 
     async def _dispatch_review(request: Request) -> Response:
-        """Route a ``pull_request_review`` event into the heimdall loopback."""
+        """Route a ``pull_request_review`` event into the heimdall loopback.
+
+        Only heimdall's bot verdict drives the loopback: a review by anyone else (a human
+        ``high:`` line, an approving other-bot review) is acked 204 and enqueues nothing,
+        so it can never burn a rebuild round or spuriously trigger convergence/handoff.
+        """
         body: dict[str, Any] = await request.json()
+        if _review_author_login(body) != heimdall_bot_login:
+            return Response(status_code=204)
         job = _build_review_job(body)
         await enqueue_review(request.app.state.arq_pool, job)
         logger.info(

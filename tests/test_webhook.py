@@ -17,6 +17,7 @@ from retinue.queue import MergedPrJob, PrdJob, ReviewJob
 from retinue.webhook import compute_signature, verify_signature
 
 _SECRET = "test-webhook-secret"
+_HEIMDALL_LOGIN = "heimdall[bot]"
 
 
 def _make_settings() -> Settings:
@@ -65,11 +66,20 @@ def _pull_request_payload(
 
 
 def _review_payload(
-    *, number: int = 42, state: str = "changes_requested", body: str = "blocking: x"
+    *,
+    number: int = 42,
+    state: str = "changes_requested",
+    body: str = "blocking: x",
+    login: str = _HEIMDALL_LOGIN,
 ) -> dict:  # type: ignore[type-arg]
+    """A signed ``pull_request_review`` payload; defaults to heimdall's bot review.
+
+    ``login`` defaults to the heimdall bot so the common path is the one the inbound
+    filter enqueues; pass a human/other-bot login to exercise the drop path.
+    """
     return {
         "action": "submitted",
-        "review": {"state": state, "body": body},
+        "review": {"state": state, "body": body, "user": {"login": login}},
         "pull_request": {"number": number},
         "repository": {"full_name": "owner/repo"},
     }
@@ -312,15 +322,20 @@ def test_opened_pull_request_is_ignored(
     enqueue_merged.assert_not_called()
 
 
-def test_pull_request_review_enqueues_loopback(
+def test_heimdall_review_enqueues_loopback(
     dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
 ) -> None:
-    """A pull_request_review returns 202 and enqueues the loopback with its state/body."""
+    """A review by heimdall's bot returns 202 and enqueues the loopback with state/body."""
     client, enqueue_prd, enqueue_review, enqueue_merged = dispatch_client
     response = _post(
         client,
         "pull_request_review",
-        _review_payload(number=42, state="changes_requested", body="blocking nit"),
+        _review_payload(
+            number=42,
+            state="changes_requested",
+            body="blocking nit",
+            login=_HEIMDALL_LOGIN,
+        ),
     )
     assert response.status_code == 202
     enqueue_review.assert_awaited_once()
@@ -330,6 +345,27 @@ def test_pull_request_review_enqueues_loopback(
         review_state="changes_requested",
         review_body="blocking nit",
     )
+    enqueue_prd.assert_not_called()
+    enqueue_merged.assert_not_called()
+
+
+@pytest.mark.parametrize("login", ["a-human", "octocat", "other[bot]", ""])
+def test_non_heimdall_review_acks_204_and_enqueues_nothing(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock], login: str
+) -> None:
+    """A review by anyone but heimdall's bot is acked 204 and enqueues nothing.
+
+    Only heimdall's verdict drives the loopback; a human ``high:`` line or an
+    approving other-bot review must not burn a rebuild round or trigger handoff.
+    """
+    client, enqueue_prd, enqueue_review, enqueue_merged = dispatch_client
+    response = _post(
+        client,
+        "pull_request_review",
+        _review_payload(number=42, state="changes_requested", login=login),
+    )
+    assert response.status_code == 204
+    enqueue_review.assert_not_called()
     enqueue_prd.assert_not_called()
     enqueue_merged.assert_not_called()
 

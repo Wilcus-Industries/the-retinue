@@ -702,7 +702,10 @@ def build_pipeline_factory(
         pr_ops = GhCliPrOps(pr_runner, token=token)
         reap_gh = HandoffGh(token=token)
         rebuild = GhCliRebuilder(
-            loopback_runner, create_issue=create_issue, token=token
+            loopback_runner,
+            create_issue=create_issue,
+            token=token,
+            reviewer_login=settings.heimdall_bot_login,
         )
         reconcile_gh = GhCliReconcile(
             _ReconcileGhRunner(token), merge_base=config.staging_branch

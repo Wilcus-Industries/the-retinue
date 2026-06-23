@@ -410,12 +410,19 @@ def test_auth_env_carries_only_the_gh_token_bearer() -> None:
 
 
 def test_re_review_args_assemble_a_heimdall_review_re_request() -> None:
-    """The re-review argv re-adds the heimdall bot as a reviewer on the right PR."""
-    args = _re_review_args(_rebuild_request())
+    """The re-review argv re-adds the configured heimdall bot as a reviewer on the PR."""
+    args = _re_review_args(_rebuild_request(), "heimdall[bot]")
     assert args[:5] == ["pr", "edit", "42", "--repo", "owner/repo"]
     # The heimdall bot is re-requested as a reviewer (this re-triggers its bot review).
     add_at = args.index("--add-reviewer")
     assert args[add_at + 1] == "heimdall[bot]"
+
+
+def test_re_review_args_use_the_configured_reviewer_login() -> None:
+    """The re-review re-requests whatever login is configured, not a hardcoded one."""
+    args = _re_review_args(_rebuild_request(), "watcher[bot]")
+    add_at = args.index("--add-reviewer")
+    assert args[add_at + 1] == "watcher[bot]"
 
 
 def test_parse_review_requested_reads_the_pr_number_from_the_url() -> None:
@@ -452,17 +459,20 @@ async def test_gh_cli_rebuilder_refiles_via_creator_then_re_requests_review() ->
         GhResult(exit_code=0, stdout="https://github.com/owner/repo/pull/42")
     )
     creator = _RecordingCreator()
-    rebuilder = GhCliRebuilder(runner, create_issue=creator, token="ghs_tok")
+    rebuilder = GhCliRebuilder(
+        runner, create_issue=creator, token="ghs_tok", reviewer_login="watcher[bot]"
+    )
 
     await rebuilder(_rebuild_request())
 
     # Each fix-issue was re-filed through the injected IssueCreator (Layer 2 seam).
     assert len(creator.drafts) == 2
     assert all(READY_LABEL in d.labels for d in creator.drafts)
-    # Exactly one gh call: the heimdall re-review, GH_TOKEN-authenticated.
+    # Exactly one gh call: the heimdall re-review, GH_TOKEN-authenticated, re-requesting
+    # the *configured* reviewer login (not a hardcoded one).
     assert len(runner.calls) == 1
     args, env = runner.calls[0]
-    assert args == _re_review_args(_rebuild_request())
+    assert args == _re_review_args(_rebuild_request(), "watcher[bot]")
     assert env == {"GH_TOKEN": "ghs_tok"}
 
 
@@ -471,7 +481,10 @@ async def test_gh_cli_rebuilder_raises_on_a_failed_re_review() -> None:
     """A non-zero ``gh`` re-review surfaces a GhCommandError carrying the stderr."""
     runner = _RecordingRunner(GhResult(exit_code=1, stderr="no such PR"))
     rebuilder = GhCliRebuilder(
-        runner, create_issue=_RecordingCreator(), token="ghs_tok"
+        runner,
+        create_issue=_RecordingCreator(),
+        token="ghs_tok",
+        reviewer_login="heimdall[bot]",
     )
 
     with pytest.raises(GhCommandError, match="no such PR"):

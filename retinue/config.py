@@ -57,6 +57,16 @@ class Settings(BaseSettings):
         description="Path to the GitHub App RSA private key (PEM) used to sign app JWTs",
     )
 
+    # Heimdall's bot identity. The single source of truth for the reviewer login: the
+    # webhook filters inbound ``pull_request_review`` events to this login (only
+    # heimdall's verdict drives the loopback — a human/other-bot review is dropped), and
+    # the loopback re-requests this same login to re-trigger a fresh heimdall review.
+    heimdall_bot_login: str = Field(
+        default="heimdall[bot]",
+        description="The bot login heimdall reviews under; the inbound review filter and "
+        "the loopback re-request both key on it",
+    )
+
     # Anthropic auth. BOTH credentials are carried so a deployment can run either metering
     # mode without re-keying: ``api_key`` mode reads ``anthropic_api_key`` (dollars),
     # ``subscription`` mode reads ``anthropic_oauth_token`` (tokens, an ``sk-ant-oat...``

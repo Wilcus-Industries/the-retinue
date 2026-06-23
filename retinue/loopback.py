@@ -493,11 +493,6 @@ async def _file_backlog_nits(
 # :mod:`retinue.slicer` / :mod:`retinue.pr_opener`; each module keeps its own copy so the
 # layers stay edit-isolated.
 
-# The bot login heimdall reviews under. Re-requesting it as a reviewer on the PR is what
-# re-triggers a fresh heimdall bot review of the just-rebuilt integration branch.
-_HEIMDALL_REVIEWER = "heimdall[bot]"
-
-
 @dataclass(frozen=True)
 class GhResult:
     """Captured result of a single ``gh`` invocation.
@@ -554,13 +549,15 @@ def _auth_env(token: str) -> dict[str, str]:
     return {"GH_TOKEN": token}
 
 
-def _re_review_args(request: RebuildRequest) -> list[str]:
+def _re_review_args(request: RebuildRequest, reviewer_login: str) -> list[str]:
     """Assemble the ``gh pr edit`` argv that re-requests a heimdall review (no ``"gh"``).
 
-    Re-adding the heimdall bot as a reviewer on the rebuilt PR is what re-triggers a fresh
-    bot review of the integration branch the fix-issues were just built onto. ``--repo``
-    targets the request's repo and the trailing positional is the PR number. The argv is
-    assembled purely so it is unit-testable without a live ``gh``.
+    Re-adding the heimdall bot (``reviewer_login``) as a reviewer on the rebuilt PR is what
+    re-triggers a fresh bot review of the integration branch the fix-issues were just built
+    onto. The login is the centralized ``Settings.heimdall_bot_login`` — the same value the
+    webhook filters inbound reviews by — so the re-request and the inbound filter cannot
+    drift. ``--repo`` targets the request's repo and the trailing positional is the PR
+    number. The argv is assembled purely so it is unit-testable without a live ``gh``.
     """
     return [
         "pr",
@@ -569,7 +566,7 @@ def _re_review_args(request: RebuildRequest) -> list[str]:
         "--repo",
         request.repo_full_name,
         "--add-reviewer",
-        _HEIMDALL_REVIEWER,
+        reviewer_login,
     ]
 
 
@@ -633,6 +630,9 @@ class GhCliRebuilder:
         runner: The process-spawn seam that runs each ``gh`` command.
         create_issue: The slicer's gh create seam used to (re)file the fix-issue slices.
         token: The installation/access token ``gh`` authenticates with.
+        reviewer_login: The bot login re-requested as a reviewer to re-trigger heimdall's
+            review — the centralized ``Settings.heimdall_bot_login`` the webhook also
+            filters inbound reviews by, so the re-request and the filter cannot drift.
     """
 
     def __init__(
@@ -641,17 +641,19 @@ class GhCliRebuilder:
         *,
         create_issue: IssueCreator,
         token: str,
+        reviewer_login: str,
     ) -> None:
         self._runner = runner
         self._create_issue = create_issue
         self._token = token
+        self._reviewer_login = reviewer_login
 
     async def __call__(self, request: RebuildRequest) -> None:
         """(Re)file the fix-issue slices, then re-request the heimdall review on the PR."""
         for draft in _refile_drafts(request):
             await self._create_issue(draft)
 
-        args = _re_review_args(request)
+        args = _re_review_args(request, self._reviewer_login)
         result = await self._runner.run(args, env=_auth_env(self._token))
         if not result.ok:
             raise GhCommandError(args, result)
