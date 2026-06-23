@@ -70,8 +70,10 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   green (a red check pushes nothing). On a green build the injected `AdhocReviewer`
   (`ContainerAdhocReviewer`) reviews the `issue-<N>` diff and files each finding as a flat
   `review-fix` + `ready-for-agent` follow-up that loops back as ordinary ad-hoc work; the
-  review is advisory (never blocks the build/push) and the review-fix chain is bounded by
-  the per-unit retry cap. No integration branch, no merge.
+  review is advisory (never blocks the build/push) and the review-fix chain is bounded by a
+  `Chain-depth: <n>` lineage marker on each filed fix (not a shared store), so it terminates
+  at `retry_cap` hops without colliding with triage's build-retry budget. No integration
+  branch, no merge.
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
@@ -363,9 +365,12 @@ staging base in the same container, runs the internal reviewer (Opus/`max`) over
 and files each finding as a **flat** `review-fix` + `ready-for-agent` follow-up issue (no
 `Part of #` footer, no Blocked-by wiring — ad-hoc work has no parent PRD) that loops back as
 ordinary ad-hoc work. The review is **advisory**: it never blocks the build or the push, and
-any error it raises is swallowed. The review-fix chain is bounded by the **per-unit retry
-cap** (the same persisted `ImplRetryStore` counter triage uses), so a review-fix issue
-cannot spawn review fixes without limit. There is no integration branch and no merge — that
+any error it raises is swallowed. The review-fix **chain** is bounded by a **lineage marker**,
+not by the issue number: each filed fix carries a `Chain-depth: <n>` line in its body, and a
+build whose issue is already at depth `retry_cap` files no more fixes — so the chain
+`#29 -> #501 -> #503 -> ...` terminates after `retry_cap` hops even though each hop is a fresh
+GitHub issue number. The bound rides the issue body and touches no shared store, so it never
+collides with triage's build-retry budget. There is no integration branch and no merge — that
 is the orchestrator lane's job. Every collaborator (planner, implementer, reviewer,
 container, auth, secret resolver, report sink) is an injected seam, so the flow is tested
 with no Agent SDK, Docker, gh, or network.
