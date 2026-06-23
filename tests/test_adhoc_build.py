@@ -604,6 +604,68 @@ def test_a_body_without_a_marker_is_chain_origin_depth_zero() -> None:
     assert parse_chain_depth("just a plain issue body, no lineage marker") == 0
 
 
+# --- from_fetched_issue: the canonical constructor seam ---------------------------
+
+
+def test_from_fetched_issue_reads_chain_depth_from_the_body() -> None:
+    """AC2: a fetched body carrying ``Chain-depth: <n>`` yields ``chain_depth == n``.
+
+    This is the seam the ad-hoc drain (#32) must call instead of building ``AdhocIssue``
+    by hand: it parses the lineage marker the prior hop stamped, so the #39 chain bound
+    is read back and stops being inert.
+    """
+    body = f"a review-fix to apply.\n\n{render_chain_depth(2)}"
+    issue = AdhocIssue.from_fetched_issue("owner/repo", 503, body)
+
+    assert issue == AdhocIssue(
+        repo_full_name="owner/repo", issue_number=503, chain_depth=2
+    )
+
+
+def test_from_fetched_issue_defaults_a_marker_less_body_to_depth_zero() -> None:
+    """AC2: a marker-less fetched body is a chain origin, so ``chain_depth == 0``."""
+    issue = AdhocIssue.from_fetched_issue("owner/repo", 29, "a hand-filed nit, no marker")
+
+    assert issue.chain_depth == 0
+    assert issue == AdhocIssue(repo_full_name="owner/repo", issue_number=29)
+
+
+@pytest.mark.asyncio
+async def test_round_trip_through_the_constructor_terminates_at_the_cap() -> None:
+    """AC3: file -> re-fetch -> rebuild round-trip terminates the chain at the cap.
+
+    A review-fix filed at depth ``retry_cap - 1`` is captured from its stamped body,
+    fed back through :meth:`AdhocIssue.from_fetched_issue` exactly as the drain would
+    rebuild it from the re-fetched issue, and rebuilt: the reviewer files no further
+    review-fix. This proves the bound holds across the lane round-trip — not just within
+    one reviewer call — because the next hop is reconstructed through the real seam.
+    """
+    rec = _ReviewRecorder()
+    generate, _ = _finding_generator(
+        ReviewFinding(title="Another fix", body="more to fix")
+    )
+    config = RepoConfig(retry_cap=2)
+    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
+
+    # First hop: an issue one below the cap files exactly one review-fix.
+    first_body = f"the originating defect.\n\n{render_chain_depth(config.retry_cap - 1)}"
+    first = AdhocIssue.from_fetched_issue("owner/repo", 501, first_body)
+    assert first.chain_depth == config.retry_cap - 1
+
+    await reviewer.review(first, container=_DiffContainer(DEFECT_DIFF))
+    assert len(rec.created) == 1  # the fix was filed at depth retry_cap - 1
+
+    # Re-fetch the just-filed fix: rebuild the next hop through the real constructor
+    # seam from the body it was filed with (fresh GitHub number, carried depth).
+    next_body = rec.created[-1].body
+    next_hop = AdhocIssue.from_fetched_issue("owner/repo", rec.last_number, next_body)
+    assert next_hop.chain_depth == config.retry_cap  # at the cap now
+
+    # Rebuild: the next hop is at the cap, so it files no further review-fix.
+    await reviewer.review(next_hop, container=_DiffContainer(DEFECT_DIFF))
+    assert len(rec.created) == 1  # the chain terminated; nothing new filed
+
+
 @pytest.mark.asyncio
 async def test_review_fix_chain_terminates_within_the_cap() -> None:
     """AC1: a chain with a *fresh issue number per hop* terminates within the cap.

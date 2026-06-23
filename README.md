@@ -370,7 +370,10 @@ not by the issue number: each filed fix carries a `Chain-depth: <n>` line in its
 build whose issue is already at depth `retry_cap` files no more fixes — so the chain
 `#29 -> #501 -> #503 -> ...` terminates after `retry_cap` hops even though each hop is a fresh
 GitHub issue number. The bound rides the issue body and touches no shared store, so it never
-collides with triage's build-retry budget. There is no integration branch and no merge — that
+collides with triage's build-retry budget. It stays live only because the ad-hoc lane rebuilds
+each fetched issue through `AdhocIssue.from_fetched_issue`, which parses that `Chain-depth:`
+marker back into the issue — constructing the issue by hand would default every hop to depth 0
+and make the bound inert. There is no integration branch and no merge — that
 is the orchestrator lane's job. Every collaborator (planner, implementer, reviewer,
 container, auth, secret resolver, report sink) is an injected seam, so the flow is tested
 with no Agent SDK, Docker, gh, or network.

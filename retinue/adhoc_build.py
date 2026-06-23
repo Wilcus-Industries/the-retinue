@@ -33,7 +33,12 @@ from. The whole build runs in **one disposable container** that is destroyed on 
    the chain ``#29 -> #501 -> #503 -> ...`` terminates after ``retry_cap`` hops even though
    each hop is a fresh GitHub issue with its own number. This bound is self-carrying — it
    lives in the issue body, touches no shared store, and so never collides with triage's
-   build-retry budget (:func:`~retinue.triage.triage_implementer`).
+   build-retry budget (:func:`~retinue.triage.triage_implementer`). It is only *live*,
+   though, if the lane reads the marker back when it rebuilds a fetched issue: the ad-hoc
+   drain (#32) must construct each issue with :meth:`AdhocIssue.from_fetched_issue`, the
+   one constructor that parses ``Chain-depth:`` out of the fetched body into
+   :attr:`AdhocIssue.chain_depth`. Building ``AdhocIssue`` by hand instead defaults every
+   hop to depth 0 and makes the bound inert.
 
 Every side-effecting collaborator — the planner spawn, the implementer spawn, the
 reviewer, the container runtime, the auth, the secret resolver, and the report sink — is
@@ -137,6 +142,32 @@ class AdhocIssue:
     repo_full_name: str
     issue_number: int
     chain_depth: int = 0
+
+    @classmethod
+    def from_fetched_issue(
+        cls, repo_full_name: str, issue_number: int, body: str
+    ) -> AdhocIssue:
+        """Build the issue from a fetched GitHub issue, reading its lineage depth.
+
+        The canonical constructor the ad-hoc drain (:mod:`retinue.lane`'s ranked drain,
+        #32) must call instead of ``AdhocIssue(repo_full_name=..., issue_number=...)``.
+        It parses the ``Chain-depth: <n>`` marker the prior review-fix hop stamped into
+        ``body`` (:func:`parse_chain_depth`) and threads it into :attr:`chain_depth`, so
+        the #39 review-fix chain bound — which lives entirely in the issue body — is read
+        back and stops being inert. Building the issue by hand instead would default every
+        hop to depth 0, leaving the ``#29 -> #501 -> #503 -> ...`` chain unbounded.
+
+        Args:
+            repo_full_name: The target repo, e.g. ``"owner/repo"``.
+            issue_number: The fetched issue's GitHub number.
+            body: The fetched issue body; its ``Chain-depth:`` marker carries the depth
+                (a marker-less body is a chain origin, depth 0).
+        """
+        return cls(
+            repo_full_name=repo_full_name,
+            issue_number=issue_number,
+            chain_depth=parse_chain_depth(body),
+        )
 
     @property
     def branch(self) -> str:
