@@ -250,13 +250,63 @@ def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:
     kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
 
     assert kwargs["model"] == "claude-opus-4-8"
-    assert kwargs["messages"] == [
-        {"role": "user", "content": "Slice this PRD into vertical slices."}
-    ]
+    user_content = kwargs["messages"][0]["content"]
+    assert kwargs["messages"][0]["role"] == "user"
+    assert "Slice this PRD into vertical slices." in user_content
     fmt = kwargs["output_config"]["format"]
     assert fmt["type"] == "json_schema"
     assert fmt["schema"]["properties"]["slices"]["type"] == "array"
     assert kwargs["max_tokens"] > 0
+
+
+def test_request_injects_prd_testing_decisions_as_authoritative_seam() -> None:
+    """The PRD's ## Testing Decisions section is injected as the labeled testing seam.
+
+    The testing seam is read from the PRD (drift fix #6): the slicer must extract the
+    ``## Testing Decisions`` section and hand it to the model as an explicit, labeled
+    block so slices inherit the PRD's testing decisions rather than inventing their own.
+    """
+    gen = ClaudeSliceGenerator(token="sk-ant-123")
+
+    kwargs = gen._build_request_kwargs(WELL_FORMED_PRD)
+
+    user_content = kwargs["messages"][0]["content"]
+    assert "TESTING SEAM" in user_content
+    assert "Use pytest with mocked sinks; no real network in tests." in user_content
+    # The whole PRD body still reaches the model alongside the labeled seam.
+    assert "Transport spine — webhook + queue." in user_content
+
+
+def test_request_omits_testing_seam_block_when_prd_has_no_testing_decisions() -> None:
+    """A PRD without a ## Testing Decisions section carries no labeled seam block."""
+    gen = ClaudeSliceGenerator(token="sk-ant-123")
+
+    kwargs = gen._build_request_kwargs("## Slices\n\n1. Just one slice, no testing section.")
+
+    user_content = kwargs["messages"][0]["content"]
+    assert "TESTING SEAM" not in user_content
+    assert "Just one slice, no testing section." in user_content
+
+
+_TRAILING_SECTION_PRD = "## Testing Decisions\nlast section, no trailing heading."
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (WELL_FORMED_PRD, "Use pytest with mocked sinks; no real network in tests."),
+        (_TRAILING_SECTION_PRD, "last section, no trailing heading."),
+        ("no heading at all", None),
+        ("## Other\n\nstuff", None),
+    ],
+)
+def test_extract_testing_decisions_pulls_only_the_section(
+    body: str, expected: str | None
+) -> None:
+    """The extractor returns the Testing Decisions section text, or None when absent."""
+    from retinue.slicer import _extract_testing_decisions
+
+    assert _extract_testing_decisions(body) == expected
 
 
 def test_request_kwargs_carry_xhigh_effort() -> None:

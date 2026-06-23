@@ -86,6 +86,13 @@ _SLICE_SYSTEM = (
     "matching the schema; no prose."
 )
 
+# The PRD section the testing seam is read from, and the labeled block the slicer
+# wraps it in so the model honors the PRD's testing decisions instead of inventing
+# its own. The seam is read from the PRD (a locked design decision), so it is injected
+# explicitly rather than left to ride opaquely inside the body.
+_TESTING_DECISIONS_HEADING = "## Testing Decisions"
+_TESTING_SEAM_LABEL = "TESTING SEAM — read from the PRD, honor this, do not invent:"
+
 # A PRD body shorter than this (after stripping) is too thin to slice responsibly.
 _MIN_PRD_BODY_CHARS = 40
 
@@ -237,6 +244,11 @@ class ClaudeSliceGenerator:
         reasoning-effort tier via ``output_config.effort`` (Opus 4.8 removed the thinking
         ``budget_tokens`` mechanism). The effort rides the same ``output_config`` dict as
         the JSON-schema ``format`` — one output_config carries both.
+
+        The PRD's ``## Testing Decisions`` section is the authoritative testing seam, so
+        it is extracted and prepended as an explicit, labeled block instructing the model
+        to honor it; the full PRD body follows. A PRD without that section keeps the body
+        verbatim (and the caller escalates a thin/malformed PRD before reaching here).
         """
         return {
             "model": self.model,
@@ -246,7 +258,7 @@ class ClaudeSliceGenerator:
                 "effort": _EFFORT_XHIGH,
                 "format": {"type": "json_schema", "schema": _SLICE_SCHEMA},
             },
-            "messages": [{"role": "user", "content": prd_body}],
+            "messages": [{"role": "user", "content": _build_user_content(prd_body)}],
         }
 
     @staticmethod
@@ -278,6 +290,40 @@ class ClaudeSliceGenerator:
                 )
             )
         return SlicePlan(slices=slices)
+
+
+def _build_user_content(prd_body: str) -> str:
+    """Compose the slice request's user message: the testing seam, then the PRD body.
+
+    When the PRD carries a ``## Testing Decisions`` section, its text is prepended as an
+    explicit, labeled block (see :data:`_TESTING_SEAM_LABEL`) so the model honors the
+    PRD's testing decisions instead of inventing its own; the full body still follows so
+    the slicer sees the whole PRD. A PRD without that section yields the body verbatim.
+    """
+    decisions = _extract_testing_decisions(prd_body)
+    if decisions is None:
+        return prd_body
+    return f"{_TESTING_SEAM_LABEL}\n{decisions}\n\n{prd_body}"
+
+
+def _extract_testing_decisions(prd_body: str) -> str | None:
+    """Return the text of the PRD's ``## Testing Decisions`` section, or ``None``.
+
+    The section runs from its heading to the next ``## `` heading (or end of body); the
+    returned text is stripped. ``None`` means the PRD has no such section, so the caller
+    leaves the body untouched rather than fabricating a testing seam.
+    """
+    lines = prd_body.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == _TESTING_DECISIONS_HEADING:
+            section: list[str] = []
+            for body_line in lines[index + 1 :]:
+                if body_line.startswith("## "):
+                    break
+                section.append(body_line)
+            text = "\n".join(section).strip()
+            return text or None
+    return None
 
 
 def _first_text(content: list[Any]) -> str:
