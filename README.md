@@ -67,7 +67,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   into `.retinue/plan.md`, run the same implementer the PRD lane uses — pointed at that
   plan file via its `plan_path` so it reads the plan first — on an `issue-<N>` branch cut
   off `config.staging_branch`, gate on `run_done_check`, and push the branch only when
-  green (a red check pushes nothing). No integration branch, no merge.
+  green (a red check pushes nothing). On a green build the injected `AdhocReviewer`
+  (`ContainerAdhocReviewer`) reviews the `issue-<N>` diff and files each finding as a flat
+  `review-fix` + `ready-for-agent` follow-up that loops back as ordinary ad-hoc work; the
+  review is advisory (never blocks the build/push) and the review-fix chain is bounded by
+  the per-unit retry cap. No integration branch, no merge.
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
@@ -353,10 +357,18 @@ maps the code with an Explore subagent and emits a plan), **materializes** that 
 `.retinue/plan.md` via its `plan_path` so it reads the plan first — to build and commit on
 an `issue-<N>` branch cut off `config.staging_branch`. The repo's done-check
 runs in the same container; a green check pushes the branch (for a human to open a PR
-from), a red check pushes nothing. There is no integration branch and no merge — that is
-the orchestrator lane's job. Every collaborator (planner, implementer, container, auth,
-secret resolver, report sink) is an injected seam, so the flow is tested with no Agent
-SDK, Docker, gh, or network.
+from), a red check pushes nothing. On a green build only, the injected `AdhocReviewer`
+(`ContainerAdhocReviewer`) runs the third pass: it diffs the `issue-<N>` branch over the
+staging base in the same container, runs the internal reviewer (Opus/`max`) over that diff,
+and files each finding as a **flat** `review-fix` + `ready-for-agent` follow-up issue (no
+`Part of #` footer, no Blocked-by wiring — ad-hoc work has no parent PRD) that loops back as
+ordinary ad-hoc work. The review is **advisory**: it never blocks the build or the push, and
+any error it raises is swallowed. The review-fix chain is bounded by the **per-unit retry
+cap** (the same persisted `ImplRetryStore` counter triage uses), so a review-fix issue
+cannot spawn review fixes without limit. There is no integration branch and no merge — that
+is the orchestrator lane's job. Every collaborator (planner, implementer, reviewer,
+container, auth, secret resolver, report sink) is an injected seam, so the flow is tested
+with no Agent SDK, Docker, gh, or network.
 
 `retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
 loose `backlog` issues **one at a time**. Each tick runs under an injected single-run

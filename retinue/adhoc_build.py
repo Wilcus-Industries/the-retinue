@@ -1,4 +1,4 @@
-"""Ad-hoc build primitive: plan -> materialize -> implement -> commit, gated on done-check.
+"""Ad-hoc build primitive: plan -> materialize -> implement -> review, gated on done-check.
 
 The ad-hoc lane (:mod:`retinue.lane`) routes a standalone ``ready-for-agent`` issue — one
 with no ``Part of #<prd>`` link — here. Unlike a PRD slice there is no integration branch
@@ -21,15 +21,24 @@ from. The whole build runs in **one disposable container** that is destroyed on 
 5. **done-check** — the repo's done-check runs in the *same* container over the real
    changes, and the outcome is posted to the report sink,
 6. **push** — only on a green done-check is ``issue-<N>`` pushed to origin; a red check
-   pushes nothing.
+   pushes nothing,
+7. **review** — after a green push, the internal reviewer (the
+   :data:`~retinue.roles.Role.REVIEWER` Opus role) reviews the ``issue-<N>`` diff and
+   files each finding as a flat ``review-fix`` + ``ready-for-agent`` follow-up issue that
+   loops back as ordinary ad-hoc work. The review is **advisory**: it never blocks the
+   build or the push, and any error it raises is swallowed. The review-fix chain is bounded
+   by the per-unit retry cap (the same persisted counter triage uses), so a review-fix
+   issue cannot spawn review fixes without limit.
 
 Every side-effecting collaborator — the planner spawn, the implementer spawn, the
-container runtime, the auth, the secret resolver, and the report sink — is injected, so
-the whole flow is exercised in tests with no Agent SDK, no Docker, no gh, and no network.
-The container/git/done-check/credential mechanics are reused wholesale from
-:mod:`retinue.orchestrator` and :mod:`retinue.done_check`; this module only adds the
-planner seam, the plan materialization, threading :data:`PLAN_FILE` into the implementer
-as its ``plan_path``, and the no-merge plan->execute ordering.
+reviewer, the container runtime, the auth, the secret resolver, and the report sink — is
+injected, so the whole flow is exercised in tests with no Agent SDK, no Docker, no gh, and
+no network. The container/git/done-check/credential mechanics are reused wholesale from
+:mod:`retinue.orchestrator` and :mod:`retinue.done_check`, and the review filing reuses the
+internal reviewer's :class:`~retinue.reviewer.ReviewGenerator` seam, ``review-fix`` label,
+and gh issue creator; this module only adds the planner seam, the plan materialization,
+threading :data:`PLAN_FILE` into the implementer as its ``plan_path``, the no-merge
+plan->execute ordering, and the advisory, retry-cap-bounded third review pass.
 """
 
 from __future__ import annotations
@@ -49,6 +58,7 @@ from retinue.done_check import (
     run_done_check_commands,
 )
 from retinue.github_app import InstallationAuth
+from retinue.impl_retry import ImplRetryStore, impl_retry_key
 from retinue.orchestrator import (
     _GIT_COMMITTER_ENV,
     Implementer,
@@ -59,6 +69,14 @@ from retinue.orchestrator import (
     _write_file_command,
 )
 from retinue.repo_config import RepoConfig
+from retinue.reviewer import (
+    READY_LABEL,
+    REVIEW_FIX_LABEL,
+    IssueCreator,
+    IssueDraft,
+    ReviewGenerator,
+    ReviewInput,
+)
 from retinue.roles import Role, planner_cli_argv, resolve_model
 
 logger = logging.getLogger(__name__)
@@ -184,6 +202,144 @@ class ContainerPlanner:
         return _implement_env(self.credential, self.auth_mode)
 
 
+class AdhocReviewer(Protocol):
+    """Reviews a freshly-built ``issue-<N>`` diff and files review-fix follow-ups.
+
+    The third pass of the ad-hoc build. After a green build pushes ``issue-<N>``, the
+    orchestration hands the issue and the build container here; a production
+    implementation diffs the issue branch over the staging base, runs the internal
+    reviewer over that diff, and files each finding as a flat ``review-fix`` +
+    ``ready-for-agent`` follow-up issue (no ``Part of #`` footer — ad-hoc work has no
+    parent PRD — and no Blocked-by wiring; the fix loops back as ordinary ad-hoc work).
+    The review is advisory: :func:`build_adhoc_issue` swallows whatever ``review`` raises
+    so a reviewer error never undoes the green build or its push. Tests inject a fake that
+    records the request without the Agent SDK, gh, or network.
+    """
+
+    async def review(self, issue: AdhocIssue, *, container: Container) -> None:
+        """Review ``issue``'s diff in ``container`` and file review-fix follow-ups."""
+        ...
+
+    def auth_env(self) -> dict[str, str]:
+        """The credential env merged into the build container at start, for symmetry."""
+        ...
+
+
+def _issue_diff_command(branch: str, base: str) -> list[str]:
+    """Argv for the diff a freshly-built ``branch`` contributed over the staging ``base``.
+
+    Uses the three-dot form (``base...branch``) so the diff is the issue branch's own
+    contribution since it was cut off the staging base — the work the build produced —
+    rather than also folding in whatever else advanced staging in parallel. The branch is
+    the *local* ``issue-<N>`` ref the build just committed to (no ``origin/`` prefix): the
+    review runs in the same container that built it, so the local tip is the surface to
+    review.
+    """
+    return ["git", "diff", f"{base}...{branch}"]
+
+
+@dataclass(frozen=True)
+class ContainerAdhocReviewer:
+    """Real :class:`AdhocReviewer`: review the issue diff and file flat review-fix issues.
+
+    Satisfies the reviewer protocol ``review(issue, *, container) -> None`` so it drops in
+    where the fake sits in tests and at the wiring site. The flow reuses the internal
+    reviewer wholesale:
+
+    1. diff the ``issue-<N>`` branch over ``config.staging_branch`` inside the build
+       container (the same container that built it, so the local tip is reviewed),
+    2. run the injected :class:`~retinue.reviewer.ReviewGenerator` (the headless Agent-SDK
+       reviewer, Opus/max) over that diff, and
+    3. file each finding via the injected :class:`~retinue.slicer.IssueCreator` (gh) as a
+       flat ``review-fix`` + ``ready-for-agent`` issue — no ``Part of #`` footer and no
+       Blocked-by wiring, since ad-hoc work has no parent PRD; the fix loops back as
+       ordinary ad-hoc work.
+
+    The review-fix chain is bounded by the **per-unit retry cap**: the reviewer reuses the
+    persisted :class:`~retinue.impl_retry.ImplRetryStore` keyed by the issue's
+    :func:`~retinue.impl_retry.impl_retry_key`. A unit that has already spent its
+    ``config.retry_cap`` review budget files nothing more, so a review-fix issue cannot
+    spawn review fixes without limit. A review that files at least one fix records one
+    attempt against the cap; a clean review consumes no budget.
+
+    Attributes:
+        repo_full_name: The target repo the review-fix issues are filed against.
+        config: The accepted repo config; ``staging_branch`` is the diff base and
+            ``retry_cap`` bounds the review-fix chain.
+        generate: The headless Agent-SDK reviewer (the :class:`ReviewGenerator` seam).
+        create_issue: The gh issue creator filing each flat review-fix issue (slicer's
+            seam, reused from the internal reviewer).
+        retry_store: The persisted per-unit attempt counter bounding the chain.
+        credential: The reviewing model's credential; for seam symmetry with the planner
+            and implementer (the generator holds its own credential over HTTP).
+        auth_mode: ``"api_key"`` or ``"subscription"``; routes :meth:`auth_env`.
+    """
+
+    repo_full_name: str
+    config: RepoConfig
+    generate: ReviewGenerator
+    create_issue: IssueCreator
+    retry_store: ImplRetryStore
+    credential: str = ""
+    auth_mode: str = "api_key"
+
+    async def review(self, issue: AdhocIssue, *, container: Container) -> None:
+        """Review ``issue``'s diff and file each finding as a flat review-fix issue."""
+        key = impl_retry_key(_slice_for_issue(issue))
+        spent = await self.retry_store.count(key)
+        if spent >= self.config.retry_cap:
+            # The unit has spent its whole review budget; do not file more fixes — this
+            # bounds the review-fix chain so it cannot loop without limit.
+            logger.info(
+                "Skipping ad-hoc review of %s: retry budget spent (%d/%d)",
+                issue.branch,
+                spent,
+                self.config.retry_cap,
+            )
+            return
+        diff = await self._issue_diff(issue, container)
+        plan = await self.generate(
+            ReviewInput(
+                repo_full_name=self.repo_full_name,
+                prd_number=issue.issue_number,
+                merged_issues=[],
+                diff=diff,
+            )
+        )
+        if not plan.findings:
+            logger.info("Ad-hoc review of %s found nothing to fix", issue.branch)
+            return
+        for finding in plan.findings:
+            await self.create_issue(
+                IssueDraft(
+                    title=finding.title,
+                    body=finding.body.rstrip(),
+                    labels=[READY_LABEL, REVIEW_FIX_LABEL],
+                )
+            )
+        # One review pass that filed fixes spends one unit of the retry budget, so a
+        # review-fix issue that loops back gets at most ``retry_cap`` review passes.
+        await self.retry_store.record_attempt(key)
+        logger.info(
+            "Ad-hoc review of %s filed %d review-fix follow-up(s)",
+            issue.branch,
+            len(plan.findings),
+        )
+
+    async def _issue_diff(self, issue: AdhocIssue, container: Container) -> str:
+        """Return the issue branch's contribution over the staging base, from the build."""
+        result = await container.run_command(
+            _issue_diff_command(issue.branch, self.config.staging_branch)
+        )
+        return result.stdout
+
+    def auth_env(self) -> dict[str, str]:
+        """The credential env the orchestration merges into the build container at start."""
+        if not self.credential:
+            return {}
+        return _implement_env(self.credential, self.auth_mode)
+
+
 @dataclass(frozen=True)
 class AdhocBuildResult:
     """Result of building one ad-hoc issue.
@@ -209,16 +365,17 @@ async def build_adhoc_issue(
     runtime: ContainerRuntime,
     resolve_secret: SecretResolver,
     report: ReportSink,
+    reviewer: AdhocReviewer | None = None,
     image: str = DEFAULT_IMAGE,
 ) -> AdhocBuildResult:
-    """Build one ad-hoc issue in one container: plan -> materialize -> implement -> push.
+    """Build one ad-hoc issue in one container: plan -> implement -> push -> review.
 
     Runs the whole build in a single disposable container, destroyed on every path:
 
     1. parse the done-check and resolve the config's secrets (a missing one escalates on
        the report sink and propagates *before* any container starts),
-    2. start the container with the secrets, the git committer identity, and *both* the
-       planner's and the implementer's credential env (the env is fixed at ``start``),
+    2. start the container with the secrets, the git committer identity, and the planner's,
+       the implementer's, and the reviewer's credential env (the env is fixed at ``start``),
     3. clone the repo and check out a fresh ``issue-<N>`` branch off ``config.staging_branch``,
     4. run the read-only planner to produce a plan, captured from its output,
     5. materialize the plan into :data:`PLAN_FILE` for the implementer to read,
@@ -226,7 +383,11 @@ async def build_adhoc_issue(
        the plan first — to build and commit the issue on ``issue-<N>``,
     7. run the done-check over the real changes and post the outcome,
     8. push ``issue-<N>`` to origin only when the done-check is green (a red build pushes
-       nothing).
+       nothing),
+    9. on a green build only, run the injected ``reviewer`` (when present) over the
+       ``issue-<N>`` diff to file review-fix follow-ups. The review is **advisory**: any
+       error it raises is logged and swallowed so it never undoes the green build or its
+       push, and a red build is never reviewed (there is no built work to review).
 
     Args:
         issue: The ad-hoc issue to build (repo, issue number).
@@ -239,6 +400,8 @@ async def build_adhoc_issue(
         runtime: Spawns the disposable build container (the Docker seam).
         resolve_secret: Resolves the config's declared secret names/refs to values.
         report: Sink the done-check outcome is posted to (commit status / comment).
+        reviewer: The internal reviewer run after a green build (the reviewer seam);
+            absent means no third review pass (and no review-fix follow-ups).
         image: Container image the build runs in.
 
     Returns:
@@ -247,7 +410,8 @@ async def build_adhoc_issue(
 
     Raises:
         Propagates whatever the build container raises (e.g. a missing secret, a clone
-        failure, or a :class:`PlanError` from the planner exec).
+        failure, or a :class:`PlanError` from the planner exec). The advisory review pass
+        is the one step that never propagates: its errors are swallowed.
     """
     commands = parse_done_check(claude_md)
     env = await resolve_secrets_or_escalate(
@@ -258,6 +422,7 @@ async def build_adhoc_issue(
         **_GIT_COMMITTER_ENV,
         **planner.auth_env(),
         **implementer.auth_env(),
+        **(reviewer.auth_env() if reviewer is not None else {}),
     }
     token = await auth.installation_token(issue.repo_full_name)
     container = await runtime.start(image=image, env=start_env)
@@ -289,11 +454,35 @@ async def build_adhoc_issue(
             issue.branch,
             "passed" if passed else "failed",
         )
+        if passed and reviewer is not None:
+            await _review_advisory(reviewer, issue, container)
         return AdhocBuildResult(branch=issue.branch, passed=passed)
     finally:
         # Guaranteed teardown: the disposable container is destroyed on every path,
         # including when clone, plan, implement, the done-check, or push raises.
         await container.destroy()
+
+
+async def _review_advisory(
+    reviewer: AdhocReviewer, issue: AdhocIssue, container: Container
+) -> None:
+    """Run the third review pass, swallowing any error so it never blocks the build.
+
+    The review is advisory — it files review-fix follow-ups but must not undo the green
+    build or its push — so a reviewer failure is logged and dropped rather than propagated
+    out of :func:`build_adhoc_issue`. The container is still torn down by the build's
+    ``finally`` regardless.
+    """
+    try:
+        await reviewer.review(issue, container=container)
+    except Exception:
+        # Review is advisory: never let it block the build/PR path. KeyboardInterrupt/
+        # SystemExit are not caught — only Exception — so process control still propagates.
+        logger.warning(
+            "Ad-hoc review of %s failed; continuing (review is advisory)",
+            issue.branch,
+            exc_info=True,
+        )
 
 
 async def _materialize_plan(container: Container, plan: str) -> None:

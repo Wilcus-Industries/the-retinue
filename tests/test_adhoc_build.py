@@ -15,6 +15,7 @@ done-check pushes nothing.
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 
 import pytest
 
@@ -22,9 +23,12 @@ from retinue.adhoc_build import (
     PLAN_FILE,
     AdhocBuildResult,
     AdhocIssue,
+    AdhocReviewer,
+    ContainerAdhocReviewer,
     ContainerPlanner,
     PlanError,
     Planner,
+    _issue_diff_command,
     _materialize_plan_command,
     _plan_prompt,
     _slice_for_issue,
@@ -32,8 +36,18 @@ from retinue.adhoc_build import (
 )
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport
+from retinue.impl_retry import ImplRetryStore, impl_retry_key
 from retinue.orchestrator import Implementer, Slice, _implement_prompt
 from retinue.repo_config import RepoConfig
+from retinue.reviewer import (
+    READY_LABEL,
+    REVIEW_FIX_LABEL,
+    CreatedIssue,
+    IssueDraft,
+    ReviewFinding,
+    ReviewInput,
+    ReviewPlan,
+)
 from retinue.roles import Role, planner_cli_argv, resolve_model
 from tests.test_done_check import (
     CLAUDE_MD,
@@ -92,6 +106,7 @@ async def _build(
     config: RepoConfig | None = None,
     captured: list[DoneCheckReport] | None = None,
     issue: AdhocIssue | None = None,
+    reviewer: AdhocReviewer | None = None,
 ) -> AdhocBuildResult:
     return await build_adhoc_issue(
         issue or _issue(),
@@ -103,6 +118,7 @@ async def _build(
         runtime=runtime,
         resolve_secret=_resolver({}),
         report=_sink(captured if captured is not None else []),
+        reviewer=reviewer,
     )
 
 
@@ -327,3 +343,263 @@ def test_container_planner_routes_subscription_credential() -> None:
     """A subscription auth mode threads the credential as the OAuth env var."""
     planner = ContainerPlanner(credential="tok", auth_mode="subscription")
     assert planner.auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+
+
+# --- the third pass: the internal reviewer reviews the issue-N diff ----------------
+
+
+class _ReviewRecorder:
+    """Records the reviewer's calls and the issues it filed for assertions."""
+
+    def __init__(self) -> None:
+        self.reviewed: list[AdhocIssue] = []
+        self.created: list[IssueDraft] = []
+        self._next_number = 500
+
+    async def review(self, issue: AdhocIssue, *, container: Container) -> None:
+        self.reviewed.append(issue)
+        await container.run_command(["review", issue.branch])
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
+
+    async def create_issue(self, draft: IssueDraft) -> CreatedIssue:
+        self._next_number += 1
+        self.created.append(draft)
+        return CreatedIssue(issue_number=self._next_number)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_runs_after_a_green_build() -> None:
+    """AC1: after a green build, the reviewer reviews the issue-N diff in-container."""
+    reviewer = _ReviewRecorder()
+    runtime = FakeRuntime()
+
+    await _build(runtime=runtime, reviewer=reviewer)
+
+    assert reviewer.reviewed == [_issue()]
+    # The review runs after the implementer and after the green push.
+    impl_idx = runtime.log.index("run:implement issue-29")
+    push_idx = runtime.log.index("run:git push origin issue-29")
+    review_idx = runtime.log.index("run:review issue-29")
+    assert impl_idx < review_idx
+    assert push_idx < review_idx
+
+
+@pytest.mark.asyncio
+async def test_reviewer_does_not_run_on_a_red_build() -> None:
+    """A red done-check skips the reviewer — there is no build to review."""
+    reviewer = _ReviewRecorder()
+    runtime = FakeRuntime(results={"uv": RunResult(exit_code=1, stderr="boom")})
+
+    result = await _build(runtime=runtime, reviewer=reviewer)
+
+    assert result.passed is False
+    assert reviewer.reviewed == []
+
+
+@pytest.mark.asyncio
+async def test_review_never_blocks_the_build_or_push() -> None:
+    """AC3: a reviewer that raises does not undo the green build or its push."""
+
+    class ExplodingReviewer:
+        async def review(self, issue: AdhocIssue, *, container: Container) -> None:
+            raise RuntimeError("reviewer blew up")
+
+        def auth_env(self) -> dict[str, str]:
+            return {}
+
+    runtime = FakeRuntime()
+    captured: list[DoneCheckReport] = []
+
+    result = await _build(
+        runtime=runtime, reviewer=ExplodingReviewer(), captured=captured
+    )
+
+    # The build still passed and the branch was still pushed — review is advisory.
+    assert result.passed is True
+    assert "run:git push origin issue-29" in runtime.log
+    assert [r.passed for r in captured] == [True]
+    # The container is still torn down on the swallowed-error path.
+    assert runtime.container is not None
+    assert runtime.container.destroyed is True
+
+
+@pytest.mark.asyncio
+async def test_reviewer_credentials_are_injected_at_start() -> None:
+    """The reviewer's auth env rides the build container at start, like the others."""
+
+    class CredReviewer(_ReviewRecorder):
+        def auth_env(self) -> dict[str, str]:
+            return {"REVIEWER_TOKEN": "r"}
+
+    runtime = FakeRuntime()
+    await _build(runtime=runtime, reviewer=CredReviewer())
+
+    assert runtime.started_env is not None
+    assert runtime.started_env["REVIEWER_TOKEN"] == "r"
+
+
+@pytest.mark.asyncio
+async def test_no_reviewer_runs_no_review_pass() -> None:
+    """An absent reviewer seam leaves the two-pass build unchanged (no review pass)."""
+    runtime = FakeRuntime()
+
+    result = await _build(runtime=runtime, reviewer=None)
+
+    assert result.passed is True
+    assert not any(event.startswith("run:review") for event in runtime.log)
+
+
+# --- ContainerAdhocReviewer: the real reviewer adapter ----------------------------
+
+
+class _DiffContainer:
+    """A container that scripts the diff stdout and records every command."""
+
+    def __init__(self, diff: str) -> None:
+        self._diff = diff
+        self.commands: list[list[str]] = []
+
+    async def run_command(self, command: list[str]) -> RunResult:
+        self.commands.append(command)
+        if command[:2] == ["git", "diff"]:
+            return RunResult(exit_code=0, stdout=self._diff)
+        return RunResult(exit_code=0)
+
+    async def destroy(self) -> None:  # pragma: no cover - unused here
+        pass
+
+
+DEFECT_DIFF = """\
+diff --git a/retinue/widget.py b/retinue/widget.py
++def total(items):
++    return sum(items) + 1  # planted off-by-one
+"""
+
+
+def _finding_generator(*findings: ReviewFinding):
+    captured: list[ReviewInput] = []
+
+    async def generate(review_input: ReviewInput) -> ReviewPlan:
+        captured.append(review_input)
+        return ReviewPlan(findings=list(findings))
+
+    return generate, captured
+
+
+def _reviewer(
+    *,
+    generate,
+    create_issue,
+    retry_store: ImplRetryStore,
+    config: RepoConfig | None = None,
+) -> ContainerAdhocReviewer:
+    return ContainerAdhocReviewer(
+        repo_full_name="owner/repo",
+        config=config or RepoConfig(),
+        generate=generate,
+        create_issue=create_issue,
+        retry_store=retry_store,
+    )
+
+
+def test_issue_diff_command_uses_the_three_dot_diff_over_staging() -> None:
+    """The issue diff is the branch's own contribution since it left the staging base."""
+    command = _issue_diff_command("issue-29", "staging")
+    assert command == ["git", "diff", "staging...issue-29"]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_files_each_finding_as_a_flat_review_fix_issue(
+    tmp_path: Path,
+) -> None:
+    """AC2: each finding is filed as a flat ``review-fix`` + ``ready-for-agent`` issue.
+
+    Flat = no ``Part of #`` footer (ad-hoc work has no parent PRD) and no Blocked-by
+    wiring; the fix loops back as ordinary ad-hoc work.
+    """
+    rec = _ReviewRecorder()
+    generate, captured = _finding_generator(
+        ReviewFinding(title="Fix off-by-one", body="total() adds a stray +1."),
+        ReviewFinding(title="Stale doc", body="README still claims X."),
+    )
+    store = ImplRetryStore(tmp_path / "retries.sqlite3")
+    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, retry_store=store)
+    container = _DiffContainer(DEFECT_DIFF)
+
+    await reviewer.review(_issue(29), container=container)
+
+    # The reviewer reviewed the issue-29 diff over the staging branch.
+    assert ["git", "diff", "staging...issue-29"] in container.commands
+    assert captured[0].diff == DEFECT_DIFF
+    # Two findings -> two flat review-fix issues.
+    assert len(rec.created) == 2
+    for draft in rec.created:
+        assert REVIEW_FIX_LABEL in draft.labels
+        assert READY_LABEL in draft.labels
+        # Flat: no PRD back-link footer on an ad-hoc review-fix.
+        assert "Part of #" not in draft.body
+
+
+@pytest.mark.asyncio
+async def test_clean_review_files_nothing(tmp_path: Path) -> None:
+    """A clean review (no findings) files no issue and records no retry attempt."""
+    rec = _ReviewRecorder()
+    generate, _ = _finding_generator()  # no findings
+    store = ImplRetryStore(tmp_path / "retries.sqlite3")
+    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, retry_store=store)
+
+    await reviewer.review(_issue(29), container=_DiffContainer(""))
+
+    assert rec.created == []
+    # No findings means no attempt was consumed against the cap.
+    assert await store.count(impl_retry_key(_slice_for_issue(_issue(29)))) == 0
+
+
+@pytest.mark.asyncio
+async def test_review_fix_chain_is_bounded_by_the_retry_cap(tmp_path: Path) -> None:
+    """AC4: once the issue has spent its retry budget, the review files no more fixes.
+
+    The per-unit retry cap (the same persisted counter triage uses) bounds how many
+    review passes one unit may spend filing fixes, so a review-fix issue cannot spawn
+    review fixes without limit.
+    """
+    rec = _ReviewRecorder()
+    generate, _ = _finding_generator(
+        ReviewFinding(title="Another fix", body="more to fix")
+    )
+    store = ImplRetryStore(tmp_path / "retries.sqlite3")
+    config = RepoConfig(retry_cap=2)
+    reviewer = _reviewer(
+        generate=generate, create_issue=rec.create_issue, retry_store=store, config=config
+    )
+    issue = _issue(29)
+
+    # Each review that files fixes consumes one unit of the retry budget.
+    await reviewer.review(issue, container=_DiffContainer(DEFECT_DIFF))
+    await reviewer.review(issue, container=_DiffContainer(DEFECT_DIFF))
+    assert len(rec.created) == 2  # two passes, cap=2 — budget now spent
+
+    # The third pass is over budget: the reviewer files nothing more (chain bounded).
+    rec.created.clear()
+    await reviewer.review(issue, container=_DiffContainer(DEFECT_DIFF))
+    assert rec.created == []
+
+
+@pytest.mark.asyncio
+async def test_reviewer_credential_rides_the_auth_env(tmp_path: Path) -> None:
+    """The reviewer's credential is threaded as the container's auth env."""
+    rec = _ReviewRecorder()
+    generate, _ = _finding_generator()
+    store = ImplRetryStore(tmp_path / "retries.sqlite3")
+    reviewer = ContainerAdhocReviewer(
+        repo_full_name="owner/repo",
+        config=RepoConfig(),
+        generate=generate,
+        create_issue=rec.create_issue,
+        retry_store=store,
+        credential="tok",
+        auth_mode="subscription",
+    )
+    assert reviewer.auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
