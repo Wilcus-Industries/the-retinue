@@ -414,6 +414,27 @@ class BudgetGovernor:
             return GateDecision(deferred=True, defer_until=defer_until)
         return GateDecision(deferred=False, defer_until=None)
 
+    async def meter_adhoc(self, *, amount: float) -> bool:
+        """Meter one ad-hoc build's flat charge against the shared rolling-24h cap.
+
+        The ad-hoc lane has no PRD slice set to checkpoint, so it never pauses+resumes
+        the PRD way; it just charges the *same* service-level ledger the PRD lane meters,
+        atomically. A charge that still fits under the cap is recorded and the build is
+        admitted; one that would cross it records nothing and the build is declined. The
+        check-and-record is the identical atomic primitive the PRD :meth:`meter` uses
+        (:meth:`BudgetLedger.try_record_if_within_cap`), so an ad-hoc build and a PRD meter
+        racing on the shared ledger serialize on the write lock and the cap is never
+        overshot.
+
+        Args:
+            amount: The build's charge in the ledger's unit (dollars or tokens).
+
+        Returns:
+            True when the charge fit under the cap and was recorded (build admitted);
+            False when the shared window leaves no room (build declined, nothing written).
+        """
+        return await self._ledger.try_record_if_within_cap(amount=amount)
+
     async def meter(
         self,
         *,

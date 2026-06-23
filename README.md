@@ -74,13 +74,19 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   `Chain-depth: <n>` lineage marker on each filed fix (not a shared store), so it terminates
   at `retry_cap` hops without colliding with triage's build-retry budget. No integration
   branch, no merge.
-- `retinue.adhoc_drain` — `run_adhoc_drain`, the ad-hoc lane's per-repo drain: list every
-  open `ready-for-agent` non-PRD issue via the gh seam (`GhCli`, surfacing each issue's
-  body), keep only the ad-hoc lane (drop `prd`-labeled and `Part of #<prd>` issues, mirroring
-  `lane.classify`), rank by `priority:<sev>` (no-priority lowest), then drive the
+- `retinue.adhoc_drain` — `run_adhoc_drain`, the ad-hoc lane's per-repo drain, hardened for
+  production: list every open `ready-for-agent` non-PRD issue via the gh seam (`GhCli`,
+  surfacing each issue's body), keep only the ad-hoc lane (drop `prd`-labeled and
+  `Part of #<prd>` issues, mirroring `lane.classify`), rank by `priority:<sev>` (no-priority
+  lowest), **dedup** against GitHub truth (skip any issue whose `issue-<N>` branch or open PR
+  exists, via `AdhocGh.in_flight`, mirroring `reconcile`), then drive the
   `build_adhoc_issue` + `process_adhoc_pr` primitive for each up to `config.max_parallel`.
-  Each issue is rebuilt through `AdhocIssue.from_fetched_issue` (fed the fetched body) so the
-  `Chain-depth:` marker is read back and the review-fix chain bound stays live.
+  The whole drain runs under its own **single-run lock** (`AdhocDrainBusyError`, separate
+  from the PRD lock so it runs alongside a PRD build), each build **meters** the one shared
+  `BudgetGovernor`, and **PRD-first ordering** holds — except a `priority:critical|high`
+  issue preempts when a PRD is in flight. Each issue is rebuilt through
+  `AdhocIssue.from_fetched_issue` (fed the fetched body) so the `Chain-depth:` marker is read
+  back and the review-fix chain bound stays live.
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
@@ -407,9 +413,22 @@ issue, concurrently but capped at `config.max_parallel` live builds. Each issue 
 materialized through `AdhocIssue.from_fetched_issue` fed the **fetched body**, never the bare
 constructor, so the `Chain-depth:` lineage marker is read back into `chain_depth` and the
 review-fix chain bound stays live — building the issue by hand would default every hop to
-depth 0 and make the bound inert. No dedup/locking/budget hardening yet (that is the next
-slice). The gh query and the downstream build are injected and faked, so the drain runs with
-no real `gh`, no Docker, and no network.
+depth 0 and make the bound inert.
+
+The drain is hardened for production with four guards. **Dedup via GitHub truth**:
+`AdhocGh.in_flight` skips any issue whose `issue-<N>` branch or open PR already exists
+(mirroring `reconcile`'s source-of-truth approach), so no duplicate branch or PR is opened.
+**Single-run lock**: the whole drain runs under an injected lock so two drains for a repo
+never overlap (a second entry raises `AdhocDrainBusyError`); the lock is *separate* from the
+orchestrator's, so the drain still runs alongside a PRD build. **Shared budget governor**:
+every build meters against the *one* service-level `BudgetGovernor` the PRD lane uses
+(`meter_adhoc`, the same atomic check-and-record as the PRD meter), so a build that would
+cross the rolling-24h cap is skipped and the shared budget is never overshot. **PRD-first
+ordering with preemption**: when a PRD build is in flight, only a `priority:critical|high`
+issue (the rule `lane.preempts_prd_first` is the single source of truth for) builds —
+ordinary ad-hoc work waits for the PRD. The gh queries, the budget store, and the downstream
+build are all injected and faked, so the drain runs with no real `gh`, no Docker, and no
+network.
 
 `retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
 loose `backlog` issues **one at a time**. Each tick runs under an injected single-run
