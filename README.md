@@ -74,6 +74,13 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   `Chain-depth: <n>` lineage marker on each filed fix (not a shared store), so it terminates
   at `retry_cap` hops without colliding with triage's build-retry budget. No integration
   branch, no merge.
+- `retinue.adhoc_drain` — `run_adhoc_drain`, the ad-hoc lane's per-repo drain: list every
+  open `ready-for-agent` non-PRD issue via the gh seam (`GhCli`, surfacing each issue's
+  body), keep only the ad-hoc lane (drop `prd`-labeled and `Part of #<prd>` issues, mirroring
+  `lane.classify`), rank by `priority:<sev>` (no-priority lowest), then drive the
+  `build_adhoc_issue` + `process_adhoc_pr` primitive for each up to `config.max_parallel`.
+  Each issue is rebuilt through `AdhocIssue.from_fetched_issue` (fed the fetched body) so the
+  `Chain-depth:` marker is read back and the review-fix chain bound stays live.
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
@@ -388,6 +395,21 @@ keyed by the single ad-hoc issue (no PRD parent, no slice children), so the PR d
 existing `process_review` heimdall loopback and `test-and-merge` handoff, and on the human's
 merge the unchanged `reap_pr` reaps the single ad-hoc issue closed (there is no PRD to reap).
 "The retinue never merges" — only a human merges; the reap reacts to that merge.
+
+`retinue.adhoc_drain.run_adhoc_drain` ties the ad-hoc lane together — one drain per repo. It
+**lists** every open `ready-for-agent` issue via the gh seam (`GhCli`, which surfaces each
+issue's `body` alongside its labels), **filters** to the ad-hoc lane the same way
+`lane.classify` decides it — dropping any `prd`-labeled issue and any issue carrying a
+`Part of #<prd>` link, since those route to the orchestrator lane — and **ranks** the
+survivors by `priority:<sev>` with no-priority lowest. It then **drives** the
+`build_adhoc_issue` + `process_adhoc_pr` primitive (one injected callable) for each ranked
+issue, concurrently but capped at `config.max_parallel` live builds. Each issue is
+materialized through `AdhocIssue.from_fetched_issue` fed the **fetched body**, never the bare
+constructor, so the `Chain-depth:` lineage marker is read back into `chain_depth` and the
+review-fix chain bound stays live — building the issue by hand would default every hop to
+depth 0 and make the bound inert. No dedup/locking/budget hardening yet (that is the next
+slice). The gh query and the downstream build are injected and faked, so the drain runs with
+no real `gh`, no Docker, and no network.
 
 `retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
 loose `backlog` issues **one at a time**. Each tick runs under an injected single-run

@@ -235,12 +235,13 @@ def _list_backlog_argv(repo_full_name: str, *, limit: int) -> list[str]:
     ]
 
 
-def _parse_backlog(stdout: bytes) -> list[BacklogIssue]:
-    """Parse a ``gh issue list --json`` payload into :class:`BacklogIssue` objects.
+def _parse_json_array(stdout: bytes) -> list[object]:
+    """Parse a ``gh issue list --json`` payload into its JSON array of issue entries.
 
-    ``gh`` emits a JSON array of objects, each with ``number``, ``createdAt`` (an ISO-8601
-    timestamp, ``Z``-suffixed UTC), and ``labels`` (a list of ``{"name": ...}`` objects).
-    A malformed payload raises :class:`ValueError` rather than silently dropping issues.
+    ``gh`` emits a JSON array of objects; a payload that is not valid JSON or not an array
+    raises :class:`ValueError` rather than silently yielding nothing. Shared with the
+    ad-hoc drain's :class:`retinue.adhoc_drain.GhCli` so both gh listers parse the array
+    envelope identically; each lister maps the entries into its own issue dataclass.
     """
     try:
         payload = json.loads(stdout)
@@ -248,7 +249,17 @@ def _parse_backlog(stdout: bytes) -> list[BacklogIssue]:
         raise ValueError(f"gh issue list returned non-JSON output: {exc}") from exc
     if not isinstance(payload, list):
         raise ValueError(f"gh issue list expected a JSON array, got {type(payload)}")
-    return [_parse_issue(entry) for entry in payload]
+    return payload
+
+
+def _parse_backlog(stdout: bytes) -> list[BacklogIssue]:
+    """Parse a ``gh issue list --json`` payload into :class:`BacklogIssue` objects.
+
+    Each entry carries ``number``, ``createdAt`` (an ISO-8601 timestamp, ``Z``-suffixed
+    UTC), and ``labels`` (a list of ``{"name": ...}`` objects). A malformed payload raises
+    :class:`ValueError` rather than silently dropping issues.
+    """
+    return [_parse_issue(entry) for entry in _parse_json_array(stdout)]
 
 
 def _parse_issue(entry: object) -> BacklogIssue:
