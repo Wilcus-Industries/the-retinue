@@ -27,11 +27,12 @@ from retinue.adhoc_build import (
     Planner,
     _materialize_plan_command,
     _plan_prompt,
+    _slice_for_issue,
     build_adhoc_issue,
 )
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport
-from retinue.orchestrator import Implementer, Slice
+from retinue.orchestrator import Implementer, Slice, _implement_prompt
 from retinue.repo_config import RepoConfig
 from retinue.roles import Role, planner_cli_argv, resolve_model
 from tests.test_done_check import (
@@ -66,9 +67,13 @@ class FakeImplementer:
 
     def __init__(self) -> None:
         self.built: list[Slice] = []
+        self.plan_paths: list[str | None] = []
 
-    async def implement(self, slice_: Slice, *, container: Container) -> None:
+    async def implement(
+        self, slice_: Slice, *, container: Container, plan_path: str | None = None
+    ) -> None:
         self.built.append(slice_)
+        self.plan_paths.append(plan_path)
         await container.run_command(["implement", slice_.branch])
 
     def auth_env(self) -> dict[str, str]:
@@ -158,10 +163,37 @@ async def test_plan_is_materialized_into_the_plan_file_before_implementing() -> 
 
 
 def test_plan_prompt_names_the_plan_file_and_issue() -> None:
-    """The implementer prompt points at the issue and the materialized plan file."""
+    """The planner prompt points at the issue and the materialized plan file."""
     prompt = _plan_prompt(_issue(29))
     assert "#29" in prompt
     assert PLAN_FILE in prompt
+
+
+# --- the implementer is pointed at the plan file it must consume ------------------
+
+
+@pytest.mark.asyncio
+async def test_implementer_is_pointed_at_the_plan_file() -> None:
+    """The ad-hoc lane tells the implementer to read PLAN_FILE, not just write it.
+
+    Closes #29 AC2: consumption, not mere materialization — the implementer the ad-hoc
+    lane runs receives ``PLAN_FILE`` as its plan path, so it is instructed to read the
+    plan the planner wrote before building.
+    """
+    implementer = FakeImplementer()
+    runtime = FakeRuntime()
+
+    await _build(runtime=runtime, implementer=implementer)
+
+    assert implementer.plan_paths == [PLAN_FILE]
+
+
+def test_implement_prompt_with_plan_path_instructs_reading_the_plan() -> None:
+    """A plan_path makes the implement prompt point the subagent at PLAN_FILE first."""
+    prompt = _implement_prompt(_slice_for_issue(_issue(29)), plan_path=PLAN_FILE)
+
+    assert PLAN_FILE in prompt
+    assert "read" in prompt.lower()
 
 
 # --- branch cut off staging -------------------------------------------------------

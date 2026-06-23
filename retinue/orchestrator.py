@@ -100,8 +100,16 @@ class Implementer(Protocol):
     return value, it gates on the done-check that follows.
     """
 
-    async def implement(self, slice_: Slice, *, container: Container) -> None:
-        """Build ``slice_`` in ``container``, committing to its ``issue-<N>`` branch."""
+    async def implement(
+        self, slice_: Slice, *, container: Container, plan_path: str | None = None
+    ) -> None:
+        """Build ``slice_`` in ``container``, committing to its ``issue-<N>`` branch.
+
+        ``plan_path`` is the in-container path of a materialized implementation plan the
+        subagent must read before building. The PRD lane passes nothing (``None``), so its
+        prompt is unchanged; the ad-hoc lane passes its ``PLAN_FILE`` so the subagent is
+        pointed at the plan the planner wrote.
+        """
         ...
 
     def auth_env(self) -> dict[str, str]:
@@ -154,14 +162,22 @@ _IMPLEMENT_SYSTEM = (
 )
 
 
-def _implement_prompt(slice_: Slice) -> str:
+def _implement_prompt(slice_: Slice, *, plan_path: str | None = None) -> str:
     """Assemble the per-slice prompt: which issue to build, on which branch.
 
     Names the target repo, the issue number to implement, and the ``issue-<N>`` branch the
     work must be committed to, so the spawned subagent commits where the orchestrator's
-    merge seam expects to find it.
+    merge seam expects to find it. When ``plan_path`` is given (the ad-hoc lane), the prompt
+    leads with an instruction to read that materialized plan first; with no ``plan_path``
+    (the PRD lane) the prompt is unchanged, so ``build_slice``/``build_prd`` are unaffected.
     """
+    plan_preamble = (
+        f"Read the implementation plan at '{plan_path}' first, then implement it. "
+        if plan_path is not None
+        else ""
+    )
     return (
+        f"{plan_preamble}"
         f"Implement issue #{slice_.issue_number} of {slice_.repo_full_name}. "
         f"Commit your work to the '{slice_.branch}' branch (already checked out). "
         "Implement test-driven and ensure the repo's checks pass before committing."
@@ -254,9 +270,16 @@ class ContainerImplementer:
     auth_mode: str = "api_key"
     model: str = field(default_factory=lambda: resolve_model(Role.IMPLEMENTER))
 
-    async def implement(self, slice_: Slice, *, container: Container) -> None:
-        """Exec ``claude`` in ``container`` to build ``slice_``; raise on an errored run."""
-        argv = _claude_argv(prompt=_implement_prompt(slice_), model=self.model)
+    async def implement(
+        self, slice_: Slice, *, container: Container, plan_path: str | None = None
+    ) -> None:
+        """Exec ``claude`` in ``container`` to build ``slice_``; raise on an errored run.
+
+        ``plan_path``, when given, names a materialized plan the per-slice prompt instructs
+        the subagent to read before building (the ad-hoc lane); the PRD lane passes nothing.
+        """
+        prompt = _implement_prompt(slice_, plan_path=plan_path)
+        argv = _claude_argv(prompt=prompt, model=self.model)
         result = await container.run_command(argv)
         if not result.ok:
             raise ImplementError(

@@ -290,13 +290,17 @@ def bind_round_reviewer(
 class _TriagingImplementer:
     """An :class:`Implementer` that routes each attempt through triage reasoning.
 
-    Satisfies the orchestrator's ``implement(slice_, *, container) -> None`` contract by
-    delegating to :func:`retinue.triage.triage_implementer`, which drives the real
-    implementer in the build ``container`` and, on a failure or returned notes, decides
+    Satisfies the orchestrator's ``implement(slice_, *, container, plan_path) -> None``
+    contract by delegating to :func:`retinue.triage.triage_implementer`, which drives the
+    real implementer in the build ``container`` and, on a failure or returned notes, decides
     retry / reslice / escalate against the persisted cap. The orchestrator gates on the
     done-check that follows, so a triaged-and-built slice proceeds normally and an
     escalated one leaves no commit to push or merge. ``auth_env`` is forwarded to the
     wrapped implementer so the orchestrator can inject the agent's credential at start.
+
+    This is the PRD lane's implementer, where there is no materialized plan file, so
+    ``plan_path`` is accepted for protocol conformance and ignored — the ad-hoc lane's
+    plan threading is a :mod:`retinue.adhoc_build` concern, not a triaged-build one.
     """
 
     implementer: Implementer | TriageImplementer
@@ -305,7 +309,9 @@ class _TriagingImplementer:
     create_issue: IssueCreator
     retry_store: ImplRetryStore
 
-    async def implement(self, slice_: Slice, *, container: Container) -> None:
+    async def implement(
+        self, slice_: Slice, *, container: Container, plan_path: str | None = None
+    ) -> None:
         await triage_implementer(
             slice_,
             self.config,
