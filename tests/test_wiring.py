@@ -51,12 +51,17 @@ class _Implementer:
     outcomes: dict[int, object] = field(default_factory=dict)
     calls: list[int] = field(default_factory=list)
 
-    async def implement(self, slice_: Slice) -> ImplementerNotes | None:
+    async def implement(
+        self, slice_: Slice, *, container: object
+    ) -> ImplementerNotes | None:
         self.calls.append(slice_.issue_number)
         outcome = self.outcomes.get(slice_.issue_number)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome  # type: ignore[return-value]
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
 
 
 @dataclass
@@ -219,12 +224,17 @@ _CLAUDE_MD = "## Definition of done\n```\nuv run pytest\n```\n"
 
 
 class _RedContainer:
-    """A container whose clone succeeds but whose done-check command fails (red check)."""
+    """A container whose git ops succeed but whose done-check command fails (red check).
+
+    Clone, fetch, checkout, and push all return 0 so the per-slice build container reaches
+    the done-check; the done-check command itself fails, so the slice is blocked (and never
+    pushed). The implementer is a fake (it does not exec ``claude`` against this container).
+    """
 
     async def run_command(self, command: list[str]) -> object:
         from retinue.container import RunResult
 
-        if command[:2] == ["git", "clone"]:
+        if command and command[0] == "git":
             return RunResult(exit_code=0)
         return RunResult(exit_code=1, stderr="check failed")
 

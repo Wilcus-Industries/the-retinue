@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from retinue.budget import BudgetGovernor, Clock
-from retinue.container import ContainerRuntime
+from retinue.container import Container, ContainerRuntime
 from retinue.cron import CronBuild, CronGh, CronTickResult, run_cron_tick
 from retinue.done_check import ReportSink, SecretResolver
 from retinue.github_app import InstallationAuth
@@ -152,11 +152,13 @@ def bind_build_prd(
 class _TriagingImplementer:
     """An :class:`Implementer` that routes each attempt through triage reasoning.
 
-    Satisfies the orchestrator's ``implement(slice_) -> None`` contract by delegating to
-    :func:`retinue.triage.triage_implementer`, which drives the real implementer and, on a
-    failure or returned notes, decides retry / reslice / escalate against the persisted
-    cap. The orchestrator gates on the done-check that follows, so a triaged-and-built
-    slice proceeds normally and an escalated one leaves no commit to merge.
+    Satisfies the orchestrator's ``implement(slice_, *, container) -> None`` contract by
+    delegating to :func:`retinue.triage.triage_implementer`, which drives the real
+    implementer in the build ``container`` and, on a failure or returned notes, decides
+    retry / reslice / escalate against the persisted cap. The orchestrator gates on the
+    done-check that follows, so a triaged-and-built slice proceeds normally and an
+    escalated one leaves no commit to push or merge. ``auth_env`` is forwarded to the
+    wrapped implementer so the orchestrator can inject the agent's credential at start.
     """
 
     implementer: Implementer | TriageImplementer
@@ -165,7 +167,7 @@ class _TriagingImplementer:
     create_issue: IssueCreator
     retry_store: ImplRetryStore
 
-    async def implement(self, slice_: Slice) -> None:
+    async def implement(self, slice_: Slice, *, container: Container) -> None:
         await triage_implementer(
             slice_,
             self.config,
@@ -173,7 +175,11 @@ class _TriagingImplementer:
             notifier=self.notifier,
             create_issue=self.create_issue,
             retry_store=self.retry_store,
+            container=container,
         )
+
+    def auth_env(self) -> dict[str, str]:
+        return self.implementer.auth_env()
 
 
 def bind_cron_tick(

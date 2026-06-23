@@ -1,0 +1,41 @@
+# The disposable per-slice build/done-check runner image.
+#
+# Every slice builds inside one throwaway container started from this image
+# (retinue.orchestrator._build_slice_in_container): it clones the target repo, checks out
+# the issue branch, runs the headless `claude` CLI to implement the slice, then runs the
+# repo's own done-check over the result. So the image must carry, in one place:
+#   - git    — clone the target repo and push the issue/integration branches,
+#   - claude — the headless CLI the implementer execs (needs Node),
+#   - uv + python — run a uv-based done-check (the smoke's toy repo is `uv run pytest`).
+#
+# This image is the value of retinue.done_check.DEFAULT_IMAGE
+# (ghcr.io/the-retinue/done-check-runner:latest). It is NOT built by docker-compose — it
+# is a prerequisite you build and push once before the #17 smoke (see DEPLOY.md). Per
+# target-language runner variants are a follow-up; this covers the uv/pytest smoke.
+FROM python:3.12-slim
+
+# uv: copy the static binary from the pinned upstream image (pin the tag, never :latest),
+# matching the main Dockerfile's approach.
+COPY --from=ghcr.io/astral-sh/uv:0.9.6 /uv /uvx /usr/local/bin/
+
+# git: clone/checkout/push the target repo. ca-certificates: HTTPS clone + npm/Anthropic.
+# curl + gnupg: bootstrap the NodeSource apt repo for a current Node LTS (the `claude` CLI
+# needs Node 18+); we pin to the Node 20 LTS line.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# The headless Claude Code CLI the implementer shells out to. Pin the major line so a
+# runner rebuild does not silently jump CLI versions under the autonomous agent.
+RUN npm install -g @anthropic-ai/claude-code@2
+
+# Match the workspace the orchestrator clones into and execs every command from
+# (retinue.container.WORKSPACE_DIR).
+WORKDIR /workspace
+
+ENV PYTHONUNBUFFERED=1
+
+# No CMD: the container idles on a keep-alive command supplied by the runtime
+# (retinue.container._KEEP_ALIVE_CMD) so the orchestrator can exec into it.

@@ -1,17 +1,22 @@
 """Orchestrator: build one ready slice, or build a full PRD in dependency order.
 
 The single-slice primitive (issue #6) is :func:`build_slice`. For one ready slice the
-orchestrator:
+orchestrator runs the whole build inside **one disposable container** that is destroyed
+on every path (:func:`_build_slice_in_container`):
 
-1. **spawn** — runs one implementer subagent (the Agent SDK seam) in an isolated git
-   worktree inside the disposable container; it implements TDD-first and commits to
-   an ``issue-<N>`` branch,
-2. **done-check** — runs the repo's done-check via :func:`retinue.done_check.run_done_check`
-   (auth -> clone -> inject -> run -> report -> teardown), which yields a pass/fail,
-3. **merge** — only on a green done-check, ensures the integration branch
-   ``retinue/prd-<n>`` exists (created off the config's ``staging_branch`` when absent)
-   and merges ``issue-<N>`` into it. A red done-check **blocks** the merge: no red
-   slice is ever merged.
+1. **clone + branch** — the container clones the repo over the installation token and
+   checks out a fresh ``issue-<N>`` branch off the config's ``staging_branch``,
+2. **implement** — one implementer subagent (the Agent SDK seam) execs the headless
+   ``claude`` CLI *inside that container* and commits the slice to ``issue-<N>``; the AI
+   step is confined to the throwaway container, off the worker host and its docker.sock,
+3. **done-check** — the repo's done-check runs in the *same* container, over the real
+   changes, and the outcome is posted to the report sink,
+4. **push** — only on a green done-check the ``issue-<N>`` branch is pushed to origin, so
+   the merge seam can fetch it. A red done-check pushes nothing and **blocks** the merge.
+
+The merge then ensures the integration branch ``retinue/prd-<n>`` exists (created off the
+config's ``staging_branch`` when absent) and merges the pushed ``issue-<N>`` into it. No
+red slice is ever merged.
 
 The full-PRD driver (issue #7) is :func:`build_prd`. It wraps the single-slice
 primitive: pick the ready set (every ``blocked_by`` ref merged/closed), fan out
@@ -33,17 +38,19 @@ import base64
 import enum
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from retinue.container import Container, ContainerRuntime, RunResult
 from retinue.done_check import (
     DEFAULT_IMAGE,
+    DoneCheckReport,
     ReportSink,
     SecretResolver,
-    run_done_check,
+    parse_done_check,
+    resolve_secrets_or_escalate,
+    run_done_check_commands,
 )
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
@@ -81,45 +88,55 @@ def integration_branch(prd_number: int) -> str:
 class Implementer(Protocol):
     """Spawns one implementer subagent that builds a slice. The Agent SDK seam.
 
-    A production implementation spawns a Claude Agent-SDK subagent in an isolated git
-    worktree inside the disposable container; the subagent implements TDD-first and
-    commits to the slice's ``issue-<N>`` branch. Tests inject a fake that records the
-    request without any real spawn. The contract is the commit on ``slice.branch``;
-    the orchestrator does not read a return value, it gates on the done-check that
-    follows.
+    A production implementation execs the headless ``claude`` CLI *inside the disposable
+    build container* the orchestrator passes in; the subagent implements TDD-first and
+    commits to the slice's ``issue-<N>`` branch already checked out there. Tests inject a
+    fake that records the request (and may mark the container log) without any real spawn.
+    The contract is the commit on ``slice.branch``; the orchestrator does not read a
+    return value, it gates on the done-check that follows.
     """
 
-    async def implement(self, slice_: Slice) -> None:
-        """Build ``slice_``, committing the work to its ``issue-<N>`` branch."""
+    async def implement(self, slice_: Slice, *, container: Container) -> None:
+        """Build ``slice_`` in ``container``, committing to its ``issue-<N>`` branch."""
+        ...
+
+    def auth_env(self) -> dict[str, str]:
+        """The env the agent authenticates with, merged into the container at start.
+
+        Returned by the implementer (which owns the Anthropic credential) so the
+        orchestrator can inject it into the build container's environment at ``start``
+        without knowing how the credential is routed. A fake that needs no credential
+        returns an empty mapping.
+        """
         ...
 
 
-# --- real Agent-SDK implementer (production adapter behind the Implementer seam) ---
+# --- real container-exec implementer (production adapter behind the Implementer seam) ---
 #
-# The production :class:`Implementer` spawns a Claude Agent-SDK subagent (the headless
-# ``claude`` CLI the SDK drives) inside the already-cloned repo and lets it implement the
-# slice TDD-first, edit files, and commit to the ``issue-<N>`` branch. The one side effect
-# is the spawn, so it is taken behind the injected ``query`` seam (default:
-# ``claude_agent_sdk.query``) exactly as the slicer/reviewer/resolver inject their model
-# boundary — tests script the message stream without a live model, the SDK, Docker, gh, or
-# network. The bug-prone pure parts — prompt assembly, option construction (cwd, model, and
-# the api_key-vs-subscription env auth routing), and reading the terminal result — are
-# factored into the free functions/methods below so they are unit-tested in isolation.
+# The production :class:`Implementer` execs the headless ``claude`` CLI *inside the
+# disposable build container* the orchestrator owns — the "shell out to claude" discipline
+# the PRD cites. The repo is already cloned and the ``issue-<N>`` branch checked out in that
+# container, so the agent edits files and commits over the real tree the done-check then
+# runs against. Confining the autonomous AI step to a throwaway container keeps it off the
+# worker host and its mounted ``docker.sock``. The one side effect is the exec, taken behind
+# the injected :class:`~retinue.container.Container`, so the flow is exercisable without a
+# live model, the CLI, Docker, gh, or network. The bug-prone pure parts — prompt assembly,
+# argv construction, the api_key-vs-subscription env auth routing, and reading the CLI result
+# — are factored into the free functions below so they are unit-tested in isolation.
 #
 # Auth mirrors :class:`retinue.config.Settings`: ``auth_mode="api_key"`` threads the
-# credential to the spawned CLI as ``ANTHROPIC_API_KEY``; ``auth_mode="subscription"``
-# threads it as ``CLAUDE_CODE_OAUTH_TOKEN`` (the subscription OAuth env var). The contract
-# is the commit on ``slice.branch``; the orchestrator gates on the done-check that follows,
-# so a run the subagent finishes "successfully" but that fails to satisfy the repo is still
-# caught downstream. A spawn that the SDK reports as errored raises :class:`ImplementError`.
+# credential to the CLI as ``ANTHROPIC_API_KEY``; ``auth_mode="subscription"`` threads it as
+# ``CLAUDE_CODE_OAUTH_TOKEN`` (the subscription OAuth env var). The credential rides the
+# container env (fixed at ``start``), so the implementer exposes it via :meth:`auth_env` for
+# the orchestrator to merge in, rather than passing it per-exec. The contract is the commit
+# on ``slice.branch``; the orchestrator gates on the done-check that follows, so a run the
+# CLI finishes "successfully" but that fails to satisfy the repo is still caught downstream.
+# A non-zero CLI exit (or a json result flagged ``is_error``) raises :class:`ImplementError`.
 
 _IMPLEMENT_MODEL = "claude-opus-4-8"
-# The cloned-repo directory the done-check clones into and the implementer commits within;
-# matches :data:`retinue.container.WORKSPACE_DIR` so the subagent runs over the same tree.
-_IMPLEMENT_WORKSPACE = "/workspace"
 
-# The implementer's brief. Frozen (no per-slice interpolation) so the spawned subagent's
-# system prefix is stable; the slice specifics ride in the per-slice prompt.
+# The implementer's brief, appended to the CLI's system prompt. Frozen (no per-slice
+# interpolation) so the prefix is stable; the slice specifics ride in the per-slice prompt.
 _IMPLEMENT_SYSTEM = (
     "You are an autonomous implementer. Build the requested GitHub issue inside the "
     "repository you are running in, test-driven: write or update a failing test first, "
@@ -138,156 +155,113 @@ def _implement_prompt(slice_: Slice) -> str:
     """
     return (
         f"Implement issue #{slice_.issue_number} of {slice_.repo_full_name}. "
-        f"Commit your work to the '{slice_.branch}' branch (create it off the current "
-        "checkout if it does not exist). Implement test-driven and ensure the repo's "
-        "checks pass before committing."
+        f"Commit your work to the '{slice_.branch}' branch (already checked out). "
+        "Implement test-driven and ensure the repo's checks pass before committing."
     )
 
 
 def _implement_env(credential: str, auth_mode: str) -> dict[str, str]:
-    """Build the env the spawned CLI authenticates with, routing the credential by mode.
+    """Build the env the ``claude`` CLI authenticates with, routing the credential by mode.
 
     ``api_key`` mode threads the credential as ``ANTHROPIC_API_KEY``; ``subscription`` mode
     threads it as ``CLAUDE_CODE_OAUTH_TOKEN`` (the Claude subscription OAuth env var the
-    headless CLI reads). Only the credential env var is set here — the SDK merges it onto
-    the parent environment when it spawns the CLI.
+    headless CLI reads). Only the credential env var is set here — the orchestrator merges
+    it into the build container's environment at ``start``.
     """
     if auth_mode == "subscription":
         return {"CLAUDE_CODE_OAUTH_TOKEN": credential}
     return {"ANTHROPIC_API_KEY": credential}
 
 
+def _claude_argv(*, prompt: str, model: str) -> list[str]:
+    """Assemble the headless ``claude`` CLI argv for one in-container implement run.
+
+    Runs non-interactively (``-p`` print mode), pins the implementing ``model``, accepts
+    edits without a human in the loop (``--permission-mode acceptEdits`` — the run is
+    autonomous), appends the frozen implementer brief to the system prompt, and emits a
+    machine-readable json result so the exit can be cross-checked. The CLI runs in the
+    container's working dir (the cloned repo), so no cwd flag is needed.
+    """
+    return [
+        "claude",
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--permission-mode",
+        "acceptEdits",
+        "--append-system-prompt",
+        _IMPLEMENT_SYSTEM,
+        "--output-format",
+        "json",
+    ]
+
+
+def _claude_result_is_error(stdout: str) -> bool:
+    """Whether the CLI's ``--output-format json`` result flags the run as errored.
+
+    The headless CLI emits a json object carrying an ``is_error`` boolean. A non-json or
+    empty stdout is not treated as an error here — the exit code is the primary signal —
+    so this only catches a run that exited 0 yet reported an internal error.
+    """
+    try:
+        result = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return bool(isinstance(result, dict) and result.get("is_error"))
+
+
 class ImplementError(RuntimeError):
-    """The Agent-SDK implementer spawn ended in an error rather than a clean build.
+    """The container-exec implementer run ended in an error rather than a clean build.
 
     Distinct from a *clean-but-insufficient* build, which the orchestrator catches via the
-    done-check that follows: this is the SDK reporting the run itself failed (a
-    ``ResultMessage`` with ``is_error``), so the slice surfaces the failure rather than
-    proceeding to a done-check over a half-built tree.
+    done-check that follows: this is the ``claude`` CLI exec itself failing (a non-zero exit
+    code, or a json result flagged ``is_error``), so the slice surfaces the failure rather
+    than proceeding to a done-check over a half-built tree.
     """
-
-
-# The injected spawn seam: ``claude_agent_sdk.query(prompt=..., options=...)`` returns an
-# async iterator of SDK messages. Kept narrow so the implement flow is exercisable without
-# the SDK, a live model, or a real clone; production binds the real ``query``.
-QuerySeam = Callable[..., AsyncIterator[Any]]
-# Builds the SDK ``ClaudeAgentOptions`` from the assembled kwargs. Injected alongside the
-# ``query`` seam so the option-kwargs assembly is tested without the SDK installed; the
-# default lazily constructs the real ``ClaudeAgentOptions``.
-OptionsFactory = Callable[..., Any]
-
-
-def _implement_option_kwargs(
-    *, credential: str, auth_mode: str, model: str, workspace: str
-) -> dict[str, Any]:
-    """Assemble the ``ClaudeAgentOptions`` kwargs for one spawn — the pure, testable core.
-
-    Runs the subagent in the cloned-repo ``workspace`` (so edits and the commit land in the
-    tree the done-check clones), pins the implementing ``model``, leads with the frozen
-    implementer brief, accepts edits non-interactively (no human approves the autonomous
-    run), and threads the credential to the spawned CLI via the env var its ``auth_mode``
-    selects.
-    """
-    return {
-        "cwd": workspace,
-        "model": model,
-        "system_prompt": _IMPLEMENT_SYSTEM,
-        "permission_mode": "acceptEdits",
-        "env": _implement_env(credential, auth_mode),
-    }
 
 
 @dataclass(frozen=True)
-class AgentSdkImplementer:
-    """Real :class:`Implementer`: build a slice by spawning a Claude Agent-SDK subagent.
+class ContainerImplementer:
+    """Real :class:`Implementer`: build a slice by exec-ing ``claude`` in the build container.
 
-    Satisfies the implementer protocol ``implement(slice_) -> None`` so it drops in where
-    the fake implementer sits in tests and at the wiring site. It spawns the headless
-    ``claude`` CLI (via the injected ``query`` seam) inside the cloned repo, hands it the
-    per-slice prompt, and lets it implement TDD-first and commit to ``slice.branch``. The
+    Satisfies the implementer protocol ``implement(slice_, *, container) -> None`` so it
+    drops in where the fake implementer sits in tests and at the wiring site. It execs the
+    headless ``claude`` CLI inside the already-cloned, branch-checked-out container, hands it
+    the per-slice prompt, and lets it implement TDD-first and commit to ``slice.branch``. The
     orchestrator gates on the done-check that follows, so the contract here is only that the
-    spawn ran and committed; a run the SDK reports as errored raises :class:`ImplementError`.
+    exec ran and committed; a non-zero exit (or an ``is_error`` json result) raises
+    :class:`ImplementError`.
 
     Attributes:
         credential: The Anthropic credential (API key or subscription OAuth token).
         auth_mode: ``"api_key"`` (credential rides ``ANTHROPIC_API_KEY``) or
             ``"subscription"`` (credential rides ``CLAUDE_CODE_OAUTH_TOKEN``).
-        query: The Agent-SDK spawn seam; defaults to ``claude_agent_sdk.query``.
-        options_factory: Builds the SDK options from the assembled kwargs; defaults to the
-            real ``ClaudeAgentOptions``. Injected so the spawn runs without the SDK in tests.
         model: The implementing model id; defaults to Opus 4.8.
-        workspace: The cloned-repo directory the subagent runs in; the SDK's ``cwd``.
     """
 
     credential: str
     auth_mode: str = "api_key"
-    query: QuerySeam | None = None
-    options_factory: OptionsFactory | None = None
     model: str = _IMPLEMENT_MODEL
-    workspace: str = _IMPLEMENT_WORKSPACE
 
-    async def implement(self, slice_: Slice) -> None:
-        """Spawn the subagent to build ``slice_``; raise on an errored run."""
-        query = self._resolve_query()
-        options = self._build_options()
-        result = None
-        async for message in query(prompt=_implement_prompt(slice_), options=options):
-            if _is_result_message(message):
-                result = message
-        if result is not None and getattr(result, "is_error", False):
+    async def implement(self, slice_: Slice, *, container: Container) -> None:
+        """Exec ``claude`` in ``container`` to build ``slice_``; raise on an errored run."""
+        argv = _claude_argv(prompt=_implement_prompt(slice_), model=self.model)
+        result = await container.run_command(argv)
+        if not result.ok:
             raise ImplementError(
-                f"implementer spawn for {slice_.branch} ended in error: "
-                f"{getattr(result, 'result', None)}"
+                f"implementer for {slice_.branch} exited {result.exit_code}: "
+                f"{result.stderr}"
             )
-        logger.info("Implementer spawn for %s completed", slice_.branch)
+        if _claude_result_is_error(result.stdout):
+            raise ImplementError(
+                f"implementer for {slice_.branch} reported an error: {result.stdout}"
+            )
+        logger.info("Implementer for %s completed in-container", slice_.branch)
 
-    def _resolve_query(self) -> QuerySeam:
-        """The injected spawn seam, or the real ``claude_agent_sdk.query`` lazily imported.
-
-        The lazy import keeps the module (and the unit tests over the pure prompt/option
-        helpers) import-clean without the Agent SDK installed; type-ignored because the SDK
-        is an optional runtime dependency.
-        """
-        if self.query is not None:
-            return self.query
-        from claude_agent_sdk import query  # type: ignore[import-not-found,unused-ignore]
-
-        return cast(QuerySeam, query)
-
-    def _build_options(self) -> Any:
-        """Build the SDK options object from the assembled kwargs via the options factory.
-
-        The kwargs are assembled by the pure :func:`_implement_option_kwargs`; the factory
-        (default: the real ``ClaudeAgentOptions``, lazily imported) turns them into the SDK
-        object. Tests inject a passthrough factory so the kwargs are asserted without the SDK.
-        """
-        kwargs = _implement_option_kwargs(
-            credential=self.credential,
-            auth_mode=self.auth_mode,
-            model=self.model,
-            workspace=self.workspace,
-        )
-        factory = self.options_factory or self._default_options_factory()
-        return factory(**kwargs)
-
-    @staticmethod
-    def _default_options_factory() -> OptionsFactory:
-        """Lazily import the real ``ClaudeAgentOptions`` as the default options factory."""
-        from claude_agent_sdk import (  # type: ignore[import-not-found,unused-ignore]
-            ClaudeAgentOptions,
-        )
-
-        return cast(OptionsFactory, ClaudeAgentOptions)
-
-
-def _is_result_message(message: Any) -> bool:
-    """Whether an SDK message is the terminal ``ResultMessage`` carrying ``is_error``.
-
-    Matched structurally (the message exposes ``is_error``) rather than by importing the
-    SDK type, so the result-reading path is unit-testable with a plain stand-in and the
-    module imports without the SDK present.
-    """
-    return hasattr(message, "is_error")
+    def auth_env(self) -> dict[str, str]:
+        """The credential env the orchestrator merges into the build container at start."""
+        return _implement_env(self.credential, self.auth_mode)
 
 
 class MergeConflict(Exception):
@@ -344,6 +318,17 @@ _GIT_IDENTITY_FLAGS = [
     f"user.email={_GIT_AUTHOR_EMAIL}",
 ]
 
+# The committer identity injected into the build container's env so the *agent's* own
+# ``git commit`` (and the push) run non-interactively. The container env is fixed at
+# ``start``, so the identity must ride it there rather than per-command ``-c`` flags the
+# agent would not use; git reads these four vars without any repo config.
+_GIT_COMMITTER_ENV = {
+    "GIT_AUTHOR_NAME": _GIT_AUTHOR_NAME,
+    "GIT_AUTHOR_EMAIL": _GIT_AUTHOR_EMAIL,
+    "GIT_COMMITTER_NAME": _GIT_AUTHOR_NAME,
+    "GIT_COMMITTER_EMAIL": _GIT_AUTHOR_EMAIL,
+}
+
 # Substrings git prints to stdout/stderr when a merge stops on a content conflict, as
 # opposed to a hard error (unknown ref, not a repo, …). Matched case-insensitively.
 _CONFLICT_MARKERS = (
@@ -351,6 +336,16 @@ _CONFLICT_MARKERS = (
     "automatic merge failed",
     "fix conflicts and then commit",
 )
+
+
+def _clone_command(clone_url: str) -> list[str]:
+    """Argv that clones the repo (over the installation-token URL) into the workspace."""
+    return ["git", "clone", clone_url, "."]
+
+
+def _push_branch_command(branch: str) -> list[str]:
+    """Argv that pushes ``branch`` to ``origin`` (authenticated by the cloned remote URL)."""
+    return ["git", "push", "origin", branch]
 
 
 def _branch_exists_command(branch: str) -> list[str]:
@@ -413,11 +408,12 @@ def _is_merge_conflict(result: RunResult) -> bool:
 class ContainerGitOps:
     """Production :class:`GitOps` that runs ``git`` in the cloned-repo container.
 
-    The integration-branch merges happen inside the same disposable container the
-    done-check cloned the repo into, so this seam has no external dependency of its own
-    beyond the injected :class:`~retinue.container.Container`. A merge that stops on a
-    content conflict is aborted (to leave the workspace clean for the resolver) and
-    surfaced as :class:`MergeConflict`; any other ``git`` failure is a hard
+    The integration-branch merges happen inside a disposable merge container that has
+    cloned the repo, so this seam has no external dependency of its own beyond the
+    injected :class:`~retinue.container.Container`. A successful merge is pushed to
+    ``origin`` so the opened staging PR has a real remote head to land. A merge that
+    stops on a content conflict is aborted (to leave the workspace clean for the
+    resolver) and surfaced as :class:`MergeConflict`; any other ``git`` failure is a hard
     :class:`GitOpsError`, never silently swallowed.
     """
 
@@ -435,18 +431,22 @@ class ContainerGitOps:
         logger.info("Created integration branch %s off %s", branch, base)
 
     async def merge(self, *, source: str, into: str) -> None:
-        """Merge ``source`` into ``into``; raise :class:`MergeConflict` on a conflict.
+        """Merge ``source`` into ``into`` and push ``into``; raise on a conflict.
 
-        Runs checkout + fetch + merge. A merge that stops on a content conflict is
-        aborted to leave the workspace clean, then raised as :class:`MergeConflict`; any
-        other non-zero ``git`` exit is a :class:`GitOpsError`.
+        Runs checkout + fetch + merge, then pushes ``into`` to ``origin`` so the staging
+        PR opened off it has a real remote head. A merge that stops on a content conflict
+        is aborted to leave the workspace clean, then raised as :class:`MergeConflict`;
+        any other non-zero ``git`` exit (merge or push) is a :class:`GitOpsError`.
         """
         commands = _merge_commands(source, into)
         for command in commands[:-1]:
             await self._run_checked(command, action=f"prepare merge of {source}")
         result = await self._container.run_command(commands[-1])
         if result.ok:
-            logger.info("Merged %s into %s", source, into)
+            await self._run_checked(
+                _push_branch_command(into), action=f"push {into} after merge"
+            )
+            logger.info("Merged %s into %s and pushed %s", source, into, into)
             return
         if _is_merge_conflict(result):
             await self._container.run_command(_ABORT_MERGE_COMMAND)
@@ -829,42 +829,45 @@ async def build_slice(
     report: ReportSink,
     image: str = DEFAULT_IMAGE,
 ) -> BuildResult:
-    """Build one ready slice: spawn the implementer, gate on the done-check, merge.
+    """Build one ready slice in its own container, gate on the done-check, then merge.
 
-    The implementer builds and commits the slice to its ``issue-<N>`` branch, then the
-    repo's done-check runs in a fresh disposable container. The done-check result gates
-    the merge: a green check merges ``issue-<N>`` into the integration branch
+    The whole build runs in one disposable container (:func:`_build_slice_in_container`):
+    clone, check out a fresh ``issue-<N>`` branch off ``config.staging_branch``, let the
+    implementer exec ``claude`` inside it and commit, run the repo's done-check over the
+    real changes, and push ``issue-<N>`` only when green. The done-check result gates the
+    merge: a green check merges the pushed ``issue-<N>`` into the integration branch
     ``retinue/prd-<n>`` (created off ``config.staging_branch`` if absent), while a red
-    check blocks the merge so no failing slice is ever integrated.
+    check pushes nothing and blocks the merge so no failing slice is ever integrated.
 
     Args:
         slice_: The ready slice to build (repo, issue number, PRD number).
-        config: The accepted repo config; its ``staging_branch`` is the base for a
-            new integration branch and its ``secrets`` are injected into the check.
+        config: The accepted repo config; its ``staging_branch`` is the slice-branch base
+            and the integration-branch base, and its ``secrets`` are injected into the
+            container.
         claude_md: The repo's ``CLAUDE.md`` text, carrying the done-check command.
-        implementer: Spawns the implementer subagent (the Agent SDK seam).
+        implementer: Execs the implementer subagent in the container (the Agent SDK seam).
         git: Integration-branch git operations (the merge seam).
         auth: Mints the installation token used to clone (the auth seam).
-        runtime: Spawns the disposable container the done-check runs in (Docker seam).
+        runtime: Spawns the disposable build container (the Docker seam).
         resolve_secret: Resolves the config's declared secret names/refs to values.
         report: Sink the done-check outcome is posted to (commit status / comment).
-        image: Container image the done-check runs in.
+        image: Container image the build runs in.
 
     Returns:
         A :class:`BuildResult`: ``MERGED`` when the green slice was merged, or
         ``BLOCKED`` when a red done-check stopped it.
 
     Raises:
-        Propagates whatever ``run_done_check`` raises (e.g. a missing secret), and any
-        merge error the git seam raises on a conflict.
+        Propagates whatever the build container raises (e.g. a missing secret or a clone
+        failure), and any merge error the git seam raises on a conflict.
     """
     branch = integration_branch(slice_.prd_number)
 
-    await implementer.implement(slice_)
-    passed = await _run_slice_done_check(
+    passed = await _build_slice_in_container(
         slice_,
         config,
         claude_md,
+        implementer=implementer,
         auth=auth,
         runtime=runtime,
         resolve_secret=resolve_secret,
@@ -873,7 +876,7 @@ async def build_slice(
     )
 
     if not passed:
-        # A red slice is never merged: leave the integration branch untouched.
+        # A red slice is never merged: nothing was pushed, leave the branch untouched.
         logger.info(
             "Blocking merge of %s into %s: done-check failed",
             slice_.branch,
@@ -885,29 +888,91 @@ async def build_slice(
     return BuildResult(outcome=BuildOutcome.MERGED, integration_branch=branch)
 
 
-async def _run_slice_done_check(
+async def _build_slice_in_container(
     slice_: Slice,
     config: RepoConfig,
     claude_md: str,
     *,
+    implementer: Implementer,
     auth: InstallationAuth,
     runtime: ContainerRuntime,
     resolve_secret: SecretResolver,
     report: ReportSink,
     image: str,
 ) -> bool:
-    """Run the repo's done-check for ``slice_``; return True only when it is green."""
-    check = await run_done_check(
-        slice_.repo_full_name,
-        config,
-        claude_md,
-        auth=auth,
-        runtime=runtime,
-        resolve_secret=resolve_secret,
-        report=report,
-        image=image,
+    """Run one slice's full build in a single disposable container; return green/red.
+
+    Owns the whole per-slice lifecycle, destroying the container on every path:
+
+    1. parse the done-check and resolve the config's secrets (a missing one escalates on
+       the report sink and propagates *before* any container starts),
+    2. start the container with the secrets, the git committer identity, and the agent's
+       credential all in its env (the env is fixed at ``start``),
+    3. clone the repo and check out a fresh ``issue-<N>`` branch off ``staging_branch``,
+    4. exec the implementer (``claude``) inside the container to build and commit the slice,
+    5. run the done-check over the real changes and post the outcome,
+    6. push ``issue-<N>`` to ``origin`` only when the done-check is green (so the merge seam
+       can fetch it; a red slice pushes nothing).
+
+    Returns:
+        True only when the done-check passed (and the branch was pushed); False on red.
+    """
+    commands = parse_done_check(claude_md)
+    env = await resolve_secrets_or_escalate(
+        slice_.repo_full_name, config, resolve_secret, report
     )
-    return check.passed
+    start_env = {**env, **_GIT_COMMITTER_ENV, **implementer.auth_env()}
+    token = await auth.installation_token(slice_.repo_full_name)
+    container = await runtime.start(image=image, env=start_env)
+    try:
+        await _clone_and_branch(
+            container, token.clone_url, branch=slice_.branch, base=config.staging_branch
+        )
+        await implementer.implement(slice_, container=container)
+        passed, detail = await run_done_check_commands(container, commands)
+        if passed:
+            await _push_branch(container, slice_.branch)
+        await report(
+            DoneCheckReport(
+                repo_full_name=slice_.repo_full_name,
+                passed=passed,
+                escalated=False,
+                detail=detail,
+            )
+        )
+        logger.info(
+            "Slice %s done-check %s", slice_.branch, "passed" if passed else "failed"
+        )
+        return passed
+    finally:
+        # Guaranteed teardown: the disposable container is destroyed on every path,
+        # including when clone, implement, the done-check, the push, or report raises.
+        await container.destroy()
+
+
+async def _clone_and_branch(
+    container: Container, clone_url: str, *, branch: str, base: str
+) -> None:
+    """Clone the repo into ``container`` and check out a fresh ``branch`` off ``base``."""
+    clone = await container.run_command(_clone_command(clone_url))
+    if not clone.ok:
+        raise GitOpsError(f"clone failed (exit {clone.exit_code}): {clone.stderr}")
+    for command in _create_branch_commands(branch, base):
+        result = await container.run_command(command)
+        if not result.ok:
+            raise GitOpsError(
+                f"failed to create slice branch {branch} off {base} "
+                f"(exit {result.exit_code}): {result.stderr}"
+            )
+
+
+async def _push_branch(container: Container, branch: str) -> None:
+    """Push ``branch`` to ``origin`` from inside ``container``; raise on failure."""
+    result = await container.run_command(_push_branch_command(branch))
+    if not result.ok:
+        raise GitOpsError(
+            f"failed to push {branch} (exit {result.exit_code}): {result.stderr}"
+        )
 
 
 async def _merge_green_slice(
@@ -1120,19 +1185,20 @@ async def _build_round(
 ) -> list[tuple[PrdSlice, bool]]:
     """Fan out the ready slices, bounded by ``max_parallel``; return (slice, passed).
 
-    Each slice's implementer runs then its done-check runs, concurrently across the
-    round but capped at ``config.max_parallel`` live builds. Only the done-check phase
-    runs here; merges are serialized afterwards in dependency order.
+    Each slice's build runs in its own disposable container (clone → branch → implement →
+    done-check → push-on-green), concurrently across the round but capped at
+    ``config.max_parallel`` live builds. Only the build phase runs here; merges are
+    serialized afterwards in dependency order, against the branches the green builds pushed.
     """
     semaphore = asyncio.Semaphore(config.max_parallel or len(ready) or 1)
 
     async def build_one(slice_: PrdSlice) -> tuple[PrdSlice, bool]:
         async with semaphore:
-            await implementer.implement(slice_)
-            passed = await _run_slice_done_check(
+            passed = await _build_slice_in_container(
                 slice_,
                 config,
                 claude_md,
+                implementer=implementer,
                 auth=auth,
                 runtime=runtime,
                 resolve_secret=resolve_secret,

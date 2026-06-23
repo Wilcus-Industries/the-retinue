@@ -11,21 +11,28 @@ This runbook takes you from a fresh GitHub App to a live deployment. Follow it i
 > (slice → build → open staging PR, plus the heimdall loopback and merge reap) once
 > GitHub App auth is configured: `on_startup` wires the real `fetch_config`, the PRD-body
 > fetcher, and a `pipeline_factory` that — per repo — sources the target's `CLAUDE.md`
-> (the done-check command) and binds the live orchestrator build lane (the Agent-SDK
-> implementer behind the budget gate + triage, the disposable done-check container, and
-> the integration-branch merge). An issue event on an opted-in repo now slices the PRD,
-> builds the slices, and opens the staging PR — it is no longer a skip.
+> (the done-check command) and binds the live orchestrator build lane. Each slice builds
+> inside its **own disposable container**: it clones the repo, checks out the `issue-<N>`
+> branch, runs the headless `claude` CLI **inside that container** to implement the slice
+> (behind the budget gate + triage), runs the repo's done-check over the real changes, and
+> on green **pushes** the branch; the merge container then merges and pushes the
+> integration branch. An issue event on an opted-in repo now slices the PRD, builds the
+> slices, and opens the staging PR — it is no longer a skip.
+>
+> Running the agent inside the throwaway container keeps the autonomous AI step **off the
+> worker host and its mounted `docker.sock`** — the isolation the PRD intends.
 >
 > Without GitHub App credentials the `fetch_config` seam treats every repo as *not opted
 > in*, so a delivered event is logged as a SKIP — still proving the webhook auth +
 > transport + queue + worker path end to end, but doing no real work.
 >
-> **The full pipeline spends real money and needs Docker.** The build lane spawns the
-> Agent SDK (real Anthropic token spend, metered against `WEEKLY_BUDGET`) and runs the
+> **The full pipeline spends real money and needs Docker.** The build lane runs the
+> `claude` CLI (real Anthropic token spend, metered against `WEEKLY_BUDGET`) and the
 > done-check inside a disposable container, so the worker needs the **Docker socket**
-> mounted and a funded `WEEKLY_BUDGET`. A full live smoke (the #17 end-to-end run) will
-> therefore spend real Anthropic tokens and exercise Docker — keep that in mind before
-> opening an issue on an opted-in repo.
+> mounted, a funded `WEEKLY_BUDGET`, **and the runner image built and pushed** (step
+> (c-runner) below). A full live smoke (the #17 end-to-end run) will therefore spend real
+> Anthropic tokens and exercise Docker — keep that in mind before opening an issue on an
+> opted-in repo.
 
 ---
 
@@ -77,6 +84,35 @@ cp .env.example .env
 
 `.env` is **gitignored — NEVER commit it.** Same for the `.pem`.
 
+## c-runner. Build and push the disposable runner image
+
+Every slice builds inside a throwaway container started from a **runner image** that
+carries `git`, the headless `claude` CLI (and its Node runtime), and `uv` + Python — so
+the in-container implement *and* a `uv`-based done-check both run. The worker pulls this
+image by the name in `retinue.done_check.DEFAULT_IMAGE`:
+
+```
+ghcr.io/the-retinue/done-check-runner:latest
+```
+
+That image **does not exist until you build and push it** — it is a prerequisite of any
+real build (and of the #17 smoke). Build it from `Dockerfile.runner` and push it to a
+registry the worker's Docker daemon can pull from:
+
+```sh
+docker build -f Dockerfile.runner -t ghcr.io/the-retinue/done-check-runner:latest .
+docker push ghcr.io/the-retinue/done-check-runner:latest
+```
+
+If you publish under a different name/registry, override `DEFAULT_IMAGE` accordingly (it
+is deployment config, not a `Settings` field). The image bundles the Node 20 `claude` CLI
+and a uv toolchain; per target-language runner variants (beyond the uv/pytest smoke) are a
+follow-up.
+
+> The runner image is **separate** from the `Dockerfile` that builds web/worker. The
+> worker drives the host Docker socket to start runner containers as siblings, so the
+> runner image must be present in (or pullable by) that daemon.
+
 ## d. Notifications
 
 Pick one notification transport (the notify adapter publishes escalations to it):
@@ -117,11 +153,12 @@ What happens next depends on the repo's opt-in:
   auth + transport + queue + worker are wired, doing no real work. Use this as the safe
   transport-only check.
 - **Opted in** (the `.github/retinue.yml` from step (b)): the worker drives the **real
-  pipeline** — it slices the PRD into issues, runs the build lane (Agent-SDK implementer
-  → done-check container → integration-branch merge), and opens the staging PR. This is
-  the full #17 smoke: it **spends real Anthropic tokens** (metered against
-  `WEEKLY_BUDGET`) and **requires the Docker socket** mounted for the done-check
-  container. Only open an issue on an opted-in repo once you are ready for that.
+  pipeline** — it slices the PRD into issues, runs the build lane (per-slice container:
+  clone → in-container `claude` implement → done-check → push, then the integration-branch
+  merge), and opens the staging PR. This is the full #17 smoke: it **spends real Anthropic
+  tokens** (metered against `WEEKLY_BUDGET`) and **requires the Docker socket** mounted
+  plus the runner image from step (c-runner). Only open an issue on an opted-in repo once
+  you are ready for that.
 
 ## g. Deploy to a VPS (edge profile)
 

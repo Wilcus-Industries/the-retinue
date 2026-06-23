@@ -48,13 +48,16 @@ class RecordingImplementer:
         self._live = 0
         self.peak = 0
 
-    async def implement(self, slice_: Slice) -> None:
+    async def implement(self, slice_: Slice, *, container: object) -> None:
         self.started.append(slice_.issue_number)
         self._live += 1
         self.peak = max(self.peak, self._live)
         # Yield so siblings scheduled in the same round actually interleave.
         await asyncio.sleep(0)
         self._live -= 1
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
 
 
 class OneAtATimeLock:

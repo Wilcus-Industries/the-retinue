@@ -23,7 +23,7 @@ A worker restart resumes through :meth:`Pipeline.reconcile` (:func:`reconcile_ru
 
 The orchestrator ``build_prd`` call is an injected seam (so a fake drops in for tests),
 but production now binds it to the real, budget-gated, triaged build over the
-:class:`~retinue.orchestrator.AgentSdkImplementer` per repo inside
+:class:`~retinue.orchestrator.ContainerImplementer` per repo inside
 :func:`build_pipeline_factory` — every side-effecting collaborator, the build lane
 included, is a real adapter wired there.
 """
@@ -84,8 +84,8 @@ from retinue.notify import (
     PushSink,
 )
 from retinue.orchestrator import (
-    AgentSdkImplementer,
     ContainerGitOps,
+    ContainerImplementer,
     PrdBuildResult,
     PrdSlice,
 )
@@ -630,7 +630,7 @@ def build_pipeline_factory(
 
     The orchestrator ``build_prd`` seam defaults to the real budget-gated, triaged build
     bound per repo via :func:`retinue.wiring.bind_build_prd` over the real
-    :class:`~retinue.orchestrator.AgentSdkImplementer`, container/git/secret/report
+    :class:`~retinue.orchestrator.ContainerImplementer`, container/git/secret/report
     adapters — so a constructed :class:`Pipeline` has a live build lane. A caller may pass
     a ``build_prd`` to override it (a fake in tests); passing one skips the per-repo bind.
 
@@ -742,7 +742,7 @@ def _bind_build_prd_for_repo(
 ) -> BuildPrd:
     """Bind the real budget-gated, triaged orchestrator build for one repo.
 
-    Constructs the build lane's real adapters — the Agent-SDK implementer, the Docker
+    Constructs the build lane's real adapters — the container-exec implementer, the Docker
     runtime, the lazy merge-container git ops, the env secret resolver, and the gh report
     sink — then binds them through :func:`retinue.wiring.bind_build_prd`. The merge
     container the lazy git ops starts is destroyed after each build in a ``finally``, so a
@@ -766,7 +766,7 @@ def _bind_build_prd_for_repo(
     git = _MergeContainerGitOps(
         repo_full_name=repo_full_name, auth=auth, runtime=runtime
     )
-    implementer = AgentSdkImplementer(
+    implementer = ContainerImplementer(
         credential=settings.anthropic_credential, auth_mode=settings.auth_mode
     )
     resolve_secret: SecretResolver = EnvSecretResolver()

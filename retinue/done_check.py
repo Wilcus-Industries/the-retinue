@@ -1,19 +1,21 @@
-"""Run a repo's done-check in a fresh disposable container, then report and tear down.
+"""Done-check building blocks: parse the gate, resolve its secrets, run it, report it.
 
-This is the heart of issue #4. For an accepted PRD the worker:
+Issue #4 originally owned the whole disposable-container orchestration here. Since the
+B-full refactor the orchestrator owns the per-slice container lifecycle (clone → branch
+→ implement → done-check → push → destroy, see
+:func:`retinue.orchestrator._build_slice_in_container`), so this module is now the set of
+reusable, container-agnostic pieces that lifecycle drives:
 
-1. **auth** — mints a GitHub App installation token (:mod:`retinue.github_app`),
-2. **clone** — clones the repo into a fresh container over that token,
-3. **inject** — places the config's secrets into the container env (a missing required
-   secret escalates *before* the doomed check runs),
-4. **run** — runs the done-check command read from the repo's ``CLAUDE.md``,
-5. **report** — posts the outcome to an observable sink (an issue comment via ``gh``),
-6. **teardown** — destroys the container.
+1. **parse** — :func:`parse_done_check` reads the done-check command from ``CLAUDE.md``,
+2. **inject** — :func:`resolve_secrets_or_escalate` resolves the config's declared secrets
+   (a missing required secret escalates on the report sink *before* any container starts),
+3. **run** — :func:`run_done_check_commands` runs the commands inside a container the
+   caller owns and already cloned the slice's changes into, yielding ``(passed, detail)``,
+4. **report** — :func:`render_report_body` / :class:`GhReportSink` post the outcome to an
+   observable sink (an issue comment via ``gh``).
 
-Every collaborator — auth, the container runtime, the secret resolver, and the report
-sink — is injected, so the whole orchestration is exercised in tests with no Docker and
-no network. Teardown is guaranteed by ``try/finally``: the container is destroyed on
-every path, including when clone, run, or report raises.
+Every collaborator — the secret resolver, the container, and the report sink — is
+injected, so each piece is exercised in tests with no Docker and no network.
 """
 
 from __future__ import annotations
@@ -26,8 +28,7 @@ import shlex
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from retinue.container import Container, ContainerRuntime, RunResult
-from retinue.github_app import InstallationAuth
+from retinue.container import Container, RunResult
 from retinue.repo_config import RepoConfig
 
 logger = logging.getLogger(__name__)
@@ -279,7 +280,7 @@ class GhReportSink:
     The subprocess spawn is the one impure edge, factored behind the injected ``runner``
     so command assembly, the auth env, and body rendering are unit-testable without a
     real ``gh``, Docker, or network — mirroring :class:`retinue.cron.GhCli`. The instance
-    is callable, so it drops into :func:`run_done_check` wherever the fake sink did.
+    is callable, so it drops into the orchestrator's build flow wherever the fake did.
 
     Args:
         token: The GitHub token ``gh`` authenticates with, placed in the child env as
@@ -376,17 +377,14 @@ async def _resolve_secrets(
     return env
 
 
-async def _clone_repo(container: Container, clone_url: str) -> None:
-    """Clone the repo into the container over the installation token URL."""
-    result = await container.run_command(["git", "clone", clone_url, "."])
-    if not result.ok:
-        raise DoneCheckError(f"clone failed (exit {result.exit_code}): {result.stderr}")
-
-
-async def _run_done_check(
+async def run_done_check_commands(
     container: Container, commands: list[list[str]]
 ) -> tuple[bool, str]:
-    """Run each done-check command in order; stop at the first failure.
+    """Run each done-check command in order in ``container``; stop at the first failure.
+
+    The container is owned by the caller (the orchestrator's per-slice build container,
+    which has already cloned the repo and let the implementer commit the slice), so the
+    commands run over the *real* changes rather than a pristine clone.
 
     Returns:
         ``(passed, detail)`` — ``passed`` is True only if every command exited 0.
@@ -399,78 +397,43 @@ async def _run_done_check(
     return True, "all done-check commands passed"
 
 
-async def run_done_check(
+async def resolve_secrets_or_escalate(
     repo_full_name: str,
     config: RepoConfig,
-    claude_md: str,
-    *,
-    auth: InstallationAuth,
-    runtime: ContainerRuntime,
     resolve_secret: SecretResolver,
     report: ReportSink,
-    image: str = DEFAULT_IMAGE,
-) -> DoneCheckReport:
-    """Run a repo's done-check in a disposable container and report the outcome.
+) -> dict[str, str]:
+    """Resolve the config's declared secrets; on a miss, escalate then re-raise.
 
-    Orchestrates auth -> clone -> inject -> run -> report -> teardown. Secrets are
-    resolved and a missing required secret escalates *before* any container starts,
-    so a doomed check never runs. The container is started only once secrets are in
-    hand, and is destroyed in a ``finally`` so it is never leaked on any path.
+    Resolving secrets up front lets the caller inject them into the container env at
+    ``start`` *and* lets a missing required secret escalate before any container spins
+    up — no doomed check, nothing to tear down. The escalation is observable on the
+    report sink; the :class:`MissingSecretError` still propagates so the caller skips
+    the build.
 
     Args:
-        repo_full_name: The repo to check, e.g. "owner/repo".
-        config: The accepted repo config (its ``secrets`` block is injected).
-        claude_md: The repo's ``CLAUDE.md`` text, carrying the done-check command.
-        auth: Mints the installation token used to clone (the auth seam).
-        runtime: Spawns the disposable container (the Docker seam).
+        repo_full_name: The repo whose secrets are being resolved (for the escalation).
+        config: The accepted repo config (its ``secrets`` block is resolved).
         resolve_secret: Resolves declared secret names/refs to values.
-        report: Sink the outcome is posted to (commit status / issue comment).
-        image: Container image to run the check in.
+        report: Sink the escalation is posted to on a miss.
 
     Returns:
-        The :class:`DoneCheckReport` that was posted to ``report``.
+        The resolved ``{env_name: value}`` map to inject into the container env.
 
     Raises:
         MissingSecretError: A required secret was missing; an escalation report is
-            posted before the error propagates, and no container is started.
-        DoneCheckError: The done-check could not be parsed, the clone failed, or a
-            command could not be run.
+            posted before the error propagates.
     """
-    commands = parse_done_check(claude_md)
-
-    # Inject step first: resolving secrets up front means a missing required secret
-    # escalates before a container ever spins up — no doomed check, nothing to tear
-    # down. The escalation is itself observable on the report sink.
     try:
-        env = await _resolve_secrets(config, resolve_secret)
+        return await _resolve_secrets(config, resolve_secret)
     except MissingSecretError as exc:
-        escalation = DoneCheckReport(
-            repo_full_name=repo_full_name,
-            passed=False,
-            escalated=True,
-            detail=f"escalated: required secret {exc.secret_name!r} is missing",
+        await report(
+            DoneCheckReport(
+                repo_full_name=repo_full_name,
+                passed=False,
+                escalated=True,
+                detail=f"escalated: required secret {exc.secret_name!r} is missing",
+            )
         )
-        await report(escalation)
         logger.warning("Escalating %s: missing secret %s", repo_full_name, exc.secret_name)
         raise
-
-    token = await auth.installation_token(repo_full_name)
-    container = await runtime.start(image=image, env=env)
-    try:
-        await _clone_repo(container, token.clone_url)
-        passed, detail = await _run_done_check(container, commands)
-        report_result = DoneCheckReport(
-            repo_full_name=repo_full_name,
-            passed=passed,
-            escalated=False,
-            detail=detail,
-        )
-        await report(report_result)
-        logger.info(
-            "Done-check for %s: %s", repo_full_name, "passed" if passed else "failed"
-        )
-        return report_result
-    finally:
-        # Guaranteed teardown: the disposable container is destroyed on every path,
-        # including when clone, run, or report raises.
-        await container.destroy()

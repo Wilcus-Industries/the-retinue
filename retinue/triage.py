@@ -31,6 +31,7 @@ import logging
 from dataclasses import dataclass
 from typing import Protocol
 
+from retinue.container import Container
 from retinue.impl_retry import ImplRetryStore, impl_retry_key
 from retinue.notify import Notification, Notifier
 from retinue.orchestrator import Slice
@@ -65,11 +66,18 @@ class TriageImplementer(Protocol):
     Extends the orchestrator's :class:`retinue.orchestrator.Implementer` contract:
     a clean build returns ``None`` (so existing implementers satisfy it unchanged),
     while a build that needs reasoning returns :class:`ImplementerNotes`. A hard
-    failure raises, as before.
+    failure raises, as before. Like the base contract, it builds the slice inside the
+    disposable build ``container`` the orchestrator owns.
     """
 
-    async def implement(self, slice_: Slice) -> ImplementerNotes | None:
-        """Build ``slice_``; return notes to triage, ``None`` on a clean build."""
+    async def implement(
+        self, slice_: Slice, *, container: Container
+    ) -> ImplementerNotes | None:
+        """Build ``slice_`` in ``container``; return notes to triage, ``None`` if clean."""
+        ...
+
+    def auth_env(self) -> dict[str, str]:
+        """The agent's credential env, merged into the build container at start."""
         ...
 
 
@@ -154,16 +162,17 @@ async def triage_implementer(
     notifier: Notifier,
     create_issue: IssueCreator,
     retry_store: ImplRetryStore,
+    container: Container,
 ) -> TriageResult:
     """Run the implementer for ``slice_``, reasoning about any failure or notes.
 
-    Invokes the implementer; a clean build is :attr:`TriageOutcome.BUILT`. A hard
-    failure or returned notes is fed — with the *persisted* attempt count — to
-    :func:`decide_triage`. ``RETRY`` records an attempt against the persisted cap and
-    re-runs the implementer; ``RESLICE`` files an adjusted slice via ``create_issue``;
-    ``ESCALATE`` notifies a human and applies the ``hitl`` label. Retries are bounded
-    by the persisted count, so a slice that has spent its budget in an earlier run
-    escalates without re-running.
+    Invokes the implementer in the build ``container``; a clean build is
+    :attr:`TriageOutcome.BUILT`. A hard failure or returned notes is fed — with the
+    *persisted* attempt count — to :func:`decide_triage`. ``RETRY`` records an attempt
+    against the persisted cap and re-runs the implementer (in the same container);
+    ``RESLICE`` files an adjusted slice via ``create_issue``; ``ESCALATE`` notifies a
+    human and applies the ``hitl`` label. Retries are bounded by the persisted count, so
+    a slice that has spent its budget in an earlier run escalates without re-running.
 
     Args:
         slice_: The slice whose implementer to drive and triage.
@@ -172,6 +181,7 @@ async def triage_implementer(
         notifier: Shared notify primitive for the escalate path.
         create_issue: The gh issue creator (slicer's seam) for the reslice path.
         retry_store: Persisted per-slice attempt counter bounding the retries.
+        container: The disposable build container the implementer execs in.
 
     Returns:
         A :class:`TriageResult` recording the terminal outcome.
@@ -184,7 +194,7 @@ async def triage_implementer(
         return await _escalate(slice_, _Signal(failed=True), notifier)
 
     while True:
-        signal = await _run_implementer(slice_, implementer)
+        signal = await _run_implementer(slice_, implementer, container)
         if signal.clean:
             return TriageResult(outcome=TriageOutcome.BUILT)
 
@@ -209,15 +219,17 @@ async def triage_implementer(
         return await _escalate(slice_, signal, notifier)
 
 
-async def _run_implementer(slice_: Slice, implementer: TriageImplementer) -> _Signal:
-    """Run one implementer attempt, capturing a hard failure or returned notes.
+async def _run_implementer(
+    slice_: Slice, implementer: TriageImplementer, container: Container
+) -> _Signal:
+    """Run one implementer attempt in ``container``, capturing a failure or notes.
 
     A raised exception becomes a failure signal rather than propagating, so the
     triage gets to reason about it. ``KeyboardInterrupt``/``SystemExit`` are not
     caught — only ``Exception`` — so process control still propagates.
     """
     try:
-        notes = await implementer.implement(slice_)
+        notes = await implementer.implement(slice_, container=container)
     except Exception:
         logger.warning("Implementer failed for %s", impl_retry_key(slice_), exc_info=True)
         return _Signal(failed=True)

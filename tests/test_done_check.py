@@ -1,10 +1,15 @@
-"""Tests for the disposable-container done-check orchestration (issue #4).
+"""Tests for the done-check building blocks (issue #4, post B-full).
 
-The orchestration is auth -> clone -> inject -> run -> report -> teardown. Every
-collaborator is faked: a fake :class:`InstallationAuth` mints a canned token, a fake
-:class:`ContainerRuntime` records the command order and whether the container was
-destroyed, a dict-backed secret resolver stands in for the secret store, and a list
-sink captures what was reported. No Docker, no network.
+The orchestrator now owns the per-slice container lifecycle (see
+``tests/test_orchestrator.py``); this module covers the reusable, container-agnostic
+pieces that lifecycle drives: parsing the gate from ``CLAUDE.md``, resolving its secrets
+(escalating a missing one before any container starts), running the commands in a
+container the caller owns, and the gh report sink. Every collaborator is faked — no
+Docker, no network.
+
+The in-memory ``FakeAuth`` / ``FakeContainer`` / ``FakeRuntime`` fakes and the
+``_resolver`` / ``_sink`` / ``CLAUDE_MD`` helpers are reused by the orchestrator and
+reviewer tests, so they live here.
 """
 
 from __future__ import annotations
@@ -13,7 +18,6 @@ import pytest
 
 from retinue.container import Container, RunResult
 from retinue.done_check import (
-    DEFAULT_IMAGE,
     DoneCheckError,
     DoneCheckReport,
     EnvSecretResolver,
@@ -26,7 +30,8 @@ from retinue.done_check import (
     parse_secret_ref,
     render_report_argv,
     render_report_body,
-    run_done_check,
+    resolve_secrets_or_escalate,
+    run_done_check_commands,
 )
 from retinue.github_app import InstallationToken
 from retinue.repo_config import RepoConfig, SecretsConfig
@@ -61,7 +66,7 @@ class FakeContainer:
 
     ``results`` maps the first argv token (e.g. "git", "uv") to the
     :class:`RunResult` to return; an unscripted command returns success. ``log``
-    appends each event so a test can assert clone-before-run and that destroy ran.
+    appends each event so a test can assert command order and that destroy ran.
     """
 
     def __init__(self, log: list[str], results: dict[str, RunResult]) -> None:
@@ -127,65 +132,47 @@ def test_parse_done_check_raises_without_block() -> None:
         parse_done_check("# CLAUDE.md\n\nNo commands here.\n")
 
 
-# --- happy path: ordering + report + teardown ------------------------------------
+# --- run_done_check_commands -----------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_orchestration_runs_in_order_reports_and_tears_down() -> None:
-    """Auth -> clone -> run -> report -> teardown happens in order on the happy path."""
-    auth = FakeAuth()
-    runtime = FakeRuntime()
+async def test_run_done_check_commands_passes_when_all_green() -> None:
+    """Every command exiting 0 yields ``(True, ...)`` and runs each in order."""
+    log: list[str] = []
+    container = FakeContainer(log, {})
+
+    passed, detail = await run_done_check_commands(
+        container, [["uv", "run", "pytest"], ["uv", "run", "ruff", "check", "."]]
+    )
+
+    assert passed is True
+    assert "passed" in detail
+    assert log == ["run:uv run pytest", "run:uv run ruff check ."]
+
+
+@pytest.mark.asyncio
+async def test_run_done_check_commands_stops_at_first_failure() -> None:
+    """A failing command yields ``(False, detail)`` and the later commands never run."""
+    log: list[str] = []
+    container = FakeContainer(log, {"uv": RunResult(exit_code=1, stderr="boom")})
+
+    passed, detail = await run_done_check_commands(
+        container, [["uv", "run", "pytest"], ["echo", "later"]]
+    )
+
+    assert passed is False
+    assert "boom" in detail
+    # The second command never ran (stopped at the first failure).
+    assert log == ["run:uv run pytest"]
+
+
+# --- resolve_secrets_or_escalate -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_secrets_returns_env_when_all_resolved() -> None:
+    """Resolved inline secrets and refs come back as the env to inject; nothing reported."""
     captured: list[DoneCheckReport] = []
-
-    result = await run_done_check(
-        "owner/repo",
-        _config(),
-        CLAUDE_MD,
-        auth=auth,
-        runtime=runtime,
-        resolve_secret=_resolver({}),
-        report=_sink(captured),
-    )
-
-    assert auth.calls == ["owner/repo"]
-    # Start (auth done) -> clone -> the two done-check commands -> destroy, in order.
-    assert runtime.log == [
-        f"start:{DEFAULT_IMAGE}",
-        "run:git clone https://x-access-token:ghs_faketoken@github.com/owner/repo.git .",
-        "run:uv run pytest",
-        "run:uv run ruff check .",
-        "destroy",
-    ]
-    assert runtime.container is not None and runtime.container.destroyed
-    assert captured == [result]
-    assert result.passed and not result.escalated
-
-
-@pytest.mark.asyncio
-async def test_clone_runs_before_done_check_commands() -> None:
-    """The clone must precede every done-check command in the recorded order."""
-    runtime = FakeRuntime()
-    await run_done_check(
-        "owner/repo",
-        _config(),
-        CLAUDE_MD,
-        auth=FakeAuth(),
-        runtime=runtime,
-        resolve_secret=_resolver({}),
-        report=_sink([]),
-    )
-    clone_index = next(i for i, e in enumerate(runtime.log) if "git clone" in e)
-    pytest_index = next(i for i, e in enumerate(runtime.log) if "uv run pytest" in e)
-    assert clone_index < pytest_index
-
-
-# --- secret injection ------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_secrets_are_injected_into_container_env() -> None:
-    """Resolved inline secrets and refs land in the container's env at start."""
-    runtime = FakeRuntime()
     config = _config(
         SecretsConfig(
             values={"OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}"},
@@ -196,112 +183,41 @@ async def test_secrets_are_injected_into_container_env() -> None:
         {"OPENAI_API_KEY": "sk-real", "vault://team/token": "vault-secret"}
     )
 
-    await run_done_check(
-        "owner/repo",
-        config,
-        CLAUDE_MD,
-        auth=FakeAuth(),
-        runtime=runtime,
-        resolve_secret=resolver,
-        report=_sink([]),
+    env = await resolve_secrets_or_escalate(
+        "owner/repo", config, resolver, _sink(captured)
     )
 
-    assert runtime.started_env == {
-        "OPENAI_API_KEY": "sk-real",
-        "vault://team/token": "vault-secret",
-    }
+    assert env == {"OPENAI_API_KEY": "sk-real", "vault://team/token": "vault-secret"}
+    assert captured == []  # nothing to escalate
 
 
 @pytest.mark.asyncio
-async def test_missing_secret_escalates_and_never_starts_container() -> None:
-    """A missing required secret escalates before any container is started."""
-    runtime = FakeRuntime()
+async def test_resolve_secrets_escalates_and_raises_on_missing() -> None:
+    """A missing required secret posts an escalation report and re-raises."""
     captured: list[DoneCheckReport] = []
     config = _config(SecretsConfig(values={"OPENAI_API_KEY": "${{ secrets.X }}"}))
 
     with pytest.raises(MissingSecretError):
-        await run_done_check(
-            "owner/repo",
-            config,
-            CLAUDE_MD,
-            auth=FakeAuth(),
-            runtime=runtime,
-            resolve_secret=_resolver({}),  # cannot resolve OPENAI_API_KEY
-            report=_sink(captured),
+        await resolve_secrets_or_escalate(
+            "owner/repo", config, _resolver({}), _sink(captured)
         )
 
-    # No container was started, so nothing ran and nothing needs teardown.
-    assert runtime.log == []
-    # The escalation is observable on the sink.
     assert len(captured) == 1
     assert captured[0].escalated and not captured[0].passed
     assert "OPENAI_API_KEY" in captured[0].detail
 
 
-# --- teardown is guaranteed on failure paths -------------------------------------
-
-
 @pytest.mark.asyncio
-async def test_container_torn_down_when_done_check_fails() -> None:
-    """A failing done-check still reports (passed=False) and tears the container down."""
-    runtime = FakeRuntime(results={"uv": RunResult(exit_code=1, stderr="boom")})
-    captured: list[DoneCheckReport] = []
+async def test_real_env_resolver_drops_into_resolve_secrets() -> None:
+    """The real EnvSecretResolver satisfies the resolver seam in the resolve step."""
+    config = _config(SecretsConfig(values={"API_KEY": "${{ secrets.API_KEY }}"}))
+    resolve_secret: SecretResolver = EnvSecretResolver(environ={"API_KEY": "sk-real"})
 
-    result = await run_done_check(
-        "owner/repo",
-        _config(),
-        CLAUDE_MD,
-        auth=FakeAuth(),
-        runtime=runtime,
-        resolve_secret=_resolver({}),
-        report=_sink(captured),
+    env = await resolve_secrets_or_escalate(
+        "owner/repo", config, resolve_secret, _sink([])
     )
 
-    assert not result.passed
-    assert runtime.container is not None and runtime.container.destroyed
-    assert captured == [result]
-    assert "boom" in result.detail
-
-
-@pytest.mark.asyncio
-async def test_container_torn_down_when_clone_raises() -> None:
-    """A clone failure raises DoneCheckError but teardown still runs (finally)."""
-    runtime = FakeRuntime(results={"git": RunResult(exit_code=128, stderr="no auth")})
-
-    with pytest.raises(DoneCheckError):
-        await run_done_check(
-            "owner/repo",
-            _config(),
-            CLAUDE_MD,
-            auth=FakeAuth(),
-            runtime=runtime,
-            resolve_secret=_resolver({}),
-            report=_sink([]),
-        )
-
-    assert runtime.container is not None and runtime.container.destroyed
-
-
-@pytest.mark.asyncio
-async def test_container_torn_down_when_report_raises() -> None:
-    """If the report sink raises, the container is still destroyed by the finally."""
-    runtime = FakeRuntime()
-
-    async def exploding_report(result: DoneCheckReport) -> None:
-        raise RuntimeError("sink down")
-
-    with pytest.raises(RuntimeError, match="sink down"):
-        await run_done_check(
-            "owner/repo",
-            _config(),
-            CLAUDE_MD,
-            auth=FakeAuth(),
-            runtime=runtime,
-            resolve_secret=_resolver({}),
-            report=exploding_report,
-        )
-
-    assert runtime.container is not None and runtime.container.destroyed
+    assert env == {"API_KEY": "sk-real"}
 
 
 # --- real resolver: parse_secret_ref (pure) --------------------------------------
@@ -352,26 +268,6 @@ async def test_env_resolver_returns_none_on_miss_without_logging_value(
         assert await resolver("${{ secrets.MISSING }}") is None
     assert "MISSING" in caplog.text
     assert "super-secret" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_env_resolver_satisfies_secretresolver_protocol_in_orchestration() -> None:
-    """The real resolver drops into run_done_check wherever the fake one did."""
-    runtime = FakeRuntime()
-    config = _config(SecretsConfig(values={"API_KEY": "${{ secrets.API_KEY }}"}))
-    resolve_secret: SecretResolver = EnvSecretResolver(environ={"API_KEY": "sk-real"})
-
-    await run_done_check(
-        "owner/repo",
-        config,
-        CLAUDE_MD,
-        auth=FakeAuth(),
-        runtime=runtime,
-        resolve_secret=resolve_secret,
-        report=_sink([]),
-    )
-
-    assert runtime.started_env == {"API_KEY": "sk-real"}
 
 
 # --- real report sink: GhReportSink (pure parts + fake runner) --------------------
@@ -452,24 +348,3 @@ async def test_gh_report_sink_propagates_gh_failure() -> None:
     sink = GhReportSink(token="t", runner=FakeGhRunner(fail_with=failure))
     with pytest.raises(GhCliError):
         await sink(_report())
-
-
-@pytest.mark.asyncio
-async def test_gh_report_sink_satisfies_reportsink_protocol_in_orchestration() -> None:
-    """The real sink drops into run_done_check wherever the fake one did."""
-    runner = FakeGhRunner()
-    report: ReportSink = GhReportSink(token="t", runner=runner)
-
-    result = await run_done_check(
-        "owner/repo",
-        _config(),
-        CLAUDE_MD,
-        auth=FakeAuth(),
-        runtime=FakeRuntime(),
-        resolve_secret=_resolver({}),
-        report=report,
-    )
-
-    assert result.passed
-    argv, _ = runner.calls[0]
-    assert argv == render_report_argv(result)

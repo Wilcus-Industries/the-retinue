@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from retinue.container import RunResult
 from retinue.impl_retry import ImplRetryStore
 from retinue.notify import (
     CommentRequest,
@@ -40,6 +41,19 @@ from retinue.triage import (
     decide_triage,
     triage_implementer,
 )
+
+
+class _NoContainer:
+    """A do-nothing build container the triage threads to the implementer (unused here)."""
+
+    async def run_command(self, command: list[str]) -> RunResult:
+        return RunResult(exit_code=0)
+
+    async def destroy(self) -> None:
+        return None
+
+
+_CONTAINER = _NoContainer()
 
 
 class _RecordingSinks:
@@ -80,9 +94,12 @@ class FailingImplementer:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def implement(self, slice_: Slice) -> None:
+    async def implement(self, slice_: Slice, *, container: object) -> None:
         self.calls += 1
         raise RuntimeError("implementer blew up")
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
 
 
 class NotesImplementer:
@@ -92,9 +109,12 @@ class NotesImplementer:
         self.calls = 0
         self._notes = notes
 
-    async def implement(self, slice_: Slice) -> ImplementerNotes:
+    async def implement(self, slice_: Slice, *, container: object) -> ImplementerNotes:
         self.calls += 1
         return self._notes
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
 
 
 class OkImplementer:
@@ -103,8 +123,11 @@ class OkImplementer:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def implement(self, slice_: Slice) -> None:
+    async def implement(self, slice_: Slice, *, container: object) -> None:
         self.calls += 1
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
 
 
 def _slice(issue_number: int = 7) -> Slice:
@@ -171,6 +194,7 @@ async def test_failure_retried_up_to_cap_then_escalates(tmp_path: Path) -> None:
         notifier=_notifier(sinks),
         create_issue=creator,
         retry_store=store,
+        container=_CONTAINER,
     )
 
     # One initial attempt + retries up to the cap of 2 = 3 invocations total.
@@ -200,6 +224,7 @@ async def test_failure_with_zero_cap_escalates_without_retry(tmp_path: Path) -> 
         notifier=_notifier(sinks),
         create_issue=_RecordingCreator(),
         retry_store=store,
+        container=_CONTAINER,
     )
 
     assert implementer.calls == 1
@@ -226,6 +251,7 @@ async def test_persisted_count_bounds_retries_across_runs(tmp_path: Path) -> Non
         notifier=_notifier(sinks),
         create_issue=_RecordingCreator(),
         retry_store=ImplRetryStore(db),
+        container=_CONTAINER,
     )
 
     # Budget already spent: the slice escalates without another implement attempt.
@@ -243,10 +269,13 @@ class FlakyImplementer:
         self.calls = 0
         self._fail_times = fail_times
 
-    async def implement(self, slice_: Slice) -> None:
+    async def implement(self, slice_: Slice, *, container: object) -> None:
         self.calls += 1
         if self.calls <= self._fail_times:
             raise RuntimeError("transient failure")
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
 
 
 @pytest.mark.asyncio
@@ -264,6 +293,7 @@ async def test_transient_failure_retried_then_succeeds(tmp_path: Path) -> None:
         notifier=_notifier(sinks),
         create_issue=_RecordingCreator(),
         retry_store=store,
+        container=_CONTAINER,
     )
 
     assert implementer.calls == 2
@@ -289,6 +319,7 @@ async def test_clean_build_is_built_with_no_side_effects(tmp_path: Path) -> None
         notifier=_notifier(sinks),
         create_issue=creator,
         retry_store=store,
+        container=_CONTAINER,
     )
 
     assert implementer.calls == 1
@@ -319,6 +350,7 @@ async def test_notes_requesting_reslice_files_adjusted_issue(tmp_path: Path) -> 
         notifier=_notifier(sinks),
         create_issue=creator,
         retry_store=store,
+        container=_CONTAINER,
     )
 
     assert result.outcome is TriageOutcome.RESLICED
@@ -339,11 +371,16 @@ async def test_notes_retry_then_clean_is_built(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def implement(self, slice_: Slice) -> ImplementerNotes | None:
+        async def implement(
+            self, slice_: Slice, *, container: object
+        ) -> ImplementerNotes | None:
             self.calls += 1
             if self.calls == 1:
                 return ImplementerNotes(summary="needed another pass")
             return None
+
+        def auth_env(self) -> dict[str, str]:
+            return {}
 
     implementer = NotesThenClean()
     sinks = _RecordingSinks()
@@ -355,6 +392,7 @@ async def test_notes_retry_then_clean_is_built(tmp_path: Path) -> None:
         notifier=_notifier(sinks),
         create_issue=_RecordingCreator(),
         retry_store=store,
+        container=_CONTAINER,
     )
 
     assert implementer.calls == 2
@@ -378,6 +416,7 @@ async def test_notes_never_silently_dropped_when_budget_exhausted(tmp_path: Path
         notifier=_notifier(sinks),
         create_issue=_RecordingCreator(),
         retry_store=store,
+        container=_CONTAINER,
     )
 
     assert result.outcome is TriageOutcome.ESCALATED

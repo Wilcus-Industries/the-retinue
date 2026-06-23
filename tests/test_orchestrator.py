@@ -13,33 +13,31 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import AsyncIterator
-from typing import cast
 
 import pytest
 
 from retinue.container import Container, RunResult
-from retinue.done_check import DoneCheckReport
+from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
     AgentSdkConflictResolver,
-    AgentSdkImplementer,
     AnthropicResponse,
     BuildOutcome,
     BuildResult,
     ConflictResolution,
     ConflictResolutionError,
     ContainerGitOps,
+    ContainerImplementer,
     GitOpsError,
     Implementer,
     ImplementError,
     MergeConflict,
-    QuerySeam,
     Slice,
+    _claude_argv,
+    _claude_result_is_error,
     _conflicted_paths,
     _ConflictedFile,
     _implement_env,
     _implement_prompt,
-    _is_result_message,
     _parse_resolution,
     _resolve_headers,
     _resolve_payload,
@@ -47,7 +45,7 @@ from retinue.orchestrator import (
     build_slice,
     integration_branch,
 )
-from retinue.repo_config import RepoConfig
+from retinue.repo_config import RepoConfig, SecretsConfig
 from tests.test_done_check import (
     CLAUDE_MD,
     FakeAuth,
@@ -58,13 +56,22 @@ from tests.test_done_check import (
 
 
 class FakeImplementer:
-    """Records the slice it was asked to build; no real Agent SDK spawn."""
+    """Records the slice it was asked to build and marks the build container.
+
+    Appends an ``implement`` marker to the container log so the per-slice lifecycle
+    order (clone -> checkout -> implement -> done-check -> push) is assertable, and
+    returns an empty ``auth_env`` (a fake needs no real Anthropic credential).
+    """
 
     def __init__(self) -> None:
         self.built: list[Slice] = []
 
-    async def implement(self, slice_: Slice) -> None:
+    async def implement(self, slice_: Slice, *, container: Container) -> None:
         self.built.append(slice_)
+        await container.run_command(["implement", slice_.branch])
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
 
 
 class FakeGitOps:
@@ -233,31 +240,105 @@ async def test_red_done_check_still_built_and_reported() -> None:
     assert captured[0].passed is False
 
 
-# --- ordering: implement precedes done-check -------------------------------------
+# --- per-slice container lifecycle: clone -> branch -> implement -> check -> push --
 
 
 @pytest.mark.asyncio
-async def test_implementer_runs_before_done_check() -> None:
-    """The implementer commits the slice before the done-check clones and runs it."""
-    events: list[str] = []
-
-    class RecordingImplementer:
-        async def implement(self, slice_: Slice) -> None:
-            events.append("implement")
-
+async def test_slice_builds_in_one_container_in_order() -> None:
+    """One container handles clone -> checkout issue-<N> -> implement -> done-check -> push."""
     runtime = FakeRuntime()
-    # Record the first container command (the clone) to prove ordering.
-    original_start = runtime.start
+    implementer = FakeImplementer()
 
-    async def start(*, image: str, env: dict[str, str]) -> Container:
-        events.append("done-check")
-        return await original_start(image=image, env=env)
+    result = await _build(runtime=runtime, git=FakeGitOps(), implementer=implementer)
 
-    runtime.start = start  # type: ignore[method-assign]
+    assert result.outcome is BuildOutcome.MERGED
+    # Exactly one container built the whole slice and was destroyed at the end.
+    assert runtime.container is not None and runtime.container.destroyed
+    log = runtime.log
+    clone = next(i for i, e in enumerate(log) if "git clone" in e)
+    checkout = next(i for i, e in enumerate(log) if "checkout -B issue-7" in e)
+    implement = next(i for i, e in enumerate(log) if e.startswith("run:implement"))
+    done_check = next(i for i, e in enumerate(log) if "uv run pytest" in e)
+    push = next(i for i, e in enumerate(log) if "git push origin issue-7" in e)
+    assert clone < checkout < implement < done_check < push
 
-    await _build(runtime=runtime, git=FakeGitOps(), implementer=RecordingImplementer())
 
-    assert events == ["implement", "done-check"]
+@pytest.mark.asyncio
+async def test_red_slice_pushes_nothing() -> None:
+    """A red done-check leaves the issue branch unpushed; the container is torn down."""
+    runtime = FakeRuntime(results={"uv": RunResult(exit_code=1, stderr="boom")})
+
+    result = await _build(runtime=runtime, git=FakeGitOps())
+
+    assert result.outcome is BuildOutcome.BLOCKED
+    assert not any("git push" in e for e in runtime.log)
+    assert runtime.container is not None and runtime.container.destroyed
+
+
+@pytest.mark.asyncio
+async def test_secrets_and_git_identity_injected_into_container_env() -> None:
+    """Resolved secrets, the git committer identity, and the agent creds ride the env."""
+    runtime = FakeRuntime()
+    config = RepoConfig(
+        secrets=SecretsConfig(values={"OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}"})
+    )
+
+    class CredImplementer(FakeImplementer):
+        def auth_env(self) -> dict[str, str]:
+            return {"ANTHROPIC_API_KEY": "sk-real"}
+
+    await build_slice(
+        _slice(),
+        config,
+        CLAUDE_MD,
+        implementer=CredImplementer(),
+        git=FakeGitOps(),
+        auth=FakeAuth(),
+        runtime=runtime,
+        resolve_secret=_resolver({"OPENAI_API_KEY": "sk-secret"}),
+        report=_sink([]),
+    )
+
+    env = runtime.started_env
+    assert env is not None
+    assert env["OPENAI_API_KEY"] == "sk-secret"
+    assert env["ANTHROPIC_API_KEY"] == "sk-real"  # the implementer's auth_env
+    assert env["GIT_AUTHOR_NAME"] and env["GIT_COMMITTER_EMAIL"]
+
+
+@pytest.mark.asyncio
+async def test_missing_secret_escalates_before_any_container_starts() -> None:
+    """A missing required secret escalates on the report sink and starts no container."""
+    runtime = FakeRuntime()
+    captured: list[DoneCheckReport] = []
+    config = RepoConfig(secrets=SecretsConfig(values={"OPENAI_API_KEY": "${{ secrets.X }}"}))
+
+    with pytest.raises(MissingSecretError):
+        await build_slice(
+            _slice(),
+            config,
+            CLAUDE_MD,
+            implementer=FakeImplementer(),
+            git=FakeGitOps(),
+            auth=FakeAuth(),
+            runtime=runtime,
+            resolve_secret=_resolver({}),
+            report=_sink(captured),
+        )
+
+    assert runtime.log == []  # no container ever started
+    assert len(captured) == 1 and captured[0].escalated
+
+
+@pytest.mark.asyncio
+async def test_container_torn_down_when_clone_fails() -> None:
+    """A clone failure raises GitOpsError but the container is still destroyed."""
+    runtime = FakeRuntime(results={"git": RunResult(exit_code=128, stderr="no auth")})
+
+    with pytest.raises(GitOpsError):
+        await _build(runtime=runtime, git=FakeGitOps())
+
+    assert runtime.container is not None and runtime.container.destroyed
 
 
 # --- merge conflict surfaces -----------------------------------------------------
@@ -365,6 +446,8 @@ async def test_merge_assembles_checkout_fetch_merge_argv() -> None:
     assert "merge --no-ff --no-edit origin/issue-7" in merge_cmd
     assert "user.name=" in merge_cmd
     assert "user.email=" in merge_cmd
+    # The integration branch is pushed so the staging PR has a real remote head.
+    assert cmds[3] == "git push origin retinue/prd-1"
 
 
 @pytest.mark.asyncio
@@ -596,74 +679,11 @@ async def test_resolver_escalates_on_non_200_status() -> None:
     assert not any("add" in cmd for cmd in container.commands)
 
 
-# --- real Agent-SDK implementer --------------------------------------------------
+# --- real container-exec implementer ---------------------------------------------
 #
-# Exercises the production AgentSdkImplementer's pure/parseable parts (prompt assembly,
-# env-routed auth, result-message detection) and its collaboration with the injected
-# Agent-SDK ``query`` seam over a scripted async message stream. No live model, SDK,
-# Docker, gh, or clone.
-
-
-class _FakeResultMessage:
-    """Stand-in for the SDK ``ResultMessage``: carries ``is_error`` like the real type."""
-
-    def __init__(self, *, is_error: bool = False, result: str | None = None) -> None:
-        self.is_error = is_error
-        self.result = result
-
-
-class _FakeAssistantMessage:
-    """A non-terminal SDK message: no ``is_error``, so the result reader ignores it."""
-
-    def __init__(self, text: str) -> None:
-        self.text = text
-
-
-class _SpyOptions:
-    """A passthrough options factory: captures the built kwargs as attributes (no SDK)."""
-
-    def __init__(
-        self,
-        *,
-        cwd: str,
-        model: str,
-        system_prompt: str,
-        permission_mode: str,
-        env: dict[str, str],
-    ) -> None:
-        self.cwd = cwd
-        self.model = model
-        self.system_prompt = system_prompt
-        self.permission_mode = permission_mode
-        self.env = env
-
-
-class RecordingQuery:
-    """Records the spawn (prompt + options) and replays a scripted message stream."""
-
-    def __init__(self, messages: list[object]) -> None:
-        self._messages = messages
-        self.calls: list[tuple[str, _SpyOptions]] = []
-
-    def __call__(
-        self, *, prompt: str, options: _SpyOptions
-    ) -> AsyncIterator[object]:
-        self.calls.append((prompt, options))
-
-        async def _stream() -> AsyncIterator[object]:
-            for message in self._messages:
-                yield message
-
-        return _stream()
-
-
-def _implementer(query: RecordingQuery, **kwargs: object) -> AgentSdkImplementer:
-    """Build an AgentSdkImplementer wired to the spy options factory (no live SDK)."""
-    return AgentSdkImplementer(
-        query=cast(QuerySeam, query),
-        options_factory=_SpyOptions,
-        **kwargs,  # type: ignore[arg-type]
-    )
+# Exercises the production ContainerImplementer's pure parts (prompt assembly, env-routed
+# auth, claude argv, json-result error detection) and its in-container collaboration over
+# a scripted container. No live model, CLI, Docker, gh, or clone.
 
 
 def test_implement_prompt_names_issue_repo_and_branch() -> None:
@@ -676,7 +696,7 @@ def test_implement_prompt_names_issue_repo_and_branch() -> None:
 
 
 def test_implement_env_api_key_mode_uses_anthropic_api_key() -> None:
-    """api_key mode threads the credential to the spawned CLI as ANTHROPIC_API_KEY."""
+    """api_key mode threads the credential to the CLI as ANTHROPIC_API_KEY."""
     env = _implement_env("sk-ant-api03-secret", "api_key")
 
     assert env == {"ANTHROPIC_API_KEY": "sk-ant-api03-secret"}
@@ -691,68 +711,79 @@ def test_implement_env_subscription_mode_uses_oauth_token() -> None:
     assert "ANTHROPIC_API_KEY" not in env
 
 
-def test_is_result_message_detects_terminal_result_only() -> None:
-    """Only a message carrying ``is_error`` (the ResultMessage) is the terminal result."""
-    assert _is_result_message(_FakeResultMessage()) is True
-    assert _is_result_message(_FakeAssistantMessage("working...")) is False
+def test_claude_argv_assembles_headless_invocation() -> None:
+    """The argv runs the headless CLI: print mode, model, acceptEdits, json output."""
+    argv = _claude_argv(prompt="do it", model="m")
+
+    assert argv[0] == "claude"
+    assert argv[1:3] == ["-p", "do it"]
+    assert "--model" in argv and "m" in argv
+    assert "--permission-mode" in argv and "acceptEdits" in argv
+    assert "--output-format" in argv and "json" in argv
+
+
+def test_claude_result_is_error_reads_json_flag() -> None:
+    """Only a json result flagging ``is_error`` is an error; non-json/empty is not."""
+    assert _claude_result_is_error('{"is_error": true}') is True
+    assert _claude_result_is_error('{"is_error": false}') is False
+    assert _claude_result_is_error("not json") is False
+    assert _claude_result_is_error("") is False
 
 
 @pytest.mark.asyncio
-async def test_implementer_spawns_query_with_prompt_and_options() -> None:
-    """A clean spawn drives ``query`` with the per-slice prompt and built options."""
-    query = RecordingQuery([_FakeAssistantMessage("done"), _FakeResultMessage()])
-    implementer = _implementer(query, credential="sk-ant-api03-k", workspace="/work")
+async def test_container_implementer_execs_claude_with_prompt_and_model() -> None:
+    """A clean run execs ``claude`` in the container with the per-slice prompt + model."""
+    container = ScriptedContainer()
+    implementer = ContainerImplementer(credential="sk-ant-api03-k")
 
-    await implementer.implement(_slice(issue_number=7))
+    await implementer.implement(_slice(issue_number=7), container=container)
 
-    assert len(query.calls) == 1
-    prompt, options = query.calls[0]
+    cmd = next(c for c in container.commands if c and c[0] == "claude")
+    prompt = cmd[cmd.index("-p") + 1]
     assert "issue-7" in prompt
-    # Options run in the cloned-repo workspace, pin the model, and carry the env credential.
-    assert options.cwd == "/work"
-    assert options.model == "claude-opus-4-8"
-    assert options.env == {"ANTHROPIC_API_KEY": "sk-ant-api03-k"}
+    assert "claude-opus-4-8" in cmd  # the default model is pinned
+
+
+def test_container_implementer_auth_env_routes_by_mode() -> None:
+    """auth_env routes the credential to the env var the auth mode selects."""
+    assert ContainerImplementer(credential="k").auth_env() == {"ANTHROPIC_API_KEY": "k"}
+    assert ContainerImplementer(
+        credential="t", auth_mode="subscription"
+    ).auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "t"}
 
 
 @pytest.mark.asyncio
-async def test_implementer_subscription_mode_threads_oauth_token() -> None:
-    """In subscription mode the built options carry the OAuth token env var."""
-    query = RecordingQuery([_FakeResultMessage()])
-    implementer = _implementer(
-        query, credential="sk-ant-oat01-k", auth_mode="subscription"
-    )
-
-    await implementer.implement(_slice())
-
-    _, options = query.calls[0]
-    assert options.env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-k"}
-
-
-@pytest.mark.asyncio
-async def test_implementer_raises_on_errored_result() -> None:
-    """An SDK result reporting is_error surfaces as ImplementError, not a clean build."""
-    query = RecordingQuery([_FakeResultMessage(is_error=True, result="boom")])
-    implementer = _implementer(query, credential="k")
+async def test_container_implementer_raises_on_nonzero_exit() -> None:
+    """A non-zero ``claude`` exit surfaces as ImplementError, not a clean build."""
+    container = ScriptedContainer({"claude": RunResult(exit_code=1, stderr="boom")})
 
     with pytest.raises(ImplementError):
-        await implementer.implement(_slice())
+        await ContainerImplementer(credential="k").implement(_slice(), container=container)
 
 
 @pytest.mark.asyncio
-async def test_implementer_clean_when_no_error_result() -> None:
-    """A stream with no errored result completes cleanly (returns None, no raise)."""
-    query = RecordingQuery([_FakeAssistantMessage("x"), _FakeResultMessage(is_error=False)])
-    implementer = _implementer(query, credential="k")
-
-    # A non-errored result stream returns cleanly (no ImplementError raised).
-    await implementer.implement(_slice())
-    assert len(query.calls) == 1
-
-
-def test_agent_sdk_implementer_satisfies_implementer_protocol() -> None:
-    """AgentSdkImplementer is usable wherever the Implementer protocol is expected."""
-    implementer: Implementer = AgentSdkImplementer(
-        credential="k", query=cast(QuerySeam, RecordingQuery([]))
+async def test_container_implementer_raises_on_is_error_json_result() -> None:
+    """A clean exit whose json result flags is_error still raises ImplementError."""
+    container = ScriptedContainer(
+        {"claude": RunResult(exit_code=0, stdout='{"is_error": true}')}
     )
 
-    assert hasattr(implementer, "implement")
+    with pytest.raises(ImplementError):
+        await ContainerImplementer(credential="k").implement(_slice(), container=container)
+
+
+@pytest.mark.asyncio
+async def test_container_implementer_clean_run_does_not_raise() -> None:
+    """A zero exit with a non-error json result completes cleanly."""
+    container = ScriptedContainer(
+        {"claude": RunResult(exit_code=0, stdout='{"is_error": false}')}
+    )
+
+    await ContainerImplementer(credential="k").implement(_slice(), container=container)
+
+
+def test_container_implementer_satisfies_implementer_protocol() -> None:
+    """ContainerImplementer is usable wherever the Implementer protocol is expected."""
+    implementer: Implementer = ContainerImplementer(credential="k")
+
+    assert hasattr(implementer, "implement") and hasattr(implementer, "auth_env")
