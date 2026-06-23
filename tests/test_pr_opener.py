@@ -81,7 +81,9 @@ class FakePrOps:
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         return self._staging_exists
 
-    async def bring_up_to_date(self, *, branch: str, base: str) -> None:
+    async def bring_up_to_date(
+        self, *, repo_full_name: str, branch: str, base: str
+    ) -> None:
         self.synced.append((branch, base))
 
     async def open_pr(self, request: OpenPrRequest) -> PullRequest:
@@ -398,10 +400,32 @@ async def test_bring_up_to_date_posts_a_merge() -> None:
     """bring_up_to_date POSTs base into branch via the repo merges API."""
     runner = _FakeGhRunner([GhResult(exit_code=0, stdout="{}")])
 
-    await _ops(runner).bring_up_to_date(branch="retinue/prd-5", base="staging")
+    await _ops(runner).bring_up_to_date(
+        repo_full_name="owner/repo", branch="retinue/prd-5", base="staging"
+    )
 
     args, _ = runner.calls[0]
     assert args[:2] == ["api", "--method"]
-    assert "repos/{owner}/{repo}/merges" in args
+    assert "repos/owner/repo/merges" in args
     assert "base=retinue/prd-5" in args
     assert "head=staging" in args
+
+
+@pytest.mark.asyncio
+async def test_bring_up_to_date_targets_repo_explicitly_not_cwd() -> None:
+    """The merges call names the repo in the path, never a cwd-resolved placeholder.
+
+    The worker runs in the retinue source, not a clone of the target repo, so any
+    ``{owner}/{repo}`` placeholder would resolve against the wrong (or no) git remote.
+    The repo must be threaded into the API path explicitly.
+    """
+    runner = _FakeGhRunner([GhResult(exit_code=0, stdout="{}")])
+
+    await _ops(runner).bring_up_to_date(
+        repo_full_name="acme/widgets", branch="retinue/prd-9", base="staging"
+    )
+
+    args, _ = runner.calls[0]
+    assert "repos/acme/widgets/merges" in args
+    # No gh placeholder anywhere in the argv — nothing resolves from process cwd.
+    assert not any("{owner}" in arg or "{repo}" in arg for arg in args)

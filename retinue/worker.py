@@ -527,9 +527,10 @@ def _github_claude_md_fetcher(
     Returns an async ``(repo) -> claude_md`` that mints an installation token and reads
     the target repo's root ``CLAUDE.md`` so the build's done-check command is parsed from
     the *real* repo text (not an empty default). A repo with no ``CLAUDE.md`` (404) reads
-    as empty text — the done-check then finds no command and escalates rather than running
-    a phantom gate. Any other HTTP error is raised so the job retries rather than building
-    against a degraded, empty done-check spec.
+    as empty text — the pipeline then finds no parseable done-check gate and escalates
+    (:meth:`retinue.pipeline.Pipeline._has_done_check_gate`) rather than running a phantom
+    gate or crash-looping the build. Any other HTTP error is raised so the job retries
+    rather than building against a degraded, empty done-check spec.
 
     Args:
         auth: Mints an installation token scoped to the target repo.

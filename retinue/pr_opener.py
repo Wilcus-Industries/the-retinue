@@ -89,7 +89,9 @@ class PrOps(Protocol):
         """Return True when ``branch`` (the staging branch) exists on the repo."""
         ...
 
-    async def bring_up_to_date(self, *, branch: str, base: str) -> None:
+    async def bring_up_to_date(
+        self, *, repo_full_name: str, branch: str, base: str
+    ) -> None:
         """Bring ``branch`` up to date with ``base`` before the PR is opened."""
         ...
 
@@ -211,7 +213,9 @@ async def _bring_up_to_date_and_open(
     ops: PrOps,
 ) -> PrOpenResult:
     """Sync the integration branch with staging, then open exactly one PR."""
-    await ops.bring_up_to_date(branch=branch, base=staging)
+    await ops.bring_up_to_date(
+        repo_full_name=repo_full_name, branch=branch, base=staging
+    )
     pull_request = await ops.open_pr(
         OpenPrRequest(
             repo_full_name=repo_full_name,
@@ -423,19 +427,23 @@ class GhCliPrOps:
         # error to raise on, just a False answer to the existence question.
         return result.ok
 
-    async def bring_up_to_date(self, *, branch: str, base: str) -> None:
+    async def bring_up_to_date(
+        self, *, repo_full_name: str, branch: str, base: str
+    ) -> None:
         """Merge ``base`` into ``branch`` server-side so the PR opens up to date.
 
-        The protocol omits the repo here, so this relies on ``gh``'s
-        ``{owner}/{repo}`` placeholders, which ``gh`` resolves from the working
-        directory's git remote — the worker runs this inside the repo clone.
+        The merges API path is built explicitly from ``repo_full_name`` — never from
+        ``gh``'s ``{owner}/{repo}`` placeholders, which resolve from the process's
+        working-directory git remote. The worker runs in the retinue source, not a
+        clone of the target repo, so cwd-relative resolution would target the wrong
+        repo (or fail).
         """
         await self._gh(
             [
                 "api",
                 "--method",
                 "POST",
-                "repos/{owner}/{repo}/merges",
+                f"repos/{repo_full_name}/merges",
                 "-f",
                 f"base={branch}",
                 "-f",

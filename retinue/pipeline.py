@@ -50,10 +50,12 @@ from retinue.budget import (
 from retinue.container import Container, ContainerRuntime, DockerRuntime
 from retinue.done_check import (
     DEFAULT_IMAGE,
+    DoneCheckError,
     EnvSecretResolver,
     GhReportSink,
     ReportSink,
     SecretResolver,
+    parse_done_check,
 )
 from retinue.handoff import (
     Handoff,
@@ -74,6 +76,7 @@ from retinue.loopback import (
 from retinue.notify import (
     GhCommentSink,
     GhLabelSink,
+    Notification,
     Notifier,
     NtfyPushSink,
     PushoverPushSink,
@@ -96,6 +99,7 @@ from retinue.reconcile import (
 )
 from retinue.repo_config import RepoConfig
 from retinue.slicer import (
+    HITL_LABEL,
     ClaudeSliceGenerator,
     GhCliIssueCreator,
     IssueCreator,
@@ -130,12 +134,15 @@ class PrdJobResult:
         pr_opened: True when the staging PR opened after the build.
         prd_build: The full-PRD build result, or ``None`` when the PRD never built.
         pr_open: The PR-open result, or ``None`` when the PR step was not reached.
+        done_check_missing: True when the repo had no parseable done-check gate, so the
+            build was escalated and skipped (a clean terminal skip, not a crash).
     """
 
     sliced: bool
     pr_opened: bool
     prd_build: PrdBuildResult | None = None
     pr_open: PrOpenResult | None = None
+    done_check_missing: bool = False
 
 
 @dataclass
@@ -198,6 +205,13 @@ class Pipeline:
         the owned slice set, runs the full-PRD build, then opens the staging PR behind
         the heimdall precheck and records the PR<->PRD mapping for a later resume.
 
+        Two guards keep a misconfigured or no-op build from crashing the job. A repo with
+        no parseable done-check gate is escalated and skipped (a clean terminal result, so
+        the Arq job succeeds instead of crash-looping on the build's ``DoneCheckError``).
+        A build that merged no slices (budget-deferred or all-blocked) never pushed an
+        integration branch, so the staging-PR step is skipped — opening a PR for a head
+        that doesn't exist would 404.
+
         Args:
             repo_full_name: The target repo, e.g. "owner/repo".
             prd_number: The PRD's tracking issue number.
@@ -225,7 +239,16 @@ class Pipeline:
             prd_number=prd_number,
             issue_numbers=slice_result.created_numbers,
         )
+        if not await self._has_done_check_gate(repo_full_name, prd_number):
+            return PrdJobResult(sliced=True, pr_opened=False, done_check_missing=True)
+
         build = await self._build(repo_full_name, prd_number, slices)
+        if not build.merged_issues:
+            # Budget-deferred or all-blocked: no integration branch was pushed, so there
+            # is no head to open a PR from. Surface the build (its deferral is visible in
+            # the empty merged_issues) without attempting the doomed PR open.
+            return PrdJobResult(sliced=True, pr_opened=False, prd_build=build)
+
         pr_open = await self._open_pr(repo_full_name, prd_number)
         return PrdJobResult(
             sliced=True,
@@ -233,6 +256,44 @@ class Pipeline:
             prd_build=build,
             pr_open=pr_open,
         )
+
+    async def _has_done_check_gate(
+        self, repo_full_name: str, prd_number: int
+    ) -> bool:
+        """True when the repo's CLAUDE.md carries a parseable done-check gate.
+
+        An opted-in repo whose CLAUDE.md has no "Definition of done" block would make the
+        build's :func:`retinue.done_check.parse_done_check` raise, failing the Arq task
+        into an infinite retry. Detecting it here lets the pipeline escalate the
+        misconfiguration through the notifier (push + comment + label, matching the slicer
+        and PR-opener escalations) and skip the build cleanly — never running a phantom
+        gate, never crash-looping. Returns False after escalating; True when the gate
+        parses.
+        """
+        try:
+            parse_done_check(self.claude_md)
+        except DoneCheckError as exc:
+            await self.notifier.notify(
+                Notification(
+                    repo_full_name=repo_full_name,
+                    issue_number=prd_number,
+                    title=f"Retinue can't build PRD #{prd_number}: no done-check gate",
+                    body=(
+                        "skipped: no done-check gate. The repo's CLAUDE.md has no "
+                        f"parseable 'Definition of done' block ({exc}). Add one so the "
+                        "build has a gate to run, then re-trigger the PRD."
+                    ),
+                    label=HITL_LABEL,
+                )
+            )
+            logger.warning(
+                "Skipping build for %s PRD #%d: no done-check gate (%s)",
+                repo_full_name,
+                prd_number,
+                exc,
+            )
+            return False
+        return True
 
     async def process_review(self, review: HeimdallReview) -> VerdictResult:
         """Run the heimdall loopback for one review: rebuild / converge / escalate.

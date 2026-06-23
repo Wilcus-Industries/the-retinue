@@ -62,7 +62,9 @@ class _FakePrOps:
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         return self.staging
 
-    async def bring_up_to_date(self, *, branch: str, base: str) -> None:
+    async def bring_up_to_date(
+        self, *, repo_full_name: str, branch: str, base: str
+    ) -> None:
         return None
 
     async def open_pr(self, request: OpenPrRequest) -> PullRequest:
@@ -188,6 +190,82 @@ async def test_substantive_prd_slices_then_builds_and_opens_pr(tmp_path: Path) -
     assert result.sliced is True
     assert result.pr_opened is True
     assert pr_ops.opened  # the staging PR was opened
+
+
+@pytest.mark.asyncio
+async def test_no_done_check_gate_escalates_and_skips_build(tmp_path: Path) -> None:
+    """A repo with no parseable done-check escalates and skips the build, never raising.
+
+    An opted-in repo whose CLAUDE.md carries no "Definition of done" block would make the
+    build's ``parse_done_check`` raise ``DoneCheckError``, crash-looping the Arq job.
+    Instead the pipeline must detect the missing gate, escalate through the notifier, and
+    return a clean terminal result so the job succeeds with no build and no PR attempted.
+    """
+    notifier = _RecordingNotifier()
+    built: list[object] = []
+
+    async def build_prd(**kwargs: object) -> PrdBuildResult:
+        built.append(kwargs)
+        return PrdBuildResult("retinue/prd-7", [], [], [], [])
+
+    async def generate(body: str) -> SlicePlan:
+        return SlicePlan(slices=[IssueDraft(title="s1", body="build the thing")])
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(
+        tmp_path,
+        claude_md="# CLAUDE.md\n\nNo definition-of-done block here.\n",
+        notifier=notifier,
+        slice_generate=generate,
+        pr_ops=pr_ops,
+        build_prd=build_prd,
+    )
+    body = "Implement a real feature with enough detail to slice responsibly here."
+    result = await pipeline.process_prd_job(
+        repo_full_name="owner/repo", prd_number=7, prd_body=body
+    )
+
+    assert result.sliced is True
+    assert result.done_check_missing is True
+    assert result.pr_opened is False
+    assert built == []  # the build was skipped
+    assert pr_ops.opened == []  # no PR attempted
+    assert notifier.notes  # the missing-gate escalation landed
+
+
+@pytest.mark.asyncio
+async def test_deferred_build_skips_pr_and_surfaces_deferral(tmp_path: Path) -> None:
+    """A build that merged nothing (budget-deferred / all-blocked) opens no PR.
+
+    ``_open_pr`` opens/syncs a PR for the ``retinue/prd-<n>`` head; a deferred or
+    all-blocked build never pushed that branch, so opening a PR would 404. The pipeline
+    must skip the PR step when no slices merged and still surface the no-op cleanly.
+    """
+
+    async def generate(body: str) -> SlicePlan:
+        return SlicePlan(slices=[IssueDraft(title="s1", body="build the thing")])
+
+    pr_ops = _FakePrOps()
+
+    async def build_prd(**kwargs: object) -> PrdBuildResult:
+        # No merged_issues: the budget gate deferred (or every slice was blocked).
+        return PrdBuildResult("retinue/prd-7", merged_issues=[], blocked_issues=[101],
+                              escalated_issues=[], skipped_issues=[])
+
+    pipeline = _pipeline(
+        tmp_path, slice_generate=generate, pr_ops=pr_ops, build_prd=build_prd
+    )
+    body = "Implement a real feature with enough detail to slice responsibly here."
+    result = await pipeline.process_prd_job(
+        repo_full_name="owner/repo", prd_number=7, prd_body=body
+    )
+
+    assert result.sliced is True
+    assert result.pr_opened is False
+    assert result.pr_open is None  # the PR step was never reached
+    assert result.prd_build is not None
+    assert result.prd_build.merged_issues == []  # the deferral is visible to the caller
+    assert pr_ops.opened == []  # no PR open/sync attempted
 
 
 # --- review loopback -------------------------------------------------------------
