@@ -358,6 +358,84 @@ async def test_on_startup_wires_a_live_pipeline(
 
 
 @pytest.mark.asyncio
+async def test_on_startup_adhoc_drain_drives_one_issue_to_the_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound ``ctx['adhoc_drain']`` actually drains: one listed issue reaches the build.
+
+    Extends the live-wiring path by *invoking* the bound drain (not merely asserting it is
+    callable): a fake gh seam lists one ready issue, and the ad-hoc build (faked to avoid a
+    container) drives the per-repo pipeline's ``process_adhoc_pr``. This proves
+    ``_bind_adhoc_drain`` wires the per-repo lock registry + shared governor and threads the
+    factory-built pipeline into ``bind_adhoc_build`` — the whole assembly runs end to end
+    with no Docker, gh, model, or network.
+    """
+    import retinue.adhoc_drain as adhoc_drain_mod
+    import retinue.pipeline as pipeline_mod
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
+    from retinue.adhoc_drain import ReadyIssue
+
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+    monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
+    monkeypatch.setattr(
+        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+    )
+
+    # Fake the gh seam the drain constructs: list one ready ad-hoc issue, none in flight.
+    class _FakeGhCli:
+        def __init__(self, *, token: str) -> None:
+            self.token = token
+
+        async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
+            return [ReadyIssue(number=31, labels=["ready-for-agent"], body="")]
+
+        async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
+            return False
+
+    monkeypatch.setattr(adhoc_drain_mod, "GhCli", _FakeGhCli)
+
+    # Fake the ad-hoc build so no container spawns, but drive the *real per-repo pipeline*
+    # the factory built — proving bind_adhoc_build is handed that pipeline and its
+    # process_adhoc_pr runs as the build's PR step.
+    pr_calls: list[tuple[int, bool]] = []
+    pipelines_seen: list[object] = []
+
+    def _fake_bind_adhoc_build(settings: object, auth: object, **kwargs: object) -> object:
+        pipeline = kwargs["pipeline"]
+        pipelines_seen.append(pipeline)
+
+        async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
+            # A red result drives the *real* factory-built pipeline's process_adhoc_pr
+            # without opening a network PR (a red build skips the PR step, returning None),
+            # so the per-repo pipeline is exercised end to end with no gh/network.
+            result = AdhocBuildResult(branch=issue.branch, passed=False)
+            pr_result = await pipeline.process_adhoc_pr(issue, result)  # type: ignore[attr-defined]
+            pr_calls.append((issue.issue_number, pr_result is None))
+
+        return build
+
+    monkeypatch.setattr(pipeline_mod, "bind_adhoc_build", _fake_bind_adhoc_build)
+
+    ctx: dict[str, Any] = {}
+    try:
+        await on_startup(ctx)
+        drain = ctx["adhoc_drain"]
+        assert callable(drain)
+
+        config = RepoConfig(staging_branch="staging", retry_cap=2)
+        await drain(repo_full_name="owner/repo", config=config)
+
+        # The listed issue (#31) drove the build, which ran the factory-built pipeline's
+        # process_adhoc_pr (a red build skips, returning None) — the per-repo pipeline is
+        # threaded through, the shared governor metered it (default budget has room), and
+        # the per-repo lock serialized the run.
+        assert pr_calls == [(31, True)]  # (issue_number, process_adhoc_pr returned None)
+        assert pipelines_seen  # bind_adhoc_build was handed the per-repo pipeline
+    finally:
+        await on_shutdown(ctx)
+
+
+@pytest.mark.asyncio
 async def test_on_startup_without_auth_installs_no_pipeline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

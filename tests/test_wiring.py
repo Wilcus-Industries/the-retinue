@@ -16,6 +16,7 @@ from typing import cast
 
 import pytest
 
+from retinue.adhoc_drain import AdhocGh
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
 from retinue.container import ContainerRuntime
 from retinue.cron import CronGh
@@ -30,7 +31,7 @@ from retinue.orchestrator import GitOps, Implementer, PrdSlice, Slice
 from retinue.repo_config import RepoConfig
 from retinue.slicer import IssueCreator
 from retinue.triage import ImplementerNotes
-from retinue.wiring import bind_build_prd, bind_cron_tick
+from retinue.wiring import bind_adhoc_drain, bind_build_prd, bind_cron_tick
 
 
 class _Clock:
@@ -276,6 +277,123 @@ async def test_cron_tick_drains_when_in_budget(tmp_path: Path) -> None:
     result = await tick(repo_full_name="owner/repo", tick_number=1, estimated_amount=1.0)
     assert result.issue_number == 42
     assert built == [42]
+
+
+# --- bind_adhoc_drain ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adhoc_drain_drives_run_adhoc_drain_with_its_collaborators(
+    tmp_path: Path,
+) -> None:
+    """The bound drain drives ``run_adhoc_drain`` over exactly the wired collaborators.
+
+    Binds the ad-hoc drain with a fake gh seam (one scripted ready issue), a recording
+    build, the shared service-level governor, and a real single-run lock, then fires the
+    returned ``(*, repo_full_name, config)`` callable. The scripted issue must reach the
+    recording build (the gh seam was listed, the issue ranked + built), the lock must have
+    been entered, and the governor must have metered the build against the shared cap.
+    """
+    from retinue.adhoc_build import AdhocIssue
+    from retinue.adhoc_drain import ReadyIssue
+
+    clock = _Clock()
+    ledger = BudgetLedger(
+        tmp_path / "budget.sqlite3",
+        clock=clock,
+        auth_mode=AuthMode.API_KEY,
+        weekly_budget=1000.0,
+    )
+    governor = BudgetGovernor(ledger)
+    gh = _FakeAdhocGh([ReadyIssue(number=7, labels=["ready-for-agent"], body="")])
+    built: list[AdhocIssue] = []
+
+    async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
+        built.append(issue)
+
+    lock = _AdhocLock()
+    drain = bind_adhoc_drain(
+        gh=cast(AdhocGh, gh),
+        build=build,
+        governor=governor,
+        estimated_amount=3.0,
+        lock=lock,
+    )
+
+    await drain(repo_full_name="owner/repo", config=_config())
+
+    # The gh seam was queried for the repo, the scripted issue reached the build, and the
+    # lock was entered+exited (single-run guard wired).
+    assert gh.calls == ["owner/repo"]
+    assert [issue.issue_number for issue in built] == [7]
+    assert lock.entered == 1
+    assert lock.exited == 1
+    # The governor metered the build's charge against the shared rolling-24h ledger.
+    assert await ledger.trailing_24h_spend() == 3.0
+
+
+@pytest.mark.asyncio
+async def test_adhoc_drain_skips_the_build_when_the_shared_budget_is_spent(
+    tmp_path: Path,
+) -> None:
+    """A drain whose shared cap is spent meters every issue away — nothing builds.
+
+    Proves the *shared governor* is the one the bound drain meters through: a zero-cap
+    ledger declines the metered charge, so the recording build is never called even though
+    the gh seam listed a ready issue and the lock was entered.
+    """
+    from retinue.adhoc_build import AdhocIssue
+    from retinue.adhoc_drain import ReadyIssue
+
+    clock = _Clock()
+    governor = _governor(tmp_path, clock, weekly=0.0)  # cap is 0 -> every build is declined
+    gh = _FakeAdhocGh([ReadyIssue(number=7, labels=["ready-for-agent"], body="")])
+    built: list[AdhocIssue] = []
+
+    async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
+        built.append(issue)
+
+    drain = bind_adhoc_drain(
+        gh=cast(AdhocGh, gh),
+        build=build,
+        governor=governor,
+        estimated_amount=1.0,
+        lock=_AdhocLock(),
+    )
+
+    await drain(repo_full_name="owner/repo", config=_config())
+
+    assert built == []
+
+
+@dataclass
+class _FakeAdhocGh:
+    """An in-memory ``AdhocGh``: lists the scripted ready issues, none in flight."""
+
+    issues: list[object]
+    calls: list[str] = field(default_factory=list)
+
+    async def list_ready(self, *, repo_full_name: str) -> list[object]:
+        self.calls.append(repo_full_name)
+        return list(self.issues)
+
+    async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
+        return False
+
+
+class _AdhocLock:
+    """A recording single-run lock proving the drain entered+exited it once."""
+
+    def __init__(self) -> None:
+        self.entered = 0
+        self.exited = 0
+
+    async def __aenter__(self) -> _AdhocLock:
+        self.entered += 1
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.exited += 1
 
 
 # --- inert collaborators ---------------------------------------------------------

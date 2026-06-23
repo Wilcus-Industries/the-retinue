@@ -600,3 +600,198 @@ def test_httpx_transport_is_the_default_review_transport() -> None:
     from retinue.pipeline import HttpxTransport
 
     assert HttpxTransport().timeout > 0
+
+
+# --- bind_adhoc_build: the drain's downstream build+PR primitive -----------------
+
+
+@dataclass
+class _RecordingAdhocPipeline:
+    """A pipeline recording every ``process_adhoc_pr`` call the bound build makes.
+
+    Only the two collaborators :func:`bind_adhoc_build` touches are modeled: the
+    ``process_adhoc_pr`` step (recorded here) and the ``create_issue`` the advisory review
+    pass is wired through (a harmless recording stub, never invoked by these tests since
+    the build is faked).
+    """
+
+    pr_calls: list[tuple[object, object]] = field(default_factory=list)
+    pr_result: object | None = None
+
+    async def process_adhoc_pr(self, issue: object, build: object) -> object | None:
+        self.pr_calls.append((issue, build))
+        return self.pr_result
+
+    @staticmethod
+    async def create_issue(draft: IssueDraft) -> CreatedIssue:
+        return CreatedIssue(issue_number=1000)
+
+
+def _fake_build_adhoc_issue(
+    captured: dict[str, object], result: object
+) -> object:
+    """A drop-in ``build_adhoc_issue`` capturing its call and returning ``result``.
+
+    Replaces the real build (which spawns a container + execs ``claude``) so the bound
+    build's chain — build then ``process_adhoc_pr(issue, result)`` — is exercised with no
+    Docker, gh, model, or network.
+    """
+
+    async def fake(
+        issue: object,
+        config: object,
+        claude_md: object,
+        **kwargs: object,
+    ) -> object:
+        captured["issue"] = issue
+        captured["config"] = config
+        captured["claude_md"] = claude_md
+        captured["kwargs"] = kwargs
+        return result
+
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_bind_adhoc_build_chains_process_adhoc_pr_on_a_green_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A green ad-hoc build then invokes ``process_adhoc_pr(issue, result)`` to open the PR.
+
+    The load-bearing chain: :func:`bind_adhoc_build`'s callable runs the ad-hoc build and
+    **then** hands the green :class:`AdhocBuildResult` to the pipeline's
+    ``process_adhoc_pr`` (which opens the ``issue-<N>`` -> staging PR). The build is faked
+    so no container spawns; the recording pipeline proves the result threads through.
+    """
+    import retinue.pipeline as pipeline_mod
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
+    from retinue.pipeline import bind_adhoc_build
+
+    green = AdhocBuildResult(branch="issue-31", passed=True)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        pipeline_mod, "build_adhoc_issue", _fake_build_adhoc_issue(captured, green)
+    )
+
+    pipeline = _RecordingAdhocPipeline(pr_result="opened-pr")
+    settings = _settings(tmp_path, anthropic_credential="k")
+    build = bind_adhoc_build(
+        settings,  # type: ignore[arg-type]
+        _FakeAuth(),  # type: ignore[arg-type]
+        pipeline=pipeline,  # type: ignore[arg-type]
+        repo_full_name="owner/repo",
+        token="ghs_x",
+        config=_config(),
+        claude_md="## Definition of done\n```\nuv run pytest\n```\n",
+    )
+
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    await build(issue, repo_full_name="owner/repo")
+
+    # The build ran (the faked primitive captured the issue) and its green result was then
+    # handed to process_adhoc_pr — the PR-opening chain.
+    assert captured["issue"] is issue
+    assert pipeline.pr_calls == [(issue, green)]
+
+
+@pytest.mark.asyncio
+async def test_bind_adhoc_build_still_chains_process_adhoc_pr_on_a_red_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A red ad-hoc build still calls ``process_adhoc_pr`` (which skips, opening no PR).
+
+    A red build pushed no branch, so ``process_adhoc_pr`` returns ``None`` — but the bound
+    build must *still* call it (unconditionally, after every build) rather than branching
+    on ``passed`` itself. Dropping the call on a red build would be silent, so this pins it.
+    """
+    import retinue.pipeline as pipeline_mod
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
+    from retinue.pipeline import bind_adhoc_build
+
+    red = AdhocBuildResult(branch="issue-31", passed=False)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        pipeline_mod, "build_adhoc_issue", _fake_build_adhoc_issue(captured, red)
+    )
+
+    pipeline = _RecordingAdhocPipeline(pr_result=None)  # red -> process_adhoc_pr skips
+    settings = _settings(tmp_path, anthropic_credential="k")
+    build = bind_adhoc_build(
+        settings,  # type: ignore[arg-type]
+        _FakeAuth(),  # type: ignore[arg-type]
+        pipeline=pipeline,  # type: ignore[arg-type]
+        repo_full_name="owner/repo",
+        token="ghs_x",
+        config=_config(),
+        claude_md="## Definition of done\n```\nuv run pytest\n```\n",
+    )
+
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    await build(issue, repo_full_name="owner/repo")
+
+    # The red result was still handed to process_adhoc_pr (it skips, opening no PR).
+    assert pipeline.pr_calls == [(issue, red)]
+
+
+def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each role's model in the ad-hoc build resolves against the repo config override.
+
+    A ``repo_config.models`` block keyed by the planner/implementer/reviewer roles must
+    flow into the constructed adapters' models — proving the ad-hoc lane runs the repo's
+    chosen models, not the registry defaults. The adapter constructors are captured so the
+    ``model=`` each receives is asserted against the config override.
+    """
+    import retinue.pipeline as pipeline_mod
+    from retinue.adhoc_build import ContainerPlanner
+    from retinue.orchestrator import ContainerImplementer
+    from retinue.pipeline import bind_adhoc_build
+    from retinue.reviewer import AgentSdkReviewGenerator
+    from retinue.roles import Role
+
+    captured: dict[str, str] = {}
+
+    def _record(name: str, real: object) -> object:
+        def ctor(*args: object, **kwargs: object) -> object:
+            if "model" in kwargs:
+                captured[name] = kwargs["model"]  # type: ignore[assignment]
+            return real(*args, **kwargs)  # type: ignore[operator]
+
+        return ctor
+
+    monkeypatch.setattr(
+        pipeline_mod, "ContainerPlanner", _record("planner", ContainerPlanner)
+    )
+    monkeypatch.setattr(
+        pipeline_mod, "ContainerImplementer", _record("implementer", ContainerImplementer)
+    )
+    monkeypatch.setattr(
+        pipeline_mod, "AgentSdkReviewGenerator", _record("reviewer", AgentSdkReviewGenerator)
+    )
+
+    config = RepoConfig(
+        staging_branch="staging",
+        retry_cap=2,
+        models={
+            Role.PLANNER.value: "planner-custom",
+            Role.IMPLEMENTER.value: "implementer-custom",
+            Role.REVIEWER.value: "reviewer-custom",
+        },
+    )
+    settings = _settings(tmp_path, anthropic_credential="k")
+    bind_adhoc_build(
+        settings,  # type: ignore[arg-type]
+        _FakeAuth(),  # type: ignore[arg-type]
+        pipeline=_RecordingAdhocPipeline(),  # type: ignore[arg-type]
+        repo_full_name="owner/repo",
+        token="ghs_x",
+        config=config,
+        claude_md="## Definition of done\n```\nuv run pytest\n```\n",
+    )
+
+    assert captured == {
+        "planner": "planner-custom",
+        "implementer": "implementer-custom",
+        "reviewer": "reviewer-custom",
+    }
