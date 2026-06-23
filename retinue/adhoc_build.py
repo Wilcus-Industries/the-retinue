@@ -61,6 +61,7 @@ from retinue.github_app import InstallationAuth
 from retinue.impl_retry import ImplRetryStore, impl_retry_key
 from retinue.orchestrator import (
     _GIT_COMMITTER_ENV,
+    GitOpsError,
     Implementer,
     Slice,
     _clone_and_branch,
@@ -228,14 +229,20 @@ class AdhocReviewer(Protocol):
 def _issue_diff_command(branch: str, base: str) -> list[str]:
     """Argv for the diff a freshly-built ``branch`` contributed over the staging ``base``.
 
-    Uses the three-dot form (``base...branch``) so the diff is the issue branch's own
-    contribution since it was cut off the staging base — the work the build produced —
-    rather than also folding in whatever else advanced staging in parallel. The branch is
-    the *local* ``issue-<N>`` ref the build just committed to (no ``origin/`` prefix): the
-    review runs in the same container that built it, so the local tip is the surface to
-    review.
+    Uses the three-dot form (``origin/<base>...branch``) so the diff is the issue branch's
+    own contribution since it was cut off the staging base — the work the build produced —
+    rather than also folding in whatever else advanced staging in parallel. Both sides must
+    resolve against the refs the build container actually has: :func:`_clone_and_branch`
+    runs ``git fetch origin <base>`` then ``git checkout -B issue-<N> origin/<base>``, so
+    it creates the remote-tracking ``origin/<base>`` ref and the local ``issue-<N>`` branch
+    but **no** bare local ``<base>`` (that exists only when ``staging_branch`` happens to be
+    the clone's default HEAD). The base is therefore ``origin/<base>`` — mirroring the
+    orchestrator's :func:`~retinue.orchestrator._branch_diff_command`, whose base side is
+    also a resolvable ref — while the branch stays the *local* ``issue-<N>`` ref the build
+    just committed to (no ``origin/`` prefix): the review runs in the same container that
+    built it, so the local tip is the surface to review.
     """
-    return ["git", "diff", f"{base}...{branch}"]
+    return ["git", "diff", f"origin/{base}...{branch}"]
 
 
 @dataclass(frozen=True)
@@ -246,8 +253,10 @@ class ContainerAdhocReviewer:
     where the fake sits in tests and at the wiring site. The flow reuses the internal
     reviewer wholesale:
 
-    1. diff the ``issue-<N>`` branch over ``config.staging_branch`` inside the build
-       container (the same container that built it, so the local tip is reviewed),
+    1. diff the local ``issue-<N>`` branch over the remote-tracking
+       ``origin/<config.staging_branch>`` ref inside the build container (the same
+       container that built it, so the local tip is reviewed against a ref it actually
+       has); a failed diff raises rather than yielding an empty review surface,
     2. run the injected :class:`~retinue.reviewer.ReviewGenerator` (the headless Agent-SDK
        reviewer, Opus/max) over that diff, and
     3. file each finding via the injected :class:`~retinue.slicer.IssueCreator` (gh) as a
@@ -327,10 +336,21 @@ class ContainerAdhocReviewer:
         )
 
     async def _issue_diff(self, issue: AdhocIssue, container: Container) -> str:
-        """Return the issue branch's contribution over the staging base, from the build."""
-        result = await container.run_command(
-            _issue_diff_command(issue.branch, self.config.staging_branch)
-        )
+        """Return the issue branch's contribution over the staging base, from the build.
+
+        A non-zero diff exit (e.g. an unresolvable base ref) raises rather than returning
+        the empty stdout: a failed diff must not be silently treated as an empty review
+        surface — that would leave the very branch the reviewer is meant to review
+        unreviewed with no error surfaced. The advisory wrapper
+        (:func:`_review_advisory`) still swallows the raised error, but logs it.
+        """
+        command = _issue_diff_command(issue.branch, self.config.staging_branch)
+        result = await container.run_command(command)
+        if not result.ok:
+            raise GitOpsError(
+                f"ad-hoc review diff for {issue.branch} exited "
+                f"{result.exit_code}: {result.stderr}"
+            )
         return result.stdout
 
     def auth_env(self) -> dict[str, str]:

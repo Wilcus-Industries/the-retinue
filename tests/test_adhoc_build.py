@@ -37,7 +37,7 @@ from retinue.adhoc_build import (
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport
 from retinue.impl_retry import ImplRetryStore, impl_retry_key
-from retinue.orchestrator import Implementer, Slice, _implement_prompt
+from retinue.orchestrator import GitOpsError, Implementer, Slice, _implement_prompt
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
     READY_LABEL,
@@ -471,6 +471,37 @@ class _DiffContainer:
         pass
 
 
+class _RefAwareDiffContainer:
+    """A container that resolves a diff only when its base ref actually exists.
+
+    Models the refs ``_clone_and_branch`` leaves in the build container: the
+    remote-tracking ``origin/<base>`` and the local ``issue-<N>`` branch, but **no** bare
+    local ``<base>`` unless it is the clone's default HEAD. A ``git diff`` whose base side
+    names an unknown revision exits non-zero (mirroring git's "unknown revision" 404),
+    just as the live container would, so the previous bare-``staging`` form is caught.
+    """
+
+    def __init__(self, diff: str, *, known_refs: set[str]) -> None:
+        self._diff = diff
+        self._known_refs = known_refs
+        self.commands: list[list[str]] = []
+
+    async def run_command(self, command: list[str]) -> RunResult:
+        self.commands.append(command)
+        if command[:2] == ["git", "diff"]:
+            base = command[2].split("...", 1)[0]
+            if base not in self._known_refs:
+                return RunResult(
+                    exit_code=128,
+                    stderr=f"fatal: ambiguous argument '{base}': unknown revision",
+                )
+            return RunResult(exit_code=0, stdout=self._diff)
+        return RunResult(exit_code=0)
+
+    async def destroy(self) -> None:  # pragma: no cover - unused here
+        pass
+
+
 DEFECT_DIFF = """\
 diff --git a/retinue/widget.py b/retinue/widget.py
 +def total(items):
@@ -504,10 +535,16 @@ def _reviewer(
     )
 
 
-def test_issue_diff_command_uses_the_three_dot_diff_over_staging() -> None:
-    """The issue diff is the branch's own contribution since it left the staging base."""
+def test_issue_diff_command_bases_on_the_remote_tracking_staging_ref() -> None:
+    """AC1: the diff base is ``origin/<base>``, a ref the build container actually has.
+
+    ``_clone_and_branch`` only ever creates ``origin/<base>`` (the remote-tracking ref)
+    and the local ``issue-<N>`` branch; a bare local ``staging`` exists only when it is
+    the clone's default HEAD. Basing on ``origin/<base>`` resolves in every case, while
+    the local issue tip stays on the right since the review runs in the build container.
+    """
     command = _issue_diff_command("issue-29", "staging")
-    assert command == ["git", "diff", "staging...issue-29"]
+    assert command == ["git", "diff", "origin/staging...issue-29"]
 
 
 @pytest.mark.asyncio
@@ -530,8 +567,8 @@ async def test_reviewer_files_each_finding_as_a_flat_review_fix_issue(
 
     await reviewer.review(_issue(29), container=container)
 
-    # The reviewer reviewed the issue-29 diff over the staging branch.
-    assert ["git", "diff", "staging...issue-29"] in container.commands
+    # The reviewer reviewed the issue-29 diff over the remote-tracking staging ref.
+    assert ["git", "diff", "origin/staging...issue-29"] in container.commands
     assert captured[0].diff == DEFECT_DIFF
     # Two findings -> two flat review-fix issues.
     assert len(rec.created) == 2
@@ -603,3 +640,58 @@ async def test_reviewer_credential_rides_the_auth_env(tmp_path: Path) -> None:
         auth_mode="subscription",
     )
     assert reviewer.auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+
+
+@pytest.mark.asyncio
+async def test_review_diffs_a_non_default_staging_branch(tmp_path: Path) -> None:
+    """AC2: a non-default staging branch still yields the issue branch's real diff.
+
+    When ``staging_branch`` is not the clone's default HEAD, no bare local ``<base>``
+    ref exists — only ``origin/<base>``. The previous ``<base>...issue-<N>`` form would
+    name an unknown revision and 404; basing on ``origin/<base>`` resolves, so the
+    reviewer feeds the generator the branch's actual diff and files the finding.
+    """
+    rec = _ReviewRecorder()
+    generate, captured = _finding_generator(
+        ReviewFinding(title="Fix off-by-one", body="total() adds a stray +1.")
+    )
+    store = ImplRetryStore(tmp_path / "retries.sqlite3")
+    config = RepoConfig(staging_branch="release")
+    reviewer = _reviewer(
+        generate=generate, create_issue=rec.create_issue, retry_store=store, config=config
+    )
+    # The build container only has the remote-tracking ref, not a bare local ``release``.
+    container = _RefAwareDiffContainer(DEFECT_DIFF, known_refs={"origin/release"})
+
+    await reviewer.review(_issue(29), container=container)
+
+    # The diff resolved against ``origin/release`` and the real diff reached the generator.
+    assert ["git", "diff", "origin/release...issue-29"] in container.commands
+    assert captured[0].diff == DEFECT_DIFF
+    assert len(rec.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_review_raises_on_a_failed_diff_rather_than_treating_it_as_empty(
+    tmp_path: Path,
+) -> None:
+    """AC3: a failed diff command surfaces as an error, not a silent empty review.
+
+    If the diff exits non-zero (e.g. an unresolvable base ref), ``_issue_diff`` must
+    raise so the advisory wrapper can log it — feeding the generator an empty diff would
+    leave the branch unreviewed with no error surfaced. Here the base ref is unknown, so
+    the diff fails and ``review`` propagates the error (the build's wrapper swallows it).
+    """
+    rec = _ReviewRecorder()
+    generate, captured = _finding_generator()
+    store = ImplRetryStore(tmp_path / "retries.sqlite3")
+    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, retry_store=store)
+    # No known refs: every ``git diff`` 404s, so the diff command fails.
+    container = _RefAwareDiffContainer("", known_refs=set())
+
+    with pytest.raises(GitOpsError):
+        await reviewer.review(_issue(29), container=container)
+
+    # The generator never ran on a garbage/empty diff, and nothing was filed.
+    assert captured == []
+    assert rec.created == []
