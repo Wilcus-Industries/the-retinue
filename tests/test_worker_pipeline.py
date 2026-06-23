@@ -290,10 +290,20 @@ def test_parse_heimdall_review_unknown_state_is_commented() -> None:
 
 
 class _FakeAuth:
-    """A stand-in :class:`InstallationAuth` that mints a canned token without network."""
+    """A stand-in :class:`InstallationAuth` that mints a canned token without network.
+
+    Also satisfies :class:`~retinue.github_app.InstalledRepos`: ``installed_repos`` is the
+    fixed set the heartbeat enumerator lists (the App's installed repos), so the sweep is
+    exercised without a live GitHub listing.
+    """
+
+    installed_repos: list[str] = []
 
     async def installation_token(self, repo_full_name: str) -> InstallationToken:
         return InstallationToken(token="ghs_x", clone_url="https://x/y.git")
+
+    async def installed_repositories(self) -> list[str]:
+        return list(self.installed_repos)
 
 
 async def _fake_claude_md(repo_full_name: str) -> str:
@@ -449,3 +459,171 @@ async def test_on_startup_without_auth_installs_no_pipeline(
     # No auth -> no pipeline; the fetcher is the not-opted-in fallback.
     assert "pipeline_factory" not in ctx
     assert await ctx["fetch_config"]("owner/repo") is None
+
+
+# --- on_startup: the heartbeat collaborators (issue #43) ------------------------
+
+
+def _fake_config_fetcher(auth: object, client: object) -> Any:
+    """Stand in for the contents-API config fetcher: every repo is opted in (no network)."""
+
+    async def fetch(repo_full_name: str) -> str | None:
+        return _CONFIG_YAML
+
+    return fetch
+
+
+@pytest.mark.asyncio
+async def test_on_startup_wires_the_heartbeat_collaborators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under live auth, on_startup installs all four heartbeat collaborators on ctx.
+
+    The registered ``heartbeat_tick`` reads ``heartbeat_enumerate_repos``,
+    ``heartbeat_clock``, ``heartbeat_drain``, and ``heartbeat_cron_tick`` from ctx; without
+    these it no-ops every tick. The drain must be the *same* object the webhook kick fires
+    (``ctx['adhoc_drain']``) so a kick and a sweep are one drain.
+    """
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+    monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
+    monkeypatch.setattr(
+        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+    )
+
+    ctx: dict[str, Any] = {}
+    try:
+        await on_startup(ctx)
+
+        assert callable(ctx["heartbeat_enumerate_repos"])
+        assert ctx["heartbeat_clock"].now() is not None  # the real wall-clock seam
+        assert callable(ctx["heartbeat_cron_tick"])
+        # The heartbeat sweep fires the SAME bound drain the webhook kick fires.
+        assert ctx["heartbeat_drain"] is ctx["adhoc_drain"]
+    finally:
+        await on_shutdown(ctx)
+
+
+@pytest.mark.asyncio
+async def test_on_startup_without_auth_leaves_the_heartbeat_unwired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No auth -> no heartbeat collaborators, so the registered tick stays a safe no-op."""
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+    monkeypatch.delattr(github_app, "build_installation_auth", raising=False)
+
+    ctx: dict[str, Any] = {}
+    await on_startup(ctx)
+
+    assert "heartbeat_enumerate_repos" not in ctx
+    assert "heartbeat_clock" not in ctx
+    assert "heartbeat_drain" not in ctx
+    assert "heartbeat_cron_tick" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_on_startup_heartbeat_enumerate_yields_opted_in_due_repos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound enumerator lists the App's installed, opted-in repos as DueRepos."""
+    from retinue.heartbeat import DueRepo
+
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+    monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
+    monkeypatch.setattr(
+        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+    )
+    # The App is installed on these repos; the fetcher reports each as opted in.
+    monkeypatch.setattr(_FakeAuth, "installed_repos", ["owner/a", "owner/b"])
+    monkeypatch.setattr(worker, "github_config_fetcher", _fake_config_fetcher)
+
+    ctx: dict[str, Any] = {}
+    try:
+        await on_startup(ctx)
+        due = await ctx["heartbeat_enumerate_repos"]()
+    finally:
+        await on_shutdown(ctx)
+
+    assert [r.repo_full_name for r in due] == ["owner/a", "owner/b"]
+    assert all(isinstance(r, DueRepo) for r in due)
+    assert all(r.config.staging_branch == "staging" for r in due)
+
+
+@pytest.mark.asyncio
+async def test_on_startup_heartbeat_tick_drives_run_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the collaborators wired, ``heartbeat_tick(ctx)`` drives a real sweep, not the skip.
+
+    Proves criterion 2: one opted-in, cron-due repo is enumerated, its safety-net ad-hoc
+    drain fires (one ready issue reaches the build), and its backlog cron lane ticks — the
+    not-wired ``is None`` guard is never hit. The leaf gh/build seams are faked so no
+    container, gh, model, or network runs.
+    """
+    import retinue.adhoc_drain as adhoc_drain_mod
+    import retinue.cron as cron_mod
+    import retinue.pipeline as pipeline_mod
+    from retinue.adhoc_build import AdhocIssue
+    from retinue.adhoc_drain import ReadyIssue
+    from retinue.heartbeat import heartbeat_tick
+
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+    monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
+    monkeypatch.setattr(
+        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+    )
+    # One installed repo whose cron is due on every tick, opted in via the fake fetcher.
+    cron_yaml = "staging_branch: staging\ncron: '* * * * *'\n"
+
+    def _due_config_fetcher(auth: object, client: object) -> Any:
+        async def fetch(repo_full_name: str) -> str | None:
+            return cron_yaml
+
+        return fetch
+
+    monkeypatch.setattr(_FakeAuth, "installed_repos", ["owner/due"])
+    monkeypatch.setattr(worker, "github_config_fetcher", _due_config_fetcher)
+
+    # Fake the ad-hoc drain's gh seam: one ready issue, none in flight.
+    class _FakeAdhocGh:
+        def __init__(self, *, token: str) -> None:
+            self.token = token
+
+        async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
+            return [ReadyIssue(number=31, labels=["ready-for-agent"], body="")]
+
+        async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
+            return False
+
+    monkeypatch.setattr(adhoc_drain_mod, "GhCli", _FakeAdhocGh)
+
+    drained: list[int] = []
+
+    def _fake_bind_adhoc_build(settings: object, auth: object, **kwargs: object) -> object:
+        async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
+            drained.append(issue.issue_number)
+
+        return build
+
+    monkeypatch.setattr(pipeline_mod, "bind_adhoc_build", _fake_bind_adhoc_build)
+
+    # Fake the cron backlog gh seam (empty backlog) so the cron lane ticks idle, no build.
+    class _FakeCronGh:
+        def __init__(self, *, token: str) -> None:
+            self.token = token
+
+        async def list_backlog(self, *, repo_full_name: str) -> list[object]:
+            return []
+
+    monkeypatch.setattr(cron_mod, "GhCli", _FakeCronGh)
+
+    ctx: dict[str, Any] = {}
+    try:
+        await on_startup(ctx)
+        await heartbeat_tick(ctx)
+    finally:
+        await on_shutdown(ctx)
+
+    # The due repo's safety-net drain fired (issue #31 reached the build) — not the no-op.
+    assert drained == [31]
+    # The tick counter advanced, proving run_heartbeat ran rather than the not-wired skip.
+    assert ctx["heartbeat_tick_number"] == 1

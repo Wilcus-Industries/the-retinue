@@ -102,7 +102,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   missed or the worker was down — and drives the **backlog cron lane** (`run_cron_tick`) for
   every repo, the first runtime caller of the previously-dead lane. The clock, the opted-in repo
   enumeration, the per-repo drain, and the backlog tick are all injected and faked, so the
-  heartbeat runs with no real arq, Redis, gh, Docker, or wall-clock.
+  heartbeat runs with no real arq, Redis, gh, Docker, or wall-clock. The worker's `on_startup`
+  binds those four collaborators onto `ctx` under live GitHub-App auth (the real wall-clock, the
+  App's installed-and-opted-in repo enumeration, the *same* bound ad-hoc drain the webhook kick
+  fires, and a bound `run_cron_tick`); a bare/unauthed worker leaves them unset so the tick
+  no-ops.
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
@@ -475,6 +479,11 @@ the webhook was missed or the worker was down, and drives the **backlog cron lan
 drain or tick that raises for one repo is logged and skipped so a single bad repo cannot
 starve the sweep. The clock, the repo enumeration, the per-repo drain, and the backlog tick
 are all injected, so the heartbeat runs with no real arq, Redis, `gh`, Docker, or wall-clock.
+In production the worker's `on_startup` binds them under live GitHub-App auth — the real
+wall-clock `Clock`, an enumerator over the App's installed-and-opted-in repos (each as a
+`DueRepo` with its accepted `RepoConfig`), the *same* bound ad-hoc drain the webhook kick
+fires (so a kick and a sweep are one drain), and a bound `run_cron_tick` — so the registered
+tick actually sweeps; a bare/unauthed worker leaves them unset and the tick stays a no-op.
 
 ## Configuration
 

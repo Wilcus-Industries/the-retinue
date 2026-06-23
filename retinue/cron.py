@@ -84,6 +84,39 @@ class CronBusyError(Exception):
         super().__init__("a cron tick is already in flight")
 
 
+class CronLock:
+    """The production single-run lock for the backlog cron tick: a non-blocking guard.
+
+    Satisfies the ``AbstractAsyncContextManager`` :func:`run_cron_tick` enters: the first
+    holder enters, and a *second* concurrent ``__aenter__`` raises :class:`CronBusyError`
+    rather than blocking — so the "at most one cron tick at a time" contract is observable
+    to the caller. The worker keeps a per-repo registry so two repos tick concurrently
+    while a repo's own ticks serialize through the same lock. Mirrors
+    :class:`retinue.adhoc_drain.AdhocDrainLock`.
+
+    The guard is a plain in-process flag (no real wall-clock, Redis, or file lock), correct
+    because the whole tick runs inside a single worker process; a cross-process lock is out
+    of scope for the single-worker deployment.
+    """
+
+    def __init__(self) -> None:
+        self._held = False
+
+    async def __aenter__(self) -> CronLock:
+        if self._held:
+            raise CronBusyError
+        self._held = True
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object | None,
+    ) -> None:
+        self._held = False
+
+
 @dataclass(frozen=True)
 class BacklogIssue:
     """One loose ``backlog`` issue, as reported by the backlog gh seam.

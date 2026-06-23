@@ -24,10 +24,18 @@ import httpx
 from arq import cron
 from arq.connections import RedisSettings
 
+from retinue.budget import SystemClock
+from retinue.cron import CronTickResult
 from retinue.dedupe import PrdDedupeStore, prd_dedupe_key
 from retinue.github_app import InstallationAuth
 from retinue.handoff import MergedPullRequest
-from retinue.heartbeat import HeartbeatDrain, heartbeat_tick
+from retinue.heartbeat import (
+    DueRepo,
+    HeartbeatCronTick,
+    HeartbeatDrain,
+    RepoEnumerator,
+    heartbeat_tick,
+)
 from retinue.loopback import (
     HeimdallFinding,
     HeimdallReview,
@@ -608,8 +616,13 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     GitHub App auth resolves (:func:`_load_github_client`), it also installs the real
     PRD-body fetcher and a ``pipeline_factory`` over the production adapters — the factory
     sources each repo's ``CLAUDE.md`` (the done-check command) and binds the live build
-    lane — so an accepted PRD drives the real slice -> build -> staging-PR pipeline. With
-    no auth wired, the fetcher defaults to not-opted-in and no pipeline is installed.
+    lane — so an accepted PRD drives the real slice -> build -> staging-PR pipeline. The
+    same auth branch binds the webhook's ad-hoc drain *and* the worker-global heartbeat's
+    four collaborators (:func:`retinue.heartbeat.heartbeat_tick` reads them from ``ctx``):
+    the real wall-clock, the installed-and-opted-in repo enumerator, the *same* bound
+    ad-hoc drain the kick fires, and a bound :func:`retinue.cron.run_cron_tick`. With no
+    auth wired, the fetcher defaults to not-opted-in and neither the pipeline nor the
+    heartbeat is installed (so the registered cron tick safely no-ops).
     """
     global settings
     if settings is None:
@@ -632,10 +645,27 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         ctx["fetch_prd_body"] = _github_issue_body_fetcher(auth, client)
         ctx["pipeline_factory"] = pipeline_factory
         # The webhook's low-latency ad-hoc kick (run_adhoc_drain_job) reads ``adhoc_drain``
-        # from ctx; bind it here so a kick on a deployed worker actually drains. Issue #43
-        # wires the heartbeat's ``drain`` to this same seam so a kick and a sweep fire the
-        # identical bound drain under one single-run lock.
-        ctx["adhoc_drain"] = _bind_adhoc_drain(
+        # from ctx; bind it here so a kick on a deployed worker actually drains. The
+        # heartbeat's safety-net sweep fires this *same* bound drain (below) so a kick and a
+        # sweep are identical work under one single-run lock.
+        adhoc_drain = _bind_adhoc_drain(
+            settings,
+            auth,
+            pipeline_factory=pipeline_factory,
+            fetch_claude_md=fetch_claude_md,
+        )
+        ctx["adhoc_drain"] = adhoc_drain
+        # The worker-global heartbeat (heartbeat_tick) reads its four collaborators from ctx;
+        # bind them here so the registered cron tick actually sweeps in production instead of
+        # hitting the not-wired skip. The clock is the real wall-clock, the enumerator lists
+        # the App's opted-in repos, the drain is the *same* bound ad-hoc drain the kick fires,
+        # and the cron tick is a bound run_cron_tick over the backlog lane.
+        ctx["heartbeat_clock"] = SystemClock()
+        ctx["heartbeat_enumerate_repos"] = _bind_heartbeat_enumerate(
+            auth, fetch_config=ctx["fetch_config"]
+        )
+        ctx["heartbeat_drain"] = adhoc_drain
+        ctx["heartbeat_cron_tick"] = _bind_heartbeat_cron_tick(
             settings,
             auth,
             pipeline_factory=pipeline_factory,
@@ -716,6 +746,121 @@ def _bind_adhoc_drain(
         await bound(repo_full_name=repo_full_name, config=config)
 
     return drain
+
+
+def _bind_heartbeat_enumerate(
+    auth: InstallationAuth, *, fetch_config: ConfigFetcher
+) -> RepoEnumerator:
+    """Bind the heartbeat's opted-in repo enumerator over the GitHub-App installed set.
+
+    Returns an async ``() -> list[DueRepo]`` that lists the App's installed repositories
+    (:meth:`retinue.github_app.InstalledRepos.installed_repositories`), fetches each repo's
+    ``.github/retinue.yml`` through the *same* opt-in ``fetch_config`` seam the PRD gate
+    uses, and yields a :class:`~retinue.heartbeat.DueRepo` for each repo with an accepted
+    :class:`~retinue.repo_config.RepoConfig`. A repo not opted in (no fetchable config) or
+    with a malformed config is dropped, so the sweep only touches opted-in repos — the same
+    opt-in resolution the webhook/PRD path applies, just enumerated rather than event-driven.
+
+    The enumeration seam is the production :class:`retinue.github_app.GitHubInstallationAuth`,
+    which also satisfies :class:`~retinue.github_app.InstalledRepos`; a bare auth without it
+    yields an empty sweep rather than crashing the tick.
+    """
+
+    async def enumerate_repos() -> list[DueRepo]:
+        list_repos = getattr(auth, "installed_repositories", None)
+        if list_repos is None:
+            return []
+        due: list[DueRepo] = []
+        for repo_full_name in await list_repos():
+            raw = await fetch_config(repo_full_name)
+            if raw is None:
+                continue
+            config = load_repo_config(raw)
+            if config is None:
+                continue
+            due.append(DueRepo(repo_full_name=repo_full_name, config=config))
+        return due
+
+    return enumerate_repos
+
+
+def _bind_heartbeat_cron_tick(
+    settings: Any,
+    auth: InstallationAuth,
+    *,
+    pipeline_factory: PipelineFactory,
+    fetch_claude_md: ClaudeMdFetcher,
+) -> HeartbeatCronTick:
+    """Bind the heartbeat's backlog cron tick to ``run_cron_tick`` over the real adapters.
+
+    Returns an async ``(*, repo_full_name, tick_number) -> CronTickResult`` — the
+    :data:`retinue.heartbeat.HeartbeatCronTick` shape — that drives one repo's backlog lane
+    through :func:`retinue.wiring.bind_cron_tick`. The shared collaborators are built once:
+    the service-level :class:`~retinue.budget.BudgetGovernor` over ``settings.budget_db_path``
+    (the *same* durable rolling-24h ledger the PRD and ad-hoc lanes meter, so the budget is
+    one window) and a per-repo single-run lock registry, so two repos tick concurrently while
+    a repo's own ticks serialize.
+
+    Each call mints a per-repo installation token, constructs the per-repo backlog gh seam
+    (:class:`retinue.cron.GhCli`) and the cron build (:class:`retinue.cron.SliceBuilder`
+    over the same orchestrator adapters the PRD lane builds), binds them through
+    :func:`retinue.wiring.bind_cron_tick`, and runs one tick. The heartbeat owns the
+    per-tick estimate (the flat per-build charge), so the bound callable supplies it.
+
+    Args:
+        settings: The runtime settings carrying the budget + Anthropic config.
+        auth: The GitHub App installation auth used to mint per-repo tokens.
+        pipeline_factory: The worker's pipeline factory (accepted for symmetry with the
+            other binders; the cron build assembles its own orchestrator adapters).
+        fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
+
+    Returns:
+        The bound cron tick — an async ``(*, repo_full_name, tick_number) -> CronTickResult``.
+    """
+    from contextlib import AbstractAsyncContextManager
+
+    from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
+    from retinue.cron import CronLock, GhCli
+    from retinue.pipeline import build_cron_slice_builder
+    from retinue.wiring import bind_cron_tick
+
+    governor = BudgetGovernor(
+        BudgetLedger(
+            settings.budget_db_path,
+            clock=SystemClock(),
+            auth_mode=AuthMode.from_config(settings.auth_mode),
+            weekly_budget=settings.weekly_budget,
+            daily_cap_fraction=settings.budget_daily_cap_fraction,
+        )
+    )
+    locks: dict[str, AbstractAsyncContextManager[object]] = {}
+
+    async def cron_tick(
+        *, repo_full_name: str, tick_number: int
+    ) -> CronTickResult:
+        token = (await auth.installation_token(repo_full_name)).token
+        gh = GhCli(token=token)
+        build = await build_cron_slice_builder(
+            settings,
+            auth,
+            repo_full_name=repo_full_name,
+            token=token,
+            fetch_claude_md=fetch_claude_md,
+        )
+        bound = bind_cron_tick(
+            gh=gh,
+            governor=governor,
+            clock=SystemClock(),
+            build=build,
+            lock=locks.setdefault(repo_full_name, CronLock()),
+        )
+        return await bound(
+            repo_full_name=repo_full_name,
+            tick_number=tick_number,
+            estimated_amount=_ADHOC_DRAIN_ESTIMATED_AMOUNT,
+        )
+
+    return cron_tick
 
 
 # The flat per-build charge the ad-hoc drain meters against the shared rolling-24h cap,

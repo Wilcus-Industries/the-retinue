@@ -25,9 +25,13 @@ from retinue.github_app import (
     _app_jwt_claims,
     _bearer_header,
     _clone_url,
+    _installation_repositories_url,
     _installation_url,
+    _installations_url,
     _parse_access_token_response,
     _parse_installation_id,
+    _parse_installation_ids,
+    _parse_installation_repositories,
     _token_header,
     build_installation_auth,
 )
@@ -107,26 +111,76 @@ def test_parse_access_token_response_raises_on_bad_payload(
         _parse_access_token_response(payload)
 
 
+# --- installed-repository enumeration (the heartbeat's repo seam) --------------------
+
+
+def test_installations_and_repositories_urls_carry_paging() -> None:
+    base = "https://api.github.com"
+    assert (
+        _installations_url(base, page=2, per_page=100)
+        == f"{base}/app/installations?per_page=100&page=2"
+    )
+    assert (
+        _installation_repositories_url(base, page=1, per_page=100)
+        == f"{base}/installation/repositories?per_page=100&page=1"
+    )
+
+
+def test_parse_installation_ids_keeps_integer_ids_and_skips_odd_entries() -> None:
+    """A page of installation objects yields its integer ids; a bad entry is skipped."""
+    ids = _parse_installation_ids([{"id": 7}, {"no": "id"}, {"id": 9}, "junk"])
+    assert ids == [7, 9]
+
+
+def test_parse_installation_ids_raises_when_not_an_array() -> None:
+    with pytest.raises(InstallationAuthError):
+        _parse_installation_ids({"message": "Bad credentials"})
+
+
+def test_parse_installation_repositories_reads_full_names() -> None:
+    """The wrapped page yields each repo's full_name; a nameless entry is skipped."""
+    names = _parse_installation_repositories(
+        {
+            "total_count": 2,
+            "repositories": [
+                {"full_name": "owner/a"},
+                {"no": "name"},
+                {"full_name": "owner/b"},
+            ],
+        }
+    )
+    assert names == ["owner/a", "owner/b"]
+
+
+def test_parse_installation_repositories_raises_without_array() -> None:
+    with pytest.raises(InstallationAuthError):
+        _parse_installation_repositories({"message": "Not Found"})
+
+
 # --- the adapter: full mint, header threading, caching, refresh, errors -------------
 
 
 class _FakeHttp:
-    """Records requests and replays scripted ``(status, body)`` responses in order."""
+    """Records requests and replays scripted ``(status, body)`` responses in order.
 
-    def __init__(self, responses: list[tuple[int, Mapping[str, Any]]]) -> None:
+    The body is the parsed JSON — a mapping for the token/installation reads, a JSON array
+    for ``GET /app/installations`` — so it is typed ``object`` to match the HTTP seam.
+    """
+
+    def __init__(self, responses: list[tuple[int, object]]) -> None:
         self._responses = responses
         self.gets: list[tuple[str, Mapping[str, str]]] = []
         self.posts: list[tuple[str, Mapping[str, str]]] = []
 
     async def get(
         self, url: str, headers: Mapping[str, str]
-    ) -> tuple[int, Mapping[str, Any]]:
+    ) -> tuple[int, object]:
         self.gets.append((url, headers))
         return self._responses.pop(0)
 
     async def post(
         self, url: str, headers: Mapping[str, str]
-    ) -> tuple[int, Mapping[str, Any]]:
+    ) -> tuple[int, object]:
         self.posts.append((url, headers))
         return self._responses.pop(0)
 
@@ -219,6 +273,50 @@ async def test_token_refreshes_once_inside_the_expiry_skew() -> None:
     assert first.token == "ghs_old"
     assert second.token == "ghs_new"
     assert len(http.posts) == 2  # re-minted
+
+
+@pytest.mark.asyncio
+async def test_installed_repositories_lists_repos_across_installations() -> None:
+    """The App-wide enumeration mints a token per installation and pages its repos.
+
+    Flow per installation: list installations (app-JWT GET), mint an installation token
+    (POST), then GET that installation's repositories — flattened across installations in
+    listing order. The repos seed the heartbeat sweep.
+    """
+    http = _FakeHttp(
+        [
+            (200, [{"id": 7}, {"id": 8}]),  # list installations (short page)
+            (201, {"token": "ghs_7", "expires_at": "2030-01-01T00:00:00Z"}),  # mint 7
+            (200, {"repositories": [{"full_name": "owner/a"}]}),  # repos of 7
+            (201, {"token": "ghs_8", "expires_at": "2030-01-01T00:00:00Z"}),  # mint 8
+            (200, {"repositories": [{"full_name": "owner/b"}]}),  # repos of 8
+        ]
+    )
+
+    repos = await _auth(http).installed_repositories()
+
+    assert repos == ["owner/a", "owner/b"]
+    # The installations listing is app-JWT authed; the repos listing rides the minted token.
+    assert http.gets[0][0] == "https://api/app/installations?per_page=100&page=1"
+    assert http.gets[0][1]["Authorization"] == "Bearer jwt:555:PEM"
+    assert http.posts[0][0] == "https://api/app/installations/7/access_tokens"
+    assert http.gets[1][0] == "https://api/installation/repositories?per_page=100&page=1"
+    assert http.gets[1][1]["Authorization"] == "token ghs_7"
+
+
+@pytest.mark.asyncio
+async def test_installed_repositories_is_empty_with_no_installations() -> None:
+    """No installations means an empty sweep — no token mint, no repos listing."""
+    http = _FakeHttp([(200, [])])
+    assert await _auth(http).installed_repositories() == []
+    assert http.posts == []
+
+
+@pytest.mark.asyncio
+async def test_installed_repositories_raises_on_non_2xx_installations() -> None:
+    http = _FakeHttp([(401, {"message": "Bad credentials"})])
+    with pytest.raises(InstallationAuthError, match="401"):
+        await _auth(http).installed_repositories()
 
 
 @pytest.mark.asyncio

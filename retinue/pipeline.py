@@ -56,6 +56,7 @@ from retinue.budget import (
     SystemClock,
 )
 from retinue.container import Container, ContainerRuntime, DockerRuntime
+from retinue.cron import CronBuild
 from retinue.done_check import (
     DEFAULT_IMAGE,
     DoneCheckError,
@@ -920,6 +921,70 @@ def _bind_build_prd_for_repo(
         return _prd_build_from_bound(result, prd_number=kwargs.get("prd_number"))
 
     return run
+
+
+async def build_cron_slice_builder(
+    settings: Settings,
+    auth: InstallationAuth,
+    *,
+    repo_full_name: str,
+    token: str,
+    fetch_claude_md: ClaudeMdFetcher,
+) -> CronBuild:
+    """Build the production backlog-cron downstream for one repo (the cron tick's build).
+
+    Returns a :data:`retinue.cron.CronBuild` — an async ``(*, repo_full_name, issue_number)
+    -> None`` — that drains one backlog nit through :func:`retinue.orchestrator.build_slice`
+    over the *same* orchestrator adapters the PRD lane builds: the container-exec
+    implementer, the Docker runtime, the lazy merge-container git ops, the env secret
+    resolver, and the gh report sink. The merge container the lazy git ops starts is
+    destroyed after each drained issue in a ``finally`` (mirroring
+    :func:`_bind_build_prd_for_repo`), so a long-lived worker never leaks a container across
+    cron ticks. The repo config (its ``models`` block, ``staging_branch``, and ``secrets``)
+    is read from the all-defaults config a loose backlog nit carries no per-issue override
+    for; the heartbeat already passed the opted-in config, so the cron tick reuses it.
+
+    Args:
+        settings: Carries the Anthropic credential/auth mode and budget config.
+        auth: Mints the installation token the clone authenticates with.
+        repo_full_name: The target repo the backlog drain runs against.
+        token: The minted installation token the gh report sink authenticates with.
+        fetch_claude_md: Reads the repo's ``CLAUDE.md`` text (the done-check command source).
+
+    Returns:
+        The bound cron build the backlog tick drives for the picked issue.
+    """
+    from retinue.cron import SliceBuilder
+
+    config = RepoConfig()
+    claude_md = await _fetch_claude_md(fetch_claude_md, repo_full_name)
+    runtime = DockerRuntime()
+    git = _MergeContainerGitOps(
+        repo_full_name=repo_full_name, auth=auth, runtime=runtime
+    )
+    implementer = ContainerImplementer(
+        credential=settings.anthropic_credential,
+        auth_mode=settings.auth_mode,
+        model=resolve_model(Role.IMPLEMENTER, config),
+    )
+    builder = SliceBuilder(
+        config=config,
+        claude_md=claude_md,
+        implementer=implementer,
+        git=git,
+        auth=auth,
+        runtime=runtime,
+        resolve_secret=EnvSecretResolver(),
+        report=GhReportSink(token=token),
+    )
+
+    async def build(*, repo_full_name: str, issue_number: int) -> None:
+        try:
+            await builder(repo_full_name=repo_full_name, issue_number=issue_number)
+        finally:
+            await git.aclose()
+
+    return build
 
 
 def bind_adhoc_build(
