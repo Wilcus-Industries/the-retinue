@@ -259,15 +259,23 @@ def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:
     assert kwargs["max_tokens"] > 0
 
 
-def test_request_kwargs_carry_xhigh_effort_thinking() -> None:
-    """The slicer (Opus) runs at the xhigh effort tier via extended thinking."""
+def test_request_kwargs_carry_xhigh_effort() -> None:
+    """The slicer (Opus 4.8) runs at the xhigh effort tier via output_config.effort.
+
+    Opus 4.8 removed ``thinking={"type": "enabled", "budget_tokens": N}`` (400 on the
+    live Messages API); ``output_config.effort`` is the current effort control. The
+    effort tier must ride the *same* ``output_config`` dict that already carries the
+    JSON-schema ``format`` so the slicer sends one output_config, not two.
+    """
     gen = ClaudeSliceGenerator(token="sk-ant-123")
 
     kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
 
-    assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": _EFFORT_XHIGH}
-    # The thinking budget must leave room for the response under max_tokens.
-    assert kwargs["max_tokens"] > _EFFORT_XHIGH
+    assert kwargs["output_config"]["effort"] == _EFFORT_XHIGH
+    assert _EFFORT_XHIGH == "xhigh"
+    # Effort lives alongside the schema format, not as a separate thinking budget.
+    assert kwargs["output_config"]["format"]["type"] == "json_schema"
+    assert "thinking" not in kwargs
 
 
 def test_parse_plan_maps_payload_to_ordered_drafts() -> None:

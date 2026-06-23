@@ -39,15 +39,16 @@ _SLICE_MODEL = "claude-opus-4-8"
 _OAUTH_BETA = "oauth-2025-04-20"
 _MAX_TOKENS = 16_000
 
-# Per-role reasoning effort, expressed as the extended-thinking budget the Messages
-# API call carries (``thinking={"type": "enabled", "budget_tokens": N}``). The PRD
-# pins the orchestrator/slicer to an "xhigh" tier and the internal reviewer to a
-# "max" tier; these two constants are the shared budgets every role draws from so the
-# tiers stay consistent across call sites. Each must stay strictly below the request's
-# ``max_tokens`` (the API rejects a thinking budget that doesn't leave room for the
-# response), so the slicer/reviewer (16k max) and resolver (32k max) all clear it.
-_EFFORT_XHIGH = 12_000
-_EFFORT_MAX = 14_000
+# Per-role reasoning effort, expressed as the ``output_config.effort`` tier the Messages
+# API call carries. Opus 4.8 (the model every Opus role pins) removed the extended-
+# thinking ``budget_tokens`` mechanism — it returns HTTP 400 — so effort is the current
+# control (see the claude-api skill). The PRD pins the orchestrator/slicer to the "xhigh"
+# tier and the internal reviewer to the highest "max" tier; these two constants are the
+# shared tiers every Opus role draws from so the effort stays consistent across call
+# sites (the slicer, the internal reviewer, and the conflict resolver). The literal tier
+# strings are self-documenting, so no numeric budget bookkeeping is needed.
+_EFFORT_XHIGH = "xhigh"
+_EFFORT_MAX = "max"
 
 # Strict JSON schema the headless slicer must emit: an ordered list of vertical
 # slices, each with its 1-based intra-PRD blocked_by indices and a hitl flag.
@@ -233,15 +234,18 @@ class ClaudeSliceGenerator:
         """Assemble the streaming-request kwargs for one PRD slice run.
 
         The slicer is the PRD-decision Opus role, so the request carries the "xhigh"
-        reasoning-effort tier via the extended-thinking ``budget_tokens`` (kept under
-        ``max_tokens`` so the API has room for the response).
+        reasoning-effort tier via ``output_config.effort`` (Opus 4.8 removed the thinking
+        ``budget_tokens`` mechanism). The effort rides the same ``output_config`` dict as
+        the JSON-schema ``format`` — one output_config carries both.
         """
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
-            "thinking": {"type": "enabled", "budget_tokens": _EFFORT_XHIGH},
             "system": _SLICE_SYSTEM,
-            "output_config": {"format": {"type": "json_schema", "schema": _SLICE_SCHEMA}},
+            "output_config": {
+                "effort": _EFFORT_XHIGH,
+                "format": {"type": "json_schema", "schema": _SLICE_SCHEMA},
+            },
             "messages": [{"role": "user", "content": prd_body}],
         }
 

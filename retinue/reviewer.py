@@ -252,8 +252,8 @@ class AgentSdkReviewGenerator:
         """Assemble the Messages API request body for one round's review.
 
         The internal reviewer is the highest-rigor Opus role, so the request carries
-        the "max" reasoning-effort tier via the extended-thinking ``budget_tokens``
-        (kept under ``max_tokens`` so the API has room for the response).
+        the "max" reasoning-effort tier via ``output_config.effort`` (Opus 4.8 removed
+        the extended-thinking ``budget_tokens`` mechanism, which now returns HTTP 400).
         """
         merged = ", ".join(f"#{n}" for n in review_input.merged_issues) or "(none)"
         user = (
@@ -267,7 +267,7 @@ class AgentSdkReviewGenerator:
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
-            "thinking": {"type": "enabled", "budget_tokens": _EFFORT_MAX},
+            "output_config": {"effort": _EFFORT_MAX},
             "system": _REVIEW_SYSTEM,
             "messages": [{"role": "user", "content": user}],
             "response_format": {"type": "json_schema", "json_schema": _REVIEW_SCHEMA},

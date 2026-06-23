@@ -19,7 +19,6 @@ import pytest
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
-    _EFFORT_XHIGH,
     _IMPLEMENT_MODEL,
     AgentSdkConflictResolver,
     AnthropicResponse,
@@ -48,6 +47,7 @@ from retinue.orchestrator import (
     integration_branch,
 )
 from retinue.repo_config import RepoConfig, SecretsConfig
+from retinue.slicer import _EFFORT_XHIGH
 from tests.test_done_check import (
     CLAUDE_MD,
     FakeAuth,
@@ -611,14 +611,20 @@ def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
     assert "issue-7" in user and "retinue/prd-1" in user
 
 
-def test_resolve_payload_carries_xhigh_effort_thinking() -> None:
-    """The conflict resolver (the orchestrator's Opus call) runs at the xhigh tier."""
+def test_resolve_payload_carries_xhigh_effort() -> None:
+    """The conflict resolver (the orchestrator's Opus 4.8 call) runs at the xhigh tier.
+
+    Opus 4.8 removed the ``thinking`` budget mechanism (400 on the live Messages API);
+    ``output_config.effort`` is the current effort control. The resolver reuses the
+    slicer's shared ``_EFFORT_XHIGH`` tier rather than keeping its own copy.
+    """
     files = [_ConflictedFile(path="a.py", content="conflict-a")]
 
     payload = _resolve_payload(files, source="issue-7", into="retinue/prd-1", model="m")
 
-    assert payload["thinking"] == {"type": "enabled", "budget_tokens": _EFFORT_XHIGH}
-    assert payload["max_tokens"] > _EFFORT_XHIGH
+    assert payload["output_config"]["effort"] == _EFFORT_XHIGH
+    assert _EFFORT_XHIGH == "xhigh"
+    assert "thinking" not in payload
 
 
 def test_parse_resolution_maps_paths_to_resolved_bodies() -> None:

@@ -278,16 +278,22 @@ def test_payload_carries_model_schema_diff_and_merged_issues() -> None:
     assert f"PRD #{PRD_NUMBER}" in user
 
 
-def test_payload_carries_max_effort_thinking() -> None:
-    """The internal reviewer (Opus) runs at the max effort tier via extended thinking."""
+def test_payload_carries_max_effort() -> None:
+    """The internal reviewer (Opus 4.8) runs at the max effort tier via output_config.
+
+    Opus 4.8 removed the ``thinking`` budget mechanism (400 on the live Messages API);
+    ``output_config.effort`` is the current effort control, and ``max`` is the highest-
+    rigor tier the PRD pins the internal reviewer to.
+    """
     gen = AgentSdkReviewGenerator(
         credential="k", transport=_FakeTransport(_text_response({"findings": []}))
     )
 
     payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
 
-    assert payload["thinking"] == {"type": "enabled", "budget_tokens": _EFFORT_MAX}
-    assert payload["max_tokens"] > _EFFORT_MAX
+    assert payload["output_config"]["effort"] == _EFFORT_MAX
+    assert _EFFORT_MAX == "max"
+    assert "thinking" not in payload
 
 
 @pytest.mark.asyncio
