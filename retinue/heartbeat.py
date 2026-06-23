@@ -93,8 +93,10 @@ def cron_due(cron_expr: str | None, when: datetime) -> bool:
     no cadence (``None``) is never picked up by the scheduled sweep, and a repo with a
     cadence is swept only on a tick its cadence matches. Supports the standard cron field
     grammar — ``*`` (any), a literal value, a ``a,b`` comma list, an ``a-b`` inclusive
-    range, and a ``*/step`` or ``a-b/step`` step — across minute, hour, day-of-month,
-    month, and day-of-week. Sunday is accepted as both ``0`` and ``7``. The seconds/lower
+    range, and a ``*/step``, ``a-b/step``, or ``N/step`` step — across minute, hour,
+    day-of-month, month, and day-of-week. A value-base step follows Vixie semantics: ``N/step``
+    is ``N-high/step`` (``5/15`` minute is ``5,20,35,50``), not the single point ``N``.
+    Sunday is accepted as both ``0`` and ``7``. The seconds/lower
     resolution is ignored: arq fires the global tick on whole minutes, so matching to the
     minute is the right grain.
 
@@ -149,19 +151,24 @@ def _field_matches(field: str, value: int, *, low: int, high: int) -> bool:
 def _term_matches(term: str, value: int, *, low: int, high: int) -> bool:
     """Whether one cron term (``*``, a value, ``a-b``, ``*/s``, or ``a-b/s``) matches ``value``."""
     base, _, step_text = term.partition("/")
-    step = _parse_step(step_text) if step_text else 1
-    start, end = _term_range(base, low=low, high=high)
+    has_step = bool(step_text)
+    step = _parse_step(step_text) if has_step else 1
+    start, end = _term_range(base, has_step=has_step, low=low, high=high)
     if start is None or end is None or step is None:
         return False
     return start <= value <= end and (value - start) % step == 0
 
 
-def _term_range(base: str, *, low: int, high: int) -> tuple[int | None, int | None]:
+def _term_range(
+    base: str, *, has_step: bool, low: int, high: int
+) -> tuple[int | None, int | None]:
     """Resolve a cron term's base (before any ``/step``) into an inclusive ``[start, end]``.
 
-    ``*`` spans the whole field; ``a-b`` is the literal inclusive range; a bare value is the
-    single point ``[v, v]``. A non-numeric or out-of-bounds base yields ``(None, None)`` so
-    the term simply does not match rather than raising into the worker-global tick.
+    ``*`` spans the whole field; ``a-b`` is the literal inclusive range. A bare value is the
+    single point ``[v, v]`` on its own, but ``[v, high]`` when a ``/step`` follows it: Vixie
+    cron reads ``N/step`` as ``N-high/step`` (``5/15`` minute is ``5,20,35,50``, not just
+    ``5``). A non-numeric or out-of-bounds base yields ``(None, None)`` so the term simply
+    does not match rather than raising into the worker-global tick.
     """
     if base == "*":
         return low, high
@@ -172,7 +179,11 @@ def _term_range(base: str, *, low: int, high: int) -> tuple[int | None, int | No
             return None, None
         return start, end
     point = _parse_int(base)
-    return (point, point)
+    if point is None:
+        return None, None
+    # A bare value with a step walks from the value to the field's max (Vixie N-high/step);
+    # without a step it is the single point.
+    return (point, high) if has_step else (point, point)
 
 
 def _parse_int(text: str) -> int | None:

@@ -65,6 +65,34 @@ def test_cron_due_matches_each_field(
     assert cron_due(cron_expr, when) is due
 
 
+@pytest.mark.parametrize(
+    ("cron_expr", "when", "due"),
+    [
+        # A value-base step is Vixie "N-high/step": 5/15 minute == 5,20,35,50.
+        ("5/15 * * * *", datetime(2026, 6, 23, 0, 5, tzinfo=UTC), True),
+        ("5/15 * * * *", datetime(2026, 6, 23, 0, 20, tzinfo=UTC), True),
+        ("5/15 * * * *", datetime(2026, 6, 23, 0, 35, tzinfo=UTC), True),
+        ("5/15 * * * *", datetime(2026, 6, 23, 0, 50, tzinfo=UTC), True),
+        # ...and not the off-step minutes, nor minute 0 below the base.
+        ("5/15 * * * *", datetime(2026, 6, 23, 0, 10, tzinfo=UTC), False),
+        ("5/15 * * * *", datetime(2026, 6, 23, 0, 25, tzinfo=UTC), False),
+        ("5/15 * * * *", datetime(2026, 6, 23, 0, 0, tzinfo=UTC), False),
+        # The same form on the hour field steps to the hour max (23): 2/6 == 2,8,14,20.
+        ("0 2/6 * * *", datetime(2026, 6, 23, 2, 0, tzinfo=UTC), True),
+        ("0 2/6 * * *", datetime(2026, 6, 23, 8, 0, tzinfo=UTC), True),
+        ("0 2/6 * * *", datetime(2026, 6, 23, 14, 0, tzinfo=UTC), True),
+        ("0 2/6 * * *", datetime(2026, 6, 23, 20, 0, tzinfo=UTC), True),
+        ("0 2/6 * * *", datetime(2026, 6, 23, 0, 0, tzinfo=UTC), False),
+        ("0 2/6 * * *", datetime(2026, 6, 23, 5, 0, tzinfo=UTC), False),
+    ],
+)
+def test_cron_due_value_base_step_walks_to_field_max(
+    cron_expr: str, when: datetime, due: bool
+) -> None:
+    """A bare-value base with a step (``N/step``) is Vixie ``N-high/step``, not point ``N``."""
+    assert cron_due(cron_expr, when) is due
+
+
 def test_cron_due_is_false_when_no_cadence_configured() -> None:
     """A repo with no ``cron`` set is never picked up by the scheduled sweep."""
     assert cron_due(None, datetime(2026, 6, 23, 6, 0, tzinfo=UTC)) is False
