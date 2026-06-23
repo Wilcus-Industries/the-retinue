@@ -5,7 +5,9 @@ orchestrator runs the whole build inside **one disposable container** that is de
 on every path (:func:`_build_slice_in_container`):
 
 1. **clone + branch** — the container clones the repo over the installation token and
-   checks out a fresh ``issue-<N>`` branch off the config's ``staging_branch``,
+   checks out a fresh ``issue-<N>`` branch off the integration branch ``retinue/prd-<n>``
+   (created off the config's ``staging_branch`` on origin *before* the build starts), so a
+   later-round slice builds on the sibling work an earlier round already merged onto it,
 2. **implement** — one implementer subagent (the Agent SDK seam) execs the headless
    ``claude`` CLI *inside that container* and commits the slice to ``issue-<N>``; the AI
    step is confined to the throwaway container, off the worker host and its docker.sock,
@@ -14,9 +16,9 @@ on every path (:func:`_build_slice_in_container`):
 4. **push** — only on a green done-check the ``issue-<N>`` branch is pushed to origin, so
    the merge seam can fetch it. A red done-check pushes nothing and **blocks** the merge.
 
-The merge then ensures the integration branch ``retinue/prd-<n>`` exists (created off the
-config's ``staging_branch`` when absent) and merges the pushed ``issue-<N>`` into it. No
-red slice is ever merged.
+The merge then advances the integration branch ``retinue/prd-<n>`` (ensured to exist on
+origin before the build) by merging the pushed ``issue-<N>`` into it. No red slice is ever
+merged.
 
 The full-PRD driver (issue #7) is :func:`build_prd`. It wraps the single-slice
 primitive: pick the ready set (every ``blocked_by`` ref merged/closed), fan out
@@ -349,9 +351,14 @@ def _push_branch_command(branch: str) -> list[str]:
     return ["git", "push", "origin", branch]
 
 
-def _branch_exists_command(branch: str) -> list[str]:
-    """Argv that exits 0 iff local ``branch`` already exists in the workspace."""
-    return ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]
+def _remote_branch_exists_command(branch: str) -> list[str]:
+    """Argv that exits 0 iff ``branch`` already exists on ``origin``.
+
+    The integration branch lives on ``origin`` (a prior run may have created it and a
+    fresh merge-container clone has no local ref for it), so its existence is checked
+    against the remote, not the local ``refs/heads``.
+    """
+    return ["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"]
 
 
 def _create_branch_commands(branch: str, base: str) -> list[list[str]]:
@@ -422,14 +429,25 @@ class ContainerGitOps:
         self._container = container
 
     async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
-        """Ensure ``branch`` exists locally, creating it off ``origin/<base>`` if absent."""
-        exists = await self._container.run_command(_branch_exists_command(branch))
+        """Ensure ``branch`` exists on ``origin``, creating it off ``origin/<base>`` if absent.
+
+        Checked before the implementers run so they can root issue-<N> on the integration
+        branch's tip: a fresh branch is created off ``origin/<base>`` *and pushed to origin*
+        so each build container can ``git fetch`` it as its branch base. An existing branch
+        is reused untouched (a no-op fetch already keeps later rounds on its merged tip).
+        """
+        exists = await self._container.run_command(
+            _remote_branch_exists_command(branch)
+        )
         if exists.ok:
-            logger.info("Integration branch %s already exists", branch)
+            logger.info("Integration branch %s already exists on origin", branch)
             return
         for command in _create_branch_commands(branch, base):
             await self._run_checked(command, action=f"create {branch} off {base}")
-        logger.info("Created integration branch %s off %s", branch, base)
+        await self._run_checked(
+            _push_branch_command(branch), action=f"push {branch} to origin"
+        )
+        logger.info("Created integration branch %s off %s and pushed to origin", branch, base)
 
     async def merge(self, *, source: str, into: str) -> None:
         """Merge ``source`` into ``into`` and push ``into``; raise on a conflict.
@@ -832,19 +850,20 @@ async def build_slice(
 ) -> BuildResult:
     """Build one ready slice in its own container, gate on the done-check, then merge.
 
-    The whole build runs in one disposable container (:func:`_build_slice_in_container`):
-    clone, check out a fresh ``issue-<N>`` branch off ``config.staging_branch``, let the
-    implementer exec ``claude`` inside it and commit, run the repo's done-check over the
-    real changes, and push ``issue-<N>`` only when green. The done-check result gates the
-    merge: a green check merges the pushed ``issue-<N>`` into the integration branch
-    ``retinue/prd-<n>`` (created off ``config.staging_branch`` if absent), while a red
-    check pushes nothing and blocks the merge so no failing slice is ever integrated.
+    The integration branch ``retinue/prd-<n>`` is ensured on origin first (created off
+    ``config.staging_branch`` when absent), then the whole build runs in one disposable
+    container (:func:`_build_slice_in_container`): clone, check out a fresh ``issue-<N>``
+    branch off the integration branch's tip, let the implementer exec ``claude`` inside it
+    and commit, run the repo's done-check over the real changes, and push ``issue-<N>``
+    only when green. The done-check result gates the merge: a green check merges the pushed
+    ``issue-<N>`` into ``retinue/prd-<n>``, while a red check pushes nothing and blocks the
+    merge so no failing slice is ever integrated.
 
     Args:
         slice_: The ready slice to build (repo, issue number, PRD number).
-        config: The accepted repo config; its ``staging_branch`` is the slice-branch base
-            and the integration-branch base, and its ``secrets`` are injected into the
-            container.
+        config: The accepted repo config; its ``staging_branch`` is the integration-branch
+            base (and the integration branch is the slice-branch base), and its ``secrets``
+            are injected into the container.
         claude_md: The repo's ``CLAUDE.md`` text, carrying the done-check command.
         implementer: Execs the implementer subagent in the container (the Agent SDK seam).
         git: Integration-branch git operations (the merge seam).
@@ -864,10 +883,16 @@ async def build_slice(
     """
     branch = integration_branch(slice_.prd_number)
 
+    # The integration branch is created off staging *before* the implementer runs, so
+    # the build container can root issue-<N> on its tip (PRD: implementers branch off the
+    # integration branch, not staging).
+    await git.ensure_integration_branch(branch=branch, base=config.staging_branch)
+
     passed = await _build_slice_in_container(
         slice_,
         config,
         claude_md,
+        base=branch,
         implementer=implementer,
         auth=auth,
         runtime=runtime,
@@ -894,6 +919,7 @@ async def _build_slice_in_container(
     config: RepoConfig,
     claude_md: str,
     *,
+    base: str,
     implementer: Implementer,
     auth: InstallationAuth,
     runtime: ContainerRuntime,
@@ -909,7 +935,9 @@ async def _build_slice_in_container(
        the report sink and propagates *before* any container starts),
     2. start the container with the secrets, the git committer identity, and the agent's
        credential all in its env (the env is fixed at ``start``),
-    3. clone the repo and check out a fresh ``issue-<N>`` branch off ``staging_branch``,
+    3. clone the repo and check out a fresh ``issue-<N>`` branch off ``base`` — the
+       integration branch ``retinue/prd-<n>`` (already created off staging at build start),
+       so a later-round slice builds on its already-merged sibling work,
     4. exec the implementer (``claude``) inside the container to build and commit the slice,
     5. run the done-check over the real changes and post the outcome,
     6. push ``issue-<N>`` to ``origin`` only when the done-check is green (so the merge seam
@@ -927,7 +955,7 @@ async def _build_slice_in_container(
     container = await runtime.start(image=image, env=start_env)
     try:
         await _clone_and_branch(
-            container, token.clone_url, branch=slice_.branch, base=config.staging_branch
+            container, token.clone_url, branch=slice_.branch, base=base
         )
         await implementer.implement(slice_, container=container)
         passed, detail = await run_done_check_commands(container, commands)
@@ -1089,6 +1117,13 @@ async def build_prd(
     """
     branch = integration_branch(slices[0].prd_number) if slices else integration_branch(0)
     async with lock:
+        # One integration branch off staging per PRD, created up front so every round's
+        # implementers branch off its tip — and a later round builds on the sibling work
+        # the earlier round already merged onto it. An empty PRD creates nothing.
+        if slices:
+            await git.ensure_integration_branch(
+                branch=branch, base=config.staging_branch
+            )
         state = _PrdState(slices)
         while True:
             ready = state.ready_set()
@@ -1098,6 +1133,7 @@ async def build_prd(
                 ready,
                 config,
                 claude_md,
+                base=branch,
                 implementer=implementer,
                 auth=auth,
                 runtime=runtime,
@@ -1177,6 +1213,7 @@ async def _build_round(
     config: RepoConfig,
     claude_md: str,
     *,
+    base: str,
     implementer: Implementer,
     auth: InstallationAuth,
     runtime: ContainerRuntime,
@@ -1186,10 +1223,12 @@ async def _build_round(
 ) -> list[tuple[PrdSlice, bool]]:
     """Fan out the ready slices, bounded by ``max_parallel``; return (slice, passed).
 
-    Each slice's build runs in its own disposable container (clone → branch → implement →
-    done-check → push-on-green), concurrently across the round but capped at
-    ``config.max_parallel`` live builds. Only the build phase runs here; merges are
-    serialized afterwards in dependency order, against the branches the green builds pushed.
+    Each slice's build runs in its own disposable container (clone → branch off ``base``
+    → implement → done-check → push-on-green), concurrently across the round but capped at
+    ``config.max_parallel`` live builds. ``base`` is the integration branch, so a later
+    round branches off the sibling work an earlier round already merged onto it. Only the
+    build phase runs here; merges are serialized afterwards in dependency order, against
+    the branches the green builds pushed.
     """
     semaphore = asyncio.Semaphore(config.max_parallel or len(ready) or 1)
 
@@ -1199,6 +1238,7 @@ async def _build_round(
                 slice_,
                 config,
                 claude_md,
+                base=base,
                 implementer=implementer,
                 auth=auth,
                 runtime=runtime,

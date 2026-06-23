@@ -143,6 +143,34 @@ async def test_full_prd_builds_in_dependency_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prd_slices_branch_off_the_integration_branch_not_staging() -> None:
+    """Every slice's issue-<N> branch roots on retinue/prd-<n>, never on staging.
+
+    PRD: one integration branch per PRD; implementers branch off *it* so a later-round
+    slice builds on already-merged sibling work. Each container checks out issue-<N> off
+    ``origin/retinue/prd-1``, and the integration branch is created off staging first.
+    """
+    timeline: list[str] = []
+    git = FakeGitOps(timeline=timeline)
+    runtime = FakeRuntime(timeline=timeline)
+    config = RepoConfig(staging_branch="staging")
+    slices = [_prd_slice(1), _prd_slice(2, blocked_by=[1])]
+
+    await _build_prd(slices, runtime=runtime, git=git, config=config)
+
+    # The integration branch is created off staging before any container is started.
+    assert timeline[0] == "create:retinue/prd-1<-staging"
+    create_index = timeline.index("create:retinue/prd-1<-staging")
+    first_start = next(i for i, e in enumerate(timeline) if e.startswith("start:"))
+    assert create_index < first_start
+    # Each round's container roots issue-<N> on the integration branch, not staging.
+    checkouts = [e for e in runtime.log if "checkout -B issue-" in e]
+    assert checkouts  # at least one round ran
+    assert all("origin/retinue/prd-1" in e for e in checkouts)
+    assert not any("origin/staging" in e for e in checkouts)
+
+
+@pytest.mark.asyncio
 async def test_diamond_dependency_drains_in_rounds() -> None:
     """A diamond graph (1 <- {2,3} <- 4) builds and merges, draining every round."""
     slices = [
@@ -369,10 +397,14 @@ async def test_second_concurrent_run_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_prd_is_a_clean_noop() -> None:
-    """A PRD with no slices drains immediately to an empty result."""
-    result = await _build_prd([])
+    """A PRD with no slices drains immediately to an empty result, touching no branch."""
+    git = FakeGitOps()
+
+    result = await _build_prd([], git=git)
 
     assert result.merged_issues == []
     assert result.blocked_issues == []
     assert result.escalated_issues == []
     assert result.skipped_issues == []
+    # No slices means no implementers, so no integration branch is created.
+    assert git.log == []

@@ -86,14 +86,23 @@ class FakeContainer:
 class FakeRuntime:
     """Spawns one :class:`FakeContainer`, recording the start event and injected env."""
 
-    def __init__(self, results: dict[str, RunResult] | None = None) -> None:
+    def __init__(
+        self,
+        results: dict[str, RunResult] | None = None,
+        timeline: list[str] | None = None,
+    ) -> None:
         self.log: list[str] = []
         self.started_env: dict[str, str] | None = None
         self.container: FakeContainer | None = None
         self._results = results or {}
+        # Optional shared event list, written to by both this runtime and the git seam,
+        # so a test can assert ordering *across* the container and git seams.
+        self._timeline = timeline
 
     async def start(self, *, image: str, env: dict[str, str]) -> Container:
         self.log.append(f"start:{image}")
+        if self._timeline is not None:
+            self._timeline.append(f"start:{image}")
         self.started_env = env
         self.container = FakeContainer(self.log, self._results)
         return self.container

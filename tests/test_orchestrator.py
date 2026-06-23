@@ -87,17 +87,24 @@ class FakeGitOps:
         self,
         existing: set[str] | None = None,
         conflicts: set[str] | None = None,
+        timeline: list[str] | None = None,
     ) -> None:
         self.existing = set(existing or set())
         self._conflicts = set(conflicts or set())
         self.log: list[str] = []
         self.merges: list[tuple[str, str]] = []
+        # Optional shared event list, written to by both this seam and the runtime, so a
+        # test can assert ordering *across* the git and container seams.
+        self._timeline = timeline
 
     async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
         if branch in self.existing:
             self.log.append(f"exists:{branch}")
             return
-        self.log.append(f"create:{branch}<-{base}")
+        event = f"create:{branch}<-{base}"
+        self.log.append(event)
+        if self._timeline is not None:
+            self._timeline.append(event)
         self.existing.add(branch)
 
     async def merge(self, *, source: str, into: str) -> None:
@@ -220,9 +227,10 @@ async def test_red_done_check_blocks_the_merge() -> None:
 
     assert result.outcome is BuildOutcome.BLOCKED
     assert result.merged is False
-    # No red slice is merged, and no integration branch work happened.
+    # No red slice is merged. The integration branch is still ensured up front (the
+    # implementer needs it as a base), but nothing is ever merged onto it.
     assert git.merges == []
-    assert git.log == []
+    assert not any(event.startswith("merge:") for event in git.log)
 
 
 @pytest.mark.asyncio
@@ -262,6 +270,45 @@ async def test_slice_builds_in_one_container_in_order() -> None:
     done_check = next(i for i, e in enumerate(log) if "uv run pytest" in e)
     push = next(i for i, e in enumerate(log) if "git push origin issue-7" in e)
     assert clone < checkout < implement < done_check < push
+
+
+@pytest.mark.asyncio
+async def test_issue_branch_roots_on_the_integration_branch_not_staging() -> None:
+    """The implementer's issue-<N> branch is rooted on retinue/prd-<n>, not staging.
+
+    PRD: one integration branch per PRD off staging; implementers branch off *it* so a
+    later-round slice builds on already-merged sibling work. The container checks out
+    issue-<N> off ``origin/retinue/prd-<n>``, never off ``origin/staging``.
+    """
+    runtime = FakeRuntime()
+    config = RepoConfig(staging_branch="staging")
+
+    await _build(runtime=runtime, git=FakeGitOps(), config=config)
+
+    log = runtime.log
+    assert any("git checkout -B issue-7 origin/retinue/prd-1" in e for e in log)
+    assert not any("checkout -B issue-7 origin/staging" in e for e in log)
+
+
+@pytest.mark.asyncio
+async def test_integration_branch_exists_before_the_implementer_runs() -> None:
+    """retinue/prd-<n> is created off staging before any build container starts.
+
+    The integration branch must exist (on origin) before the implementer's container
+    fetches it as its branch base, so the create must precede the container start.
+    """
+    timeline: list[str] = []
+    git = FakeGitOps(timeline=timeline)
+    runtime = FakeRuntime(timeline=timeline)
+    config = RepoConfig(staging_branch="staging")
+
+    await _build(runtime=runtime, git=git, config=config)
+
+    assert timeline[0] == "create:retinue/prd-1<-staging"
+    assert any(e.startswith("start:") for e in timeline)
+    create_index = timeline.index("create:retinue/prd-1<-staging")
+    start_index = next(i for i, e in enumerate(timeline) if e.startswith("start:"))
+    assert create_index < start_index
 
 
 @pytest.mark.asyncio
@@ -390,22 +437,26 @@ def _joined(container: ScriptedContainer) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_ensure_branch_reuses_existing_without_creating() -> None:
-    """When rev-parse confirms the branch exists, no fetch/checkout is issued."""
-    container = ScriptedContainer()  # rev-parse returns exit 0 -> branch exists
+async def test_ensure_branch_reuses_existing_on_origin_without_creating() -> None:
+    """When the branch already exists on origin, no fetch/checkout/push is issued."""
+    container = ScriptedContainer()  # ls-remote returns exit 0 -> branch on origin
     git = ContainerGitOps(container)
 
     await git.ensure_integration_branch(branch="retinue/prd-1", base="main")
 
     cmds = _joined(container)
-    assert cmds == ["git rev-parse --verify --quiet refs/heads/retinue/prd-1"]
+    assert cmds == ["git ls-remote --exit-code origin refs/heads/retinue/prd-1"]
 
 
 @pytest.mark.asyncio
-async def test_ensure_branch_creates_off_origin_base_when_absent() -> None:
-    """An absent branch is fetched and checked out (-B) off ``origin/<base>``."""
+async def test_ensure_branch_creates_off_origin_base_and_pushes_when_absent() -> None:
+    """An absent branch is fetched, checked out (-B) off ``origin/<base>``, and pushed.
+
+    The integration branch must exist on origin before implementers branch off it, so a
+    freshly created branch is pushed to origin within ensure (not only at merge time).
+    """
     container = ScriptedContainer(
-        {"rev-parse": RunResult(exit_code=1)}  # branch missing
+        {"ls-remote": RunResult(exit_code=2)}  # branch missing on origin
     )
     git = ContainerGitOps(container)
 
@@ -414,6 +465,7 @@ async def test_ensure_branch_creates_off_origin_base_when_absent() -> None:
     cmds = _joined(container)
     assert "git fetch origin staging" in cmds
     assert "git checkout -B retinue/prd-1 origin/staging" in cmds
+    assert "git push origin retinue/prd-1" in cmds
 
 
 @pytest.mark.asyncio
@@ -421,7 +473,7 @@ async def test_ensure_branch_raises_gitops_error_on_checkout_failure() -> None:
     """A hard git failure while creating the branch is a GitOpsError, not silent."""
     container = ScriptedContainer(
         {
-            "rev-parse": RunResult(exit_code=1),
+            "ls-remote": RunResult(exit_code=2),
             "checkout": RunResult(exit_code=128, stderr="fatal: bad object"),
         }
     )
