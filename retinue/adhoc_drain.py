@@ -73,6 +73,40 @@ class AdhocDrainBusyError(Exception):
     def __init__(self) -> None:
         super().__init__("an ad-hoc drain is already in flight")
 
+
+class AdhocDrainLock:
+    """The production single-run lock: a non-blocking in-process guard for one repo's drain.
+
+    Satisfies the ``AbstractAsyncContextManager`` :func:`run_adhoc_drain` enters: the first
+    holder enters, and a *second* concurrent ``__aenter__`` raises :class:`AdhocDrainBusyError`
+    rather than blocking — so the "at most one ad-hoc drain per repo at a time" contract is
+    observable to the caller (mirroring the test fake's reject-don't-block behavior). One lock
+    instance guards one repo; the worker keeps a per-repo registry so two repos drain
+    concurrently while a repo's own kicked and swept drains serialize through the same lock.
+
+    The guard is a plain in-process flag (no real wall-clock, Redis, or file lock), which is
+    correct because the whole drain runs inside a single worker process; a cross-process lock
+    is out of scope for the single-worker deployment.
+    """
+
+    def __init__(self) -> None:
+        self._held = False
+
+    async def __aenter__(self) -> AdhocDrainLock:
+        if self._held:
+            raise AdhocDrainBusyError
+        self._held = True
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object | None,
+    ) -> None:
+        self._held = False
+
+
 # How many ready-for-agent issues to pull per drain. The cap on concurrent *builds* is
 # ``config.max_parallel``; this generous-but-bounded page just keeps the visible set from
 # an unbounded fetch, mirroring the cron lane's list limit.

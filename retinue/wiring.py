@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
+from retinue.adhoc_drain import AdhocBuild, AdhocGh, run_adhoc_drain
 from retinue.budget import BudgetGovernor, Clock
 from retinue.container import Container, ContainerRuntime
 from retinue.cron import CronBuild, CronGh, CronTickResult, run_cron_tick
@@ -371,3 +372,55 @@ def bind_cron_tick(
         )
 
     return tick
+
+
+def bind_adhoc_drain(
+    *,
+    gh: AdhocGh,
+    build: AdhocBuild,
+    governor: BudgetGovernor,
+    estimated_amount: float,
+    lock: AbstractAsyncContextManager[object],
+) -> Callable[..., Awaitable[None]]:
+    """Bind the ad-hoc drain to its real collaborators behind one ``(repo, config)`` callable.
+
+    Returns an async ``(*, repo_full_name, config) -> None`` — the
+    :data:`retinue.heartbeat.HeartbeatDrain` shape — that drives
+    :func:`retinue.adhoc_drain.run_adhoc_drain` with the gh seam, the per-issue build, the
+    shared service-level governor, and the single-run lock already bound. The two callers of
+    the bound drain fire the *same* drain: the webhook's low-latency ad-hoc kick
+    (:func:`retinue.worker.run_adhoc_drain_job`) and the heartbeat's safety-net sweep
+    (issue #43 wires the heartbeat's ``drain`` to this same seam), so a kicked drain and a
+    swept drain are identical work under one single-run lock.
+
+    The governor is the *same* service-level governor the orchestrator and cron lanes share,
+    so every ad-hoc build meters against the one rolling-24h window. ``prd_in_flight`` is left
+    at the drain's default (False): the kick path has no live PRD-build signal to thread, so
+    the drain ranks and builds every ad-hoc issue rather than deferring to a PRD it cannot
+    observe — PRD-first preemption stays a heartbeat-side refinement.
+
+    Args:
+        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues; answers the in-flight
+            dedup query).
+        build: The downstream ad-hoc build+PR primitive run per surviving issue.
+        governor: The shared service-level budget governor each build meters through.
+        estimated_amount: The per-build charge metered against the shared cap.
+        lock: The single-run lock; a second concurrent drain for the repo raises
+            :class:`retinue.adhoc_drain.AdhocDrainBusyError`.
+
+    Returns:
+        An async drain callable taking ``repo_full_name`` and the repo's ``config``.
+    """
+
+    async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
+        await run_adhoc_drain(
+            repo_full_name=repo_full_name,
+            gh=gh,
+            build=build,
+            config=config,
+            governor=governor,
+            estimated_amount=estimated_amount,
+            lock=lock,
+        )
+
+    return drain

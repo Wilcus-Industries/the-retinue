@@ -27,7 +27,7 @@ from arq.connections import RedisSettings
 from retinue.dedupe import PrdDedupeStore, prd_dedupe_key
 from retinue.github_app import InstallationAuth
 from retinue.handoff import MergedPullRequest
-from retinue.heartbeat import heartbeat_tick
+from retinue.heartbeat import HeartbeatDrain, heartbeat_tick
 from retinue.loopback import (
     HeimdallFinding,
     HeimdallReview,
@@ -299,6 +299,44 @@ async def reap_pr_job(
     logger.info(
         "Reap for %s PR #%d: %s", repo_full_name, pr_number, result.outcome.value
     )
+
+
+# The kick task and the heartbeat sweep read the bound drain from ``ctx`` under the *same*
+# :data:`retinue.heartbeat.HeartbeatDrain` shape — an async ``(*, repo_full_name, config) ->
+# None`` produced by :func:`retinue.wiring.bind_adhoc_drain` — so a webhook kick and a swept
+# sweep fire the identical bound drain; a bare worker with none wired no-ops the kick.
+async def run_adhoc_drain_job(
+    ctx: dict[str, Any],
+    *,
+    repo_full_name: str,
+) -> None:
+    """Arq task: run one ad-hoc drain for a repo, kicked by the webhook (``RUN_ADHOC_DRAIN_TASK``).
+
+    The webhook enqueues this low-latency kick when a ``ready-for-agent`` (non-``prd``) issue
+    event arrives, so the repo's ad-hoc backlog drains without waiting for the cron heartbeat
+    (a flurry of events for one repo coalesces to a single drain via the queue's per-repo job
+    id). The bound drain is read from ``ctx`` (populated by :func:`on_startup` under live
+    GitHub-App auth) — the *same* drain the heartbeat fires (issue #43) — so a kick and a
+    sweep are identical work under one single-run lock.
+
+    Two skips keep one kick from crashing the worker, mirroring the other tasks' discipline:
+    with no drain wired (a bare worker / round-trip skeleton) the kick logs and returns, and a
+    repo no longer opted in (no fetchable config) is a skip rather than a drain of a de-opted
+    repo.
+
+    Args:
+        ctx: Arq worker context; may carry ``adhoc_drain`` (the bound drain) and
+            ``fetch_config`` (the opt-in config seam).
+        repo_full_name: e.g. "owner/repo".
+    """
+    drain: HeartbeatDrain | None = ctx.get("adhoc_drain")
+    if drain is None:
+        logger.info("No ad-hoc drain wired; dropping kick for %s", repo_full_name)
+        return
+    config = await _config_for(ctx, repo_full_name)
+    if config is None:
+        return
+    await drain(repo_full_name=repo_full_name, config=config)
 
 
 async def _config_for(ctx: dict[str, Any], repo_full_name: str) -> RepoConfig | None:
@@ -585,13 +623,105 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         ctx["fetch_config"] = _no_config_fetcher
     else:
         auth, client = wiring
+        fetch_claude_md = _github_claude_md_fetcher(auth, client)
+        pipeline_factory = build_pipeline_factory(
+            settings, auth, fetch_claude_md=fetch_claude_md
+        )
         ctx["github_client"] = client
         ctx["fetch_config"] = github_config_fetcher(auth, client)
         ctx["fetch_prd_body"] = _github_issue_body_fetcher(auth, client)
-        ctx["pipeline_factory"] = build_pipeline_factory(
-            settings, auth, fetch_claude_md=_github_claude_md_fetcher(auth, client)
+        ctx["pipeline_factory"] = pipeline_factory
+        # The webhook's low-latency ad-hoc kick (run_adhoc_drain_job) reads ``adhoc_drain``
+        # from ctx; bind it here so a kick on a deployed worker actually drains. Issue #43
+        # wires the heartbeat's ``drain`` to this same seam so a kick and a sweep fire the
+        # identical bound drain under one single-run lock.
+        ctx["adhoc_drain"] = _bind_adhoc_drain(
+            settings,
+            auth,
+            pipeline_factory=pipeline_factory,
+            fetch_claude_md=fetch_claude_md,
         )
     ctx["dedupe"] = PrdDedupeStore(settings.dedupe_db_path)
+
+
+def _bind_adhoc_drain(
+    settings: Any,
+    auth: InstallationAuth,
+    *,
+    pipeline_factory: PipelineFactory,
+    fetch_claude_md: ClaudeMdFetcher,
+) -> HeartbeatDrain:
+    """Bind the production ad-hoc drain to a ``(*, repo_full_name, config)`` callable.
+
+    The webhook's kick (:func:`run_adhoc_drain_job`) and — once issue #43 wires it — the
+    heartbeat's sweep both fire the drain through this one seam, so they are the *same* work
+    under one single-run lock. The shared collaborators are built once: the service-level
+    :class:`~retinue.budget.BudgetGovernor` over ``settings.budget_db_path`` (the *same*
+    durable rolling-24h ledger the PRD and cron lanes meter, so the budget is one window) and
+    a per-repo single-run lock registry, so two repos drain concurrently while a repo's own
+    kicked and swept drains serialize.
+
+    Each call mints a per-repo installation token, then constructs the per-repo gh seam
+    (:class:`retinue.adhoc_drain.GhCli`), reuses the worker's ``pipeline_factory`` to build
+    the repo's pipeline (its ``process_adhoc_pr`` opens the PR), binds the real ad-hoc
+    build+PR primitive (:func:`retinue.pipeline.bind_adhoc_build`), and drives
+    :func:`retinue.adhoc_drain.run_adhoc_drain` via :func:`retinue.wiring.bind_adhoc_drain`.
+
+    Args:
+        settings: The runtime settings carrying the budget + Anthropic config.
+        auth: The GitHub App installation auth used to mint per-repo tokens.
+        pipeline_factory: The worker's pipeline factory, reused so the ad-hoc PR step rides
+            the same per-repo pipeline the PRD lane builds.
+        fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
+
+    Returns:
+        The bound drain — an async ``(*, repo_full_name, config) -> None``.
+    """
+    from retinue.adhoc_drain import AdhocDrainLock, GhCli
+    from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
+    from retinue.pipeline import bind_adhoc_build
+    from retinue.wiring import bind_adhoc_drain
+
+    governor = BudgetGovernor(
+        BudgetLedger(
+            settings.budget_db_path,
+            clock=SystemClock(),
+            auth_mode=AuthMode.from_config(settings.auth_mode),
+            weekly_budget=settings.weekly_budget,
+            daily_cap_fraction=settings.budget_daily_cap_fraction,
+        )
+    )
+    locks: dict[str, AdhocDrainLock] = {}
+
+    async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
+        token = (await auth.installation_token(repo_full_name)).token
+        gh = GhCli(token=token)
+        pipeline = await pipeline_factory(repo_full_name, config)
+        build = bind_adhoc_build(
+            settings,
+            auth,
+            pipeline=pipeline,
+            repo_full_name=repo_full_name,
+            token=token,
+            config=config,
+            claude_md=await fetch_claude_md(repo_full_name),
+        )
+        bound = bind_adhoc_drain(
+            gh=gh,
+            build=build,
+            governor=governor,
+            estimated_amount=_ADHOC_DRAIN_ESTIMATED_AMOUNT,
+            lock=locks.setdefault(repo_full_name, AdhocDrainLock()),
+        )
+        await bound(repo_full_name=repo_full_name, config=config)
+
+    return drain
+
+
+# The flat per-build charge the ad-hoc drain meters against the shared rolling-24h cap,
+# matching the PRD lane's estimate (:data:`retinue.pipeline._BUILD_ESTIMATED_AMOUNT`); a
+# build that would cross the cap is skipped so the one shared budget is never overshot.
+_ADHOC_DRAIN_ESTIMATED_AMOUNT = 1.0
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
@@ -665,7 +795,7 @@ class WorkerSettings:
         arq retinue.worker.WorkerSettings
     """
 
-    functions = [process_prd, process_review_job, reap_pr_job]
+    functions = [process_prd, process_review_job, reap_pr_job, run_adhoc_drain_job]
     # The worker-global cron heartbeat: fires every Nth minute as the safety-net sweep for
     # issues labeled while the webhook was missed (firing the ad-hoc drain for each due repo)
     # and drives the backlog cron lane (``run_cron_tick``) — the first runtime caller of the

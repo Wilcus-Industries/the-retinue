@@ -42,7 +42,13 @@ import retinue.loopback as _loopback_gh
 import retinue.pr_opener as _pr_gh
 import retinue.reviewer as _reviewer_gh
 import retinue.slicer as _slicer_gh
-from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
+from retinue.adhoc_build import (
+    AdhocBuildResult,
+    AdhocIssue,
+    ContainerAdhocReviewer,
+    ContainerPlanner,
+    build_adhoc_issue,
+)
 from retinue.budget import (
     AuthMode,
     BudgetGovernor,
@@ -914,6 +920,90 @@ def _bind_build_prd_for_repo(
         return _prd_build_from_bound(result, prd_number=kwargs.get("prd_number"))
 
     return run
+
+
+def bind_adhoc_build(
+    settings: Settings,
+    auth: InstallationAuth,
+    *,
+    pipeline: Pipeline,
+    repo_full_name: str,
+    token: str,
+    config: RepoConfig,
+    claude_md: str,
+) -> Callable[..., Awaitable[None]]:
+    """Bind the real ad-hoc build+PR primitive for one repo (the drain's downstream).
+
+    Returns an async ``(issue, *, repo_full_name) -> None`` — the
+    :data:`retinue.adhoc_drain.AdhocBuild` shape — that drives one ad-hoc issue end to end:
+    :func:`retinue.adhoc_build.build_adhoc_issue` (plan -> implement -> done-check -> push,
+    then the advisory review pass) in a fresh disposable container, then the *already
+    constructed* repo :class:`Pipeline`'s :meth:`~Pipeline.process_adhoc_pr` to open the
+    ``issue-<N>`` -> staging PR on a green build (reusing the pipeline's PR ops, gh issue
+    creator, and run-state store rather than standing up parallel ones). The build's
+    container/planner/implementer/reviewer adapters are the *same* real ones the PRD lane
+    uses (:func:`_bind_build_prd_for_repo`), each with its model resolved against the repo's
+    ``models`` override, so an ad-hoc build runs the production lane — not a bare no-op. A red
+    build pushes nothing and opens no PR (``process_adhoc_pr`` skips it).
+
+    Args:
+        settings: Carries the Anthropic credential/auth mode (planner, implementer, reviewer).
+        auth: Mints the installation token the build clones over.
+        pipeline: The repo's constructed pipeline; its ``process_adhoc_pr`` opens the PR and
+            records the PR<->issue mapping after a green build, and its ``create_issue`` is
+            the gh issue creator the advisory review pass files review-fix issues through.
+        repo_full_name: The target repo the build runs against.
+        token: The minted installation token the gh report sink files under.
+        config: The repo's validated config (staging branch, secrets, model overrides,
+            retry-cap chain bound).
+        claude_md: The repo's ``CLAUDE.md`` text carrying the done-check command.
+
+    Returns:
+        The bound :data:`retinue.adhoc_drain.AdhocBuild` callable the drain runs per issue.
+    """
+    runtime = DockerRuntime()
+    planner = ContainerPlanner(
+        credential=settings.anthropic_credential,
+        auth_mode=settings.auth_mode,
+        model=resolve_model(Role.PLANNER, config),
+    )
+    implementer = ContainerImplementer(
+        credential=settings.anthropic_credential,
+        auth_mode=settings.auth_mode,
+        model=resolve_model(Role.IMPLEMENTER, config),
+    )
+    review_generate = AgentSdkReviewGenerator(
+        credential=settings.anthropic_credential,
+        transport=HttpxTransport(),
+        model=resolve_model(Role.REVIEWER, config),
+    )
+    reviewer = ContainerAdhocReviewer(
+        repo_full_name=repo_full_name,
+        config=config,
+        generate=review_generate,
+        create_issue=pipeline.create_issue,
+        credential=settings.anthropic_credential,
+        auth_mode=settings.auth_mode,
+    )
+    resolve_secret: SecretResolver = EnvSecretResolver()
+    report: ReportSink = GhReportSink(token=token)
+
+    async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
+        result = await build_adhoc_issue(
+            issue,
+            config,
+            claude_md,
+            planner=planner,
+            implementer=implementer,
+            auth=auth,
+            runtime=runtime,
+            resolve_secret=resolve_secret,
+            report=report,
+            reviewer=reviewer,
+        )
+        await pipeline.process_adhoc_pr(issue, result)
+
+    return build
 
 
 def _build_review_reviewer_factory(

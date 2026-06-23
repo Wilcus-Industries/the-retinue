@@ -27,14 +27,17 @@ from retinue.loopback import (
     VerdictResult,
 )
 from retinue.pipeline import PrdJobResult
+from retinue.queue import RUN_ADHOC_DRAIN_TASK
 from retinue.repo_config import RepoConfig
 from retinue.worker import (
+    WorkerSettings,
     on_shutdown,
     on_startup,
     parse_heimdall_review,
     process_prd,
     process_review_job,
     reap_pr_job,
+    run_adhoc_drain_job,
 )
 
 _CONFIG_YAML = "staging_branch: staging\nretry_cap: 2\n"
@@ -187,6 +190,69 @@ async def test_reap_pr_job_skips_unknown_pr(tmp_path: Path) -> None:
     assert pipeline.reaps == []
 
 
+# --- ad-hoc drain kick ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_adhoc_drain_job_drives_the_bound_drain(tmp_path: Path) -> None:
+    """A kicked drain job calls the bound drain from ctx with the repo (and its config)."""
+    calls: list[dict[str, Any]] = []
+
+    async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
+        calls.append({"repo": repo_full_name, "config": config})
+
+    ctx = _ctx(tmp_path, _RecordingPipeline())
+    ctx["adhoc_drain"] = drain
+
+    await run_adhoc_drain_job(ctx, repo_full_name="owner/repo")
+
+    assert len(calls) == 1
+    assert calls[0]["repo"] == "owner/repo"
+    assert calls[0]["config"].staging_branch == "staging"
+
+
+@pytest.mark.asyncio
+async def test_run_adhoc_drain_job_without_drain_is_a_noop(tmp_path: Path) -> None:
+    """With no drain wired (bare worker) the kick logs and returns, never crashing."""
+    ctx = _ctx(tmp_path, _RecordingPipeline())
+    assert "adhoc_drain" not in ctx
+
+    await run_adhoc_drain_job(ctx, repo_full_name="owner/repo")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_run_adhoc_drain_job_skips_a_deopted_repo(tmp_path: Path) -> None:
+    """A repo no longer opted in (no config) is a skip — the drain is never fired."""
+    calls: list[str] = []
+
+    async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
+        calls.append(repo_full_name)
+
+    ctx = _ctx(tmp_path, _RecordingPipeline())
+    ctx["adhoc_drain"] = drain
+
+    async def no_config(repo_full_name: str) -> str | None:
+        return None
+
+    ctx["fetch_config"] = no_config
+
+    await run_adhoc_drain_job(ctx, repo_full_name="owner/repo")
+
+    assert calls == []
+
+
+def test_worker_registers_the_adhoc_drain_task() -> None:
+    """WorkerSettings registers a function named ``run_adhoc_drain_job`` (the kick task).
+
+    Mirrors the cron-job registration test: the webhook enqueues
+    ``RUN_ADHOC_DRAIN_TASK`` and Arq dequeues by ``__name__``, so a function with that
+    exact name must be in ``WorkerSettings.functions`` or the kick is dropped.
+    """
+    names = {fn.__name__ for fn in WorkerSettings.functions}
+    assert RUN_ADHOC_DRAIN_TASK in names
+    assert run_adhoc_drain_job.__name__ == RUN_ADHOC_DRAIN_TASK
+
+
 # --- parse_heimdall_review ------------------------------------------------------
 
 
@@ -278,6 +344,9 @@ async def test_on_startup_wires_a_live_pipeline(
         assert callable(ctx["fetch_config"])
         assert callable(ctx["fetch_prd_body"])
         assert callable(ctx["pipeline_factory"])
+        # The webhook's ad-hoc kick task reads ``adhoc_drain`` from ctx; a deployed
+        # worker under live auth must have it bound so the kick actually drains.
+        assert callable(ctx["adhoc_drain"])
 
         # The produced pipeline has a live build lane (the wiring blocker is closed).
         pipeline = await ctx["pipeline_factory"](

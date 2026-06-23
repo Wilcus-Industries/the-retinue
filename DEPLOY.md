@@ -17,7 +17,10 @@ This runbook takes you from a fresh GitHub App to a live deployment. Follow it i
 > (behind the budget gate + triage), runs the repo's done-check over the real changes, and
 > on green **pushes** the branch; the merge container then merges and pushes the
 > integration branch. An issue event on an opted-in repo now slices the PRD, builds the
-> slices, and opens the staging PR — it is no longer a skip.
+> slices, and opens the staging PR — it is no longer a skip. `on_startup` likewise binds the
+> ad-hoc `adhoc_drain` seam, so the webhook's low-latency ad-hoc kick
+> (`run_adhoc_drain_job`) drains a deployed repo's `ready-for-agent` backlog rather than
+> being dropped.
 >
 > Running the agent inside the throwaway container keeps the autonomous AI step **off the
 > worker host and its mounted `docker.sock`** — the isolation the PRD intends.

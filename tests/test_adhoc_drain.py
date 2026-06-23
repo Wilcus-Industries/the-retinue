@@ -34,6 +34,7 @@ from retinue.adhoc_build import AdhocIssue, render_chain_depth
 from retinue.adhoc_drain import (
     AdhocBuild,
     AdhocDrainBusyError,
+    AdhocDrainLock,
     AdhocGh,
     GhCli,
     ReadyIssue,
@@ -368,6 +369,24 @@ async def test_a_second_concurrent_drain_is_rejected_by_the_lock(
     gate.set()
     await first
     assert [issue.issue_number for issue in build.built] == [7]
+
+
+@pytest.mark.asyncio
+async def test_adhoc_drain_lock_rejects_a_second_holder_then_reenters() -> None:
+    """The production lock rejects a concurrent second holder, then frees on exit.
+
+    :class:`AdhocDrainLock` is the production single-run guard the worker binds per repo:
+    the first holder enters; a second concurrent ``__aenter__`` raises (never blocks); and
+    once the first exits the lock is free to be entered again (a later kick is not poisoned).
+    """
+    lock = AdhocDrainLock()
+    async with lock:
+        with pytest.raises(AdhocDrainBusyError):
+            async with lock:
+                pass
+    # Freed on exit: a subsequent drain can take it again.
+    async with lock:
+        pass
 
 
 # --- AC3 shared budget governor: each build meters the one shared budget -----------

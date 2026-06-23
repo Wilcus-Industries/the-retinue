@@ -54,9 +54,12 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   explore-first, no-write invocation and captures the plan as the run's output.
 - `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
 - `retinue.worker` — the `process_prd` Arq task (gate → drive the pipeline), the
-  `process_review_job` / `reap_pr_job` tasks the webhook events enqueue, the `gate_prd`
-  opt-in gate, and `WorkerSettings`. `on_startup` wires the real `fetch_config`, PRD-body
-  fetcher, and `pipeline_factory` onto the Arq context.
+  `process_review_job` / `reap_pr_job` tasks the webhook events enqueue, the
+  `run_adhoc_drain_job` task the webhook's ad-hoc kick (`RUN_ADHOC_DRAIN_TASK`) dequeues to
+  fire one ad-hoc drain (no-op when unwired), the `gate_prd` opt-in gate, and
+  `WorkerSettings`. `on_startup` wires the real `fetch_config`, PRD-body fetcher,
+  `pipeline_factory`, and the bound `adhoc_drain` onto the Arq context — the *same* bound
+  drain the heartbeat sweep fires, under one per-repo single-run lock.
 - `retinue.github_app` — `InstallationAuth`, the seam that mints a GitHub App
   installation token (`InstallationToken`) the worker clones with.
 - `retinue.container` — `ContainerRuntime` / `Container`, the disposable-container
@@ -135,7 +138,8 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 A validly signed `prd`-labeled `issues` webhook (action opened/reopened/edited/labeled)
 returns 202 and enqueues exactly one PRD job; a `ready-for-agent` non-`prd` issue on those
 actions returns 202 and enqueues exactly one ad-hoc drain kick (`prd` wins when both labels
-are present). An invalid or missing signature returns 401 and enqueues nothing. A signed
+are present), which the worker dequeues into `run_adhoc_drain_job` to fire that repo's
+drain. An invalid or missing signature returns 401 and enqueues nothing. A signed
 issues event with neither label (or any other action), a `pull_request_review` not from
 heimdall's bot, and any other off-target event are acked with 204 without enqueuing.
 
