@@ -1,12 +1,14 @@
 """Ad-hoc drain: list + rank ready-for-agent non-PRD issues, build up to the cap (#32).
 
 One ad-hoc drain runs per repo. It lists every open ``ready-for-agent`` issue via the gh
-seam, keeps only the ones :mod:`retinue.lane` routes to the **ad-hoc** lane (dropping any
+seam, keeps only the ones the **ad-hoc** lane decision claims (dropping any
 ``prd``-labeled issue and any issue carrying a ``Part of #<prd>`` link — those route to the
 orchestrator lane), ranks the survivors by ``priority:<severity>`` (no-priority lowest),
 and drives the ad-hoc build+PR primitive for each up to the concurrency cap
-(``config.max_parallel``). It is the first real consumer of :func:`retinue.lane.classify`
-for ad-hoc work.
+(``config.max_parallel``). The lane filter **mirrors** :func:`retinue.lane.classify`'s
+ad-hoc decision (reusing :class:`~retinue.lane.IssueFacts`) but deliberately does **not**
+call ``classify``: routing standalone ``priority:critical``/``high`` issues through
+classify would preempt them onto the orchestrator lane and exclude them from the drain.
 
 Each surviving issue is materialized into an :class:`~retinue.adhoc_build.AdhocIssue`
 through :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` — fed the issue body the
@@ -51,9 +53,9 @@ class ReadyIssue:
 
     The body is surfaced (unlike the cron lane's backlog seam) because the drain feeds it
     to :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue`, which reads the
-    ``Chain-depth:`` lineage marker out of it — and to :func:`retinue.lane.classify`,
-    which reads the ``Part of #<prd>`` link out of it to split orchestrator-lane slices
-    from ad-hoc work.
+    ``Chain-depth:`` lineage marker out of it — and because :meth:`is_adhoc` scans it for
+    the ``Part of #<prd>`` link (mirroring :func:`retinue.lane.classify`'s decision, not
+    calling it) to split orchestrator-lane slices from ad-hoc work.
 
     Attributes:
         number: The issue number; the build commits to the derived ``issue-<N>`` branch.
@@ -119,8 +121,9 @@ class GhCli:
     Runs ``gh issue list --repo <repo> --label ready-for-agent --state open --json
     number,labels,body`` and parses the JSON into :class:`ReadyIssue` objects. The ``body``
     field is requested — unlike the cron lane's backlog query — because the drain feeds it
-    to :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (lineage marker) and to
-    :func:`retinue.lane.classify` (the ``Part of #<prd>`` link). Authenticates by injecting
+    to :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (lineage marker) and
+    scans it in :meth:`ReadyIssue.is_adhoc` for the ``Part of #<prd>`` link (mirroring
+    :func:`retinue.lane.classify`'s decision, not calling it). Authenticates by injecting
     the GitHub token into the child env as ``GH_TOKEN``, so no token is ever placed on the
     command line.
 
@@ -228,7 +231,8 @@ async def run_adhoc_drain(
     """Drain the repo's ad-hoc work: list, filter, rank, then build up to the cap.
 
     1. **list** the repo's open ``ready-for-agent`` issues (number, labels, body),
-    2. **filter** to the ad-hoc lane via :func:`retinue.lane.classify` — dropping any
+    2. **filter** to the ad-hoc lane via :meth:`ReadyIssue.is_adhoc` — which mirrors
+       :func:`retinue.lane.classify`'s ad-hoc decision (not calling it) — dropping any
        ``prd``-labeled issue and any issue carrying a ``Part of #<prd>`` link, since those
        route to the orchestrator lane,
     3. **rank** the survivors by ``priority:<severity>`` (no-priority lowest), and

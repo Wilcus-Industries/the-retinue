@@ -5,9 +5,10 @@ ranks them by ``priority:<severity>`` (no-priority lowest), and drives the ad-ho
 build+PR primitive for each up to the concurrency cap (``max_parallel``):
 
 1. **list** — pull the repo's open ``ready-for-agent`` issues (number, labels, body),
-2. **filter** — keep only the ad-hoc lane (consuming :func:`retinue.lane.classify`):
-   drop any PRD-labeled issue and any issue carrying a ``Part of #<prd>`` link, since
-   those route to the orchestrator lane,
+2. **filter** — keep only the ad-hoc lane via ``ReadyIssue.is_adhoc``, which mirrors
+   :func:`retinue.lane.classify`'s ad-hoc decision but does **not** call it: drop any
+   PRD-labeled issue and any issue carrying a ``Part of #<prd>`` link, since those route
+   to the orchestrator lane,
 3. **rank** — order by ``priority:<severity>`` with no-priority lowest,
 4. **drive** — materialize each ranked issue into an :class:`AdhocIssue` through
    :meth:`AdhocIssue.from_fetched_issue` (fed the fetched body, so the ``Chain-depth:``
