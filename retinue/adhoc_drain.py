@@ -1,4 +1,4 @@
-"""Ad-hoc drain: list + rank ready-for-agent non-PRD issues, build up to the cap (#32).
+"""Ad-hoc drain: ready-for-agent non-PRD issues, deduped, locked, budget-gated (#32, #33).
 
 One ad-hoc drain runs per repo. It lists every open ``ready-for-agent`` issue via the gh
 seam, keeps only the ones the **ad-hoc** lane decision claims (dropping any
@@ -18,9 +18,24 @@ gh seam surfaces — never the bare constructor. ``from_fetched_issue`` parses t
 default every hop to depth 0 and silently make the #39/#40 review-fix chain bound inert.
 The gh list seam therefore surfaces each issue's ``body`` alongside its labels.
 
-No dedup/locking/budget hardening yet — that is the next slice (#33). The gh query and the
-downstream build are injected and faked, so the whole drain runs with no real ``gh``, no
-Docker, and no network — mirroring the injected-seam style of :mod:`retinue.cron`.
+The drain is hardened for production (#33) with four guards:
+
+* **dedup via GitHub truth** — :meth:`AdhocGh.in_flight` skips any issue whose
+  ``issue-<N>`` branch or open PR already exists, mirroring the reconcile-style
+  source-of-truth approach (:mod:`retinue.reconcile`) so no duplicate branch/PR is opened;
+* **single-run lock** — the whole drain runs under an injected lock so two drains for a
+  repo never overlap (a second entry raises :class:`AdhocDrainBusyError`); the lock is
+  *separate* from the orchestrator's, so the drain still runs alongside a PRD build;
+* **shared budget governor** — every build meters against the one service-level
+  :class:`~retinue.budget.BudgetGovernor` the PRD lane uses, so a build that would cross
+  the rolling-24h cap is skipped and the shared budget is never overshot;
+* **PRD-first ordering with preemption** — when a PRD build is in flight, only a
+  ``priority:critical``/``high`` issue (the same rule :func:`retinue.lane.classify`
+  preempts on) builds; ordinary ad-hoc work waits for the PRD to finish.
+
+Every leaf I/O — the gh queries, the budget store, the downstream build — is injected and
+faked, so the whole drain runs with no real ``gh``, no Docker, and no network — mirroring
+the injected-seam style of :mod:`retinue.cron`.
 """
 
 from __future__ import annotations
@@ -28,18 +43,35 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Protocol
 
 from retinue.adhoc_build import AdhocIssue
-from retinue.cron import GhRunner, _parse_json_array, _run_gh_subprocess
-from retinue.lane import IssueFacts
+from retinue.budget import BudgetGovernor
+from retinue.cron import GhCliError, GhRunner, _parse_json_array, _run_gh_subprocess
+from retinue.lane import IssueFacts, preempts_prd_first
 from retinue.loopback import Severity
 from retinue.repo_config import RepoConfig
 from retinue.slicer import READY_LABEL
 from retinue.webhook import PRD_LABEL
 
 logger = logging.getLogger(__name__)
+
+
+class AdhocDrainBusyError(Exception):
+    """A second ad-hoc drain was attempted for a repo while one is already in flight.
+
+    The single-run guarantee: :func:`run_adhoc_drain` runs inside an injected lock that
+    rejects a concurrent holder rather than blocking, so the "at most one ad-hoc drain
+    per repo at a time" contract is observable to the caller. This lock is *separate* from
+    the orchestrator's :class:`retinue.orchestrator.OrchestratorBusyError` lock, so an
+    ad-hoc drain still runs concurrently with a PRD build. Mirrors
+    :class:`retinue.cron.CronBusyError`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("an ad-hoc drain is already in flight")
 
 # How many ready-for-agent issues to pull per drain. The cap on concurrent *builds* is
 # ``config.max_parallel``; this generous-but-bounded page just keeps the visible set from
@@ -100,18 +132,38 @@ class ReadyIssue:
         """
         return self._facts().priority()
 
+    def preempts(self) -> bool:
+        """Whether this issue's priority jumps PRD-first ordering (``critical``/``high``).
+
+        Reuses :func:`retinue.lane.preempts_prd_first` — the single source of truth for the
+        preemption rule :func:`retinue.lane.classify` applies — so the drain and the
+        classifier agree on what preempts.
+        """
+        return preempts_prd_first(self.severity())
+
 
 class AdhocGh(Protocol):
-    """The gh query behind the ad-hoc drain. The ad-hoc lane's gh seam.
+    """The gh queries behind the ad-hoc drain. The ad-hoc lane's gh seam.
 
     A production implementation runs ``gh issue list --label ready-for-agent`` (with each
-    issue's labels and body); tests inject a fake that returns scripted issues. Modeled as
-    a protocol so the whole drain injects through a single collaborator, mirroring the
+    issue's labels and body) for :meth:`list_ready`, and the branch-existence + open-PR
+    lookups for :meth:`in_flight`; tests inject a fake that scripts both. Modeled as one
+    protocol so the whole drain injects through a single collaborator, mirroring the
     gh-seam style of :mod:`retinue.cron` / :mod:`retinue.reconcile`.
     """
 
     async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
         """Return the repo's open ``ready-for-agent`` issues with their labels and body."""
+        ...
+
+    async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
+        """Return True when GitHub shows the issue is already being built.
+
+        The dedup source of truth, mirroring the reconcile-style GitHub-truth approach
+        (:mod:`retinue.reconcile`): an issue is in flight when its ``issue-<N>`` branch
+        exists OR an open PR for it exists. Either proves a build is already under way (or
+        landed), so the drain skips it rather than rebuilding a duplicate branch/PR.
+        """
         ...
 
 
@@ -162,6 +214,40 @@ class GhCli:
         stdout = await self._runner(argv, self._auth_env())
         return [_parse_ready_issue(entry) for entry in _parse_json_array(stdout)]
 
+    async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
+        """Return True when the ``issue-<N>`` branch exists or an open PR for it exists.
+
+        Queries GitHub truth in two legs, short-circuiting on the first that proves the
+        issue is already in flight: the branch-ref lookup (a missing ref 404s, surfaced by
+        the runner as :class:`GhCliError`, read here as "no branch"), then the open-PR list
+        for the ``issue-<N>`` head. Mirrors the reconcile-style source-of-truth dedup.
+
+        Raises:
+            ValueError: the open-PR query returned a payload that did not parse as a JSON
+                array.
+        """
+        branch = _issue_branch(issue_number)
+        if await self._branch_exists(repo_full_name, branch):
+            return True
+        return await self._open_pr_exists(repo_full_name, branch)
+
+    async def _branch_exists(self, repo_full_name: str, branch: str) -> bool:
+        """Whether ``branch`` resolves to a ref on the repo (a 404 means it does not)."""
+        argv = _branch_ref_argv(repo_full_name, branch)
+        try:
+            await self._runner(argv, self._auth_env())
+        except GhCliError:
+            # A missing ref is a 404 / non-zero exit — not an error to propagate, just a
+            # False answer to the existence question (mirrors pr_opener's staging_exists).
+            return False
+        return True
+
+    async def _open_pr_exists(self, repo_full_name: str, branch: str) -> bool:
+        """Whether an open PR with ``branch`` as its head exists on the repo."""
+        argv = _open_pr_argv(repo_full_name, branch)
+        stdout = await self._runner(argv, self._auth_env())
+        return len(_parse_json_array(stdout)) > 0
+
     def _auth_env(self) -> Mapping[str, str]:
         """The child-process env carrying the token as ``GH_TOKEN`` (empty when none).
 
@@ -196,6 +282,46 @@ def _list_ready_argv(repo_full_name: str, *, limit: int) -> list[str]:
     ]
 
 
+def _issue_branch(issue_number: int) -> str:
+    """The ``issue-<N>`` branch an ad-hoc build commits to (the dedup branch name)."""
+    return f"issue-{issue_number}"
+
+
+def _branch_ref_argv(repo_full_name: str, branch: str) -> list[str]:
+    """Assemble the ``gh api`` argv reading one branch ref (404s when it does not exist).
+
+    Hits ``repos/<repo>/git/ref/heads/<branch>`` rather than ``gh pr``/``gh branch`` so a
+    missing branch is a clean 404 the adapter reads as "no branch", mirroring
+    :meth:`retinue.pr_opener.GhCliPrOps.staging_exists`.
+    """
+    return [
+        "gh",
+        "api",
+        f"repos/{repo_full_name}/git/ref/heads/{branch}",
+    ]
+
+
+def _open_pr_argv(repo_full_name: str, head: str) -> list[str]:
+    """Assemble the ``gh pr list`` argv for the open PRs with ``head`` as their branch.
+
+    Mirrors :func:`retinue.reconcile._staging_pr_argv` (``pr list --head ... --state open
+    --json number``); a non-empty array means an open PR already exists for the issue.
+    """
+    return [
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        repo_full_name,
+        "--head",
+        head,
+        "--state",
+        "open",
+        "--json",
+        "number",
+    ]
+
+
 def _parse_ready_issue(entry: object) -> ReadyIssue:
     """Parse one ``gh`` issue object into a :class:`ReadyIssue`.
 
@@ -227,57 +353,160 @@ async def run_adhoc_drain(
     gh: AdhocGh,
     build: AdhocBuild,
     config: RepoConfig,
+    governor: BudgetGovernor,
+    estimated_amount: float,
+    lock: AbstractAsyncContextManager[object],
+    prd_in_flight: bool = False,
 ) -> list[AdhocIssue]:
-    """Drain the repo's ad-hoc work: list, filter, rank, then build up to the cap.
+    """Drain the repo's ad-hoc work, hardened for production: list, filter, dedup, build.
+
+    The whole drain runs under ``lock`` so two drains for the same repo never overlap (a
+    second entry raises :class:`AdhocDrainBusyError`); the lock is *separate* from the
+    orchestrator's, so the drain still runs concurrently with a PRD build. Inside the lock:
 
     1. **list** the repo's open ``ready-for-agent`` issues (number, labels, body),
-    2. **filter** to the ad-hoc lane via :meth:`ReadyIssue.is_adhoc` — which mirrors
+    2. **filter** to the ad-hoc lane via :meth:`ReadyIssue.is_adhoc` — mirroring
        :func:`retinue.lane.classify`'s ad-hoc decision (not calling it) — dropping any
-       ``prd``-labeled issue and any issue carrying a ``Part of #<prd>`` link, since those
-       route to the orchestrator lane,
-    3. **rank** the survivors by ``priority:<severity>`` (no-priority lowest), and
-    4. **drive** the injected ``build`` for each — materializing the issue through
-       :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (fed the fetched body, so
-       the ``Chain-depth:`` marker is read back and the #39/#40 chain bound stays live) —
-       concurrently across the ranked set but capped at ``config.max_parallel`` live builds.
-
-    No dedup/locking/budget hardening in this slice (#33).
+       ``prd``-labeled issue and any issue carrying a ``Part of #<prd>`` link,
+    3. **honor PRD-first ordering**: when ``prd_in_flight`` is True, only a
+       ``priority:critical``/``high`` issue (:meth:`ReadyIssue.preempts`, the same rule
+       :func:`retinue.lane.classify` preempts on) builds — ordinary ad-hoc work waits for
+       the PRD to finish,
+    4. **rank** the survivors by ``priority:<severity>`` (no-priority lowest),
+    5. **dedup** against GitHub truth: skip any issue already in flight (an ``issue-<N>``
+       branch or open PR exists, :meth:`AdhocGh.in_flight`), so no duplicate branch/PR,
+    6. **drive** the injected ``build`` for each survivor — materialized through
+       :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (so the ``Chain-depth:``
+       marker stays live) — concurrently but capped at ``config.max_parallel`` live builds,
+       each metered against the **one shared** :class:`~retinue.budget.BudgetGovernor` (the
+       same governor the PRD lane meters): a build that would cross the rolling-24h cap is
+       skipped, so the shared budget is never overshot.
 
     Args:
         repo_full_name: The target repo, e.g. ``"owner/repo"``.
-        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues with labels + body).
-        build: The downstream ad-hoc build+PR primitive run per ranked issue, injected so
-            the drain runs with no Docker, gh, the Agent SDK, or network.
+        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues; answers the in-flight
+            dedup query).
+        build: The downstream ad-hoc build+PR primitive run per surviving issue, injected
+            so the drain runs with no Docker, gh, the Agent SDK, or network.
         config: The accepted repo config; ``max_parallel`` bounds the concurrent builds.
+        governor: The shared service-level budget governor; each build is metered through
+            it and skipped when the rolling-24h cap leaves no room.
+        estimated_amount: The per-build charge metered against the shared cap.
+        lock: The single-run lock; entering it raises :class:`AdhocDrainBusyError` when a
+            drain for this repo is already in flight. Separate from the PRD build's lock.
+        prd_in_flight: Whether a PRD build is currently running for this repo. When True,
+            PRD-first ordering holds and only preempting (``critical``/``high``) issues
+            build; when False, every ranked ad-hoc issue builds.
 
     Returns:
-        The :class:`~retinue.adhoc_build.AdhocIssue` objects driven through ``build``, in
-        rank order (highest priority first) — the drain's observable surface.
-    """
-    listed = await gh.list_ready(repo_full_name=repo_full_name)
-    ranked = _rank_adhoc([issue for issue in listed if issue.is_adhoc()])
-    issues = [
-        AdhocIssue.from_fetched_issue(repo_full_name, ready.number, ready.body)
-        for ready in ranked
-    ]
-    if not issues:
-        logger.info("Ad-hoc drain idle: no ready-for-agent issues for %s", repo_full_name)
-        return []
+        The :class:`~retinue.adhoc_build.AdhocIssue` objects actually driven through
+        ``build`` (dedup-skipped and budget-skipped issues excluded), in rank order.
 
-    logger.info(
-        "Ad-hoc drain building %d issue(s) for %s (cap=%s)",
-        len(issues),
-        repo_full_name,
-        config.max_parallel,
-    )
+    Raises:
+        AdhocDrainBusyError: A drain for this repo is already in flight (from the lock).
+    """
+    async with lock:
+        listed = await gh.list_ready(repo_full_name=repo_full_name)
+        candidates = _select_candidates(repo_full_name, prd_in_flight, listed)
+        buildable = await _drop_in_flight(repo_full_name, candidates, gh)
+        if not buildable:
+            logger.info(
+                "Ad-hoc drain idle: no buildable ready-for-agent issues for %s",
+                repo_full_name,
+            )
+            return []
+
+        logger.info(
+            "Ad-hoc drain building up to %d issue(s) for %s (cap=%s)",
+            len(buildable),
+            repo_full_name,
+            config.max_parallel,
+        )
+        return await _build_metered(
+            repo_full_name,
+            buildable,
+            build=build,
+            config=config,
+            governor=governor,
+            estimated_amount=estimated_amount,
+        )
+
+
+def _select_candidates(
+    repo_full_name: str, prd_in_flight: bool, listed: list[ReadyIssue]
+) -> list[AdhocIssue]:
+    """Filter to the ad-hoc lane, honor PRD-first preemption, rank, and materialize.
+
+    Drops non-ad-hoc issues, then — when a PRD is in flight — keeps only the preempting
+    (``critical``/``high``) issues so PRD-first ordering holds. The survivors are ranked
+    and materialized through :meth:`AdhocIssue.from_fetched_issue` so each one's
+    ``chain_depth`` is read back from its body.
+    """
+    adhoc = [issue for issue in listed if issue.is_adhoc()]
+    if prd_in_flight:
+        adhoc = [issue for issue in adhoc if issue.preempts()]
+    return [
+        AdhocIssue.from_fetched_issue(repo_full_name, ready.number, ready.body)
+        for ready in _rank_adhoc(adhoc)
+    ]
+
+
+async def _drop_in_flight(
+    repo_full_name: str, issues: list[AdhocIssue], gh: AdhocGh
+) -> list[AdhocIssue]:
+    """Drop issues already in flight (an ``issue-<N>`` branch or open PR exists).
+
+    Mirrors the reconcile-style GitHub-truth dedup: a build already under way (or landed)
+    is skipped so the drain never opens a duplicate branch or PR. Order is preserved.
+    """
+    buildable: list[AdhocIssue] = []
+    for issue in issues:
+        if await gh.in_flight(
+            repo_full_name=repo_full_name, issue_number=issue.issue_number
+        ):
+            logger.info(
+                "Ad-hoc drain skipping issue #%d (%s): already in flight",
+                issue.issue_number,
+                repo_full_name,
+            )
+            continue
+        buildable.append(issue)
+    return buildable
+
+
+async def _build_metered(
+    repo_full_name: str,
+    issues: list[AdhocIssue],
+    *,
+    build: AdhocBuild,
+    config: RepoConfig,
+    governor: BudgetGovernor,
+    estimated_amount: float,
+) -> list[AdhocIssue]:
+    """Build the issues concurrently (capped), each metered against the shared budget.
+
+    Every build first meters its charge against the one shared
+    :class:`~retinue.budget.BudgetGovernor` (the same governor the PRD lane uses); a build
+    that would cross the rolling-24h cap is skipped, so the shared budget is never
+    overshot. Returns the issues that actually built, in rank order.
+    """
     semaphore = asyncio.Semaphore(config.max_parallel or len(issues))
+    built: list[AdhocIssue] = []
 
     async def build_one(issue: AdhocIssue) -> None:
         async with semaphore:
+            if not await governor.meter_adhoc(amount=estimated_amount):
+                logger.info(
+                    "Ad-hoc drain skipping issue #%d (%s): shared budget spent",
+                    issue.issue_number,
+                    repo_full_name,
+                )
+                return
             await build(issue, repo_full_name=repo_full_name)
+            built.append(issue)
 
     await asyncio.gather(*(build_one(issue) for issue in issues))
-    return issues
+    return [issue for issue in issues if issue in built]
 
 
 # A no-priority issue ranks below every labeled severity, so its rank key sits one step

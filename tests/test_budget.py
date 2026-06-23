@@ -295,6 +295,65 @@ async def test_try_record_if_within_cap_is_atomic_under_concurrency(
     assert await ledger_a.trailing_24h_spend() == pytest.approx(12.0)
 
 
+# --- ad-hoc per-build meter: atomic charge against the shared ledger -------------
+
+
+@pytest.mark.asyncio
+async def test_meter_adhoc_records_a_charge_that_fits(db_path: Path) -> None:
+    """An ad-hoc build whose charge fits under the cap is admitted and recorded."""
+    ledger = BudgetLedger(
+        db_path, clock=FakeClock(), auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    governor = BudgetGovernor(ledger)
+
+    admitted = await governor.meter_adhoc(amount=5.0)
+
+    assert admitted is True
+    assert await ledger.trailing_24h_spend() == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_meter_adhoc_declines_a_charge_over_the_cap(db_path: Path) -> None:
+    """An ad-hoc build over the cap is declined and records nothing."""
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=12.0)  # the cap is fully spent
+    governor = BudgetGovernor(ledger)
+
+    admitted = await governor.meter_adhoc(amount=1.0)
+
+    assert admitted is False
+    assert await ledger.trailing_24h_spend() == pytest.approx(12.0)
+
+
+@pytest.mark.asyncio
+async def test_meter_adhoc_shares_the_ledger_with_the_prd_lane(db_path: Path) -> None:
+    """An ad-hoc charge counts against the same window the PRD meter charges.
+
+    cap = 12, the PRD lane already metered 11.0 (1.0 of room). An ad-hoc build of 2.0
+    cannot fit on the *shared* ledger, so meter_adhoc declines — the two lanes share one
+    budget rather than each getting a fresh cap.
+    """
+    clock = FakeClock()
+    prd_lane = BudgetGovernor(
+        BudgetLedger(
+            db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+        )
+    )
+    adhoc_lane = BudgetGovernor(
+        BudgetLedger(
+            db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+        )
+    )
+    await prd_lane._ledger.record_spend(amount=11.0)
+
+    assert await adhoc_lane.meter_adhoc(amount=2.0) is False
+    # The 1.0 of remaining room is shared: a charge that fits is still admitted.
+    assert await adhoc_lane.meter_adhoc(amount=1.0) is True
+
+
 # --- gate at run start -----------------------------------------------------------
 
 

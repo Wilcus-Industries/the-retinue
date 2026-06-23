@@ -42,6 +42,23 @@ _PART_OF_RE = re.compile(r"Part of #(\d+)")
 _PREEMPT_THRESHOLD = Severity.HIGH
 
 
+def preempts_prd_first(priority: Severity | None) -> bool:
+    """Whether a ``priority:<severity>`` jumps the PRD-first order (``critical``/``high``).
+
+    The single source of truth for the preemption rule, shared by :func:`classify` (which
+    routes a standalone preempting issue onto the orchestrator lane) and the ad-hoc drain
+    (which builds a preempting issue ahead of PRD-first ordering). A ``None`` priority —
+    no or unknown ``priority:*`` label — never preempts.
+
+    Args:
+        priority: The issue's parsed severity, or ``None`` when it carries no priority.
+
+    Returns:
+        True when ``priority`` is at or above the preemption threshold (``high``).
+    """
+    return priority is not None and priority >= _PREEMPT_THRESHOLD
+
+
 class Lane(enum.Enum):
     """Which work lane an issue is routed to.
 
@@ -132,8 +149,7 @@ def classify(facts: IssueFacts) -> LaneDecision:
         A :class:`LaneDecision` carrying the lane, whether it preempted, and the parent
         PRD number for an orchestrator-lane slice.
     """
-    priority = facts.priority()
-    if priority is not None and priority >= _PREEMPT_THRESHOLD:
+    if preempts_prd_first(facts.priority()):
         return LaneDecision(
             lane=Lane.ORCHESTRATOR, preempts=True, prd_number=facts.prd_link()
         )
