@@ -62,6 +62,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.orchestrator` — `build_slice`, the single-slice orchestrator: spawn one
   implementer subagent on an `issue-<N>` branch, gate on `run_done_check`, and merge
   the green slice into the integration branch `retinue/prd-<n>` (a red check blocks it).
+- `retinue.adhoc_build` — `build_adhoc_issue`, the ad-hoc-lane build primitive: in one
+  disposable container, run the read-only `planner` then materialize its captured plan
+  into `.retinue/plan.md`, run the same implementer the PRD lane uses on an `issue-<N>`
+  branch cut off `config.staging_branch`, gate on `run_done_check`, and push the branch
+  only when green (a red check pushes nothing). No integration branch, no merge.
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
@@ -339,6 +344,17 @@ classifier is pure (labels + body only, no `gh`) and reuses the same `priority:<
 vocabulary loopback emits. The slicer additionally stamps `prd-slice` alongside
 `ready-for-agent` on every slice it files, so a slice is distinguishable from ad-hoc
 pickup at the label layer.
+
+`retinue.adhoc_build.build_adhoc_issue` is the ad-hoc lane's build primitive. In one
+disposable container it runs the read-only `planner` (Opus on the in-container CLI, which
+maps the code with an Explore subagent and emits a plan), **materializes** that plan into
+`.retinue/plan.md`, then runs the **same** implementer the PRD lane uses to build and
+commit on an `issue-<N>` branch cut off `config.staging_branch`. The repo's done-check
+runs in the same container; a green check pushes the branch (for a human to open a PR
+from), a red check pushes nothing. There is no integration branch and no merge — that is
+the orchestrator lane's job. Every collaborator (planner, implementer, container, auth,
+secret resolver, report sink) is an injected seam, so the flow is tested with no Agent
+SDK, Docker, gh, or network.
 
 `retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
 loose `backlog` issues **one at a time**. Each tick runs under an injected single-run
