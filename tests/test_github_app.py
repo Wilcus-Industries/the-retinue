@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from retinue.github_app import (
+    _LIST_PER_PAGE,
     GitHubAppCredentials,
     GitHubInstallationAuth,
     InstallationAuthError,
@@ -127,9 +128,14 @@ def test_installations_and_repositories_urls_carry_paging() -> None:
 
 
 def test_parse_installation_ids_keeps_integer_ids_and_skips_odd_entries() -> None:
-    """A page of installation objects yields its integer ids; a bad entry is skipped."""
-    ids = _parse_installation_ids([{"id": 7}, {"no": "id"}, {"id": 9}, "junk"])
+    """A page yields its integer ids and the raw entry count; a bad entry is skipped.
+
+    The raw count (here 4) — not the filtered list length — is what the paging loop
+    compares against the page size, so a full page with a skipped entry still advances.
+    """
+    ids, raw_count = _parse_installation_ids([{"id": 7}, {"no": "id"}, {"id": 9}, "junk"])
     assert ids == [7, 9]
+    assert raw_count == 4
 
 
 def test_parse_installation_ids_raises_when_not_an_array() -> None:
@@ -138,8 +144,12 @@ def test_parse_installation_ids_raises_when_not_an_array() -> None:
 
 
 def test_parse_installation_repositories_reads_full_names() -> None:
-    """The wrapped page yields each repo's full_name; a nameless entry is skipped."""
-    names = _parse_installation_repositories(
+    """The wrapped page yields each full_name and the raw count; a nameless entry is skipped.
+
+    The raw count (here 3) drives page termination, so a full page that drops a malformed
+    entry still pages on instead of stopping a page early.
+    """
+    names, raw_count = _parse_installation_repositories(
         {
             "total_count": 2,
             "repositories": [
@@ -150,6 +160,7 @@ def test_parse_installation_repositories_reads_full_names() -> None:
         }
     )
     assert names == ["owner/a", "owner/b"]
+    assert raw_count == 3
 
 
 def test_parse_installation_repositories_raises_without_array() -> None:
@@ -317,6 +328,99 @@ async def test_installed_repositories_raises_on_non_2xx_installations() -> None:
     http = _FakeHttp([(401, {"message": "Bad credentials"})])
     with pytest.raises(InstallationAuthError, match="401"):
         await _auth(http).installed_repositories()
+
+
+def _full_installations_entries(start: int) -> list[dict[str, object]]:
+    """A genuinely full installations page (``_LIST_PER_PAGE`` raw entries)."""
+    return [{"id": start + offset} for offset in range(_LIST_PER_PAGE)]
+
+
+def _full_repository_entries(start: int) -> list[dict[str, object]]:
+    """A genuinely full repositories page's entries (``_LIST_PER_PAGE`` raw entries)."""
+    return [
+        {"full_name": f"owner/repo{start + offset}"}
+        for offset in range(_LIST_PER_PAGE)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_installation_ids_full_page_with_malformed_entry_advances() -> None:
+    """A full first page (100 raw entries) with one malformed entry still pages on.
+
+    The malformed entry parses to 99 ids, but termination is decided from the raw entry
+    count (100), so the loop fetches page 2 instead of stopping a page early.
+    """
+    first_page = _full_installations_entries(0)
+    first_page[50] = {"no": "id"}  # malformed: a full raw page that filters to 99
+    http = _FakeHttp([(200, first_page), (200, [{"id": 999}])])
+
+    ids = await _auth(http)._list_installation_ids(_bearer_header("jwt"))
+
+    expected = [entry["id"] for entry in first_page if "id" in entry] + [999]
+    assert ids == expected
+    assert len(http.gets) == 2  # advanced past the full page
+    assert http.gets[1][0] == "https://api/app/installations?per_page=100&page=2"
+
+
+@pytest.mark.asyncio
+async def test_list_installation_ids_pages_until_short_page() -> None:
+    """Two full pages then a short page returns every id across all pages, in order."""
+    page1 = _full_installations_entries(0)
+    page2 = _full_installations_entries(_LIST_PER_PAGE)
+    page3 = [{"id": 9001}, {"id": 9002}]  # short page ends enumeration
+    http = _FakeHttp([(200, page1), (200, page2), (200, page3)])
+
+    ids = await _auth(http)._list_installation_ids(_bearer_header("jwt"))
+
+    expected = [entry["id"] for entry in page1 + page2 + page3]
+    assert ids == expected
+    assert len(http.gets) == 3
+
+
+@pytest.mark.asyncio
+async def test_list_installation_repositories_full_page_with_malformed_entry_advances() -> None:
+    """A full first repos page (100 raw entries) with one malformed entry still pages on."""
+    first_entries = _full_repository_entries(0)
+    first_entries[50] = {"no": "name"}  # malformed: a full raw page that filters to 99
+    http = _FakeHttp(
+        [
+            (200, {"repositories": first_entries}),
+            (200, {"repositories": [{"full_name": "owner/last"}]}),
+        ]
+    )
+
+    names = await _auth(http)._list_installation_repositories("ghs_tok")
+
+    expected = [
+        entry["full_name"] for entry in first_entries if "full_name" in entry
+    ] + ["owner/last"]
+    assert names == expected
+    assert len(http.gets) == 2
+    assert (
+        http.gets[1][0]
+        == "https://api/installation/repositories?per_page=100&page=2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_installation_repositories_pages_until_short_page() -> None:
+    """Two full repos pages then a short page returns every repo across all pages, in order."""
+    page1 = _full_repository_entries(0)
+    page2 = _full_repository_entries(_LIST_PER_PAGE)
+    page3 = [{"full_name": "owner/tail"}]  # short page ends it
+    http = _FakeHttp(
+        [
+            (200, {"repositories": page1}),
+            (200, {"repositories": page2}),
+            (200, {"repositories": page3}),
+        ]
+    )
+
+    names = await _auth(http)._list_installation_repositories("ghs_tok")
+
+    expected = [entry["full_name"] for entry in page1 + page2 + page3]
+    assert names == expected
+    assert len(http.gets) == 3
 
 
 @pytest.mark.asyncio

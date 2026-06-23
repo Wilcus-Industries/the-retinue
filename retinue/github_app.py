@@ -190,42 +190,52 @@ def _parse_installation_id(payload: object) -> int:
     return installation_id
 
 
-def _parse_installation_ids(payload: object) -> list[int]:
-    """Pull the installation ids out of a ``GET /app/installations`` page.
+def _parse_installation_ids(payload: object) -> tuple[list[int], int]:
+    """Parse a ``GET /app/installations`` page into ``(ids, raw_entry_count)``.
 
     The endpoint returns a JSON array of installation objects, each with an integer
     ``id``. An entry without an integer ``id`` is skipped rather than raising, so one odd
     installation never aborts the whole enumeration (the heartbeat's per-repo skip
     discipline applied to installations).
+
+    The raw entry count is the length of the array *before* filtering, so the paging loop
+    can decide "last page" from how many entries GitHub returned — not from how many
+    survived the skip. A full page that drops a malformed entry must still page on.
     """
     if not isinstance(payload, list):
         raise InstallationAuthError(
             f"expected an installations array, got {type(payload).__name__}"
         )
-    return [
+    ids = [
         entry["id"]
         for entry in payload
         if isinstance(entry, Mapping) and isinstance(entry.get("id"), int)
     ]
+    return ids, len(payload)
 
 
-def _parse_installation_repositories(payload: object) -> list[str]:
-    """Pull the ``owner/repo`` full names out of a ``GET /installation/repositories`` page.
+def _parse_installation_repositories(payload: object) -> tuple[list[str], int]:
+    """Parse a ``GET /installation/repositories`` page into ``(full_names, raw_entry_count)``.
 
     The endpoint wraps the page in ``{"total_count": N, "repositories": [...]}``; each repo
     carries a ``full_name``. A repo without a string ``full_name`` is skipped rather than
     raising, so one malformed entry never aborts the enumeration.
+
+    The raw entry count is the length of ``repositories`` *before* filtering, so the paging
+    loop can decide "last page" from how many entries GitHub returned — not from how many
+    survived the skip. A full page that drops a malformed entry must still page on.
     """
     repositories = payload.get("repositories") if isinstance(payload, Mapping) else None
     if not isinstance(repositories, list):
         raise InstallationAuthError(
             f"no repositories array in response: {payload!r}"
         )
-    return [
+    names = [
         repo["full_name"]
         for repo in repositories
         if isinstance(repo, Mapping) and isinstance(repo.get("full_name"), str)
     ]
+    return names, len(repositories)
 
 
 def _parse_access_token_response(payload: object) -> tuple[str, float]:
@@ -393,9 +403,11 @@ class GitHubInstallationAuth:
                 _installations_url(base, page=page, per_page=_LIST_PER_PAGE), bearer
             )
             _raise_for_status(status, body, "list installations")
-            page_ids = _parse_installation_ids(body)
+            page_ids, raw_count = _parse_installation_ids(body)
             ids.extend(page_ids)
-            if len(page_ids) < _LIST_PER_PAGE:
+            # Terminate on the raw entry count, not the filtered one: a full page that
+            # drops a malformed entry must still advance, or later pages are lost.
+            if raw_count < _LIST_PER_PAGE:
                 return ids
             page += 1
 
@@ -413,9 +425,11 @@ class GitHubInstallationAuth:
                 header,
             )
             _raise_for_status(status, body, "list installation repositories")
-            page_names = _parse_installation_repositories(body)
+            page_names, raw_count = _parse_installation_repositories(body)
             names.extend(page_names)
-            if len(page_names) < _LIST_PER_PAGE:
+            # Terminate on the raw entry count, not the filtered one: a full page that
+            # drops a malformed entry must still advance, or later pages are lost.
+            if raw_count < _LIST_PER_PAGE:
                 return names
             page += 1
 
