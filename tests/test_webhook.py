@@ -33,11 +33,23 @@ def _sign(payload: bytes, secret: str) -> str:
 
 
 def _issues_payload(
-    action: str = "opened", issue_number: int = 1
+    action: str = "opened",
+    issue_number: int = 1,
+    *,
+    labels: list[str] | None = None,
 ) -> dict:  # type: ignore[type-arg]
+    """A signed ``issues`` payload; defaults to a ``prd``-labeled issue.
+
+    ``labels`` defaults to ``["prd"]`` so the common path through the gate is the
+    PRD-correct one; pass ``[]`` for an unlabeled issue.
+    """
+    label_names = ["prd"] if labels is None else labels
     return {
         "action": action,
-        "issue": {"number": issue_number},
+        "issue": {
+            "number": issue_number,
+            "labels": [{"name": name} for name in label_names],
+        },
         "repository": {"full_name": "owner/repo"},
     }
 
@@ -129,24 +141,66 @@ def test_verify_rejects_missing_and_bad() -> None:
 # --- endpoint behaviour -----------------------------------------------------
 
 
-def test_valid_issues_webhook_returns_202_and_enqueues_one(
+def test_prd_labeled_issue_returns_202_and_enqueues_one(
     app_client: tuple[TestClient, MagicMock],
 ) -> None:
-    """A validly signed issues webhook returns 202 and enqueues exactly one job."""
+    """A ``prd``-labeled, relevant-action issue returns 202 and enqueues one job."""
     client, mock_enqueue = app_client
-    payload = json.dumps(_issues_payload(action="opened", issue_number=5)).encode()
-    headers = {
-        "X-GitHub-Event": "issues",
-        "X-Hub-Signature-256": _sign(payload, _SECRET),
-        "Content-Type": "application/json",
-    }
-    response = client.post("/webhook", content=payload, headers=headers)
+    payload = json.dumps(
+        _issues_payload(action="opened", issue_number=5, labels=["prd"])
+    ).encode()
+    response = _post(client, "issues", json.loads(payload.decode()))
     assert response.status_code == 202
     mock_enqueue.assert_awaited_once()
     enqueued_job = mock_enqueue.call_args[0][1]
     assert enqueued_job == PrdJob(
         repo_full_name="owner/repo", issue_number=5, action="opened"
     )
+
+
+@pytest.mark.parametrize("action", ["opened", "reopened", "edited", "labeled"])
+def test_prd_labeled_relevant_actions_enqueue(
+    app_client: tuple[TestClient, MagicMock], action: str
+) -> None:
+    """Each relevant action on a ``prd``-labeled issue enqueues exactly one job."""
+    client, mock_enqueue = app_client
+    response = _post(client, "issues", _issues_payload(action=action, labels=["prd"]))
+    assert response.status_code == 202
+    mock_enqueue.assert_awaited_once()
+    assert mock_enqueue.call_args[0][1].action == action
+
+
+def test_unlabeled_issue_acks_204_and_enqueues_nothing(
+    app_client: tuple[TestClient, MagicMock],
+) -> None:
+    """An issue without the ``prd`` label is acked 204 and enqueues nothing."""
+    client, mock_enqueue = app_client
+    response = _post(client, "issues", _issues_payload(action="opened", labels=[]))
+    assert response.status_code == 204
+    mock_enqueue.assert_not_called()
+
+
+def test_non_prd_label_acks_204_and_enqueues_nothing(
+    app_client: tuple[TestClient, MagicMock],
+) -> None:
+    """An issue labeled with something other than ``prd`` enqueues nothing."""
+    client, mock_enqueue = app_client
+    response = _post(
+        client, "issues", _issues_payload(action="opened", labels=["bug", "backlog"])
+    )
+    assert response.status_code == 204
+    mock_enqueue.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["closed", "assigned", "deleted", "unlabeled"])
+def test_prd_labeled_irrelevant_action_acks_204(
+    app_client: tuple[TestClient, MagicMock], action: str
+) -> None:
+    """A ``prd``-labeled issue on a non-relevant action is acked 204, nothing enqueued."""
+    client, mock_enqueue = app_client
+    response = _post(client, "issues", _issues_payload(action=action, labels=["prd"]))
+    assert response.status_code == 204
+    mock_enqueue.assert_not_called()
 
 
 def test_invalid_signature_returns_401_and_enqueues_nothing(

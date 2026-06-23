@@ -1,9 +1,11 @@
 """FastAPI webhook router: signature verification and issues-event dispatch.
 
-Verifies the HMAC-SHA256 signature on every incoming webhook, acts only on
-``issues`` events, and enqueues a PRD job onto the Arq queue before acking 202.
-The enqueue is awaited inline before the ack so a failed enqueue surfaces as a
-5xx (GitHub redelivers) rather than vanishing after a 202 was already sent.
+Verifies the HMAC-SHA256 signature on every incoming webhook, then on an
+``issues`` event enqueues a PRD job onto the Arq queue only when the issue carries
+the ``prd`` label and the action is one of opened/reopened/edited/labeled —
+everything else is acked 204 and enqueues nothing, so the slicer never sees a
+non-PRD issue. The enqueue is awaited inline before the ack so a failed enqueue
+surfaces as a 5xx (GitHub redelivers) rather than vanishing after a 202.
 """
 
 from __future__ import annotations
@@ -25,6 +27,26 @@ from retinue.queue import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The PRD label gate. Per the PRD, the retinue acts only on issues carrying the ``prd``
+# label, and only on the actions that can newly mark an issue as a PRD or change its body
+# — opened/reopened/edited/labeled. Any other action (closed, assigned, unlabeled, …) or
+# an unlabeled issue is acked 204 and enqueues nothing, so non-PRD issue activity never
+# reaches the slicer.
+PRD_LABEL = "prd"
+_PRD_ACTIONS = frozenset({"opened", "reopened", "edited", "labeled"})
+
+
+def _is_prd_issue_event(body: dict[str, Any]) -> bool:
+    """Whether an ``issues`` payload should drive a PRD job.
+
+    True only when the issue carries the ``prd`` label *and* the action is one the
+    gate accepts (see :data:`_PRD_ACTIONS`).
+    """
+    if body.get("action") not in _PRD_ACTIONS:
+        return False
+    labels = body.get("issue", {}).get("labels", [])
+    return any(label.get("name") == PRD_LABEL for label in labels)
 
 
 def compute_signature(payload: bytes, secret: str) -> str:
@@ -146,6 +168,10 @@ def make_webhook_router(*, webhook_secret: str) -> APIRouter:
 
     async def _dispatch_issue(request: Request) -> Response:
         body: dict[str, Any] = await request.json()
+        if not _is_prd_issue_event(body):
+            # Not a PRD-labeled, relevant-action issue: ack and enqueue nothing so the
+            # slicer never sees a non-PRD issue.
+            return Response(status_code=204)
         job = _build_job(body)
         await enqueue_prd(request.app.state.arq_pool, job)
         logger.info(
