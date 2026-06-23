@@ -10,9 +10,12 @@ from retinue.queue import (
     PROCESS_PRD_TASK,
     PROCESS_REVIEW_TASK,
     REAP_PR_TASK,
+    RUN_ADHOC_DRAIN_TASK,
+    AdhocDrainJob,
     MergedPrJob,
     PrdJob,
     ReviewJob,
+    enqueue_adhoc_drain,
     enqueue_merged_pr,
     enqueue_prd,
     enqueue_review,
@@ -91,3 +94,27 @@ async def test_enqueue_review_deduplicated_returns_empty() -> None:
     mock_pool.enqueue_job = AsyncMock(return_value=None)
     job = ReviewJob(repo_full_name="owner/repo", pr_number=1, review_state="approved")
     assert await enqueue_review(mock_pool, job) == ""
+
+
+@pytest.mark.asyncio
+async def test_enqueue_adhoc_drain_calls_arq() -> None:
+    """enqueue_adhoc_drain pushes the drain task with the repo and a per-repo job id."""
+    mock_pool = AsyncMock()
+    mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-d"))
+    job = AdhocDrainJob(repo_full_name="owner/repo")
+
+    assert await enqueue_adhoc_drain(mock_pool, job) == "jid-d"
+    call_args = mock_pool.enqueue_job.call_args
+    assert call_args[0][0] == RUN_ADHOC_DRAIN_TASK
+    assert call_args[1]["repo_full_name"] == "owner/repo"
+    # A burst of ready-for-agent events for one repo must collapse to a single
+    # in-flight drain, so the job id is keyed on the repo (Arq dedups on it).
+    assert call_args[1]["_job_id"] == "adhoc-drain:owner/repo"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_adhoc_drain_deduplicated_returns_empty() -> None:
+    """A coalesced drain enqueue (enqueue_job None) yields an empty id."""
+    mock_pool = AsyncMock()
+    mock_pool.enqueue_job = AsyncMock(return_value=None)
+    assert await enqueue_adhoc_drain(mock_pool, AdhocDrainJob("owner/repo")) == ""

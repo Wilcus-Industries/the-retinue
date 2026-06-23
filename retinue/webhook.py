@@ -1,11 +1,14 @@
 """FastAPI webhook router: signature verification and issues-event dispatch.
 
-Verifies the HMAC-SHA256 signature on every incoming webhook, then on an
-``issues`` event enqueues a PRD job onto the Arq queue only when the issue carries
-the ``prd`` label and the action is one of opened/reopened/edited/labeled —
-everything else is acked 204 and enqueues nothing, so the slicer never sees a
-non-PRD issue. The enqueue is awaited inline before the ack so a failed enqueue
-surfaces as a 5xx (GitHub redelivers) rather than vanishing after a 202.
+Verifies the HMAC-SHA256 signature on every incoming webhook, then routes an
+``issues`` event (action opened/reopened/edited/labeled) by label: a ``prd`` issue
+enqueues a PRD job onto the Arq queue, a ``ready-for-agent`` non-``prd`` issue
+enqueues a single ad-hoc drain kick (the low-latency admission of ad-hoc work), and
+``prd`` wins when both labels are present. An issue with neither relevant label, or a
+non-relevant action, is acked 204 and enqueues nothing — so the slicer only sees PRDs
+and the drain only fires for ready-for-agent work. The enqueue is awaited inline
+before the ack so a failed enqueue surfaces as a 5xx (GitHub redelivers) rather than
+vanishing after a 202.
 """
 
 from __future__ import annotations
@@ -18,13 +21,16 @@ from typing import Any
 from fastapi import APIRouter, Header, Request, Response
 
 from retinue.queue import (
+    AdhocDrainJob,
     MergedPrJob,
     PrdJob,
     ReviewJob,
+    enqueue_adhoc_drain,
     enqueue_merged_pr,
     enqueue_prd,
     enqueue_review,
 )
+from retinue.slicer import READY_LABEL
 
 logger = logging.getLogger(__name__)
 
@@ -32,21 +38,47 @@ logger = logging.getLogger(__name__)
 # label, and only on the actions that can newly mark an issue as a PRD or change its body
 # — opened/reopened/edited/labeled. Any other action (closed, assigned, unlabeled, …) or
 # an unlabeled issue is acked 204 and enqueues nothing, so non-PRD issue activity never
-# reaches the slicer.
+# reaches the slicer. The ad-hoc kick shares the same relevant-action set: a
+# ``ready-for-agent`` issue admits work only on the actions that can newly add the label
+# or change the issue.
 PRD_LABEL = "prd"
-_PRD_ACTIONS = frozenset({"opened", "reopened", "edited", "labeled"})
+_ISSUE_ACTIONS = frozenset({"opened", "reopened", "edited", "labeled"})
+
+
+def _issue_label_names(body: dict[str, Any]) -> list[str]:
+    """The label names on an ``issues`` payload (empty when none / malformed)."""
+    labels = body.get("issue", {}).get("labels", [])
+    return [label.get("name") for label in labels]
+
+
+def _is_relevant_issue_action(body: dict[str, Any]) -> bool:
+    """Whether the issue action can newly mark or change the issue (see :data:`_ISSUE_ACTIONS`)."""
+    return body.get("action") in _ISSUE_ACTIONS
 
 
 def _is_prd_issue_event(body: dict[str, Any]) -> bool:
     """Whether an ``issues`` payload should drive a PRD job.
 
     True only when the issue carries the ``prd`` label *and* the action is one the
-    gate accepts (see :data:`_PRD_ACTIONS`).
+    gate accepts (see :data:`_ISSUE_ACTIONS`).
     """
-    if body.get("action") not in _PRD_ACTIONS:
+    if not _is_relevant_issue_action(body):
         return False
-    labels = body.get("issue", {}).get("labels", [])
-    return any(label.get("name") == PRD_LABEL for label in labels)
+    return PRD_LABEL in _issue_label_names(body)
+
+
+def _is_adhoc_issue_event(body: dict[str, Any]) -> bool:
+    """Whether an ``issues`` payload should kick an ad-hoc drain.
+
+    True only when the issue carries the ``ready-for-agent`` label but **not** ``prd``
+    (prd wins when both are present, routing to the slicer) and the action is one the
+    gate accepts. The caller checks the PRD gate first, so this need not re-exclude
+    ``prd`` for routing — but it does so explicitly to stay correct in isolation.
+    """
+    if not _is_relevant_issue_action(body):
+        return False
+    labels = _issue_label_names(body)
+    return READY_LABEL in labels and PRD_LABEL not in labels
 
 
 def compute_signature(payload: bytes, secret: str) -> str:
@@ -179,11 +211,23 @@ def make_webhook_router(*, webhook_secret: str, heimdall_bot_login: str) -> APIR
         return Response(status_code=204)
 
     async def _dispatch_issue(request: Request) -> Response:
+        """Route an ``issues`` event: PRD job, ad-hoc drain kick, or ack-and-drop.
+
+        PRD wins when both labels are present — a ``prd`` issue drives the slicer even
+        if it also carries ``ready-for-agent``. A ``ready-for-agent`` non-``prd`` issue
+        kicks a single ad-hoc drain (the low-latency admission). An issue with neither
+        relevant label (or a non-relevant action) is acked 204 and enqueues nothing.
+        """
         body: dict[str, Any] = await request.json()
-        if not _is_prd_issue_event(body):
-            # Not a PRD-labeled, relevant-action issue: ack and enqueue nothing so the
-            # slicer never sees a non-PRD issue.
-            return Response(status_code=204)
+        if _is_prd_issue_event(body):
+            return await _enqueue_prd_job(request, body)
+        if _is_adhoc_issue_event(body):
+            return await _enqueue_adhoc_kick(request, body)
+        # Neither a PRD nor a ready-for-agent issue on a relevant action: ack and enqueue
+        # nothing so the slicer and the ad-hoc drain only ever see work meant for them.
+        return Response(status_code=204)
+
+    async def _enqueue_prd_job(request: Request, body: dict[str, Any]) -> Response:
         job = _build_job(body)
         await enqueue_prd(request.app.state.arq_pool, job)
         logger.info(
@@ -192,6 +236,12 @@ def make_webhook_router(*, webhook_secret: str, heimdall_bot_login: str) -> APIR
             job.issue_number,
             job.action,
         )
+        return Response(status_code=202)
+
+    async def _enqueue_adhoc_kick(request: Request, body: dict[str, Any]) -> Response:
+        job = AdhocDrainJob(repo_full_name=body["repository"]["full_name"])
+        await enqueue_adhoc_drain(request.app.state.arq_pool, job)
+        logger.info("Enqueued ad-hoc drain kick for %s", job.repo_full_name)
         return Response(status_code=202)
 
     async def _dispatch_pull_request(request: Request) -> Response:

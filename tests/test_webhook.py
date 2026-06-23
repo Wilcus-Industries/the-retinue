@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from retinue.app import create_app
 from retinue.config import Settings
-from retinue.queue import MergedPrJob, PrdJob, ReviewJob
+from retinue.queue import AdhocDrainJob, MergedPrJob, PrdJob, ReviewJob
 from retinue.webhook import compute_signature, verify_signature
 
 _SECRET = "test-webhook-secret"
@@ -110,20 +110,24 @@ def app_client() -> Iterator[tuple[TestClient, MagicMock]]:
 
 
 @pytest.fixture()
-def dispatch_client() -> Iterator[tuple[TestClient, MagicMock, MagicMock, MagicMock]]:
-    """Yield the client with all three enqueue seams patched and recording."""
+def dispatch_client() -> (
+    Iterator[tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock]]
+):
+    """Yield the client with all four enqueue seams patched and recording."""
     settings = _make_settings()
     enqueue_prd = AsyncMock(return_value="jid-prd")
     enqueue_review = AsyncMock(return_value="jid-review")
     enqueue_merged = AsyncMock(return_value="jid-merge")
+    enqueue_adhoc = AsyncMock(return_value="jid-adhoc")
     with (
         patch("retinue.webhook.enqueue_prd", enqueue_prd),
         patch("retinue.webhook.enqueue_review", enqueue_review),
         patch("retinue.webhook.enqueue_merged_pr", enqueue_merged),
+        patch("retinue.webhook.enqueue_adhoc_drain", enqueue_adhoc),
     ):
         app = create_app(settings)
         client = TestClient(app, raise_server_exceptions=True)
-        yield client, enqueue_prd, enqueue_review, enqueue_merged
+        yield client, enqueue_prd, enqueue_review, enqueue_merged, enqueue_adhoc
 
 
 # --- signature helpers ------------------------------------------------------
@@ -280,14 +284,80 @@ def test_enqueue_failure_returns_5xx(
     failing_enqueue.assert_called_once()
 
 
+# --- ad-hoc drain dispatch (ready-for-agent issues) -------------------------
+
+
+@pytest.mark.parametrize("action", ["opened", "reopened", "edited", "labeled"])
+def test_ready_for_agent_issue_enqueues_one_adhoc_drain(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
+    action: str,
+) -> None:
+    """A ``ready-for-agent`` non-``prd`` issue enqueues exactly one ad-hoc drain unit."""
+    client, enqueue_prd, _review, _merged, enqueue_adhoc = dispatch_client
+    response = _post(
+        client, "issues", _issues_payload(action=action, labels=["ready-for-agent"])
+    )
+    assert response.status_code == 202
+    enqueue_adhoc.assert_awaited_once()
+    assert enqueue_adhoc.call_args[0][1] == AdhocDrainJob(repo_full_name="owner/repo")
+    # The ad-hoc kick must not also run the PRD path.
+    enqueue_prd.assert_not_called()
+
+
+def test_prd_wins_when_both_labels_present(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """An issue carrying both ``prd`` and ``ready-for-agent`` enqueues the PRD job only."""
+    client, enqueue_prd, _review, _merged, enqueue_adhoc = dispatch_client
+    response = _post(
+        client,
+        "issues",
+        _issues_payload(action="opened", issue_number=9, labels=["prd", "ready-for-agent"]),
+    )
+    assert response.status_code == 202
+    enqueue_prd.assert_awaited_once()
+    assert enqueue_prd.call_args[0][1] == PrdJob(
+        repo_full_name="owner/repo", issue_number=9, action="opened"
+    )
+    enqueue_adhoc.assert_not_called()
+
+
+def test_neither_label_acks_204_and_enqueues_nothing(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
+) -> None:
+    """An issue with neither ``prd`` nor ``ready-for-agent`` acks 204 and enqueues nothing."""
+    client, enqueue_prd, _review, _merged, enqueue_adhoc = dispatch_client
+    response = _post(
+        client, "issues", _issues_payload(action="opened", labels=["bug"])
+    )
+    assert response.status_code == 204
+    enqueue_prd.assert_not_called()
+    enqueue_adhoc.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["closed", "assigned", "deleted", "unlabeled"])
+def test_ready_for_agent_irrelevant_action_acks_204(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
+    action: str,
+) -> None:
+    """A ``ready-for-agent`` issue on a non-relevant action enqueues nothing."""
+    client, enqueue_prd, _review, _merged, enqueue_adhoc = dispatch_client
+    response = _post(
+        client, "issues", _issues_payload(action=action, labels=["ready-for-agent"])
+    )
+    assert response.status_code == 204
+    enqueue_prd.assert_not_called()
+    enqueue_adhoc.assert_not_called()
+
+
 # --- pull_request / pull_request_review dispatch ----------------------------
 
 
 def test_merged_pull_request_enqueues_reap(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
 ) -> None:
     """A closed+merged pull_request returns 202 and enqueues exactly one reap job."""
-    client, enqueue_prd, enqueue_review, enqueue_merged = dispatch_client
+    client, enqueue_prd, enqueue_review, enqueue_merged, _adhoc = dispatch_client
     response = _post(client, "pull_request", _pull_request_payload(number=42))
     assert response.status_code == 202
     enqueue_merged.assert_awaited_once()
@@ -299,10 +369,10 @@ def test_merged_pull_request_enqueues_reap(
 
 
 def test_closed_unmerged_pull_request_is_ignored(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
 ) -> None:
     """A closed-but-not-merged pull_request is acked 204 and reaps nothing."""
-    client, _prd, _review, enqueue_merged = dispatch_client
+    client, _prd, _review, enqueue_merged, _adhoc = dispatch_client
     response = _post(
         client, "pull_request", _pull_request_payload(action="closed", merged=False)
     )
@@ -311,10 +381,10 @@ def test_closed_unmerged_pull_request_is_ignored(
 
 
 def test_opened_pull_request_is_ignored(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
 ) -> None:
     """A non-close pull_request action (opened) is acked 204 and reaps nothing."""
-    client, _prd, _review, enqueue_merged = dispatch_client
+    client, _prd, _review, enqueue_merged, _adhoc = dispatch_client
     response = _post(
         client, "pull_request", _pull_request_payload(action="opened", merged=False)
     )
@@ -323,10 +393,10 @@ def test_opened_pull_request_is_ignored(
 
 
 def test_heimdall_review_enqueues_loopback(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
 ) -> None:
     """A review by heimdall's bot returns 202 and enqueues the loopback with state/body."""
-    client, enqueue_prd, enqueue_review, enqueue_merged = dispatch_client
+    client, enqueue_prd, enqueue_review, enqueue_merged, _adhoc = dispatch_client
     response = _post(
         client,
         "pull_request_review",
@@ -351,14 +421,14 @@ def test_heimdall_review_enqueues_loopback(
 
 @pytest.mark.parametrize("login", ["a-human", "octocat", "other[bot]", ""])
 def test_non_heimdall_review_acks_204_and_enqueues_nothing(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock], login: str
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock], login: str
 ) -> None:
     """A review by anyone but heimdall's bot is acked 204 and enqueues nothing.
 
     Only heimdall's verdict drives the loopback; a human ``high:`` line or an
     approving other-bot review must not burn a rebuild round or trigger handoff.
     """
-    client, enqueue_prd, enqueue_review, enqueue_merged = dispatch_client
+    client, enqueue_prd, enqueue_review, enqueue_merged, _adhoc = dispatch_client
     response = _post(
         client,
         "pull_request_review",
@@ -371,10 +441,10 @@ def test_non_heimdall_review_acks_204_and_enqueues_nothing(
 
 
 def test_unsigned_pull_request_returns_401(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
 ) -> None:
     """The HMAC contract is identical for the new events: a bad signature is 401."""
-    client, _prd, _review, enqueue_merged = dispatch_client
+    client, _prd, _review, enqueue_merged, _adhoc = dispatch_client
     body = json.dumps(_pull_request_payload()).encode()
     response = client.post(
         "/webhook",

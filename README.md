@@ -21,13 +21,17 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.config` — `Settings` loaded from env / `.env` (`WEBHOOK_SECRET`, `REDIS_URL`,
   `DEDUPE_DB_PATH`, the GitHub App / Anthropic / push-channel credentials).
 - `retinue.webhook` — HMAC verification then event dispatch: a `prd`-labeled `issues`
-  event (action opened/reopened/edited/labeled) enqueues a PRD job, a merged
-  `pull_request` (closed + merged) enqueues the reap, and a `pull_request_review` from
-  heimdall's bot enqueues the loopback. Off-target events (an unlabeled or non-PRD issue,
-  a review from anyone but heimdall) are acked 204 and enqueue nothing, so the slicer and
-  loopback never see them. Same 401/204/202 contract for all.
-- `retinue.queue` — the `PrdJob` / `ReviewJob` / `MergedPrJob` models and their
-  `enqueue_prd` / `enqueue_review` / `enqueue_merged_pr` helpers.
+  event (action opened/reopened/edited/labeled) enqueues a PRD job, a `ready-for-agent`
+  non-`prd` issue enqueues a single ad-hoc drain kick (`prd` wins when both labels are
+  present), a merged `pull_request` (closed + merged) enqueues the reap, and a
+  `pull_request_review` from heimdall's bot enqueues the loopback. Off-target events (an
+  issue with neither relevant label, a review from anyone but heimdall) are acked 204 and
+  enqueue nothing, so the slicer, the ad-hoc drain, and the loopback never see them. Same
+  401/204/202 contract for all.
+- `retinue.queue` — the `PrdJob` / `ReviewJob` / `MergedPrJob` / `AdhocDrainJob` models
+  and their `enqueue_prd` / `enqueue_review` / `enqueue_merged_pr` / `enqueue_adhoc_drain`
+  helpers. The drain kick pins a per-repo `_job_id` so a burst of `ready-for-agent` events
+  collapses to one in-flight drain.
 - `retinue.pipeline` — `Pipeline`, the orchestration object the worker drives once a PRD
   is accepted: slice → build → open the staging PR, plus the `process_review` /
   `reap_pr` / `reconcile` entry points the webhook events and a restart route into.
@@ -120,10 +124,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   secondary ledger (owned-slice set + PR↔PRD mapping), mirroring `PrdDedupeStore`.
 
 A validly signed `prd`-labeled `issues` webhook (action opened/reopened/edited/labeled)
-returns 202 and enqueues exactly one job; an invalid or missing signature returns 401 and
-enqueues nothing. A signed issues event without the `prd` label (or with any other action),
-a `pull_request_review` not from heimdall's bot, and any other off-target event are acked
-with 204 without enqueuing.
+returns 202 and enqueues exactly one PRD job; a `ready-for-agent` non-`prd` issue on those
+actions returns 202 and enqueues exactly one ad-hoc drain kick (`prd` wins when both labels
+are present). An invalid or missing signature returns 401 and enqueues nothing. A signed
+issues event with neither label (or any other action), a `pull_request_review` not from
+heimdall's bot, and any other off-target event are acked with 204 without enqueuing.
 
 ## Per-repo opt-in (`.github/retinue.yml`)
 
