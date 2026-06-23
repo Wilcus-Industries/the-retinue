@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING
 
 import retinue.loopback as _loopback_gh
 import retinue.pr_opener as _pr_gh
+import retinue.reviewer as _reviewer_gh
 import retinue.slicer as _slicer_gh
 from retinue.budget import (
     AuthMode,
@@ -88,6 +89,7 @@ from retinue.orchestrator import (
     ContainerImplementer,
     PrdBuildResult,
     PrdSlice,
+    RoundReviewer,
 )
 from retinue.pr_opener import GhCliPrOps, PrOpenResult, PrOps, open_staging_pr
 from retinue.reconcile import (
@@ -98,6 +100,11 @@ from retinue.reconcile import (
     reconcile_run,
 )
 from retinue.repo_config import RepoConfig
+from retinue.reviewer import (
+    AgentSdkReviewGenerator,
+    GhCliBlockedByEditor,
+    ReviewGenerator,
+)
 from retinue.slicer import (
     HITL_LABEL,
     ClaudeSliceGenerator,
@@ -107,7 +114,13 @@ from retinue.slicer import (
     SliceOutcome,
     slice_prd,
 )
-from retinue.wiring import BoundBuildResult, bind_build_prd
+from retinue.wiring import (
+    BoundBuildResult,
+    ReviewerFactory,
+    RoundDiffSource,
+    bind_build_prd,
+    bind_round_reviewer,
+)
 
 if TYPE_CHECKING:
     from retinue.config import Settings
@@ -581,6 +594,16 @@ class _MergeContainerGitOps:
         delegate = await self._ensure_delegate()
         await delegate.merge(source=source, into=into)
 
+    async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+        """Diff a round's ``merged_branches`` over ``base`` in the merge container.
+
+        The merge container is already started (the round merged into ``base`` through it),
+        so the internal reviewer reads the round's merged surface from the same clone the
+        merges advanced — no second container or clone.
+        """
+        delegate = await self._ensure_delegate()
+        return await delegate.round_diff(merged_branches=merged_branches, base=base)
+
     async def _ensure_delegate(self) -> ContainerGitOps:
         """Start + clone the merge container on first use; reuse it thereafter."""
         if self._delegate is not None:
@@ -729,6 +752,39 @@ async def _fetch_claude_md(
     return await fetch_claude_md(repo_full_name)
 
 
+# The internal reviewer's single Anthropic Messages API call runs at the "max" effort
+# tier on Opus 4.8; a high-effort Opus turn can take minutes, so the transport's timeout
+# matches the SDK's 10-minute default rather than a short connect-style cap.
+_REVIEW_HTTP_TIMEOUT_SECONDS = 600.0
+
+
+@dataclass(frozen=True)
+class HttpxTransport:
+    """Production :class:`~retinue.reviewer.HttpTransport`: POST one request via httpx.
+
+    The reviewer assembles the full request body and headers (model, effort tier, the
+    json-schema response format, and the credential's auth header); this transport only
+    POSTs them and reads the status code + JSON body back into the reviewer's
+    :class:`~retinue.reviewer.HttpResponse`. The single POST is the only network edge, so
+    it sits behind the reviewer's injected seam and the rest of the review flow is
+    exercised in tests with a fake transport — no httpx, no network.
+    """
+
+    timeout: float = _REVIEW_HTTP_TIMEOUT_SECONDS
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, object]
+    ) -> _reviewer_gh.HttpResponse:
+        """POST ``json`` to ``url`` with ``headers``; return status + parsed JSON body."""
+        import httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(url, headers=headers, json=json)
+        return _reviewer_gh.HttpResponse(
+            status_code=response.status_code, body=response.json()
+        )
+
+
 def _bind_build_prd_for_repo(
     settings: Settings,
     auth: InstallationAuth,
@@ -771,6 +827,13 @@ def _bind_build_prd_for_repo(
     )
     resolve_secret: SecretResolver = EnvSecretResolver()
     report: ReportSink = GhReportSink(token=token)
+    review_reviewer = _build_review_reviewer_factory(
+        settings,
+        repo_full_name=repo_full_name,
+        token=token,
+        create_issue=create_issue,
+        diff_source=git,
+    )
     bound = bind_build_prd(
         implementer=implementer,
         governor=governor,
@@ -783,6 +846,7 @@ def _bind_build_prd_for_repo(
         runtime=runtime,
         resolve_secret=resolve_secret,
         report=report,
+        review_reviewer=review_reviewer,
     )
 
     async def run(**kwargs: object) -> PrdBuildResult:
@@ -793,6 +857,46 @@ def _bind_build_prd_for_repo(
         return _prd_build_from_bound(result, prd_number=kwargs.get("prd_number"))
 
     return run
+
+
+def _build_review_reviewer_factory(
+    settings: Settings,
+    *,
+    repo_full_name: str,
+    token: str,
+    create_issue: IssueCreator,
+    diff_source: RoundDiffSource,
+    generate: ReviewGenerator | None = None,
+) -> ReviewerFactory:
+    """Build the per-PRD internal-reviewer factory for one repo's live build.
+
+    The reviewer is per-PRD (its ``Part of #<prd>`` footer and round diff depend on the
+    PRD), but the build lane is bound per repo, so this returns a
+    ``(repo_full_name, prd_number) -> RoundReviewer`` factory the build calls at run time.
+    Each reviewer wires the real Agent-SDK review generator (over the httpx transport),
+    the gh issue creator reused from the slicer, and the gh Blocked-by editor — so a live
+    build reviews every merged round and the review-fix follow-ups it files build later.
+    ``generate`` defaults to the real Agent-SDK reviewer; tests inject a fake to keep the
+    review flow off the network.
+    """
+    review_generate = generate or AgentSdkReviewGenerator(
+        credential=settings.anthropic_credential, transport=HttpxTransport()
+    )
+    edit_blocked_by = GhCliBlockedByEditor(
+        runner=SubprocessGhRunner(_reviewer_gh.GhResult), token=token
+    )
+
+    def factory(factory_repo: str, prd_number: int) -> RoundReviewer:
+        return bind_round_reviewer(
+            diff_source=diff_source,
+            generate=review_generate,
+            create_issue=create_issue,
+            edit_blocked_by=edit_blocked_by,
+            repo_full_name=factory_repo,
+            prd_number=prd_number,
+        )
+
+    return factory
 
 
 def _prd_build_from_bound(

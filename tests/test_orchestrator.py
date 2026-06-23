@@ -545,6 +545,43 @@ async def test_merge_hard_error_is_gitops_error_not_conflict() -> None:
     assert "git merge --abort" not in _joined(container)
 
 
+@pytest.mark.asyncio
+async def test_round_diff_fetches_then_diffs_each_branch_over_base() -> None:
+    """The round diff fetches each merged branch then diffs it (3-dot) over the base.
+
+    Feeds the internal reviewer the round's merged surface: each ``issue-<N>`` branch's
+    contribution since it diverged from the integration branch, concatenated.
+    """
+    container = ScriptedContainer(
+        {"diff retinue/prd-1...origin/issue-7": RunResult(exit_code=0, stdout="DIFF-7")}
+    )
+    git = ContainerGitOps(container)
+
+    diff = await git.round_diff(
+        merged_branches=["issue-7", "issue-8"], base="retinue/prd-1"
+    )
+
+    cmds = _joined(container)
+    assert "git fetch origin issue-7" in cmds
+    assert "git diff retinue/prd-1...origin/issue-7" in cmds
+    assert "git fetch origin issue-8" in cmds
+    assert "git diff retinue/prd-1...origin/issue-8" in cmds
+    # The matched branch's diff body is carried through into the concatenated result.
+    assert "DIFF-7" in diff
+
+
+@pytest.mark.asyncio
+async def test_round_diff_empty_when_no_branches_merged() -> None:
+    """No merged branches means an empty diff and no git commands issued."""
+    container = ScriptedContainer()
+    git = ContainerGitOps(container)
+
+    diff = await git.round_diff(merged_branches=[], base="retinue/prd-1")
+
+    assert diff == ""
+    assert container.commands == []
+
+
 # --- real Agent-SDK conflict resolver --------------------------------------------
 #
 # Exercises the production AgentSdkConflictResolver's pure/parseable parts (auth header,

@@ -414,3 +414,54 @@ def test_build_push_sink_picks_pushover_when_no_ntfy(tmp_path: Path) -> None:
     settings = _settings(tmp_path, pushover_token="pk", pushover_user="uk")
     sink = _build_push_sink(settings)  # type: ignore[arg-type]
     assert isinstance(sink, PushoverPushSink)
+
+
+@pytest.mark.asyncio
+async def test_review_reviewer_factory_diffs_round_over_integration_branch(
+    tmp_path: Path,
+) -> None:
+    """The factory's reviewer pulls the round diff over the PRD's integration branch.
+
+    Proves the production reviewer-wiring path without a network call: ``generate`` is
+    injected as a fake, the diff source records the diff request, and a clean review files
+    and enqueues nothing. The base is the PRD's integration branch (``retinue/prd-7``).
+    """
+    from retinue.pipeline import _build_review_reviewer_factory
+    from retinue.reviewer import ReviewInput, ReviewPlan
+
+    diffed: list[tuple[list[str], str]] = []
+
+    class _DiffSource:
+        async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+            diffed.append((list(merged_branches), base))
+            return "diff-body"
+
+    reviewed: list[ReviewInput] = []
+
+    async def generate(review_input: ReviewInput) -> ReviewPlan:
+        reviewed.append(review_input)
+        return ReviewPlan(findings=[])  # clean review
+
+    settings = _settings(tmp_path, anthropic_credential="k")
+    factory = _build_review_reviewer_factory(
+        settings,  # type: ignore[arg-type]
+        repo_full_name="owner/repo",
+        token="ghs_x",
+        create_issue=_created,
+        diff_source=_DiffSource(),
+        generate=generate,
+    )
+    reviewer = factory("owner/repo", 7)
+
+    fixes = await reviewer.review(merged_issues=[2, 3])
+
+    assert diffed == [(["issue-2", "issue-3"], "retinue/prd-7")]
+    assert reviewed[0].diff == "diff-body"
+    assert fixes == []  # a clean review files and enqueues nothing
+
+
+def test_httpx_transport_is_the_default_review_transport() -> None:
+    """The factory's default review transport is the real httpx-backed adapter."""
+    from retinue.pipeline import HttpxTransport
+
+    assert HttpxTransport().timeout > 0

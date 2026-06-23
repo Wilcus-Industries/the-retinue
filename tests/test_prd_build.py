@@ -102,6 +102,7 @@ async def _build_prd(
     config: RepoConfig | None = None,
     lock: object | None = None,
     resolve_conflict: object | None = None,
+    review_round: object | None = None,
 ) -> PrdBuildResult:
     return await build_prd(
         slices,
@@ -115,6 +116,7 @@ async def _build_prd(
         report=_sink([]),
         lock=lock or OneAtATimeLock(),
         resolve_conflict=resolve_conflict,
+        review_round=review_round,
     )
 
 
@@ -390,6 +392,65 @@ async def test_second_concurrent_run_is_rejected() -> None:
 
     with pytest.raises(OrchestratorBusyError):
         await run()
+
+
+# --- per-round internal reviewer -------------------------------------------------
+
+
+class RecordingReviewer:
+    """A RoundReviewer that records each round's merged set and enqueues a fix slice.
+
+    Models the PRD's per-round review: after a round merges, ``review`` is handed the
+    round's merged issue numbers. The first round's merged set carries a planted defect,
+    so the reviewer files a single review-fix slice (number 201) blocked by nothing new
+    and returns it to be built in a later round; subsequent rounds review clean.
+    """
+
+    def __init__(self, *, fix_for: list[int], fix_number: int = 201) -> None:
+        self._fix_for = set(fix_for)
+        self._fix_number = fix_number
+        self.reviewed: list[list[int]] = []
+        self.filed = False
+
+    async def review(self, *, merged_issues: list[int]) -> list[PrdSlice]:
+        self.reviewed.append(list(merged_issues))
+        if not self.filed and self._fix_for.issubset(set(merged_issues)):
+            self.filed = True
+            return [_prd_slice(self._fix_number)]
+        return []
+
+
+@pytest.mark.asyncio
+async def test_reviewer_runs_after_each_round_and_fix_builds_in_a_later_round() -> None:
+    """The reviewer runs per round; a filed review-fix slice builds in a later round.
+
+    A two-slice diamond merges in round one; the reviewer flags a planted defect and
+    files a review-fix slice (#201), which must enter a *subsequent* round's ready set
+    and be built and merged in the same run — proving the live per-round loop.
+    """
+    slices = [_prd_slice(1), _prd_slice(2, blocked_by=[1])]
+    git = FakeGitOps()
+    reviewer = RecordingReviewer(fix_for=[1])
+
+    result = await _build_prd(slices, git=git, review_round=reviewer)
+
+    # The reviewer ran after every merge round (at least the first and the fix round).
+    assert reviewer.reviewed[0] == [1]
+    assert reviewer.filed is True
+    # The filed review-fix slice was picked up and merged in a later round, same run.
+    assert 201 in result.merged_issues
+    assert result.merged_issues.index(201) > result.merged_issues.index(1)
+    assert ("issue-201", "retinue/prd-1") in git.merges
+
+
+@pytest.mark.asyncio
+async def test_no_reviewer_seam_leaves_the_build_unchanged() -> None:
+    """With no reviewer injected the build behaves exactly as before — no extra slices."""
+    slices = [_prd_slice(1), _prd_slice(2, blocked_by=[1])]
+
+    result = await _build_prd(slices)  # no review_round
+
+    assert result.merged_issues == [1, 2]
 
 
 # --- empty PRD -------------------------------------------------------------------

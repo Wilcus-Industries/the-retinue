@@ -175,6 +175,79 @@ async def test_build_prd_runs_and_triages_a_failure(tmp_path: Path) -> None:
     assert result.prd_build.merged_issues == []
 
 
+# --- bind_round_reviewer: the per-round internal reviewer seam --------------------
+
+
+@pytest.mark.asyncio
+async def test_bind_round_reviewer_reviews_diff_and_returns_fix_slices() -> None:
+    """The bound reviewer diffs the round, runs the reviewer, and yields fix slices.
+
+    Proves the production seam: it pulls the round's merged diff over the PRD's
+    integration branch, drives ``review_round`` (faked here), files a review-fix issue
+    via the issue creator, wires it into the dependent's Blocked by, and returns one
+    independently-ready :class:`PrdSlice` per filed issue for a later round to build.
+    """
+    from retinue.reviewer import (
+        EditBlockedByRequest,
+        ReviewFinding,
+        ReviewInput,
+        ReviewPlan,
+    )
+    from retinue.slicer import CreatedIssue, IssueDraft
+    from retinue.wiring import bind_round_reviewer
+
+    diffed: list[tuple[list[str], str]] = []
+
+    class _DiffSource:
+        async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+            diffed.append((list(merged_branches), base))
+            return "diff --git a/x b/x\n+off-by-one"
+
+    reviewed: list[ReviewInput] = []
+
+    async def generate(review_input: ReviewInput) -> ReviewPlan:
+        reviewed.append(review_input)
+        return ReviewPlan(
+            findings=[
+                ReviewFinding(title="fix", body="off-by-one", blocks_issues=[3])
+            ]
+        )
+
+    created: list[IssueDraft] = []
+
+    async def create_issue(draft: IssueDraft) -> CreatedIssue:
+        created.append(draft)
+        return CreatedIssue(issue_number=201)
+
+    edits: list[EditBlockedByRequest] = []
+
+    async def edit_blocked_by(request: EditBlockedByRequest) -> None:
+        edits.append(request)
+
+    reviewer = bind_round_reviewer(
+        diff_source=cast(object, _DiffSource()),  # type: ignore[arg-type]
+        generate=generate,
+        create_issue=cast(IssueCreator, create_issue),
+        edit_blocked_by=edit_blocked_by,
+        repo_full_name="owner/repo",
+        prd_number=7,
+    )
+
+    fixes = await reviewer.review(merged_issues=[2, 3])
+
+    # The round diff was taken over the PRD's integration branch for the merged branches.
+    assert diffed == [(["issue-2", "issue-3"], "retinue/prd-7")]
+    # The reviewer saw the diff + merged issues; it filed and wired the fix.
+    assert reviewed[0].merged_issues == [2, 3]
+    assert "off-by-one" in reviewed[0].diff
+    assert created and "review-fix" in created[0].labels
+    assert edits == [
+        EditBlockedByRequest(repo_full_name="owner/repo", issue_number=3, add_blocker=201)
+    ]
+    # The filed review-fix issue comes back as an independently-ready slice.
+    assert [(s.issue_number, s.prd_number) for s in fixes] == [(201, 7)]
+
+
 # --- bind_cron_tick --------------------------------------------------------------
 
 

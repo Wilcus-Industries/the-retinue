@@ -400,6 +400,17 @@ def _merge_commands(source: str, into: str) -> list[list[str]]:
 _ABORT_MERGE_COMMAND = ["git", "merge", "--abort"]
 
 
+def _branch_diff_command(branch: str, base: str) -> list[str]:
+    """Argv for the diff a merged ``branch`` contributed over the integration ``base``.
+
+    Uses the three-dot form (``base...origin/branch``) so the diff is the branch's own
+    changes since it diverged from the integration branch — the slice's contribution —
+    rather than also folding in whatever else advanced ``base`` in parallel. ``branch``
+    is taken from the remote tip the implementer pushed.
+    """
+    return ["git", "diff", f"{base}...origin/{branch}"]
+
+
 def _is_merge_conflict(result: RunResult) -> bool:
     """Whether a failed ``git merge`` stopped on a content conflict (vs. a hard error).
 
@@ -475,6 +486,26 @@ class ContainerGitOps:
             f"git merge of {source} into {into} failed "
             f"(exit {result.exit_code}): {result.stderr}"
         )
+
+    async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+        """Return the merged diff of a round's ``merged_branches`` over the ``base``.
+
+        Concatenates each merged ``issue-<N>`` branch's own contribution since it diverged
+        from the integration ``base`` (the three-dot diff), giving the internal reviewer
+        the round's merged surface to review. The branch tips are fetched from origin first
+        so the diff reads the pushed work, not a stale local ref. An empty branch list
+        yields an empty diff (nothing merged, nothing to review).
+        """
+        sections: list[str] = []
+        for branch in merged_branches:
+            await self._run_checked(
+                ["git", "fetch", "origin", branch], action=f"fetch {branch} for diff"
+            )
+            result = await self._run_checked(
+                _branch_diff_command(branch, base), action=f"diff {branch}"
+            )
+            sections.append(result.stdout)
+        return "\n".join(sections)
 
     async def _run_checked(self, command: list[str], *, action: str) -> RunResult:
         """Run ``command`` in the container; raise :class:`GitOpsError` on failure."""
@@ -1050,6 +1081,24 @@ class PrdSlice(Slice):
     blocked_by: list[int] = field(default_factory=list)
 
 
+class RoundReviewer(Protocol):
+    """Reviews a merged round and enqueues review-fix slices. The reviewer seam.
+
+    After each round's merge, :func:`build_prd` hands the round's merged issue numbers
+    (in merge order) to ``review``. A production implementation reads the round's merged
+    diff, drives :func:`retinue.reviewer.review_round` to file ``review-fix`` follow-up
+    issues (and wire them into dependents' ``## Blocked by``), and returns one
+    :class:`PrdSlice` per filed issue — wired with the in-round dependents it blocks — so
+    the fix enters a *subsequent* round's ready set and is built in a later round of the
+    same run. A clean review returns an empty list; an absent seam runs no review at all.
+    Tests inject a fake that records the merged set without the Agent SDK, gh, or network.
+    """
+
+    async def review(self, *, merged_issues: list[int]) -> list[PrdSlice]:
+        """Review the round's ``merged_issues``; return review-fix slices to enqueue."""
+        ...
+
+
 @dataclass(frozen=True)
 class PrdBuildResult:
     """Outcome of a full-PRD build, partitioned by what happened to each slice.
@@ -1089,15 +1138,19 @@ async def build_prd(
     report: ReportSink,
     lock: AbstractAsyncContextManager[object],
     resolve_conflict: ConflictResolver | None = None,
+    review_round: RoundReviewer | None = None,
     image: str = DEFAULT_IMAGE,
 ) -> PrdBuildResult:
-    """Build a full PRD: ready set -> parallel fan-out -> topological merge -> loop.
+    """Build a full PRD: ready set -> parallel fan-out -> topological merge -> review -> loop.
 
     Runs under ``lock`` so at most one orchestrator run executes at a time. Each round
     picks the ready set (every ``blocked_by`` merged this run or already merged/closed
     before it), fans the slices out to implementers bounded by ``config.max_parallel``,
     then merges the green branches in dependency order under the done-check — resolving
-    a conflict or escalating. Rounds repeat until no ready slice remains.
+    a conflict or escalating. After the round's merge, the injected ``review_round`` (when
+    present) reviews the round's merged diff and files review-fix follow-up issues, which
+    re-enter as slices and build in a *subsequent* round of the same run. Rounds repeat
+    until no ready slice remains.
 
     Args:
         slices: The PRD's slices with their ``blocked_by`` graph.
@@ -1114,12 +1167,15 @@ async def build_prd(
             when a run is already in flight.
         resolve_conflict: Attempts to resolve a merge conflict; absent means any
             conflict escalates.
+        review_round: The internal reviewer run after each round's merge (the reviewer
+            seam); absent means no per-round review and no review-fix slices.
         image: Container image the done-check runs in.
 
     Returns:
         A :class:`PrdBuildResult` partitioning the slices into
         merged/blocked/escalated/skipped — a subtree pruned by a failed upstream
-        slice lands in ``skipped``, so every slice is accounted for.
+        slice lands in ``skipped``, so every slice is accounted for. Review-fix slices
+        the reviewer filed and built mid-run land in ``merged`` alongside the originals.
 
     Raises:
         OrchestratorBusyError: A run is already in flight (from the injected lock).
@@ -1150,7 +1206,7 @@ async def build_prd(
                 report=report,
                 image=image,
             )
-            await _merge_round(
+            merged_this_round = await _merge_round(
                 built,
                 branch,
                 config=config,
@@ -1158,6 +1214,12 @@ async def build_prd(
                 resolve_conflict=resolve_conflict,
                 state=state,
             )
+            # After the round merges, the internal reviewer reviews the round's merged
+            # diff and files review-fix follow-ups; each comes back as a slice that
+            # enters a later round's ready set and builds in the same run.
+            if review_round is not None and merged_this_round:
+                fixes = await review_round.review(merged_issues=merged_this_round)
+                state.enqueue(fixes)
         # The ready set has drained; any still-pending slice was pruned by a failed
         # upstream slice. Surface it as skipped rather than dropping it silently.
         state.drain_skipped()
@@ -1204,6 +1266,20 @@ class _PrdState:
         """Move ``slice_`` out of pending into a terminal bucket."""
         self._pending.remove(slice_)
         bucket.append(slice_.issue_number)
+
+    def enqueue(self, slices: list[PrdSlice]) -> None:
+        """Add review-fix slices to the pending set so a later round builds them.
+
+        The internal reviewer files review-fix follow-ups after a round's merge; each
+        comes back as a :class:`PrdSlice` enqueued here so it joins the ready-set
+        selection and builds in a subsequent round of the same run. A slice whose number
+        is already known is ignored, so a re-reviewed round never double-enqueues a fix.
+        """
+        for slice_ in slices:
+            if slice_.issue_number in self._slice_numbers:
+                continue
+            self._pending.append(slice_)
+            self._slice_numbers.add(slice_.issue_number)
 
     def drain_skipped(self) -> None:
         """Record every still-pending slice as skipped once no slice can become ready.
@@ -1268,16 +1344,19 @@ async def _merge_round(
     git: GitOps,
     resolve_conflict: ConflictResolver | None,
     state: _PrdState,
-) -> None:
-    """Merge a round's green slices in dependency order, recording each outcome.
+) -> list[int]:
+    """Merge a round's green slices in dependency order; return the issues merged.
 
     Merges are serialized (a shared integration branch) and ordered by a Kahn
     topological sort over the round's ``blocked_by`` graph, so an in-round blocker
     always merges before its dependent; issue number only breaks ties between
     mutually independent slices, keeping the order deterministic. A red slice is
-    recorded blocked; a conflict is resolved under the done-check or escalated.
+    recorded blocked; a conflict is resolved under the done-check or escalated. The
+    returned list is *this* round's merged issue numbers in merge order — the surface
+    the per-round reviewer reviews.
     """
     passed_by_number = {slice_.issue_number: passed for slice_, passed in built}
+    merged_this_round: list[int] = []
     for slice_ in _topo_merge_order([slice_ for slice_, _ in built]):
         if not passed_by_number[slice_.issue_number]:
             state.record(slice_, state.blocked)
@@ -1286,6 +1365,9 @@ async def _merge_round(
             slice_, branch, config=config, git=git, resolve_conflict=resolve_conflict
         )
         state.record(slice_, state.merged if merged else state.escalated)
+        if merged:
+            merged_this_round.append(slice_.issue_number)
+    return merged_this_round
 
 
 def _topo_merge_order(slices: list[PrdSlice]) -> list[PrdSlice]:

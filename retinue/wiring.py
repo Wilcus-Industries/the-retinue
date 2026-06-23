@@ -26,6 +26,7 @@ from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 from retinue.budget import BudgetGovernor, Clock
 from retinue.container import Container, ContainerRuntime
@@ -39,14 +40,36 @@ from retinue.orchestrator import (
     Implementer,
     PrdBuildResult,
     PrdSlice,
+    RoundReviewer,
     Slice,
     build_prd,
+    integration_branch,
 )
 from retinue.repo_config import RepoConfig
+from retinue.reviewer import (
+    BlockedByEditor,
+    ReviewGenerator,
+    ReviewInput,
+    review_round,
+)
 from retinue.slicer import IssueCreator
 from retinue.triage import TriageImplementer, triage_implementer
 
 logger = logging.getLogger(__name__)
+
+
+class RoundDiffSource(Protocol):
+    """Produces a merged round's diff for the internal reviewer. The diff seam.
+
+    A production implementation runs ``git diff`` in the merge container that advanced
+    the integration branch (so the reviewer reads the round's merged work from the same
+    clone); tests inject a fake returning a canned diff. ``merged_branches`` are the
+    round's merged ``issue-<N>`` branches; ``base`` is the integration branch.
+    """
+
+    async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+        """Return the merged diff of ``merged_branches`` over the integration ``base``."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -78,6 +101,7 @@ def bind_build_prd(
     runtime: ContainerRuntime,
     resolve_secret: SecretResolver,
     report: ReportSink,
+    review_reviewer: ReviewerFactory | None = None,
 ) -> Callable[..., Awaitable[BoundBuildResult]]:
     """Bind the budget-gated, triage-wrapped orchestrator build.
 
@@ -100,6 +124,9 @@ def bind_build_prd(
         runtime: Spawns the disposable done-check container.
         resolve_secret: Resolves the config's declared secret names/refs.
         report: Sink the done-check outcome is posted to.
+        review_reviewer: A factory ``(repo_full_name, prd_number) -> RoundReviewer`` built
+            per build (the reviewer is per-PRD), run after each round's merge; absent means
+            no per-round review (and no review-fix follow-up slices).
 
     Returns:
         An async build callable returning a :class:`BoundBuildResult`.
@@ -131,6 +158,11 @@ def bind_build_prd(
             create_issue=create_issue,
             retry_store=retry_store,
         )
+        reviewer = (
+            review_reviewer(repo_full_name, prd_number)
+            if review_reviewer is not None
+            else None
+        )
         prd_build = await build_prd(
             slices,
             config,
@@ -142,10 +174,116 @@ def bind_build_prd(
             resolve_secret=resolve_secret,
             report=report,
             lock=nullcontext(),
+            review_round=reviewer,
         )
         return BoundBuildResult(deferred=False, prd_build=prd_build)
 
     return run
+
+
+# A factory the build lane calls per build to construct the per-PRD internal reviewer.
+# The reviewer is per-PRD (its ``Part of #<prd>`` footer and diff base depend on the
+# specific PRD), but ``bind_build_prd`` is bound per repo, so the reviewer is built lazily
+# at run time from the build's ``(repo_full_name, prd_number)``.
+ReviewerFactory = Callable[[str, int], RoundReviewer]
+
+
+@dataclass
+class _BoundRoundReviewer:
+    """Production :class:`RoundReviewer`: review a merged round, enqueue review-fix slices.
+
+    After a round merges, :func:`retinue.orchestrator.build_prd` hands the round's merged
+    issue numbers here. This adapter produces the round's merged diff (the injected
+    :class:`RoundDiffSource`, the merge container's ``git diff``), drives
+    :func:`retinue.reviewer.review_round` over the real Agent-SDK reviewer + gh issue
+    creator + Blocked-by editor to file ``review-fix`` follow-ups (and wire them into the
+    flagged dependents' ``## Blocked by`` on GitHub), then returns one independently-ready
+    :class:`PrdSlice` per filed issue so it builds in a *subsequent* round of the same run.
+
+    Attributes:
+        diff_source: Produces the round's merged diff from the merge container.
+        generate: The headless Agent-SDK reviewer (the :class:`ReviewGenerator` seam).
+        create_issue: The gh issue creator filing each review-fix issue (slicer's seam).
+        edit_blocked_by: The gh issue-body editor wiring the fix into dependents.
+        repo_full_name: The target repo the review-fix issues are filed against.
+        prd_number: The parent PRD the review-fix issues link back to (``Part of #``).
+    """
+
+    diff_source: RoundDiffSource
+    generate: ReviewGenerator
+    create_issue: IssueCreator
+    edit_blocked_by: BlockedByEditor
+    repo_full_name: str
+    prd_number: int
+
+    async def review(self, *, merged_issues: list[int]) -> list[PrdSlice]:
+        """Review ``merged_issues``' merged diff; return review-fix slices to enqueue.
+
+        The round diff is taken over the PRD's integration branch — each merged
+        ``issue-<N>`` was rooted off that branch's tip, so the three-dot diff there is the
+        round's contribution.
+        """
+        diff = await self.diff_source.round_diff(
+            merged_branches=[f"issue-{n}" for n in merged_issues],
+            base=integration_branch(self.prd_number),
+        )
+        result = await review_round(
+            ReviewInput(
+                repo_full_name=self.repo_full_name,
+                prd_number=self.prd_number,
+                merged_issues=list(merged_issues),
+                diff=diff,
+            ),
+            generate=self.generate,
+            create_issue=self.create_issue,
+            edit_blocked_by=self.edit_blocked_by,
+        )
+        return [
+            PrdSlice(
+                repo_full_name=self.repo_full_name,
+                issue_number=number,
+                prd_number=self.prd_number,
+            )
+            for number in result.filed_issues
+        ]
+
+
+def bind_round_reviewer(
+    *,
+    diff_source: RoundDiffSource,
+    generate: ReviewGenerator,
+    create_issue: IssueCreator,
+    edit_blocked_by: BlockedByEditor,
+    repo_full_name: str,
+    prd_number: int,
+) -> RoundReviewer:
+    """Bind the internal reviewer run after each round's merge in the live build.
+
+    Wires the real per-round reviewer for one repo/PRD: the merge container's diff source,
+    the Agent-SDK reviewer, and the gh issue creator + Blocked-by editor. The returned
+    :class:`RoundReviewer` is passed to :func:`bind_build_prd` so ``build_prd`` reviews
+    every merged round and the review-fix follow-ups it files build in a later round.
+
+    Args:
+        diff_source: Produces the round's merged diff (the merge container's ``git diff``).
+        generate: The headless Agent-SDK reviewer (the :class:`ReviewGenerator` seam).
+        create_issue: The gh issue creator filing each review-fix issue (slicer's seam).
+        edit_blocked_by: The gh issue-body editor wiring the fix into dependents.
+        repo_full_name: The target repo the review-fix issues are filed against.
+        prd_number: The parent PRD the review-fix issues link back to; the round diff is
+            taken over its integration branch.
+
+    Returns:
+        A :class:`RoundReviewer` the build lane runs after each round's merge.
+    """
+    return _BoundRoundReviewer(
+        diff_source=diff_source,
+        generate=generate,
+        create_issue=create_issue,
+        edit_blocked_by=edit_blocked_by,
+        repo_full_name=repo_full_name,
+        prd_number=prd_number,
+    )
 
 
 @dataclass
