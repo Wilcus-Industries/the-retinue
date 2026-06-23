@@ -28,6 +28,7 @@ from retinue.orchestrator import (
     PrdBuildResult,
     PrdSlice,
     Slice,
+    _topo_merge_order,
     build_prd,
 )
 from retinue.repo_config import RepoConfig
@@ -48,13 +49,16 @@ class RecordingImplementer:
         self._live = 0
         self.peak = 0
 
-    async def implement(self, slice_: Slice) -> None:
+    async def implement(self, slice_: Slice, *, container: object) -> None:
         self.started.append(slice_.issue_number)
         self._live += 1
         self.peak = max(self.peak, self._live)
         # Yield so siblings scheduled in the same round actually interleave.
         await asyncio.sleep(0)
         self._live -= 1
+
+    def auth_env(self) -> dict[str, str]:
+        return {}
 
 
 class OneAtATimeLock:
@@ -98,6 +102,7 @@ async def _build_prd(
     config: RepoConfig | None = None,
     lock: object | None = None,
     resolve_conflict: object | None = None,
+    review_round: object | None = None,
 ) -> PrdBuildResult:
     return await build_prd(
         slices,
@@ -111,6 +116,7 @@ async def _build_prd(
         report=_sink([]),
         lock=lock or OneAtATimeLock(),
         resolve_conflict=resolve_conflict,
+        review_round=review_round,
     )
 
 
@@ -139,6 +145,34 @@ async def test_full_prd_builds_in_dependency_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prd_slices_branch_off_the_integration_branch_not_staging() -> None:
+    """Every slice's issue-<N> branch roots on retinue/prd-<n>, never on staging.
+
+    PRD: one integration branch per PRD; implementers branch off *it* so a later-round
+    slice builds on already-merged sibling work. Each container checks out issue-<N> off
+    ``origin/retinue/prd-1``, and the integration branch is created off staging first.
+    """
+    timeline: list[str] = []
+    git = FakeGitOps(timeline=timeline)
+    runtime = FakeRuntime(timeline=timeline)
+    config = RepoConfig(staging_branch="staging")
+    slices = [_prd_slice(1), _prd_slice(2, blocked_by=[1])]
+
+    await _build_prd(slices, runtime=runtime, git=git, config=config)
+
+    # The integration branch is created off staging before any container is started.
+    assert timeline[0] == "create:retinue/prd-1<-staging"
+    create_index = timeline.index("create:retinue/prd-1<-staging")
+    first_start = next(i for i, e in enumerate(timeline) if e.startswith("start:"))
+    assert create_index < first_start
+    # Each round's container roots issue-<N> on the integration branch, not staging.
+    checkouts = [e for e in runtime.log if "checkout -B issue-" in e]
+    assert checkouts  # at least one round ran
+    assert all("origin/retinue/prd-1" in e for e in checkouts)
+    assert not any("origin/staging" in e for e in checkouts)
+
+
+@pytest.mark.asyncio
 async def test_diamond_dependency_drains_in_rounds() -> None:
     """A diamond graph (1 <- {2,3} <- 4) builds and merges, draining every round."""
     slices = [
@@ -154,6 +188,28 @@ async def test_diamond_dependency_drains_in_rounds() -> None:
     assert result.merged_issues[0] == 1
     assert result.merged_issues[-1] == 4
     assert set(result.merged_issues) == {1, 2, 3, 4}
+
+
+def test_topo_merge_order_puts_in_round_blocker_before_dependent() -> None:
+    """A round's slices merge in Kahn-topological order, not by issue number.
+
+    When a higher-numbered slice blocks a lower-numbered one inside the same round,
+    the blocker must merge first even though its issue number sorts later. Sorting by
+    issue number alone (the drifted behavior) would wrongly merge #1 before #2.
+    """
+    blocker = _prd_slice(2)
+    dependent = _prd_slice(1, blocked_by=[2])
+
+    ordered = _topo_merge_order([dependent, blocker])
+
+    assert [s.issue_number for s in ordered] == [2, 1]
+
+
+def test_topo_merge_order_tiebreaks_independent_slices_by_issue_number() -> None:
+    """Mutually independent slices stay deterministic, ordered by issue number."""
+    ordered = _topo_merge_order([_prd_slice(3), _prd_slice(1), _prd_slice(2)])
+
+    assert [s.issue_number for s in ordered] == [1, 2, 3]
 
 
 @pytest.mark.asyncio
@@ -338,15 +394,78 @@ async def test_second_concurrent_run_is_rejected() -> None:
         await run()
 
 
+# --- per-round internal reviewer -------------------------------------------------
+
+
+class RecordingReviewer:
+    """A RoundReviewer that records each round's merged set and enqueues a fix slice.
+
+    Models the PRD's per-round review: after a round merges, ``review`` is handed the
+    round's merged issue numbers. The first round's merged set carries a planted defect,
+    so the reviewer files a single review-fix slice (number 201) blocked by nothing new
+    and returns it to be built in a later round; subsequent rounds review clean.
+    """
+
+    def __init__(self, *, fix_for: list[int], fix_number: int = 201) -> None:
+        self._fix_for = set(fix_for)
+        self._fix_number = fix_number
+        self.reviewed: list[list[int]] = []
+        self.filed = False
+
+    async def review(self, *, merged_issues: list[int]) -> list[PrdSlice]:
+        self.reviewed.append(list(merged_issues))
+        if not self.filed and self._fix_for.issubset(set(merged_issues)):
+            self.filed = True
+            return [_prd_slice(self._fix_number)]
+        return []
+
+
+@pytest.mark.asyncio
+async def test_reviewer_runs_after_each_round_and_fix_builds_in_a_later_round() -> None:
+    """The reviewer runs per round; a filed review-fix slice builds in a later round.
+
+    A two-slice diamond merges in round one; the reviewer flags a planted defect and
+    files a review-fix slice (#201), which must enter a *subsequent* round's ready set
+    and be built and merged in the same run — proving the live per-round loop.
+    """
+    slices = [_prd_slice(1), _prd_slice(2, blocked_by=[1])]
+    git = FakeGitOps()
+    reviewer = RecordingReviewer(fix_for=[1])
+
+    result = await _build_prd(slices, git=git, review_round=reviewer)
+
+    # The reviewer ran after every merge round (at least the first and the fix round).
+    assert reviewer.reviewed[0] == [1]
+    assert reviewer.filed is True
+    # The filed review-fix slice was picked up and merged in a later round, same run.
+    assert 201 in result.merged_issues
+    assert result.merged_issues.index(201) > result.merged_issues.index(1)
+    assert ("issue-201", "retinue/prd-1") in git.merges
+
+
+@pytest.mark.asyncio
+async def test_no_reviewer_seam_leaves_the_build_unchanged() -> None:
+    """With no reviewer injected the build behaves exactly as before — no extra slices."""
+    slices = [_prd_slice(1), _prd_slice(2, blocked_by=[1])]
+
+    result = await _build_prd(slices)  # no review_round
+
+    assert result.merged_issues == [1, 2]
+
+
 # --- empty PRD -------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_empty_prd_is_a_clean_noop() -> None:
-    """A PRD with no slices drains immediately to an empty result."""
-    result = await _build_prd([])
+    """A PRD with no slices drains immediately to an empty result, touching no branch."""
+    git = FakeGitOps()
+
+    result = await _build_prd([], git=git)
 
     assert result.merged_issues == []
     assert result.blocked_issues == []
     assert result.escalated_issues == []
     assert result.skipped_issues == []
+    # No slices means no implementers, so no integration branch is created.
+    assert git.log == []

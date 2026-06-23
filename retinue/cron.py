@@ -26,16 +26,30 @@ tick runs with no real ``gh``, no Docker, and no network.
 
 from __future__ import annotations
 
+import asyncio
 import enum
+import json
 import logging
-from collections.abc import Awaitable, Callable
+import os
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 
 from retinue.budget import BudgetGovernor, Clock
+from retinue.container import ContainerRuntime
+from retinue.done_check import DEFAULT_IMAGE, ReportSink, SecretResolver
+from retinue.github_app import InstallationAuth
 from retinue.loopback import Severity
+from retinue.orchestrator import (
+    BuildResult,
+    GitOps,
+    Implementer,
+    Slice,
+    build_slice,
+)
+from retinue.repo_config import RepoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +124,296 @@ class CronGh(Protocol):
         ...
 
 
+# The label the backlog drainer scans for — the non-blocking heimdall nits filed by
+# :mod:`retinue.loopback` carry it. Kept here so the query and the doc agree.
+_BACKLOG_LABEL = "backlog"
+
+# How many backlog issues to pull per tick. The drainer only ever picks one, but it
+# scores across the visible set, so a generous-but-bounded page keeps the score honest
+# without an unbounded fetch.
+_DEFAULT_LIST_LIMIT = 200
+
+# An async runner for a ``gh`` argv: returns the command's stdout bytes, raising on a
+# non-zero exit. Injected so the command-assembly + payload-parsing of :class:`GhCli`
+# are exercised without spawning a real process, mirroring the injected-seam style of the
+# rest of the cron tick. The default (:func:`_run_gh_subprocess`) shells out to ``gh``.
+GhRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[bytes]]
+
+
+class GhCliError(RuntimeError):
+    """A ``gh`` invocation behind :class:`GhCli` failed (non-zero exit or bad output).
+
+    Carries the argv and the captured stderr so a backlog-query failure is debuggable
+    rather than a bare ``CalledProcessError``.
+    """
+
+    def __init__(self, argv: Sequence[str], *, returncode: int, stderr: str) -> None:
+        self.argv = list(argv)
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(
+            f"gh exited {returncode} for {' '.join(argv)}: {stderr.strip()}"
+        )
+
+
+class GhCli:
+    """The production :class:`CronGh`: lists ``backlog`` issues via the ``gh`` CLI.
+
+    Runs ``gh issue list --repo <repo> --label backlog --state open --json
+    number,labels,createdAt`` and parses the JSON into :class:`BacklogIssue` objects.
+    Authenticates by injecting the GitHub token into the child env as ``GH_TOKEN`` (the
+    same variable the ``gh`` CLI reads), so no token is ever placed on the command line.
+
+    The actual subprocess spawn is the one impure edge, factored behind the injected
+    ``runner`` so command assembly, the auth env, and payload parsing are unit-testable
+    without a real ``gh``, Docker, or network. Production leaves ``runner`` defaulted to
+    :func:`_run_gh_subprocess`.
+
+    Args:
+        token: The GitHub token ``gh`` authenticates with, placed in the child env as
+            ``GH_TOKEN``. ``None`` runs ``gh`` with the ambient auth (e.g. a logged-in
+            CLI), useful for local runs.
+        runner: The injected argv runner; defaults to the real subprocess spawn.
+        list_limit: The max number of backlog issues to pull per tick.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        runner: GhRunner | None = None,
+        list_limit: int = _DEFAULT_LIST_LIMIT,
+    ) -> None:
+        self._token = token
+        self._runner = runner or _run_gh_subprocess
+        self._list_limit = list_limit
+
+    async def list_backlog(self, *, repo_full_name: str) -> list[BacklogIssue]:
+        """Return the repo's open ``backlog`` issues with their labels and ages.
+
+        Assembles the ``gh issue list`` argv, runs it through the injected runner with
+        the auth env, and parses the JSON payload into :class:`BacklogIssue` objects.
+
+        Raises:
+            GhCliError: ``gh`` exited non-zero (propagated from the runner).
+            ValueError: ``gh`` returned a payload that did not parse as the expected
+                issue listing.
+        """
+        argv = _list_backlog_argv(repo_full_name, limit=self._list_limit)
+        stdout = await self._runner(argv, self._auth_env())
+        return _parse_backlog(stdout)
+
+    def _auth_env(self) -> Mapping[str, str]:
+        """The child-process env carrying the token as ``GH_TOKEN`` (empty when none).
+
+        The token goes in the env, never on the argv, so it never lands in a process
+        listing or a log of the command.
+        """
+        return {"GH_TOKEN": self._token} if self._token else {}
+
+
+def _list_backlog_argv(repo_full_name: str, *, limit: int) -> list[str]:
+    """Assemble the ``gh issue list`` argv for the open ``backlog`` issues of a repo.
+
+    Pulls ``number``, ``labels``, and ``createdAt`` as JSON — exactly the fields
+    :class:`BacklogIssue` needs for its severity + age weighting.
+    """
+    return [
+        "gh",
+        "issue",
+        "list",
+        "--repo",
+        repo_full_name,
+        "--label",
+        _BACKLOG_LABEL,
+        "--state",
+        "open",
+        "--json",
+        "number,labels,createdAt",
+        "--limit",
+        str(limit),
+    ]
+
+
+def _parse_backlog(stdout: bytes) -> list[BacklogIssue]:
+    """Parse a ``gh issue list --json`` payload into :class:`BacklogIssue` objects.
+
+    ``gh`` emits a JSON array of objects, each with ``number``, ``createdAt`` (an ISO-8601
+    timestamp, ``Z``-suffixed UTC), and ``labels`` (a list of ``{"name": ...}`` objects).
+    A malformed payload raises :class:`ValueError` rather than silently dropping issues.
+    """
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"gh issue list returned non-JSON output: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ValueError(f"gh issue list expected a JSON array, got {type(payload)}")
+    return [_parse_issue(entry) for entry in payload]
+
+
+def _parse_issue(entry: object) -> BacklogIssue:
+    """Parse one ``gh`` issue object into a :class:`BacklogIssue`."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"gh issue entry is not an object: {entry!r}")
+    try:
+        number = int(entry["number"])
+        labels = [str(label["name"]) for label in entry["labels"]]
+        created_at = _parse_timestamp(str(entry["createdAt"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"gh issue entry is malformed: {entry!r} ({exc})") from exc
+    return BacklogIssue(number=number, labels=labels, created_at=created_at)
+
+
+def _parse_timestamp(raw: str) -> datetime:
+    """Parse gh's ISO-8601 ``createdAt`` (``Z``-suffixed UTC) into an aware datetime."""
+    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+
+async def _run_gh_subprocess(argv: Sequence[str], env: Mapping[str, str]) -> bytes:
+    """Spawn ``gh`` with ``env`` layered over the ambient env; return stdout bytes.
+
+    The default :data:`GhRunner`. Uses :func:`asyncio.create_subprocess_exec` (no shell,
+    so the repo name is never interpolated into a command line) and raises
+    :class:`GhCliError` on a non-zero exit so the backlog query fails loudly.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **env},
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise GhCliError(
+            argv,
+            returncode=process.returncode or -1,
+            stderr=stderr.decode(errors="replace"),
+        )
+    return stdout
+
+
 # The downstream a cron tick drives for the picked issue: the same build -> PR ->
 # heimdall loopback -> notify chain the orchestrator runs, behind one injected callable so
 # the tick is exercised without Docker, gh, or network. Production wires it to the
 # orchestrator build + pr_opener + loopback + handoff chain.
 CronBuild = Callable[..., Awaitable[None]]
+
+
+# A loose backlog nit has no parent PRD — it is filed standalone by the heimdall loopback.
+# The cron lane drains each onto its own integration target so a nit's build never collides
+# with another's; the per-issue PRD number is the issue number itself, giving the dedicated
+# integration branch ``retinue/prd-<issue>`` (see :func:`retinue.orchestrator.integration_branch`).
+def _slice_for_backlog_issue(repo_full_name: str, issue_number: int) -> Slice:
+    """Assemble the standalone :class:`Slice` the cron lane builds for a backlog nit.
+
+    A loose backlog issue carries no parent PRD, so it drains onto its own integration
+    target: the per-issue PRD number is the issue number itself, yielding the dedicated
+    integration branch ``retinue/prd-<issue>``. The assembly is pure — no gh, Docker, or
+    network — so it is unit-testable in isolation.
+    """
+    return Slice(
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+        prd_number=issue_number,
+    )
+
+
+# The side-effecting build of one assembled slice: the orchestrator's spawn -> done-check
+# -> merge chain (:func:`retinue.orchestrator.build_slice`). Injected so the slice
+# assembly + downstream wiring of :class:`SliceBuilder` are exercised without the Agent
+# SDK, Docker, gh, or network, mirroring the injected-runner style of :class:`GhCli`. The
+# default (:func:`_run_build_slice`) calls the real orchestrator.
+SliceRunner = Callable[[Slice], Awaitable[BuildResult]]
+
+
+class SliceBuilder:
+    """The production :class:`CronBuild`: drains one backlog nit through ``build_slice``.
+
+    Each cron tick hands this the picked backlog ``issue_number``; the builder assembles
+    the standalone :class:`Slice` for it (:func:`_slice_for_backlog_issue`) and drives the
+    same downstream the orchestrator runs — spawn the implementer, gate on the done-check,
+    merge the green branch — via :func:`retinue.orchestrator.build_slice`.
+
+    All of that downstream's side-effecting collaborators (implementer, git, auth,
+    container runtime, secret resolver, report sink) are carried here and threaded into a
+    single injected ``runner``, so the cron-side decision and slice assembly are
+    unit-testable without the Agent SDK, Docker, gh, or network. Production leaves
+    ``runner`` defaulted to :func:`_run_build_slice`, which calls the real orchestrator
+    with the carried collaborators.
+
+    Args:
+        config: The accepted repo config (its ``staging_branch`` bases a new integration
+            branch, its ``secrets`` feed the done-check).
+        claude_md: The repo's ``CLAUDE.md`` text carrying the done-check command.
+        implementer: The Agent SDK seam that builds the slice on its ``issue-<N>`` branch.
+        git: The integration-branch git operations (the merge seam).
+        auth: Mints the installation token used to clone (the auth seam).
+        runtime: Spawns the disposable container the done-check runs in (Docker seam).
+        resolve_secret: Resolves the config's declared secret names/refs to values.
+        report: Sink the done-check outcome is posted to.
+        image: Container image the done-check runs in.
+        runner: The injected slice runner; defaults to the real ``build_slice`` call.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: RepoConfig,
+        claude_md: str,
+        implementer: Implementer,
+        git: GitOps,
+        auth: InstallationAuth,
+        runtime: ContainerRuntime,
+        resolve_secret: SecretResolver,
+        report: ReportSink,
+        image: str = DEFAULT_IMAGE,
+        runner: SliceRunner | None = None,
+    ) -> None:
+        self._config = config
+        self._claude_md = claude_md
+        self._implementer = implementer
+        self._git = git
+        self._auth = auth
+        self._runtime = runtime
+        self._resolve_secret = resolve_secret
+        self._report = report
+        self._image = image
+        self._runner = runner or self._default_runner
+
+    async def __call__(self, *, repo_full_name: str, issue_number: int) -> None:
+        """Drain one backlog nit: assemble its slice and run the orchestrator downstream.
+
+        Matches the :data:`CronBuild` protocol invoked by :func:`run_cron_tick`. Assembles
+        the standalone slice for ``issue_number`` and hands it to the injected runner; the
+        tick does not read a return value, it gates on the budget governor up front.
+        """
+        slice_ = _slice_for_backlog_issue(repo_full_name, issue_number)
+        result = await self._runner(slice_)
+        logger.info(
+            "Cron drained backlog issue #%d -> %s (%s)",
+            issue_number,
+            result.outcome.value,
+            result.integration_branch,
+        )
+
+    async def _default_runner(self, slice_: Slice) -> BuildResult:
+        """Run the real orchestrator ``build_slice`` for ``slice_`` with the carried deps.
+
+        The one impure edge, factored behind the :data:`SliceRunner` seam so the assembly
+        above is testable without it.
+        """
+        return await build_slice(
+            slice_,
+            self._config,
+            self._claude_md,
+            implementer=self._implementer,
+            git=self._git,
+            auth=self._auth,
+            runtime=self._runtime,
+            resolve_secret=self._resolve_secret,
+            report=self._report,
+            image=self._image,
+        )
 
 
 class CronOutcome(enum.Enum):

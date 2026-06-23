@@ -1,0 +1,6 @@
+# VPS edge config for the `edge` compose profile. Caddy obtains and renews a
+# Let's-Encrypt certificate for ${DOMAIN} automatically and reverse-proxies to web.
+# DOMAIN is supplied via .env (compose passes it into the caddy container's env).
+{$DOMAIN} {
+	reverse_proxy web:8000
+}

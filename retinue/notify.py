@@ -17,9 +17,15 @@ module and call :meth:`Notifier.notify`; they never re-implement the fan-out.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
-from collections.abc import Awaitable, Callable
+import os
+import urllib.error
+import urllib.request
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 
@@ -138,3 +144,422 @@ class Notifier:
                 notification.issue_number,
                 exc_info=True,
             )
+
+
+# --- Real push sink: ntfy / Pushover over HTTP -----------------------------
+#
+# This is the production adapter behind the ``PushSink`` seam. It is an async
+# callable matching the ``PushSink`` protocol — ``await sink(PushRequest(...))``
+# — so it drops straight into ``Notifier(push=...)`` where the tests inject a
+# fake. The HTTP POST is the only impure step; it runs in a worker thread via
+# ``asyncio.to_thread`` so the blocking stdlib client never stalls the loop, and
+# the request-building / response-parsing are pure methods the unit tests drive
+# without touching the network.
+
+_DEFAULT_NTFY_URL = "https://ntfy.sh"
+_PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
+
+
+@dataclass(frozen=True)
+class _HttpPost:
+    """A fully-built HTTP POST — the pure description of one push call.
+
+    Building this is side-effect-free, so the URL, headers, and body can be
+    asserted in a unit test without sending anything.
+    """
+
+    url: str
+    data: bytes
+    headers: dict[str, str]
+
+
+class NtfyPushSink:
+    """Real :data:`PushSink` backed by an `ntfy <https://ntfy.sh>`_ topic.
+
+    ntfy publishes a notification by POSTing the message body to
+    ``{base_url}/{topic}`` with the title carried in an ``X-Title`` header.
+    A token, when supplied, is sent as a ``Bearer`` ``Authorization`` header.
+
+    Args:
+        topic: The ntfy topic to publish to.
+        base_url: ntfy server base (defaults to the public ``https://ntfy.sh``).
+        token: Optional access token for a protected topic.
+        timeout: Per-request timeout in seconds.
+    """
+
+    def __init__(
+        self,
+        *,
+        topic: str,
+        base_url: str = _DEFAULT_NTFY_URL,
+        token: str | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        if not topic:
+            raise ValueError("ntfy topic must be non-empty")
+        self._topic = topic
+        self._base_url = base_url.rstrip("/")
+        self._token = token
+        self._timeout = timeout
+
+    def build_request(self, request: PushRequest) -> _HttpPost:
+        """Assemble the ntfy POST for ``request`` without sending it."""
+        headers = {
+            "X-Title": request.title,
+            "Content-Type": "text/plain; charset=utf-8",
+        }
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        return _HttpPost(
+            url=f"{self._base_url}/{self._topic}",
+            data=request.body.encode("utf-8"),
+            headers=headers,
+        )
+
+    async def __call__(self, request: PushRequest) -> None:
+        """Publish ``request`` to ntfy. Raises on any HTTP/transport error."""
+        await _send(self.build_request(request), self._timeout)
+
+
+class PushoverPushSink:
+    """Real :data:`PushSink` backed by `Pushover <https://pushover.net>`_.
+
+    Pushover takes a form-encoded POST carrying the application ``token`` and the
+    target ``user`` key alongside the ``title`` and ``message``. Both credentials
+    are required; the response is JSON whose ``status`` is ``1`` on success.
+
+    Args:
+        token: Pushover application API token.
+        user: Pushover user/group key to deliver to.
+        timeout: Per-request timeout in seconds.
+    """
+
+    def __init__(self, *, token: str, user: str, timeout: float = 10.0) -> None:
+        if not token or not user:
+            raise ValueError("Pushover token and user must both be non-empty")
+        self._token = token
+        self._user = user
+        self._timeout = timeout
+
+    def build_request(self, request: PushRequest) -> _HttpPost:
+        """Assemble the Pushover form POST for ``request`` without sending it."""
+        form = urlencode(
+            {
+                "token": self._token,
+                "user": self._user,
+                "title": request.title,
+                "message": request.body,
+            }
+        )
+        return _HttpPost(
+            url=_PUSHOVER_URL,
+            data=form.encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    @staticmethod
+    def parse_response(payload: bytes) -> None:
+        """Validate a Pushover JSON response; raise on a non-success status.
+
+        Pushover returns ``{"status": 1, ...}`` on success and ``status`` ``0``
+        with an ``errors`` list otherwise, so a 200 with ``status`` ``0`` is
+        still a failure that must surface.
+        """
+        try:
+            body = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise PushDeliveryError(f"unparseable Pushover response: {exc}") from exc
+        if body.get("status") != 1:
+            errors = body.get("errors") or ["unknown error"]
+            raise PushDeliveryError(f"Pushover rejected the push: {errors}")
+
+    async def __call__(self, request: PushRequest) -> None:
+        """Send ``request`` to Pushover. Raises on transport or status failure."""
+        payload = await _send(self.build_request(request), self._timeout)
+        self.parse_response(payload)
+
+
+def build_basic_auth_header(user: str, password: str) -> str:
+    """Build an HTTP Basic ``Authorization`` header value for ``user:password``.
+
+    Pulled out as a pure helper so the credential encoding is unit-testable and
+    reusable by any sink that fronts a Basic-auth-protected push endpoint.
+    """
+    raw = f"{user}:{password}".encode()
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+class PushDeliveryError(RuntimeError):
+    """A push was attempted but the service reported it as not delivered."""
+
+
+async def _send(post: _HttpPost, timeout: float) -> bytes:
+    """Run the blocking POST off the event loop and return the response body.
+
+    The stdlib HTTP client is synchronous, so it runs in a worker thread to keep
+    the async ``PushSink`` contract. Transport and non-2xx errors propagate as
+    :class:`PushDeliveryError`; the ``Notifier`` catches them so a flaky push
+    never blocks the comment + label.
+    """
+    return await asyncio.to_thread(_post_sync, post, timeout)
+
+
+def _post_sync(post: _HttpPost, timeout: float) -> bytes:
+    req = urllib.request.Request(  # noqa: S310 - URLs are our own constants, not user input
+        post.url, data=post.data, headers=post.headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            body: bytes = resp.read()
+            return body
+    except urllib.error.HTTPError as exc:
+        raise PushDeliveryError(f"push HTTP {exc.code} from {post.url}") from exc
+    except urllib.error.URLError as exc:
+        raise PushDeliveryError(f"push transport error to {post.url}: {exc}") from exc
+
+
+# --- Real comment sink: gh issue comment ------------------------------------
+#
+# This is the production adapter behind the ``CommentSink`` seam. It posts the
+# escalation's durable in-repo record by shelling out to ``gh issue comment``,
+# mirroring the rest of the retinue's gh-cli adapters (cron.GhCli,
+# handoff.HandoffGh): the command-assembly and the auth-env build are pure and
+# unit-tested directly, and the one impure edge — the subprocess spawn — sits
+# behind an injected ``runner`` so the seam is exercisable without a real ``gh``,
+# Docker, or network. A failing comment is a lost in-repo record, so a non-zero
+# ``gh`` exit raises :class:`CommentDeliveryError` rather than being swallowed.
+
+# An async runner for a ``gh`` argv: given the argv (no leading "gh") and the auth
+# env, it runs the command and returns nothing, raising on a non-zero exit. The
+# default spawns a real ``gh`` child; tests inject a fake to drive the pure
+# command-assembly + auth-env without a process.
+GhCommentRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[None]]
+
+
+class CommentDeliveryError(RuntimeError):
+    """A ``gh issue comment`` invocation failed (non-zero exit).
+
+    Carries the argv and captured stderr so a lost-comment failure is debuggable
+    rather than a bare ``CalledProcessError``.
+    """
+
+    def __init__(self, argv: Sequence[str], *, returncode: int, stderr: str) -> None:
+        self.argv = list(argv)
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(
+            f"gh exited {returncode} for {' '.join(argv)}: {stderr.strip()}"
+        )
+
+
+class GhCommentSink:
+    """Real :data:`CommentSink`: posts an issue comment via ``gh issue comment``.
+
+    Runs ``gh issue comment <number> --repo <owner/repo> --body <body>`` to write
+    the durable, in-repo record of an escalation. Authenticates by injecting the
+    GitHub token into the child env as ``GH_TOKEN`` (the variable ``gh`` reads), so
+    the token is never placed on the command line where a process listing or log
+    could leak it.
+
+    The command assembly (:meth:`build_argv`) and the auth env build
+    (:meth:`build_auth_env`) are pure and unit-tested directly. The subprocess
+    spawn is the one impure edge, factored behind the injected ``runner`` (default:
+    :func:`_run_gh_comment_subprocess`) so the seam is exercisable without a real
+    ``gh``, Docker, or network.
+
+    Args:
+        token: The GitHub token ``gh`` authenticates with, placed in the child env
+            as ``GH_TOKEN``. ``None`` runs ``gh`` with the ambient auth (e.g. a
+            logged-in CLI), useful for local runs.
+        runner: The injected argv runner; defaults to the real subprocess spawn.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        runner: GhCommentRunner | None = None,
+    ) -> None:
+        self._token = token
+        self._runner = runner or _run_gh_comment_subprocess
+
+    @staticmethod
+    def build_argv(request: CommentRequest) -> list[str]:
+        """Assemble the ``gh issue comment`` argv for ``request`` (no leading ``gh``).
+
+        The body rides as a ``--body`` value rather than being interpolated into a
+        shell, so a comment containing shell metacharacters is posted verbatim.
+        """
+        return [
+            "issue",
+            "comment",
+            str(request.issue_number),
+            "--repo",
+            request.repo_full_name,
+            "--body",
+            request.body,
+        ]
+
+    def build_auth_env(self) -> dict[str, str]:
+        """The child env carrying the token as ``GH_TOKEN`` (just it when supplied).
+
+        The token goes in the env, never on the argv, so it never lands in a
+        process listing or a log of the command. With no token, an empty mapping
+        lets the runner fall back to the host's own ``gh`` auth.
+        """
+        return {"GH_TOKEN": self._token} if self._token else {}
+
+    async def __call__(self, request: CommentRequest) -> None:
+        """Post ``request`` as an issue comment. Raises on a non-zero ``gh`` exit."""
+        await self._runner(self.build_argv(request), self.build_auth_env())
+
+
+async def _run_gh_comment_subprocess(
+    argv: Sequence[str], env: Mapping[str, str]
+) -> None:
+    """Spawn ``gh`` with ``env`` layered over the ambient env; raise on failure.
+
+    The default :data:`GhCommentRunner`. Uses :func:`asyncio.create_subprocess_exec`
+    (an argv list, no shell, so the body and repo name are never interpolated into a
+    command line) and raises :class:`CommentDeliveryError` on a non-zero exit so a
+    lost comment fails loudly — the comment is the durable record the caller must
+    not silently lose.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "gh",
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **env},
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise CommentDeliveryError(
+            argv,
+            returncode=process.returncode or -1,
+            stderr=stderr.decode(errors="replace"),
+        )
+
+
+# --- Real label sink: gh issue edit --add-label ------------------------------
+#
+# This is the production adapter behind the ``LabelSink`` seam. It applies the
+# escalation's routing label by shelling out to ``gh issue edit --add-label``,
+# mirroring the comment sink above (and the rest of the retinue's gh-cli
+# adapters): the command-assembly and the auth-env build are pure and unit-tested
+# directly, and the one impure edge — the subprocess spawn — sits behind an
+# injected ``runner`` so the seam is exercisable without a real ``gh``, Docker, or
+# network. The label makes the escalated issue findable and routes the agent
+# loop, so a non-zero ``gh`` exit raises :class:`LabelDeliveryError` rather than
+# being swallowed.
+
+# An async runner for a ``gh`` argv, identical in shape to GhCommentRunner: given
+# the argv (no leading "gh") and the auth env, it runs the command and returns
+# nothing, raising on a non-zero exit. The default spawns a real ``gh`` child;
+# tests inject a fake to drive the pure command-assembly + auth-env.
+GhLabelRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[None]]
+
+
+class LabelDeliveryError(RuntimeError):
+    """A ``gh issue edit --add-label`` invocation failed (non-zero exit).
+
+    Carries the argv and captured stderr so a lost-label failure is debuggable
+    rather than a bare ``CalledProcessError``.
+    """
+
+    def __init__(self, argv: Sequence[str], *, returncode: int, stderr: str) -> None:
+        self.argv = list(argv)
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(
+            f"gh exited {returncode} for {' '.join(argv)}: {stderr.strip()}"
+        )
+
+
+class GhLabelSink:
+    """Real :data:`LabelSink`: applies a label via ``gh issue edit --add-label``.
+
+    Runs ``gh issue edit <number> --repo <owner/repo> --add-label <label>`` to make
+    the escalated issue findable and to route the agent loop. Authenticates by
+    injecting the GitHub token into the child env as ``GH_TOKEN`` (the variable
+    ``gh`` reads), so the token is never placed on the command line where a process
+    listing or log could leak it.
+
+    The command assembly (:meth:`build_argv`) and the auth env build
+    (:meth:`build_auth_env`) are pure and unit-tested directly. The subprocess
+    spawn is the one impure edge, factored behind the injected ``runner`` (default:
+    :func:`_run_gh_label_subprocess`) so the seam is exercisable without a real
+    ``gh``, Docker, or network.
+
+    Args:
+        token: The GitHub token ``gh`` authenticates with, placed in the child env
+            as ``GH_TOKEN``. ``None`` runs ``gh`` with the ambient auth (e.g. a
+            logged-in CLI), useful for local runs.
+        runner: The injected argv runner; defaults to the real subprocess spawn.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        runner: GhLabelRunner | None = None,
+    ) -> None:
+        self._token = token
+        self._runner = runner or _run_gh_label_subprocess
+
+    @staticmethod
+    def build_argv(request: LabelRequest) -> list[str]:
+        """Assemble the ``gh issue edit`` argv for ``request`` (no leading ``gh``).
+
+        The label rides as an ``--add-label`` value rather than being interpolated
+        into a shell, so a label containing shell metacharacters is applied verbatim.
+        """
+        return [
+            "issue",
+            "edit",
+            str(request.issue_number),
+            "--repo",
+            request.repo_full_name,
+            "--add-label",
+            request.label,
+        ]
+
+    def build_auth_env(self) -> dict[str, str]:
+        """The child env carrying the token as ``GH_TOKEN`` (just it when supplied).
+
+        The token goes in the env, never on the argv, so it never lands in a
+        process listing or a log of the command. With no token, an empty mapping
+        lets the runner fall back to the host's own ``gh`` auth.
+        """
+        return {"GH_TOKEN": self._token} if self._token else {}
+
+    async def __call__(self, request: LabelRequest) -> None:
+        """Apply ``request``'s label. Raises on a non-zero ``gh`` exit."""
+        await self._runner(self.build_argv(request), self.build_auth_env())
+
+
+async def _run_gh_label_subprocess(
+    argv: Sequence[str], env: Mapping[str, str]
+) -> None:
+    """Spawn ``gh`` with ``env`` layered over the ambient env; raise on failure.
+
+    The default :data:`GhLabelRunner`. Uses :func:`asyncio.create_subprocess_exec`
+    (an argv list, no shell, so the label and repo name are never interpolated into
+    a command line) and raises :class:`LabelDeliveryError` on a non-zero exit so a
+    lost label fails loudly — the label routes the agent loop and the caller must
+    not silently lose it.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "gh",
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **env},
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise LabelDeliveryError(
+            argv,
+            returncode=process.returncode or -1,
+            stderr=stderr.decode(errors="replace"),
+        )

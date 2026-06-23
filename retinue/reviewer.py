@@ -20,11 +20,19 @@ without the Agent SDK, gh, or network.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 
-from retinue.slicer import READY_LABEL, CreatedIssue, IssueCreator, IssueDraft
+from retinue.slicer import (
+    _EFFORT_MAX,
+    READY_LABEL,
+    CreatedIssue,
+    IssueCreator,
+    IssueDraft,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +115,405 @@ class ReviewResult:
 # async and faked in tests — no Agent SDK, gh, or network.
 ReviewGenerator = Callable[[ReviewInput], Awaitable[ReviewPlan]]
 BlockedByEditor = Callable[[EditBlockedByRequest], Awaitable[None]]
+
+
+# ---------------------------------------------------------------------------
+# Real Agent-SDK reviewer (production adapter behind the ReviewGenerator seam).
+#
+# Drives the Anthropic Messages API headless to review a round's merged diff and
+# emit structured findings. The HTTP call is the only side effect, so it is taken
+# behind the injected :class:`HttpTransport` protocol: production wires a concrete
+# httpx-style client, tests inject a fake. The pure parts — auth header build,
+# request payload assembly, and response parsing — are exercised without network.
+#
+# SDK conventions match the slicer: Opus 4.8 is the default model; a subscription
+# OAuth token goes on ``Authorization: Bearer`` with the ``oauth-2025-04-20`` beta
+# header, while a raw API key goes on ``x-api-key``; ``anthropic-version`` is
+# always sent. The model must return only the JSON object matching the schema.
+# ---------------------------------------------------------------------------
+
+_REVIEW_MODEL = "claude-opus-4-8"
+_ANTHROPIC_VERSION = "2023-06-01"
+_OAUTH_BETA = "oauth-2025-04-20"
+_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+_MAX_TOKENS = 16_000
+
+# Strict JSON schema the headless reviewer must emit: an ordered list of findings,
+# each with the dependent issue numbers (from the round) whose work is layered on
+# the defect. ``blocks_issues`` is empty for a standalone fix (e.g. a stale doc).
+_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "blocks_issues": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["title", "body", "blocks_issues"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["findings"],
+    "additionalProperties": False,
+}
+
+# The headless reviewer's brief. Frozen (no per-request interpolation) so the
+# request prefix is cacheable across rounds; the diff and issue list ride in the
+# user message.
+_REVIEW_SYSTEM = (
+    "You review a merged pull-request diff for genuine defects: correctness bugs "
+    "introduced by the diff and documentation the diff made stale. Report only "
+    "real, actionable findings — never style nits or speculation; a clean diff "
+    "yields an empty 'findings' list. For each finding, list in 'blocks_issues' "
+    "the issue numbers (drawn only from the round's merged issues) whose work is "
+    "layered on the defect, so the fix builds first; leave it empty for a "
+    "standalone fix nothing depends on. Return only the JSON object matching the "
+    "schema; no prose."
+)
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    """The slice of an HTTP response the reviewer reads: status and JSON body."""
+
+    status_code: int
+    body: dict[str, Any]
+
+
+class HttpTransport(Protocol):
+    """Async HTTP POST seam (httpx-style). The network edge of the reviewer.
+
+    A production implementation wraps an httpx client; tests inject a fake that
+    returns a canned :class:`HttpResponse`. Kept narrow — one POST — so the real
+    review flow is exercisable without network.
+    """
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
+    ) -> HttpResponse:
+        """POST ``json`` to ``url`` with ``headers`` and return the response."""
+        ...
+
+
+@dataclass(frozen=True)
+class AgentSdkReviewGenerator:
+    """Real :data:`ReviewGenerator`: review a round's diff via the Messages API.
+
+    Satisfies the ``generate`` protocol ``(ReviewInput) -> Awaitable[ReviewPlan]``
+    by calling itself. Holds the credential and the HTTP transport; everything
+    that can be tested offline — :meth:`_headers`, :meth:`_payload`,
+    :meth:`_parse` — is a pure method.
+
+    Attributes:
+        credential: The Anthropic credential. An OAuth subscription token
+            (``sk-ant-oat...``) is sent as ``Authorization: Bearer`` with the
+            OAuth beta header; any other value is treated as a raw API key on
+            ``x-api-key``.
+        transport: The injected HTTP POST seam.
+        model: The reviewing model id; defaults to Opus 4.8.
+    """
+
+    credential: str
+    transport: HttpTransport
+    model: str = _REVIEW_MODEL
+
+    async def __call__(self, review_input: ReviewInput) -> ReviewPlan:
+        """Review ``review_input``'s diff and return the parsed :class:`ReviewPlan`."""
+        response = await self.transport.post(
+            _MESSAGES_URL,
+            headers=self._headers(),
+            json=self._payload(review_input),
+        )
+        if response.status_code != 200:
+            raise ReviewGenerationError(
+                f"Anthropic Messages API returned {response.status_code}"
+            )
+        return self._parse(response.body)
+
+    def _headers(self) -> dict[str, str]:
+        """Build the request headers, routing the credential to its auth scheme."""
+        headers = {
+            "anthropic-version": _ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+        if self.credential.startswith("sk-ant-oat"):
+            headers["authorization"] = f"Bearer {self.credential}"
+            headers["anthropic-beta"] = _OAUTH_BETA
+        else:
+            headers["x-api-key"] = self.credential
+        return headers
+
+    def _payload(self, review_input: ReviewInput) -> dict[str, Any]:
+        """Assemble the Messages API request body for one round's review.
+
+        The internal reviewer is the highest-rigor Opus role, so the request carries
+        the "max" reasoning-effort tier via ``output_config.effort`` (Opus 4.8 removed
+        the extended-thinking ``budget_tokens`` mechanism, which now returns HTTP 400).
+        """
+        merged = ", ".join(f"#{n}" for n in review_input.merged_issues) or "(none)"
+        user = (
+            f"Merged round of PRD #{review_input.prd_number} in "
+            f"{review_input.repo_full_name}.\n"
+            f"Merged issues, in merge order: {merged}.\n"
+            "Review the following merged diff and emit findings as JSON matching "
+            "the schema:\n\n"
+            f"{review_input.diff}"
+        )
+        return {
+            "model": self.model,
+            "max_tokens": _MAX_TOKENS,
+            "output_config": {"effort": _EFFORT_MAX},
+            "system": _REVIEW_SYSTEM,
+            "messages": [{"role": "user", "content": user}],
+            "response_format": {"type": "json_schema", "json_schema": _REVIEW_SCHEMA},
+        }
+
+    def _parse(self, body: dict[str, Any]) -> ReviewPlan:
+        """Parse a Messages API response body into a :class:`ReviewPlan`.
+
+        Reads the concatenated ``text`` content blocks, loads them as the schema
+        JSON, and builds one :class:`ReviewFinding` per entry. A response missing
+        text, or carrying malformed JSON or a non-list ``findings``, raises
+        :class:`ReviewGenerationError` rather than silently filing nothing.
+        """
+        text = "".join(
+            block.get("text", "")
+            for block in body.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        if not text.strip():
+            raise ReviewGenerationError("Messages API response carried no text content")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ReviewGenerationError(f"Reviewer emitted invalid JSON: {exc}") from exc
+
+        raw_findings = parsed.get("findings")
+        if not isinstance(raw_findings, list):
+            raise ReviewGenerationError("Reviewer JSON missing a 'findings' list")
+
+        findings = [
+            ReviewFinding(
+                title=str(item["title"]),
+                body=str(item["body"]),
+                blocks_issues=[int(n) for n in item.get("blocks_issues", [])],
+            )
+            for item in raw_findings
+        ]
+        return ReviewPlan(findings=findings)
+
+
+class ReviewGenerationError(RuntimeError):
+    """The headless reviewer failed to produce a usable :class:`ReviewPlan`."""
+
+
+# ---------------------------------------------------------------------------
+# Real gh-cli BlockedByEditor (production adapter behind the BlockedByEditor seam).
+#
+# Wires a filed review-fix issue into a dependent's ``## Blocked by`` block by
+# editing the dependent's issue body via ``gh``. The flow is read-modify-write:
+# read the dependent's current body (``gh issue view --json body``), add the
+# ``#<fix>`` reference to its ``## Blocked by`` block (matching the slicer's block
+# shape), then write it back (``gh issue edit --body``). The process spawn is the
+# only side effect, taken behind the injected :class:`GhRunner` protocol so the
+# pure parts — auth-env build, command assembly, body parsing, block rendering —
+# are exercised without a live ``gh`` or network.
+#
+# gh is authenticated via ``GH_TOKEN`` in the environment (gh sends it as
+# ``Authorization: Bearer`` on every REST/GraphQL call), so the adapter never
+# assembles an auth header itself — it injects the token and lets gh own the wire.
+# ---------------------------------------------------------------------------
+
+_BLOCKED_BY_HEADING = "## Blocked by"
+
+
+@dataclass(frozen=True)
+class GhResult:
+    """Captured result of a single ``gh`` invocation.
+
+    Attributes:
+        exit_code: ``gh``'s process exit status; ``0`` means success.
+        stdout: Captured standard output (the issue body payload to parse).
+        stderr: Captured standard error (surfaced in the error on failure).
+    """
+
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """True when ``gh`` exited successfully (exit code 0)."""
+        return self.exit_code == 0
+
+
+class GhRunner(Protocol):
+    """Runs a single ``gh`` command. The process-spawn seam under the editor.
+
+    A production implementation spawns ``gh`` as a subprocess with ``env`` merged
+    into its environment (so ``GH_TOKEN`` authenticates the call) and returns the
+    captured :class:`GhResult`; tests inject a fake that records each ``(args, env)``
+    and returns a canned result. ``args`` never includes the leading ``"gh"`` — the
+    runner owns the executable name.
+    """
+
+    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
+        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
+        ...
+
+
+class GhCommandError(RuntimeError):
+    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
+
+    def __init__(self, command: list[str], result: GhResult) -> None:
+        self.command = command
+        self.result = result
+        super().__init__(
+            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
+        )
+
+
+def _gh_auth_env(token: str) -> dict[str, str]:
+    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
+
+    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on
+    every REST/GraphQL call, so the adapter injects the token here and lets ``gh``
+    own the wire format rather than assembling a header itself.
+    """
+    return {"GH_TOKEN": token}
+
+
+def _issue_view_args(repo_full_name: str, issue_number: int) -> list[str]:
+    """Assemble the ``gh issue view`` argv reading the dependent's body as JSON."""
+    return [
+        "issue",
+        "view",
+        str(issue_number),
+        "--repo",
+        repo_full_name,
+        "--json",
+        "body",
+    ]
+
+
+def _issue_edit_args(repo_full_name: str, issue_number: int, body: str) -> list[str]:
+    """Assemble the ``gh issue edit`` argv writing ``body`` back to the dependent."""
+    return [
+        "issue",
+        "edit",
+        str(issue_number),
+        "--repo",
+        repo_full_name,
+        "--body",
+        body,
+    ]
+
+
+def _parse_issue_body(stdout: str) -> str:
+    """Parse ``gh issue view --json body`` output into the issue body string.
+
+    ``gh`` emits ``{"body": "<str>"}``. Raises :class:`ValueError` when the payload
+    is not JSON or is missing the ``body`` field, so a malformed response fails
+    loudly rather than clobbering the dependent's body with junk.
+    """
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"gh issue view returned non-JSON output: {stdout!r}") from exc
+    if not isinstance(payload, dict) or "body" not in payload:
+        raise ValueError(f"gh issue view output missing body: {stdout!r}")
+    return str(payload["body"])
+
+
+def add_blocked_by(body: str, blocker: int) -> str:
+    """Return ``body`` with ``#<blocker>`` added to its ``## Blocked by`` block.
+
+    Matches the slicer's block shape: a ``## Blocked by`` heading followed by one
+    ``#N`` reference per line. The edit is idempotent — a blocker already listed
+    yields the body unchanged — and a body without the block grows one appended at
+    the end, so a dependent the slicer never gave a block still gets wired.
+    """
+    existing, prefix = _split_blocked_by(body)
+    if blocker in existing:
+        return body
+    refs = "\n".join(f"#{n}" for n in [*existing, blocker])
+    block = f"{_BLOCKED_BY_HEADING}\n{refs}"
+    return f"{prefix}\n\n{block}" if prefix else block
+
+
+def _split_blocked_by(body: str) -> tuple[list[int], str]:
+    """Split ``body`` into its existing blocker numbers and the text before the block.
+
+    Returns ``(blockers, prefix)`` where ``prefix`` is everything ahead of the
+    ``## Blocked by`` heading (the whole body, right-stripped, when there is no
+    block). Only well-formed ``#<int>`` lines inside the block are read as blockers;
+    a non-reference line ends the block so trailing prose is preserved in ``prefix``.
+    """
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == _BLOCKED_BY_HEADING:
+            blockers: list[int] = []
+            for ref in lines[index + 1 :]:
+                stripped = ref.strip()
+                if stripped.startswith("#") and stripped[1:].isdigit():
+                    blockers.append(int(stripped[1:]))
+                elif stripped:
+                    break
+            prefix = "\n".join(lines[:index]).rstrip()
+            return blockers, prefix
+    return [], body.rstrip()
+
+
+@dataclass(frozen=True)
+class GhCliBlockedByEditor:
+    """Real :data:`BlockedByEditor`: wire a review-fix into a dependent via ``gh``.
+
+    Satisfies the ``edit`` protocol ``(EditBlockedByRequest) -> Awaitable[None]`` by
+    calling itself: it reads the dependent issue's body, adds the ``#<fix>``
+    reference to its ``## Blocked by`` block (idempotently), and writes the body
+    back. The injected :class:`GhRunner` is the only side-effecting seam, so command
+    assembly and body rendering are unit-testable without a live ``gh`` or network.
+
+    Attributes:
+        runner: The process-spawn seam that runs each ``gh`` command.
+        token: The token ``gh`` authenticates with (sent as ``GH_TOKEN``).
+    """
+
+    runner: GhRunner
+    token: str
+
+    async def __call__(self, request: EditBlockedByRequest) -> None:
+        """Add ``request.add_blocker`` to the dependent's ``## Blocked by`` block."""
+        body = await self._read_body(request.repo_full_name, request.issue_number)
+        updated = add_blocked_by(body, request.add_blocker)
+        if updated == body:
+            logger.info(
+                "#%d already blocked by #%d in %s; no edit",
+                request.issue_number,
+                request.add_blocker,
+                request.repo_full_name,
+            )
+            return
+        await self._gh(
+            _issue_edit_args(request.repo_full_name, request.issue_number, updated)
+        )
+
+    async def _read_body(self, repo_full_name: str, issue_number: int) -> str:
+        """Read the dependent issue's current body via ``gh issue view``."""
+        result = await self._gh(_issue_view_args(repo_full_name, issue_number))
+        return _parse_issue_body(result.stdout)
+
+    async def _gh(self, args: list[str]) -> GhResult:
+        """Run one ``gh`` command authenticated with the token, raising on failure."""
+        result = await self.runner.run(args, env=_gh_auth_env(self.token))
+        if not result.ok:
+            raise GhCommandError(args, result)
+        return result
 
 
 async def review_round(

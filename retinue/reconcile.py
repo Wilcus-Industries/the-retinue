@@ -36,6 +36,7 @@ SQLite file — no real ``gh``, no network.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -177,6 +178,36 @@ class RunStateStore:
             return None
         return int(row[0])
 
+    async def round_for_pr(
+        self, *, repo_full_name: str, pr_number: int
+    ) -> tuple[int, list[int]] | None:
+        """Return the ``(prd_number, slice_numbers)`` a PR maps to, or None if unknown.
+
+        The reverse of :meth:`record_pr`: a merged-PR or review event arrives keyed by PR
+        number, but the loopback and reap need the parent PRD and its owned slice set.
+        Scoped to the repo so a PR number is never confused across repos.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The staging PR number recorded for some PRD round.
+
+        Returns:
+            ``(prd_number, slice_numbers)`` when a row maps the PR, else ``None``.
+        """
+        prefix = f"{repo_full_name}#"
+        async with self._connect() as db:
+            await db.execute(_SCHEMA)
+            async with db.execute(
+                "SELECT prd_key, slices FROM run_state "
+                "WHERE pr_number = ? AND prd_key LIKE ?",
+                (pr_number, f"{prefix}%"),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        prd_number = int(str(row[0]).rsplit("#", 1)[-1])
+        return prd_number, _decode_slices(row[1])
+
     def _connect(self) -> aiosqlite.Connection:
         """Open a fresh DB connection, ensuring the parent dir exists first."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +245,157 @@ class ReconcileGh(Protocol):
     async def staging_pr(self, *, repo_full_name: str, prd_number: int) -> int | None:
         """Return the open ``retinue/prd-<n>`` -> staging PR number, or None."""
         ...
+
+
+class GhRunner(Protocol):
+    """Runs one ``gh`` invocation and returns its stdout. The gh-subprocess seam.
+
+    The production :class:`GhCliReconcile` assembles ``gh`` argv and parses the JSON
+    stdout; the actual subprocess spawn (and its installation-token env) lives behind
+    this one callable so the command-assembly and payload-parsing are unit-testable
+    without spawning a process or touching the network. A production runner shells out
+    to ``gh`` with :func:`gh_env` in the child environment; tests inject a fake that
+    returns canned JSON and records the argv it was handed.
+    """
+
+    async def __call__(self, argv: list[str]) -> str:
+        """Run ``gh`` with ``argv`` and return its captured stdout (raises on failure)."""
+        ...
+
+
+def gh_env(token: str, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the child-process environment that authenticates ``gh`` as the installation.
+
+    ``gh`` reads its credential from ``GH_TOKEN`` (preferred over ``GITHUB_TOKEN``); the
+    installation access token minted by :class:`retinue.github_app.InstallationAuth` goes
+    there. ``GH_PROMPT_DISABLED`` keeps a non-interactive worker from ever blocking on a
+    prompt. The token is the same ``Authorization: Bearer`` credential ``gh`` sends.
+
+    Args:
+        token: The installation access token to authenticate ``gh`` with.
+        base_env: The environment to extend (e.g. ``os.environ``); defaults to empty so
+            the build is pure and testable. A copy is returned; the input is untouched.
+
+    Returns:
+        A new env dict carrying ``GH_TOKEN`` and the non-interactive flags.
+    """
+    env = dict(base_env or {})
+    env["GH_TOKEN"] = token
+    env["GH_PROMPT_DISABLED"] = "1"
+    return env
+
+
+def _issue_state_argv(repo_full_name: str, issue_number: int) -> list[str]:
+    """Assemble the ``gh`` argv that reads one issue's open/closed state as JSON."""
+    return [
+        "api",
+        f"repos/{repo_full_name}/issues/{issue_number}",
+        "--jq",
+        "{state: .state}",
+    ]
+
+
+def _compare_argv(repo_full_name: str, base: str, head: str) -> list[str]:
+    """Assemble the ``gh`` argv comparing ``base...head`` (does base contain head?)."""
+    return [
+        "api",
+        f"repos/{repo_full_name}/compare/{base}...{head}",
+        "--jq",
+        "{ahead_by: .ahead_by, status: .status}",
+    ]
+
+
+def _staging_pr_argv(repo_full_name: str, head: str, base: str) -> list[str]:
+    """Assemble the ``gh`` argv listing the open ``head`` -> ``base`` PRs as JSON."""
+    return [
+        "pr",
+        "list",
+        "--repo",
+        repo_full_name,
+        "--head",
+        head,
+        "--base",
+        base,
+        "--state",
+        "open",
+        "--json",
+        "number",
+    ]
+
+
+def _parse_issue_closed(stdout: str) -> bool:
+    """Parse an issue-state payload: True when GitHub reports the issue ``closed``."""
+    payload = json.loads(stdout)
+    return bool(payload.get("state") == "closed")
+
+
+def _parse_branch_merged(stdout: str) -> bool:
+    """Parse a compare payload: True when the base already contains the head branch.
+
+    ``base...head`` reports how far ``head`` is *ahead of* ``base``; ``ahead_by == 0``
+    means every commit on the issue branch already landed on the integration branch, so
+    the slice's work is merged (GitHub's ``status`` is then ``identical`` or ``behind``).
+    """
+    payload = json.loads(stdout)
+    return int(payload.get("ahead_by", 0)) == 0
+
+
+def _parse_staging_pr(stdout: str) -> int | None:
+    """Parse a ``pr list --json number`` payload: the first PR number, or None if empty."""
+    payload = json.loads(stdout)
+    if not payload:
+        return None
+    return int(payload[0]["number"])
+
+
+class GhCliReconcile:
+    """Production :class:`ReconcileGh`: reads GitHub truth by shelling out to ``gh``.
+
+    Each query assembles a ``gh`` argv, runs it through the injected :class:`GhRunner`,
+    and parses the JSON stdout into the protocol's return type. ``issue_closed`` reads the
+    issue state; ``branch_merged`` asks whether the integration branch already contains the
+    ``issue-<N>`` branch (a ``base...head`` compare with ``ahead_by == 0``); ``staging_pr``
+    lists the open ``retinue/prd-<n>`` -> staging PR. The subprocess spawn and its
+    installation-token env live in the runner (see :func:`gh_env`), so this class is pure
+    command-assembly plus payload-parsing.
+
+    The ``branch_merged`` query asks whether a *merge target* already contains the
+    ``issue-<N>`` branch. The orchestrator merges slice branches into the integration
+    branch, but the protocol signature carries only the branch name (no PRD number), so
+    the comparison base is fixed at construction: ``merge_base`` is the branch a landed
+    slice's commits are guaranteed to reach (the staging branch the integration flow
+    lands into). A slice whose commits are all already on that base reports ``ahead_by 0``.
+
+    Args:
+        runner: The injected gh-subprocess seam that runs an argv and returns stdout.
+        merge_base: The branch ``branch_merged`` compares a slice branch against (the
+            staging branch landed work reaches). Also the base a staging PR opens into.
+            Defaults to ``"staging"``.
+    """
+
+    def __init__(self, runner: GhRunner, *, merge_base: str = "staging") -> None:
+        self._runner = runner
+        self._merge_base = merge_base
+
+    async def issue_closed(self, *, repo_full_name: str, issue_number: int) -> bool:
+        """Return True when GitHub reports ``issue_number`` closed on the repo."""
+        stdout = await self._runner(_issue_state_argv(repo_full_name, issue_number))
+        return _parse_issue_closed(stdout)
+
+    async def branch_merged(self, *, repo_full_name: str, branch: str) -> bool:
+        """Return True when the merge base already contains ``branch`` (ahead_by 0)."""
+        stdout = await self._runner(
+            _compare_argv(repo_full_name, self._merge_base, branch)
+        )
+        return _parse_branch_merged(stdout)
+
+    async def staging_pr(self, *, repo_full_name: str, prd_number: int) -> int | None:
+        """Return the open ``retinue/prd-<n>`` -> staging PR number, or None."""
+        head = integration_branch(prd_number)
+        stdout = await self._runner(
+            _staging_pr_argv(repo_full_name, head, self._merge_base)
+        )
+        return _parse_staging_pr(stdout)
 
 
 class ResumePhase(enum.Enum):

@@ -23,12 +23,17 @@ so both flows run with no real ``gh``, push service, or network in a unit test.
 
 from __future__ import annotations
 
+import asyncio
 import enum
+import json
 import logging
+import os
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from retinue.notify import Notification, Notifier
+from retinue.slicer import HITL_LABEL
 
 logger = logging.getLogger(__name__)
 
@@ -240,3 +245,148 @@ async def _all_non_hitl_children_closed(
         for child in children
         if not child.hitl
     )
+
+
+# --- production gh-cli reap seam --------------------------------------------------
+
+# The child-enumeration query asks ``gh`` for every issue (open or closed) carrying the
+# slicer's ``Part of #<prd>`` marker, returning just the fields the reap gate reads.
+_CHILD_JSON_FIELDS = "number,state,labels"
+
+# A subprocess runner: given the ``gh`` argv (no leading "gh") and the auth env, returns
+# the command's stdout. The default runs a real ``gh`` child; tests inject a fake to
+# exercise the pure command-assembly + payload-parsing without a network or a real CLI.
+GhRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[str]]
+
+
+def _auth_env(token: str | None) -> dict[str, str]:
+    """Build the ``gh`` subprocess environment, injecting the token when supplied.
+
+    ``gh`` reads its credential from ``GH_TOKEN`` (preferred over the host's
+    ``gh auth`` state), so a per-call installation token is threaded in via that env
+    var rather than a literal ``Authorization`` header. With no token the host's own
+    ``gh`` auth is used and the parent environment passes through unchanged.
+    """
+    env = dict(os.environ)
+    if token is not None:
+        env["GH_TOKEN"] = token
+    return env
+
+
+def _close_issue_argv(*, repo_full_name: str, issue_number: int) -> list[str]:
+    """Assemble the ``gh issue close`` argv (without the leading ``gh``)."""
+    return [
+        "issue",
+        "close",
+        str(issue_number),
+        "--repo",
+        repo_full_name,
+    ]
+
+
+def _children_query_argv(*, repo_full_name: str, prd_number: int) -> list[str]:
+    """Assemble the child-enumeration argv: every issue marked ``Part of #<prd>``.
+
+    Uses ``gh issue list`` with the ``Part of #<prd>`` search term (the slicer's child
+    marker) and ``--state all`` so closed children are returned too, emitting the
+    closed-state + labels the reap gate parses.
+    """
+    return [
+        "issue",
+        "list",
+        "--repo",
+        repo_full_name,
+        "--state",
+        "all",
+        "--search",
+        f"Part of #{prd_number} in:body",
+        "--json",
+        _CHILD_JSON_FIELDS,
+    ]
+
+
+def _parse_children(stdout: str) -> list[ChildIssue]:
+    """Parse ``gh issue list --json`` stdout into :class:`ChildIssue` records.
+
+    Each issue's ``state`` ("OPEN"/"CLOSED", case-insensitive) becomes ``closed`` and
+    the presence of the ``hitl`` label becomes ``hitl``. Empty/whitespace stdout (``gh``
+    prints nothing when there are no matches) parses to an empty child list.
+    """
+    text = stdout.strip()
+    if not text:
+        return []
+    issues = json.loads(text)
+    children: list[ChildIssue] = []
+    for issue in issues:
+        labels = {label["name"] for label in issue.get("labels", [])}
+        children.append(
+            ChildIssue(
+                number=int(issue["number"]),
+                closed=str(issue["state"]).upper() == "CLOSED",
+                hitl=HITL_LABEL in labels,
+            )
+        )
+    return children
+
+
+async def _run_gh(argv: Sequence[str], env: Mapping[str, str]) -> str:
+    """Run a real ``gh`` subprocess, returning stdout; raise on a non-zero exit.
+
+    Uses ``create_subprocess_exec`` (argv list, no shell) so the assembled command is
+    passed verbatim and never interpolated through a shell.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "gh",
+        *argv,
+        env=dict(env),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"gh {' '.join(argv)} exited {process.returncode}: "
+            f"{stderr.decode(errors='replace').strip()}"
+        )
+    return stdout.decode()
+
+
+@dataclass(frozen=True)
+class HandoffGh:
+    """The production gh-cli :class:`Handoff`: close issues + enumerate PRD children.
+
+    Backs :func:`reap_merged_pr` against a live ``gh`` CLI. ``close_issue`` runs
+    ``gh issue close``; ``children_of`` runs ``gh issue list`` for the slicer's
+    ``Part of #<prd>`` marker and parses the JSON into :class:`ChildIssue` records.
+    There is deliberately **no** merge method — the retinue never merges.
+
+    The command assembly (:func:`_close_issue_argv`, :func:`_children_query_argv`), the
+    auth env build (:func:`_auth_env`), and the payload parse (:func:`_parse_children`)
+    are pure and unit-tested directly. The subprocess itself is the injected ``runner``
+    (default: a real ``gh`` child), so the seam is exercisable without a network.
+
+    Attributes:
+        token: An optional ``gh`` token (e.g. a GitHub App installation token), threaded
+            in via ``GH_TOKEN``; ``None`` falls back to the host's own ``gh`` auth.
+        runner: The subprocess runner; defaults to a real ``gh`` invocation.
+    """
+
+    token: str | None = None
+    runner: GhRunner = _run_gh
+
+    async def close_issue(self, *, repo_full_name: str, issue_number: int) -> None:
+        """Close ``issue_number`` on ``repo_full_name`` via ``gh issue close``."""
+        argv = _close_issue_argv(
+            repo_full_name=repo_full_name, issue_number=issue_number
+        )
+        await self.runner(argv, _auth_env(self.token))
+
+    async def children_of(
+        self, *, repo_full_name: str, prd_number: int
+    ) -> list[ChildIssue]:
+        """Return the PRD's children (issues carrying ``Part of #<prd>``)."""
+        argv = _children_query_argv(
+            repo_full_name=repo_full_name, prd_number=prd_number
+        )
+        stdout = await self.runner(argv, _auth_env(self.token))
+        return _parse_children(stdout)

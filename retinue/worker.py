@@ -11,6 +11,8 @@ or via the ``retinue-worker`` console script.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import enum
 import logging
 import sys
@@ -18,18 +20,45 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from arq.connections import RedisSettings
 
 from retinue.dedupe import PrdDedupeStore, prd_dedupe_key
+from retinue.github_app import InstallationAuth
+from retinue.handoff import MergedPullRequest
+from retinue.loopback import (
+    HeimdallFinding,
+    HeimdallReview,
+    ReviewState,
+    Severity,
+)
+from retinue.pipeline import ClaudeMdFetcher, Pipeline, build_pipeline_factory
 from retinue.queue import PrdJob
 from retinue.repo_config import RepoConfig, load_repo_config
 
 logger = logging.getLogger(__name__)
 
 # Async callable that returns a repo's raw ``.github/retinue.yml`` text, or None
-# when the repo has no such file. The real GitHub fetch is injected at this seam so
-# the gate is testable without network; the fetcher is a later issue's concern.
+# when the repo has no such file. The GitHub fetch is injected at this seam so the
+# gate is testable without network; :func:`github_config_fetcher` builds the real one.
 ConfigFetcher = Callable[[str], Awaitable[str | None]]
+
+# Builds a :class:`~retinue.pipeline.Pipeline` for an accepted repo. Async so the
+# production factory can mint a per-repo installation token before constructing the gh
+# adapters. Injected onto the Arq context by :func:`on_startup` so the worker tasks stay
+# testable with a fake factory; production binds it to a factory over the real adapters.
+PipelineFactory = Callable[[str, RepoConfig], Awaitable[Pipeline]]
+
+# Async callable returning a PRD/issue body text given (repo, issue number). The gh
+# issue read the slicer needs, injected so the worker is testable without a live gh.
+IssueBodyFetcher = Callable[[str, int], Awaitable[str]]
+
+# Path of the opt-in config file inside each repo, fetched over the contents API.
+RETINUE_CONFIG_PATH = ".github/retinue.yml"
+# Path of the repo's CLAUDE.md, fetched over the contents API to source the done-check
+# command the build gates on (a missing file reads as empty text).
+CLAUDE_MD_PATH = "CLAUDE.md"
+GITHUB_API_BASE_URL = "https://api.github.com"
 
 
 class GateOutcome(enum.Enum):
@@ -134,7 +163,7 @@ async def process_prd(
         return
 
     result = await gate_prd(job, fetch_config=fetch_config, dedupe=dedupe)
-    if result.outcome is not GateOutcome.ACCEPTED:
+    if result.outcome is not GateOutcome.ACCEPTED or result.config is None:
         return
 
     logger.info(
@@ -142,8 +171,224 @@ async def process_prd(
         repo_full_name,
         issue_number,
         action,
-        result.config.staging_branch if result.config else "?",
+        result.config.staging_branch,
     )
+
+    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
+    if pipeline_factory is None:
+        # No real pipeline wired (bare worker / round-trip skeleton): the gate ran and
+        # accepted, but there is nothing downstream to drive. Stop after the accept log.
+        return
+
+    pipeline = await pipeline_factory(repo_full_name, result.config)
+    prd_result = await pipeline.process_prd_job(
+        repo_full_name=repo_full_name,
+        prd_number=issue_number,
+        prd_body=await _load_prd_body(ctx, repo_full_name, issue_number),
+    )
+    logger.info(
+        "Pipeline for %s#%d: sliced=%s pr_opened=%s",
+        repo_full_name,
+        issue_number,
+        prd_result.sliced,
+        prd_result.pr_opened,
+    )
+
+
+async def process_review_job(
+    ctx: dict[str, Any],
+    *,
+    repo_full_name: str,
+    pr_number: int,
+    review_state: str,
+    review_body: str = "",
+) -> None:
+    """Arq task: drive the heimdall loopback for one ``pull_request_review`` event.
+
+    Parses the review into a :class:`~retinue.loopback.HeimdallReview` and hands it to
+    the wired pipeline (rebuild / converge / escalate). The repo config is fetched the
+    same way the PRD gate fetches it; a repo no longer opted in is a skip. With no
+    pipeline wired (the bare worker) the event is logged and dropped.
+
+    Args:
+        ctx: Arq worker context carrying ``fetch_config`` and ``pipeline_factory``.
+        repo_full_name: e.g. "owner/repo".
+        pr_number: The reviewed PR number.
+        review_state: The gh review state.
+        review_body: The review body heimdall findings are parsed from.
+    """
+    config = await _config_for(ctx, repo_full_name)
+    if config is None:
+        return
+    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
+    if pipeline_factory is None:
+        logger.info("No pipeline wired; dropping review for %s PR #%d", repo_full_name, pr_number)
+        return
+
+    pipeline = await pipeline_factory(repo_full_name, config)
+    mapping = await pipeline.round_for_pr(
+        repo_full_name=repo_full_name, pr_number=pr_number
+    )
+    if mapping is None:
+        # A review on a PR the retinue never opened (not in run-state): not ours to act on.
+        logger.info("Review for unknown PR %s #%d; skipping", repo_full_name, pr_number)
+        return
+    prd_number, _slice_numbers = mapping
+
+    review = parse_heimdall_review(
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        prd_number=prd_number,
+        review_state=review_state,
+        review_body=review_body,
+    )
+    result = await pipeline.process_review(review)
+    logger.info(
+        "Loopback for %s PR #%d: %s", repo_full_name, pr_number, result.outcome.value
+    )
+
+
+async def reap_pr_job(
+    ctx: dict[str, Any],
+    *,
+    repo_full_name: str,
+    pr_number: int,
+) -> None:
+    """Arq task: reap a human-merged PR (close slice issues, then reap the PRD).
+
+    Resolves the PR's PRD and slice issues from the run-state store recorded when the
+    PRD round opened the PR, then drives the pipeline reap. With no pipeline wired the
+    event is logged and dropped.
+
+    Args:
+        ctx: Arq worker context carrying ``fetch_config`` and ``pipeline_factory``.
+        repo_full_name: e.g. "owner/repo".
+        pr_number: The merged PR number.
+    """
+    config = await _config_for(ctx, repo_full_name)
+    if config is None:
+        return
+    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
+    if pipeline_factory is None:
+        logger.info("No pipeline wired; dropping merge of %s PR #%d", repo_full_name, pr_number)
+        return
+
+    pipeline = await pipeline_factory(repo_full_name, config)
+    mapping = await pipeline.round_for_pr(
+        repo_full_name=repo_full_name, pr_number=pr_number
+    )
+    if mapping is None:
+        logger.info("Merge of unknown PR %s #%d; skipping reap", repo_full_name, pr_number)
+        return
+    prd_number, slice_numbers = mapping
+    merged = MergedPullRequest(
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        prd_number=prd_number,
+        slice_issues=slice_numbers,
+    )
+    result = await pipeline.reap_pr(merged)
+    logger.info(
+        "Reap for %s PR #%d: %s", repo_full_name, pr_number, result.outcome.value
+    )
+
+
+async def _config_for(ctx: dict[str, Any], repo_full_name: str) -> RepoConfig | None:
+    """Fetch and parse a repo's opt-in config the same way the PRD gate does.
+
+    A repo with no config or a malformed one is treated as not opted in (``None``), so a
+    review/merge event for a de-opted repo is a skip rather than a crash.
+    """
+    fetch_config: ConfigFetcher | None = ctx.get("fetch_config")
+    if fetch_config is None:
+        return None
+    raw = await fetch_config(repo_full_name)
+    if raw is None:
+        return None
+    return load_repo_config(raw)
+
+
+async def _load_prd_body(
+    ctx: dict[str, Any], repo_full_name: str, issue_number: int
+) -> str:
+    """Read the PRD issue body the slicer slices, via the injected fetcher.
+
+    The body fetch is an injected ``fetch_prd_body`` seam (the gh issue read), so the
+    worker stays testable without a live gh; the bare worker has no fetcher and yields
+    an empty body, which the slicer escalates as too thin.
+    """
+    fetch_body: IssueBodyFetcher | None = ctx.get("fetch_prd_body")
+    if fetch_body is None:
+        return ""
+    return await fetch_body(repo_full_name, issue_number)
+
+
+# gh review states map onto the loopback's three-valued review state. ``dismissed`` and
+# any unrecognised state are read as a plain comment (no verdict), so an odd state never
+# blocks or converges on its own.
+_REVIEW_STATE_MAP = {
+    "approved": ReviewState.APPROVED,
+    "changes_requested": ReviewState.REQUEST_CHANGES,
+    "request_changes": ReviewState.REQUEST_CHANGES,
+    "commented": ReviewState.COMMENTED,
+}
+
+
+def parse_heimdall_review(
+    *,
+    repo_full_name: str,
+    pr_number: int,
+    prd_number: int,
+    review_state: str,
+    review_body: str,
+) -> HeimdallReview:
+    """Parse a ``pull_request_review`` into a :class:`~retinue.loopback.HeimdallReview`.
+
+    Maps the gh review ``state`` onto the loopback's three-valued state and reads
+    heimdall's findings out of the review body — one finding per
+    ``<severity>: <summary>`` line (severity is one of low/medium/high/critical,
+    case-insensitive); a line without that shape is ignored as prose. The integration
+    branch is derived from the PRD number (``retinue/prd-<n>``). Pure and value-free, so
+    it is unit-tested without a live gh.
+
+    Args:
+        repo_full_name: e.g. "owner/repo".
+        pr_number: The reviewed PR number.
+        prd_number: The parent PRD (resolved from run-state); also the issue an
+            escalation comments/labels and the integration branch's number.
+        review_state: The gh review state string.
+        review_body: The review body to parse findings from.
+
+    Returns:
+        The parsed :class:`HeimdallReview`.
+    """
+    from retinue.orchestrator import integration_branch
+
+    state = _REVIEW_STATE_MAP.get(review_state.lower(), ReviewState.COMMENTED)
+    return HeimdallReview(
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        prd_number=prd_number,
+        prd_issue_number=prd_number,
+        integration_branch=integration_branch(prd_number),
+        state=state,
+        findings=_parse_findings(review_body),
+    )
+
+
+def _parse_findings(review_body: str) -> list[HeimdallFinding]:
+    """Parse ``<severity>: <summary>`` lines from a review body into findings."""
+    findings: list[HeimdallFinding] = []
+    for line in review_body.splitlines():
+        prefix, sep, summary = line.partition(":")
+        if not sep or not summary.strip():
+            continue
+        try:
+            severity = Severity[prefix.strip().upper()]
+        except KeyError:
+            continue
+        findings.append(HeimdallFinding(summary=summary.strip(), severity=severity))
+    return findings
 
 
 def _configure_logging() -> None:
@@ -162,28 +407,217 @@ def _configure_logging() -> None:
     )
 
 
-async def _fetch_repo_config(repo_full_name: str) -> str | None:
-    """Default config fetcher: no config available yet (the GitHub fetch is pending).
+def _repo_contents_url(repo_full_name: str, path: str) -> str:
+    """Build the GitHub contents-API URL for a file at ``path`` in a repo."""
+    return f"{GITHUB_API_BASE_URL}/repos/{repo_full_name}/contents/{path}"
 
-    The real implementation — fetching ``.github/retinue.yml`` over the GitHub
-    contents API — lands in a later issue. Until then every repo reads as not opted
-    in, which is the safe default: nothing is processed without an explicit config.
+
+def _contents_url(repo_full_name: str) -> str:
+    """Build the GitHub contents-API URL for a repo's ``.github/retinue.yml``."""
+    return _repo_contents_url(repo_full_name, RETINUE_CONFIG_PATH)
+
+
+def _auth_headers(token: str) -> dict[str, str]:
+    """Build the request headers authorising a GitHub contents-API read.
+
+    Uses the documented ``Bearer`` scheme and pins the v3 contents media type and API
+    version so the response shape (a base64 ``content`` field) is stable.
     """
-    logger.debug("No config fetcher wired; treating %s as not opted in", repo_full_name)
-    return None
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _decode_contents_payload(payload: dict[str, Any]) -> str:
+    """Decode a GitHub contents-API payload into the raw file text.
+
+    The contents API returns the file body base64-encoded in ``content`` (with
+    embedded newlines) under ``encoding: base64``. Decode it to UTF-8 text — the same
+    raw YAML the fake fetcher hands :func:`gate_prd` for parsing.
+
+    Raises:
+        ValueError: when the payload is not a base64-encoded file (unexpected shape,
+            e.g. a directory listing or an unknown encoding).
+    """
+    encoding = payload.get("encoding")
+    if encoding != "base64" or not isinstance(payload.get("content"), str):
+        raise ValueError(f"unexpected contents payload encoding: {encoding!r}")
+    try:
+        return base64.b64decode(payload["content"]).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError) as exc:
+        raise ValueError(f"undecodable contents payload: {exc}") from exc
+
+
+def github_config_fetcher(
+    auth: InstallationAuth, client: httpx.AsyncClient
+) -> ConfigFetcher:
+    """Build the production config fetcher backed by the GitHub contents API.
+
+    The returned async callable mints an installation token for the repo, reads
+    ``.github/retinue.yml`` over the contents API, and returns its raw YAML text — the
+    exact shape :func:`gate_prd` expects. A 404 (no such file) maps to ``None`` so the
+    gate reads the repo as not opted in, matching the injected fake. Any other HTTP
+    error is raised: a transient failure must retry the job, not be silently mistaken
+    for an opted-out repo.
+
+    Args:
+        auth: Mints an installation token scoped to the target repo.
+        client: A shared httpx client used for the contents read.
+
+    Returns:
+        A :class:`ConfigFetcher` returning the raw config text, or ``None`` on 404.
+    """
+
+    async def fetch(repo_full_name: str) -> str | None:
+        installation = await auth.installation_token(repo_full_name)
+        response = await client.get(
+            _contents_url(repo_full_name),
+            headers=_auth_headers(installation.token),
+        )
+        if response.status_code == httpx.codes.NOT_FOUND:
+            return None
+        response.raise_for_status()
+        return _decode_contents_payload(response.json())
+
+    return fetch
+
+
+def _issue_url(repo_full_name: str, issue_number: int) -> str:
+    """Build the GitHub issues-API URL for one issue."""
+    return f"{GITHUB_API_BASE_URL}/repos/{repo_full_name}/issues/{issue_number}"
+
+
+def _github_issue_body_fetcher(
+    auth: InstallationAuth, client: httpx.AsyncClient
+) -> IssueBodyFetcher:
+    """Build the production issue-body fetcher backed by the GitHub issues API.
+
+    Returns an async ``(repo, issue) -> body`` that mints an installation token and reads
+    the issue's ``body`` so the slicer slices the real PRD text. A missing body (``null``)
+    reads as empty string — the slicer escalates an empty PRD as too thin. Any HTTP error
+    is raised so the job retries rather than slicing a phantom body.
+
+    Args:
+        auth: Mints an installation token scoped to the target repo.
+        client: A shared httpx client used for the issue read.
+
+    Returns:
+        An :data:`IssueBodyFetcher` returning the issue body text.
+    """
+
+    async def fetch(repo_full_name: str, issue_number: int) -> str:
+        installation = await auth.installation_token(repo_full_name)
+        response = await client.get(
+            _issue_url(repo_full_name, issue_number),
+            headers=_auth_headers(installation.token),
+        )
+        response.raise_for_status()
+        return str(response.json().get("body") or "")
+
+    return fetch
+
+
+def _github_claude_md_fetcher(
+    auth: InstallationAuth, client: httpx.AsyncClient
+) -> ClaudeMdFetcher:
+    """Build the production ``CLAUDE.md`` fetcher backed by the GitHub contents API.
+
+    Returns an async ``(repo) -> claude_md`` that mints an installation token and reads
+    the target repo's root ``CLAUDE.md`` so the build's done-check command is parsed from
+    the *real* repo text (not an empty default). A repo with no ``CLAUDE.md`` (404) reads
+    as empty text — the pipeline then finds no parseable done-check gate and escalates
+    (:meth:`retinue.pipeline.Pipeline._has_done_check_gate`) rather than running a phantom
+    gate or crash-looping the build. Any other HTTP error is raised so the job retries
+    rather than building against a degraded, empty done-check spec.
+
+    Args:
+        auth: Mints an installation token scoped to the target repo.
+        client: A shared httpx client used for the contents read.
+
+    Returns:
+        A :data:`~retinue.pipeline.ClaudeMdFetcher` returning the ``CLAUDE.md`` text.
+    """
+
+    async def fetch(repo_full_name: str) -> str:
+        installation = await auth.installation_token(repo_full_name)
+        response = await client.get(
+            _repo_contents_url(repo_full_name, CLAUDE_MD_PATH),
+            headers=_auth_headers(installation.token),
+        )
+        if response.status_code == httpx.codes.NOT_FOUND:
+            return ""
+        response.raise_for_status()
+        return _decode_contents_payload(response.json())
+
+    return fetch
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
-    """Populate the worker context with the PRD gate's collaborators.
+    """Populate the worker context with the gate's collaborators and the live pipeline.
 
     Installs the config fetcher and the SQLite-backed dedupe store onto ``ctx`` so
-    :func:`process_prd` can gate each dequeued PRD on opt-in, validity, and novelty.
+    :func:`process_prd` can gate each dequeued PRD on opt-in, validity, and novelty. When
+    GitHub App auth resolves (:func:`_load_github_client`), it also installs the real
+    PRD-body fetcher and a ``pipeline_factory`` over the production adapters — the factory
+    sources each repo's ``CLAUDE.md`` (the done-check command) and binds the live build
+    lane — so an accepted PRD drives the real slice -> build -> staging-PR pipeline. With
+    no auth wired, the fetcher defaults to not-opted-in and no pipeline is installed.
     """
     global settings
     if settings is None:
         settings = _load_settings()
-    ctx["fetch_config"] = _fetch_repo_config
+    wiring = _load_github_client()
+    if wiring is None:
+        # No GitHub App auth wired yet (the concrete InstallationAuth is another
+        # layer's seam): fall back to the safe not-opted-in default so nothing is
+        # processed without an explicit config, rather than crashing the worker. With
+        # no auth there is also no pipeline, so an accepted PRD stops after the gate.
+        ctx["fetch_config"] = _no_config_fetcher
+    else:
+        auth, client = wiring
+        ctx["github_client"] = client
+        ctx["fetch_config"] = github_config_fetcher(auth, client)
+        ctx["fetch_prd_body"] = _github_issue_body_fetcher(auth, client)
+        ctx["pipeline_factory"] = build_pipeline_factory(
+            settings, auth, fetch_claude_md=_github_claude_md_fetcher(auth, client)
+        )
     ctx["dedupe"] = PrdDedupeStore(settings.dedupe_db_path)
+
+
+async def on_shutdown(ctx: dict[str, Any]) -> None:
+    """Close the shared GitHub HTTP client opened in :func:`on_startup`, if any."""
+    client: httpx.AsyncClient | None = ctx.get("github_client")
+    if client is not None:
+        await client.aclose()
+
+
+async def _no_config_fetcher(repo_full_name: str) -> str | None:
+    """Fallback fetcher used when no GitHub App auth is wired: treat repo as opted out.
+
+    The safe default — nothing is processed without an explicit, fetchable config.
+    """
+    logger.debug("No GitHub auth wired; treating %s as not opted in", repo_full_name)
+    return None
+
+
+def _load_github_client() -> tuple[InstallationAuth, httpx.AsyncClient] | None:
+    """Construct the production GitHub installation auth and HTTP client, if available.
+
+    Returns ``None`` when no concrete :class:`~retinue.github_app.InstallationAuth`
+    builder is wired yet — its production implementation is owned by a separate
+    seam/layer (:mod:`retinue.github_app` exposes only the protocol today). In that
+    case the worker falls back to the safe not-opted-in default rather than crashing.
+    Resolved lazily so registering the task (e.g. in tests) needs no GitHub App
+    credentials and opens no network client at import time.
+    """
+    import retinue.github_app as github_app
+
+    builder = getattr(github_app, "build_installation_auth", None)
+    if builder is None:
+        return None
+    return builder(), httpx.AsyncClient(timeout=30.0)
 
 
 # Module-level settings, loaded lazily in main() so importing this module does
@@ -223,8 +657,9 @@ class WorkerSettings:
         arq retinue.worker.WorkerSettings
     """
 
-    functions = [process_prd]
+    functions = [process_prd, process_review_job, reap_pr_job]
     on_startup = on_startup
+    on_shutdown = on_shutdown
     # Overridden from the configured REDIS_URL in main() at process start (arq
     # reads this attribute before on_startup runs); the localhost default keeps it
     # a valid RedisSettings for the ``arq retinue.worker.WorkerSettings`` launch.

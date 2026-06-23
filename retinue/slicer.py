@@ -19,9 +19,11 @@ injected so the slicer is unit-testable without network, Agent SDK, or gh.
 from __future__ import annotations
 
 import enum
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from retinue.notify import Notification, Notifier
 
@@ -29,6 +31,67 @@ logger = logging.getLogger(__name__)
 
 READY_LABEL = "ready-for-agent"
 HITL_LABEL = "hitl"
+
+# The Agent-SDK model that does the slicing, and the OAuth beta header that a
+# subscription token requires. See the claude-api skill: Opus 4.8 is the default
+# model, OAuth tokens go on Authorization: Bearer with the oauth beta header.
+_SLICE_MODEL = "claude-opus-4-8"
+_OAUTH_BETA = "oauth-2025-04-20"
+_MAX_TOKENS = 16_000
+
+# Per-role reasoning effort, expressed as the ``output_config.effort`` tier the Messages
+# API call carries. Opus 4.8 (the model every Opus role pins) removed the extended-
+# thinking ``budget_tokens`` mechanism — it returns HTTP 400 — so effort is the current
+# control (see the claude-api skill). The PRD pins the orchestrator/slicer to the "xhigh"
+# tier and the internal reviewer to the highest "max" tier; these two constants are the
+# shared tiers every Opus role draws from so the effort stays consistent across call
+# sites (the slicer, the internal reviewer, and the conflict resolver). The literal tier
+# strings are self-documenting, so no numeric budget bookkeeping is needed.
+_EFFORT_XHIGH = "xhigh"
+_EFFORT_MAX = "max"
+
+# Strict JSON schema the headless slicer must emit: an ordered list of vertical
+# slices, each with its 1-based intra-PRD blocked_by indices and a hitl flag.
+_SLICE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "slices": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "blocked_by": {"type": "array", "items": {"type": "integer"}},
+                    "hitl": {"type": "boolean"},
+                },
+                "required": ["title", "body", "blocked_by", "hitl"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["slices"],
+    "additionalProperties": False,
+}
+
+# The headless slicer's brief. Kept frozen (no per-request interpolation) so the
+# request prefix is cacheable across PRDs.
+_SLICE_SYSTEM = (
+    "You slice a Product Requirements Doc into tracer-bullet vertical slices. "
+    "Each slice cuts every layer and is demoable on its own. Emit them in "
+    "dependency order — a slice may only depend on earlier ones. Reference an "
+    "earlier slice via its 1-based index in 'blocked_by'. Set 'hitl' true only "
+    "for a genuinely human-only slice (a secret, an external account, or a "
+    "design call) the agent loop must not attempt. Return only the JSON object "
+    "matching the schema; no prose."
+)
+
+# The PRD section the testing seam is read from, and the labeled block the slicer
+# wraps it in so the model honors the PRD's testing decisions instead of inventing
+# its own. The seam is read from the PRD (a locked design decision), so it is injected
+# explicitly rather than left to ride opaquely inside the body.
+_TESTING_DECISIONS_HEADING = "## Testing Decisions"
+_TESTING_SEAM_LABEL = "TESTING SEAM — read from the PRD, honor this, do not invent:"
 
 # A PRD body shorter than this (after stripping) is too thin to slice responsibly.
 _MIN_PRD_BODY_CHARS = 40
@@ -101,6 +164,178 @@ class SliceResult:
 # body; ``create_issue`` files one issue via gh. Both are async and faked in tests.
 SliceGenerator = Callable[[str], Awaitable[SlicePlan]]
 IssueCreator = Callable[[IssueDraft], Awaitable[CreatedIssue]]
+
+
+@dataclass(frozen=True)
+class ClaudeSliceGenerator:
+    """Real :data:`SliceGenerator`: slice a PRD with the Agent SDK (Anthropic API).
+
+    An instance is callable as ``await generator(prd_body)`` — it satisfies the
+    :data:`SliceGenerator` protocol via :meth:`generate`, so it drops straight in
+    where the fake generator sits in tests and at the wiring site.
+
+    The dollar/token metering split mirrors :class:`retinue.config.Settings`:
+    ``auth_mode="api_key"`` authenticates with an ``ANTHROPIC_API_KEY`` (the
+    ``x-api-key`` header the SDK builds from ``api_key``); ``auth_mode=
+    "subscription"`` authenticates with a short-lived OAuth token on
+    ``Authorization: Bearer`` plus the ``oauth-2025-04-20`` beta header.
+
+    The Anthropic SDK is imported lazily inside :meth:`generate` so the module —
+    and the unit tests over the pure header/request/parse helpers — import with
+    no SDK or network present.
+
+    Attributes:
+        token: The API key (``api_key`` mode) or OAuth bearer token
+            (``subscription`` mode).
+        auth_mode: ``"api_key"`` or ``"subscription"``.
+        model: The model the headless slicer runs on.
+    """
+
+    token: str
+    auth_mode: str = "api_key"
+    model: str = _SLICE_MODEL
+
+    async def generate(self, prd_body: str) -> SlicePlan:
+        """Run the headless slicer over ``prd_body`` and return its :class:`SlicePlan`.
+
+        Streams the request (large ``max_tokens``) and parses the strict-schema
+        JSON payload into ordered :class:`IssueDraft` slices. Raises on a response
+        the slicer can't parse; an empty plan is a valid result the caller escalates.
+        """
+        # Lazy import keeps the module (and its unit tests) import-clean: the heavy
+        # ``anthropic`` client is only pulled in when a real slice generation runs.
+        from anthropic import AsyncAnthropic
+
+        client = AsyncAnthropic(**self._client_kwargs())
+        async with client.messages.stream(**self._build_request_kwargs(prd_body)) as stream:
+            message = await stream.get_final_message()
+        return self._parse_plan(_first_text(message.content))
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        """Client constructor kwargs: the key/token and any OAuth default headers.
+
+        In ``api_key`` mode the token rides ``api_key=`` (the SDK renders the
+        ``x-api-key`` header). In ``subscription`` mode it rides ``auth_token=``
+        (rendered as ``Authorization: Bearer``) and the OAuth beta header is added
+        as a default header so it is sent on every request.
+        """
+        if self.auth_mode == "subscription":
+            return {
+                "auth_token": self.token,
+                "default_headers": self._build_auth_headers(),
+            }
+        return {"api_key": self.token}
+
+    def _build_auth_headers(self) -> dict[str, str]:
+        """Extra headers required by the auth mode.
+
+        ``subscription`` (OAuth) must carry ``anthropic-beta: oauth-2025-04-20``;
+        ``api_key`` needs no extra header (the ``x-api-key`` header is built from
+        the key by the SDK).
+        """
+        if self.auth_mode == "subscription":
+            return {"anthropic-beta": _OAUTH_BETA}
+        return {}
+
+    def _build_request_kwargs(self, prd_body: str) -> dict[str, Any]:
+        """Assemble the streaming-request kwargs for one PRD slice run.
+
+        The slicer is the PRD-decision Opus role, so the request carries the "xhigh"
+        reasoning-effort tier via ``output_config.effort`` (Opus 4.8 removed the thinking
+        ``budget_tokens`` mechanism). The effort rides the same ``output_config`` dict as
+        the JSON-schema ``format`` — one output_config carries both.
+
+        The PRD's ``## Testing Decisions`` section is the authoritative testing seam, so
+        it is extracted and prepended as an explicit, labeled block instructing the model
+        to honor it; the full PRD body follows. A PRD without that section keeps the body
+        verbatim (and the caller escalates a thin/malformed PRD before reaching here).
+        """
+        return {
+            "model": self.model,
+            "max_tokens": _MAX_TOKENS,
+            "system": _SLICE_SYSTEM,
+            "output_config": {
+                "effort": _EFFORT_XHIGH,
+                "format": {"type": "json_schema", "schema": _SLICE_SCHEMA},
+            },
+            "messages": [{"role": "user", "content": _build_user_content(prd_body)}],
+        }
+
+    @staticmethod
+    def _parse_plan(payload: str) -> SlicePlan:
+        """Parse the strict-schema JSON ``payload`` into an ordered :class:`SlicePlan`.
+
+        ``blocked_by`` and ``hitl`` are optional in a malformed-but-parseable
+        payload and default to the empty list / ``False``; ``title`` and ``body``
+        are required. Raises :class:`ValueError` if the payload isn't the expected
+        object shape so the caller fails loudly rather than filing junk issues.
+        """
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"slicer returned non-JSON payload: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("slices"), list):
+            raise ValueError("slicer payload missing a 'slices' array")
+
+        slices: list[IssueDraft] = []
+        for raw in data["slices"]:
+            if not isinstance(raw, dict) or "title" not in raw or "body" not in raw:
+                raise ValueError(f"slice is missing title/body: {raw!r}")
+            slices.append(
+                IssueDraft(
+                    title=str(raw["title"]),
+                    body=str(raw["body"]),
+                    blocked_by=[int(i) for i in raw.get("blocked_by", [])],
+                    hitl=bool(raw.get("hitl", False)),
+                )
+            )
+        return SlicePlan(slices=slices)
+
+
+def _build_user_content(prd_body: str) -> str:
+    """Compose the slice request's user message: the testing seam, then the PRD body.
+
+    When the PRD carries a ``## Testing Decisions`` section, its text is prepended as an
+    explicit, labeled block (see :data:`_TESTING_SEAM_LABEL`) so the model honors the
+    PRD's testing decisions instead of inventing its own; the full body still follows so
+    the slicer sees the whole PRD. A PRD without that section yields the body verbatim.
+    """
+    decisions = _extract_testing_decisions(prd_body)
+    if decisions is None:
+        return prd_body
+    return f"{_TESTING_SEAM_LABEL}\n{decisions}\n\n{prd_body}"
+
+
+def _extract_testing_decisions(prd_body: str) -> str | None:
+    """Return the text of the PRD's ``## Testing Decisions`` section, or ``None``.
+
+    The section runs from its heading to the next ``## `` heading (or end of body); the
+    returned text is stripped. ``None`` means the PRD has no such section, so the caller
+    leaves the body untouched rather than fabricating a testing seam.
+    """
+    lines = prd_body.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == _TESTING_DECISIONS_HEADING:
+            section: list[str] = []
+            for body_line in lines[index + 1 :]:
+                if body_line.startswith("## "):
+                    break
+                section.append(body_line)
+            text = "\n".join(section).strip()
+            return text or None
+    return None
+
+
+def _first_text(content: list[Any]) -> str:
+    """Return the first text block's text from a message's content blocks.
+
+    ``output_config.format`` guarantees the JSON arrives as a single leading text
+    block; an empty content array means the model produced nothing to parse.
+    """
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            return str(block.text)
+    raise ValueError("slicer response carried no text block")
 
 
 async def slice_prd(
@@ -241,3 +476,168 @@ def _resolve_blocked_by(blocked_by: list[int], created_numbers: list[int]) -> li
                 len(created_numbers),
             )
     return resolved
+
+
+# --- production gh-cli IssueCreator ------------------------------------------------
+#
+# :func:`slice_prd` (and the review flows that reuse this seam) depend only on the
+# :data:`IssueCreator` protocol. Production wires the concrete
+# :class:`GhCliIssueCreator` below; tests inject a fake that records create calls and
+# returns canned numbers. ``GhCliIssueCreator`` itself does not shell out — it assembles
+# the ``gh issue create`` argv and parses gh's output, delegating the actual process
+# spawn to an injected :class:`GhRunner`. That keeps every pure/parseable part (auth-env
+# build, command assembly, URL parsing) testable with a recording fake runner, never a
+# live ``gh``/network. The local :class:`GhRunner`/:class:`GhResult` mirror the gh-seam
+# shape used in :mod:`retinue.pr_opener` / :mod:`retinue.reconcile`; each module keeps its
+# own copy so the layers stay edit-isolated.
+
+
+@dataclass(frozen=True)
+class GhResult:
+    """Captured result of a single ``gh`` invocation.
+
+    Attributes:
+        exit_code: ``gh``'s process exit status; ``0`` means success.
+        stdout: Captured standard output (the issue URL ``GhCliIssueCreator`` parses).
+        stderr: Captured standard error (surfaced in the error on failure).
+    """
+
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """True when ``gh`` exited successfully (exit code 0)."""
+        return self.exit_code == 0
+
+
+class GhRunner(Protocol):
+    """Runs a single ``gh`` command. The process-spawn seam under :class:`GhCliIssueCreator`.
+
+    A production implementation spawns ``gh`` as a subprocess with ``env`` merged into
+    its environment (so ``GH_TOKEN`` authenticates the call) and returns the captured
+    :class:`GhResult`; tests inject a fake that records each ``(args, env)`` and returns a
+    canned result. ``args`` never includes the leading ``"gh"`` — the runner owns the
+    executable name.
+    """
+
+    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
+        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
+        ...
+
+
+class GhCommandError(RuntimeError):
+    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
+
+    def __init__(self, command: list[str], result: GhResult) -> None:
+        self.command = command
+        self.result = result
+        super().__init__(
+            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
+        )
+
+
+def _auth_env(token: str) -> dict[str, str]:
+    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
+
+    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on every
+    REST/GraphQL call, so the adapter never assembles a header itself — it injects the
+    token here and lets ``gh`` own the wire format.
+    """
+    return {"GH_TOKEN": token}
+
+
+def _issue_create_args(
+    draft: IssueDraft, repo_full_name: str, blocked_by_numbers: list[int]
+) -> list[str]:
+    """Assemble the ``gh issue create`` argv for ``draft`` (no leading ``"gh"``).
+
+    Each of the draft's labels rides its own ``--label`` flag, and every resolved
+    ``Blocked by`` number rides its own ``--blocked-by`` flag so gh records the native
+    dependency link in addition to the ``## Blocked by`` block already rendered into the
+    body. The body is passed verbatim — the slicer finalized it before calling this seam.
+    """
+    args = [
+        "issue",
+        "create",
+        "--repo",
+        repo_full_name,
+        "--title",
+        draft.title,
+        "--body",
+        draft.body,
+    ]
+    for label in draft.labels:
+        args += ["--label", label]
+    for number in blocked_by_numbers:
+        args += ["--blocked-by", str(number)]
+    return args
+
+
+def _parse_issue_number(stdout: str) -> int:
+    """Parse the issue number from ``gh issue create``'s output.
+
+    ``gh issue create`` prints the created issue's URL (e.g.
+    ``https://github.com/owner/repo/issues/123``) to stdout. The number is the trailing
+    path segment. Raises :class:`ValueError` when the output has no trailing integer, so a
+    malformed response fails loudly rather than yielding a bogus issue number.
+    """
+    tail = stdout.strip().rstrip("/").rsplit("/", 1)[-1]
+    try:
+        return int(tail)
+    except ValueError as exc:
+        raise ValueError(f"gh issue create returned no issue number: {stdout!r}") from exc
+
+
+def _blocked_by_numbers(body: str) -> list[int]:
+    """Pull the resolved ``#<n>`` refs out of a finalized draft's ``## Blocked by`` block.
+
+    :func:`_finalize_draft` renders dependencies as a trailing ``## Blocked by`` section of
+    ``#<n>`` lines (real, already-created issue numbers). This reads them back so the gh
+    create call can also carry native ``--blocked-by`` links. A draft with no such section
+    yields an empty list.
+    """
+    _, _, block = body.partition("## Blocked by")
+    if not block:
+        return []
+    numbers: list[int] = []
+    for line in block.splitlines():
+        ref = line.strip()
+        if ref.startswith("#") and ref[1:].isdigit():
+            numbers.append(int(ref[1:]))
+    return numbers
+
+
+class GhCliIssueCreator:
+    """Production :data:`IssueCreator`: files one slice issue via ``gh issue create``.
+
+    An instance is callable as ``await creator(draft)`` — it satisfies the
+    :data:`IssueCreator` protocol via :meth:`__call__`, so it drops straight in where the
+    fake issue creator sits in tests and at the wiring site (``slice_prd`` and the review
+    flows that reuse this seam). It assembles the ``gh issue create`` argv (labels +
+    native ``--blocked-by`` links read back from the finalized body) and dispatches it
+    through the injected :class:`GhRunner`, authenticated with a ``GH_TOKEN`` bearer (see
+    :func:`_auth_env`). The runner is the only side-effecting seam, which keeps command
+    assembly and number parsing unit-testable with no live ``gh``/network.
+
+    Args:
+        runner: The process-spawn seam that runs each ``gh`` command.
+        token: The installation/access token ``gh`` authenticates with.
+        repo_full_name: The repo the slice issues are filed against, e.g. "owner/repo".
+    """
+
+    def __init__(self, runner: GhRunner, *, token: str, repo_full_name: str) -> None:
+        self._runner = runner
+        self._token = token
+        self._repo_full_name = repo_full_name
+
+    async def __call__(self, draft: IssueDraft) -> CreatedIssue:
+        """File ``draft`` via ``gh issue create`` and return the parsed issue number."""
+        args = _issue_create_args(
+            draft, self._repo_full_name, _blocked_by_numbers(draft.body)
+        )
+        result = await self._runner.run(args, env=_auth_env(self._token))
+        if not result.ok:
+            raise GhCommandError(args, result)
+        return CreatedIssue(issue_number=_parse_issue_number(result.stdout))

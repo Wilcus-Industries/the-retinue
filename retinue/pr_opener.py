@@ -23,6 +23,7 @@ whole flow runs with no real ``gh`` and no network. Escalations reuse the shared
 from __future__ import annotations
 
 import enum
+import json
 import logging
 from dataclasses import dataclass
 from typing import Protocol
@@ -88,7 +89,9 @@ class PrOps(Protocol):
         """Return True when ``branch`` (the staging branch) exists on the repo."""
         ...
 
-    async def bring_up_to_date(self, *, branch: str, base: str) -> None:
+    async def bring_up_to_date(
+        self, *, repo_full_name: str, branch: str, base: str
+    ) -> None:
         """Bring ``branch`` up to date with ``base`` before the PR is opened."""
         ...
 
@@ -210,7 +213,9 @@ async def _bring_up_to_date_and_open(
     ops: PrOps,
 ) -> PrOpenResult:
     """Sync the integration branch with staging, then open exactly one PR."""
-    await ops.bring_up_to_date(branch=branch, base=staging)
+    await ops.bring_up_to_date(
+        repo_full_name=repo_full_name, branch=branch, base=staging
+    )
     pull_request = await ops.open_pr(
         OpenPrRequest(
             repo_full_name=repo_full_name,
@@ -261,3 +266,192 @@ async def _escalate(
     return PrOpenResult(
         outcome=outcome, integration_branch=branch, pull_request=None
     )
+
+
+# --- production gh-cli PrOps -------------------------------------------------------
+#
+# The flow above depends only on the :class:`PrOps` protocol. Production wires the
+# concrete :class:`GhCliPrOps` below; tests inject a fake. ``GhCliPrOps`` itself does
+# not shell out — it assembles ``gh`` invocations and parses their output, delegating
+# the actual process spawn to an injected :class:`GhRunner`. That keeps every
+# pure/parseable part (auth-header build, command assembly, payload parsing) testable
+# with a recording fake runner, never a live ``gh``/network.
+
+
+@dataclass(frozen=True)
+class GhResult:
+    """Captured result of a single ``gh`` invocation.
+
+    Attributes:
+        exit_code: ``gh``'s process exit status; ``0`` means success.
+        stdout: Captured standard output (the payload ``GhCliPrOps`` parses).
+        stderr: Captured standard error (surfaced in the error on failure).
+    """
+
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """True when ``gh`` exited successfully (exit code 0)."""
+        return self.exit_code == 0
+
+
+class GhRunner(Protocol):
+    """Runs a single ``gh`` command. The process-spawn seam under :class:`GhCliPrOps`.
+
+    A production implementation spawns ``gh`` as a subprocess with ``env`` merged into
+    its environment (so ``GH_TOKEN`` authenticates the call) and returns the captured
+    :class:`GhResult`; tests inject a fake that records each ``(args, env)`` and returns
+    a canned result. ``args`` never includes the leading ``"gh"`` — the runner owns the
+    executable name.
+    """
+
+    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
+        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
+        ...
+
+
+class GhCommandError(RuntimeError):
+    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
+
+    def __init__(self, command: list[str], result: GhResult) -> None:
+        self.command = command
+        self.result = result
+        super().__init__(
+            f"gh {' '.join(command)} exited {result.exit_code}: "
+            f"{result.stderr.strip()}"
+        )
+
+
+def _auth_env(token: str) -> dict[str, str]:
+    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
+
+    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on every
+    REST/GraphQL call, so the adapter never assembles a header itself — it injects the
+    token here and lets ``gh`` own the wire format.
+    """
+    return {"GH_TOKEN": token}
+
+
+def _pr_create_args(request: OpenPrRequest) -> list[str]:
+    """Assemble the ``gh pr create`` argv for ``request`` (no leading ``"gh"``)."""
+    return [
+        "pr",
+        "create",
+        "--repo",
+        request.repo_full_name,
+        "--base",
+        request.base,
+        "--head",
+        request.head,
+        "--title",
+        request.title,
+        "--body",
+        request.body,
+    ]
+
+
+def _parse_pr(stdout: str) -> PullRequest:
+    """Parse ``gh pr create --json number,url`` output into a :class:`PullRequest`.
+
+    ``gh`` emits a JSON object ``{"number": <int>, "url": "<str>"}``. Raises
+    :class:`ValueError` when the payload is missing either field or is not JSON, so a
+    malformed response fails loudly rather than yielding a bogus PR handle.
+    """
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"gh pr create returned non-JSON output: {stdout!r}") from exc
+    if not isinstance(payload, dict) or "number" not in payload or "url" not in payload:
+        raise ValueError(f"gh pr create output missing number/url: {stdout!r}")
+    return PullRequest(number=int(payload["number"]), url=str(payload["url"]))
+
+
+class GhCliPrOps:
+    """Production :class:`PrOps`: drives the staging PR through ``gh`` and ``git``.
+
+    Every gh-touching step the flow needs — the heimdall check lookup, the staging
+    branch-existence query, the bring-up-to-date, and ``gh pr create`` — is assembled
+    here and dispatched through the injected :class:`GhRunner`, authenticated with a
+    ``GH_TOKEN`` bearer (see :func:`_auth_env`). The runner is the only side-effecting
+    seam, which keeps command assembly and payload parsing unit-testable.
+
+    Args:
+        runner: The process-spawn seam that runs each ``gh`` command.
+        token: The installation/access token ``gh`` authenticates with.
+        heimdall_check_name: The check-run name that marks heimdall as installed.
+    """
+
+    def __init__(
+        self,
+        runner: GhRunner,
+        *,
+        token: str,
+        heimdall_check_name: str = "heimdall",
+    ) -> None:
+        self._runner = runner
+        self._token = token
+        self._heimdall_check_name = heimdall_check_name
+
+    async def _gh(self, args: list[str]) -> GhResult:
+        """Run one ``gh`` command authenticated with the token, raising on failure."""
+        result = await self._runner.run(args, env=_auth_env(self._token))
+        if not result.ok:
+            raise GhCommandError(args, result)
+        return result
+
+    async def heimdall_installed(self, repo_full_name: str) -> bool:
+        """Return True when a check named ``heimdall`` exists on the repo's rulesets."""
+        result = await self._gh(
+            [
+                "api",
+                f"repos/{repo_full_name}/rulesets",
+                "--jq",
+                # Surface the required-check contexts across every ruleset; the
+                # adapter then membership-tests the heimdall name against them.
+                "[.[].rules[]?.parameters.required_status_checks[]?.context]",
+            ]
+        )
+        contexts = json.loads(result.stdout or "[]")
+        return self._heimdall_check_name in contexts
+
+    async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
+        """Return True when ``branch`` resolves to a ref on ``repo_full_name``."""
+        result = await self._runner.run(
+            ["api", f"repos/{repo_full_name}/branches/{branch}"],
+            env=_auth_env(self._token),
+        )
+        # A missing branch is a 404, which gh reports as a non-zero exit — not an
+        # error to raise on, just a False answer to the existence question.
+        return result.ok
+
+    async def bring_up_to_date(
+        self, *, repo_full_name: str, branch: str, base: str
+    ) -> None:
+        """Merge ``base`` into ``branch`` server-side so the PR opens up to date.
+
+        The merges API path is built explicitly from ``repo_full_name`` — never from
+        ``gh``'s ``{owner}/{repo}`` placeholders, which resolve from the process's
+        working-directory git remote. The worker runs in the retinue source, not a
+        clone of the target repo, so cwd-relative resolution would target the wrong
+        repo (or fail).
+        """
+        await self._gh(
+            [
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repo_full_name}/merges",
+                "-f",
+                f"base={branch}",
+                "-f",
+                f"head={base}",
+            ]
+        )
+
+    async def open_pr(self, request: OpenPrRequest) -> PullRequest:
+        """Open the PR via ``gh pr create`` and return the parsed PR handle."""
+        result = await self._gh([*_pr_create_args(request), "--json", "number,url"])
+        return _parse_pr(result.stdout)

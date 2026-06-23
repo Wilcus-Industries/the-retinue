@@ -1,0 +1,84 @@
+# Retinue stack: redis + FastAPI web + Arq worker, with two optional edge profiles.
+#
+#   (default)         redis, web, worker
+#   --profile tunnel  + cloudflared  — LOCAL real-GitHub: ephemeral trycloudflare URL
+#   --profile edge    + caddy        — VPS: ${DOMAIN} with automatic Let's-Encrypt TLS
+#
+# REDIS_URL / DEDUPE_DB_PATH / BUDGET_DB_PATH are pinned here (they describe the
+# container topology, not the operator's secrets); everything else comes from .env.
+
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  web:
+    build: .
+    command: uvicorn retinue.app:create_app --factory --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: retinue-worker
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      # SQLite state lives on the worker-data volume so it survives restarts.
+      DEDUPE_DB_PATH: /data/retinue-dedupe.sqlite3
+      BUDGET_DB_PATH: /data/retinue-budget.sqlite3
+    volumes:
+      - worker-data:/data
+      # The disposable done-check container runtime drives the host daemon: the worker
+      # launches sibling containers via the mounted host socket, not Docker-in-Docker.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # LOCAL real-GitHub: prints a free ephemeral https://<rand>.trycloudflare.com URL in
+  # its logs. The runbook tells the human to paste that (+ /webhook) into the App.
+  cloudflared:
+    image: cloudflare/cloudflared
+    command: tunnel --no-autoupdate --url http://web:8000
+    depends_on:
+      - web
+    restart: unless-stopped
+    profiles: ["tunnel"]
+
+  # VPS edge: terminates TLS for ${DOMAIN} (automatic Let's-Encrypt) and reverse-proxies
+  # to web. Requires DOMAIN in .env and a Caddyfile next to this compose file.
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - web
+    restart: unless-stopped
+    profiles: ["edge"]
+
+volumes:
+  redis-data:
+  worker-data:
+  caddy_data:

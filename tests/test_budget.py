@@ -24,8 +24,10 @@ from retinue.budget import (
     AuthMode,
     BudgetGovernor,
     BudgetLedger,
+    Clock,
     GateDecision,
     MeterDecision,
+    SystemClock,
 )
 from retinue.orchestrator import PrdSlice
 from tests.test_reconcile import FakeReconcileGh
@@ -59,6 +61,67 @@ def _prd_slice(issue_number: int, blocked_by: list[int] | None = None) -> PrdSli
         prd_number=1,
         blocked_by=blocked_by or [],
     )
+
+
+# --- real SystemClock: the production adapter behind the Clock seam --------------
+
+
+def test_system_clock_satisfies_the_clock_protocol() -> None:
+    """The production adapter structurally implements the :class:`Clock` seam.
+
+    The ledger reads time through the single-method ``now()`` protocol; binding the real
+    impl to a ``Clock`` annotation and calling it proves it satisfies that contract (the
+    Protocol is not ``@runtime_checkable``, so this is a structural, not ``isinstance``,
+    check).
+    """
+    clock: Clock = SystemClock()
+    assert callable(clock.now)
+    assert isinstance(clock.now(), datetime)
+
+
+def test_system_clock_now_is_timezone_aware_utc() -> None:
+    """``now()`` returns a tz-aware UTC instant, so the window arithmetic is unambiguous.
+
+    The injected ``FakeClock`` returns UTC-aware datetimes; the real impl must honour the
+    identical contract or the ledger's ``spent_at`` comparisons mix naive and aware
+    datetimes and raise. Pin both the tzinfo and the actual UTC offset.
+    """
+    now = SystemClock().now()
+    assert now.tzinfo is not None
+    assert now.utcoffset() == timedelta(0)
+
+
+def test_system_clock_tracks_wall_time_and_advances_monotonically() -> None:
+    """``now()`` reads the real wall clock and never goes backwards between reads."""
+    before = datetime.now(UTC)
+    first = SystemClock().now()
+    second = SystemClock().now()
+    after = datetime.now(UTC)
+    # Bracketed by two independent wall-clock reads, so it is the real clock, not a stub.
+    assert before <= first <= second <= after
+
+
+@pytest.mark.asyncio
+async def test_ledger_window_math_is_unchanged_under_the_real_clock(
+    db_path: Path,
+) -> None:
+    """Driven by the real :class:`SystemClock`, the trailing-24h window math is identical.
+
+    The fake clock is only a deterministic stand-in for this same ``now()`` protocol: a
+    charge recorded now sits inside the trailing 24h, and a cutoff just past it excludes
+    it. Proving this against the wall clock confirms the real adapter changes none of the
+    ledger's window arithmetic.
+    """
+    ledger = BudgetLedger(
+        db_path, clock=SystemClock(), auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=7.0)
+
+    # A charge stamped at wall-clock now is inside the trailing 24h window.
+    assert await ledger.trailing_24h_spend() == pytest.approx(7.0)
+    # And it still gates against the cap exactly as the fake-clock cases do.
+    assert await ledger.would_exceed(amount=4.0) is False
+    assert await ledger.would_exceed(amount=6.0) is True
 
 
 # --- rolling-24h window math -----------------------------------------------------
