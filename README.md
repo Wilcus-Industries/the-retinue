@@ -20,9 +20,12 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 
 - `retinue.config` — `Settings` loaded from env / `.env` (`WEBHOOK_SECRET`, `REDIS_URL`,
   `DEDUPE_DB_PATH`, the GitHub App / Anthropic / push-channel credentials).
-- `retinue.webhook` — HMAC verification then event dispatch: an `issues` event enqueues a
-  PRD job, a merged `pull_request` (closed + merged) enqueues the reap, and a
-  `pull_request_review` enqueues the heimdall loopback. Same 401/204/202 contract for all.
+- `retinue.webhook` — HMAC verification then event dispatch: a `prd`-labeled `issues`
+  event (action opened/reopened/edited/labeled) enqueues a PRD job, a merged
+  `pull_request` (closed + merged) enqueues the reap, and a `pull_request_review` from
+  heimdall's bot enqueues the loopback. Off-target events (an unlabeled or non-PRD issue,
+  a review from anyone but heimdall) are acked 204 and enqueue nothing, so the slicer and
+  loopback never see them. Same 401/204/202 contract for all.
 - `retinue.queue` — the `PrdJob` / `ReviewJob` / `MergedPrJob` models and their
   `enqueue_prd` / `enqueue_review` / `enqueue_merged_pr` helpers.
 - `retinue.pipeline` — `Pipeline`, the orchestration object the worker drives once a PRD
@@ -84,9 +87,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   resumes correctly. The gh queries are injected seams; `RunStateStore` is the durable
   secondary ledger (owned-slice set + PR↔PRD mapping), mirroring `PrdDedupeStore`.
 
-A validly signed `issues` webhook returns 202 and enqueues exactly one job; an
-invalid or missing signature returns 401 and enqueues nothing. Non-`issues` events
-are acked with 204 without enqueuing.
+A validly signed `prd`-labeled `issues` webhook (action opened/reopened/edited/labeled)
+returns 202 and enqueues exactly one job; an invalid or missing signature returns 401 and
+enqueues nothing. A signed issues event without the `prd` label (or with any other action),
+a `pull_request_review` not from heimdall's bot, and any other off-target event are acked
+with 204 without enqueuing.
 
 ## Per-repo opt-in (`.github/retinue.yml`)
 

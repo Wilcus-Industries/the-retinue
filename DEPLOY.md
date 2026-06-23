@@ -141,9 +141,11 @@ https://<random>.trycloudflare.com/webhook
 
 ## f. Verify the transport (and, on an opted-in repo, the pipeline)
 
-1. Open an issue on the test repo.
+1. Open an issue on the test repo **labeled `prd`** (the webhook only enqueues a PRD job
+   for a `prd`-labeled issue; an unlabeled or non-PRD issue is acked 204 and does nothing).
 2. GitHub delivers the webhook; **web** verifies the HMAC and returns **202**, enqueuing
-   the event (check the App's webhook "Recent Deliveries" tab for the 202).
+   the event (check the App's webhook "Recent Deliveries" tab for the 202 — an unlabeled
+   issue shows a 204 instead).
 3. The **worker** logs that it received the event.
 
 What happens next depends on the repo's opt-in:
