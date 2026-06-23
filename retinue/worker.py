@@ -21,11 +21,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from arq import cron
 from arq.connections import RedisSettings
 
 from retinue.dedupe import PrdDedupeStore, prd_dedupe_key
 from retinue.github_app import InstallationAuth
 from retinue.handoff import MergedPullRequest
+from retinue.heartbeat import heartbeat_tick
 from retinue.loopback import (
     HeimdallFinding,
     HeimdallReview,
@@ -52,6 +54,12 @@ PipelineFactory = Callable[[str, RepoConfig], Awaitable[Pipeline]]
 # Async callable returning a PRD/issue body text given (repo, issue number). The gh
 # issue read the slicer needs, injected so the worker is testable without a live gh.
 IssueBodyFetcher = Callable[[str, int], Awaitable[str]]
+
+# The worker-global heartbeat fires every Nth minute (the global tick). This is the coarse
+# arq-level cadence; ``repo_config.cron`` is the finer per-repo "is this repo due?" filter
+# under it (:func:`retinue.heartbeat.cron_due`). A 15-minute tick keeps the safety-net sweep
+# responsive (a missed-webhook issue is caught within the quarter-hour) without busy-looping.
+HEARTBEAT_MINUTES = frozenset(range(0, 60, 15))
 
 # Path of the opt-in config file inside each repo, fetched over the contents API.
 RETINUE_CONFIG_PATH = ".github/retinue.yml"
@@ -658,6 +666,12 @@ class WorkerSettings:
     """
 
     functions = [process_prd, process_review_job, reap_pr_job]
+    # The worker-global cron heartbeat: fires every Nth minute as the safety-net sweep for
+    # issues labeled while the webhook was missed (firing the ad-hoc drain for each due repo)
+    # and drives the backlog cron lane (``run_cron_tick``) — the first runtime caller of the
+    # previously-dead lane. Its collaborators are read from ``ctx`` in :func:`heartbeat_tick`;
+    # a bare worker with none wired ticks harmlessly.
+    cron_jobs = [cron(heartbeat_tick, minute=set(HEARTBEAT_MINUTES))]
     on_startup = on_startup
     on_shutdown = on_shutdown
     # Overridden from the configured REDIS_URL in main() at process start (arq

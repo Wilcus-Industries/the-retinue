@@ -91,6 +91,15 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   issue preempts when a PRD is in flight. Each issue is rebuilt through
   `AdhocIssue.from_fetched_issue` (fed the fetched body) so the `Chain-depth:` marker is read
   back and the review-fix chain bound stays live.
+- `retinue.heartbeat` — `run_heartbeat` + `heartbeat_tick`, the worker-global arq `cron_jobs`
+  tick. Registered in `WorkerSettings.cron_jobs`, it fires every Nth minute (the global tick)
+  and, per opted-in repo: fires the safety-net **ad-hoc drain** (`run_adhoc_drain`) when the
+  repo's `repo_config.cron` cadence is due on this tick (`cron_due`, the per-repo "is this repo
+  due?" filter under the global tick) — the catch-up for issues labeled while the webhook was
+  missed or the worker was down — and drives the **backlog cron lane** (`run_cron_tick`) for
+  every repo, the first runtime caller of the previously-dead lane. The clock, the opted-in repo
+  enumeration, the per-repo drain, and the backlog tick are all injected and faked, so the
+  heartbeat runs with no real arq, Redis, gh, Docker, or wall-clock.
 - `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
   channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
   Every escalation in the retinue routes through it.
@@ -451,6 +460,17 @@ The clock is injected (age-weighting) and the tick counter is passed in (the quo
 so nothing reads the wall clock. The backlog `gh` query, the budget governor, the
 single-run lock, and the downstream build are all injected and faked, so a tick runs with
 no real `gh`, no Docker, and no network.
+
+`retinue.heartbeat.run_heartbeat` is what fires both lanes at runtime. Registered as the
+worker-global arq `cron_jobs` tick (`WorkerSettings.cron_jobs`, every 15th minute — the
+global tick), each heartbeat sweeps the opted-in repos: it fires the safety-net **ad-hoc
+drain** for each repo whose `repo_config.cron` cadence is due on this tick (`cron_due` is the
+per-repo "is this repo due?" filter under the global tick), catching up issues labeled while
+the webhook was missed or the worker was down, and drives the **backlog cron lane**
+(`run_cron_tick`) for every repo — the first runtime caller of the previously-dead lane. A
+drain or tick that raises for one repo is logged and skipped so a single bad repo cannot
+starve the sweep. The clock, the repo enumeration, the per-repo drain, and the backlog tick
+are all injected, so the heartbeat runs with no real arq, Redis, `gh`, Docker, or wall-clock.
 
 ## Configuration
 
