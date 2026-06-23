@@ -1,13 +1,22 @@
 """The agent-role registry: one table owning every agent role's model and effort.
 
-The retinue runs four agent roles — the PRD :class:`~retinue.slicer.ClaudeSliceGenerator`,
+The retinue runs five agent roles — the PRD :class:`~retinue.slicer.ClaudeSliceGenerator`,
 the :class:`~retinue.orchestrator.ContainerImplementer`, the
-:class:`~retinue.orchestrator.AgentSdkConflictResolver`, and the internal
-:class:`~retinue.reviewer.AgentSdkReviewGenerator`. Each one needs a model id, a
-reasoning-effort tier, and an invocation transport. This module is the single place
+:class:`~retinue.orchestrator.AgentSdkConflictResolver`, the internal
+:class:`~retinue.reviewer.AgentSdkReviewGenerator`, and the read-only ``planner`` (Opus
+on the in-container CLI, run with no write/edit/commit capability — it maps the code via
+an Explore subagent and emits a plan as its captured output). Each one needs a model id,
+a reasoning-effort tier, and an invocation transport. This module is the single place
 those facts live: :data:`ROLE_REGISTRY` maps each :class:`Role` to its :class:`RoleSpec`,
-and the four adapters resolve their model and effort from it instead of hand-rolling
-private constants — so a tier can't silently drift between two Opus call sites.
+and the adapters resolve their model and effort from it instead of hand-rolling private
+constants — so a tier can't silently drift between two Opus call sites.
+
+The planner also owns its invocation construction here: :func:`planner_cli_argv` builds
+the read-only headless ``claude`` argv — the CLI's non-mutating ``plan`` permission mode,
+an allow-list of read/search tools plus the ``Task`` tool that spawns the Explore
+subagent, and a deny-list of every write-capable tool. The brief mandates at least one
+Explore subagent before a plan is produced, and the plan is captured from the run's
+output rather than written to the workspace.
 
 :func:`resolve_model` applies a repo's ``models`` override (the optional ``role ->
 model-id`` block in ``.github/retinue.yml``, carried on :class:`~retinue.repo_config.RepoConfig`)
@@ -55,7 +64,7 @@ class Transport(enum.Enum):
 
 
 class Role(enum.Enum):
-    """The four agent roles the retinue runs.
+    """The agent roles the retinue runs.
 
     The ``value`` is the key a repo's ``models`` override block uses to target a role
     (e.g. ``models: {implementer: claude-opus-4-8}``), so it is the stable public name
@@ -66,6 +75,7 @@ class Role(enum.Enum):
     IMPLEMENTER = "implementer"
     RESOLVER = "resolver"
     REVIEWER = "reviewer"
+    PLANNER = "planner"
 
 
 @dataclass(frozen=True)
@@ -86,8 +96,11 @@ class RoleSpec:
 
 
 # The single source of truth for each role's model + effort + transport. The defaults are
-# the PRD-pinned tiers the four roles previously held as private constants: slicer
-# Opus/xhigh, implementer Sonnet/high, resolver Opus/xhigh, reviewer Opus/max.
+# the PRD-pinned tiers the roles previously held as private constants: slicer Opus/xhigh,
+# implementer Sonnet/high, resolver Opus/xhigh, reviewer Opus/max. The planner is Opus at
+# the ``high`` tier on the in-container CLI — like the implementer it execs ``claude``, but
+# run read-only (see :func:`planner_cli_argv`); the CLI carries no effort flag today, so
+# ``high`` is registry metadata that records the PRD's intent without changing the wire.
 ROLE_REGISTRY: dict[Role, RoleSpec] = {
     Role.SLICER: RoleSpec(
         model="claude-opus-4-8",
@@ -108,6 +121,11 @@ ROLE_REGISTRY: dict[Role, RoleSpec] = {
         model="claude-opus-4-8",
         effort=EFFORT_MAX,
         transport=Transport.MESSAGES_API,
+    ),
+    Role.PLANNER: RoleSpec(
+        model="claude-opus-4-8",
+        effort=EFFORT_HIGH,
+        transport=Transport.CLAUDE_CLI,
     ),
 }
 
@@ -148,3 +166,75 @@ def resolve_effort(role: Role, config: RepoConfig | None = None) -> str:
         :data:`EFFORT_MAX`).
     """
     return ROLE_REGISTRY[role].effort
+
+
+# --- planner invocation construction (read-only, explore-first) -------------------
+#
+# The planner execs the same in-container ``claude`` CLI as the implementer, but run
+# read-only: it maps the relevant code with an Explore subagent and emits a plan, never
+# touching the workspace. Read-only is belt-and-suspenders — the CLI's non-mutating
+# ``plan`` permission mode, plus an explicit allow-list of read/search tools (and the
+# ``Task`` tool the Explore subagent rides on) against a deny-list naming every
+# write-capable tool. The plan is captured from the run's output, so unlike the
+# implementer there is no ``--output-format json`` result-file contract.
+
+# The CLI permission mode that lets the planner read and search but commits no edits.
+# The ``claude`` CLI offers a first-class non-mutating ``plan`` mode; pinning it (rather
+# than relying on tool lists alone) makes the read-only intent explicit at the wire.
+_PLANNER_PERMISSION_MODE = "plan"
+
+# Read/search tools the planner may use, including the ``Task`` tool that spawns the
+# mandated Explore subagent. No write-capable tool appears here, so the planner cannot
+# edit, write, or run shell commands even if the permission mode were misread.
+_PLANNER_ALLOWED_TOOLS = "Read,Glob,Grep,Task,WebFetch,WebSearch"
+
+# Write-capable tools named explicitly in the deny-list so the read-only contract holds
+# regardless of CLI default-tool changes — a second guard alongside the allow-list and
+# the ``plan`` permission mode.
+_PLANNER_DISALLOWED_TOOLS = "Write,Edit,MultiEdit,NotebookEdit,Bash,BashOutput,KillShell"
+
+# The planner's brief, appended to the CLI's system prompt. It mandates at least one
+# Explore subagent to map the code before any plan, and frames the captured output as
+# the plan itself — the planner writes nothing to the workspace.
+_PLANNER_SYSTEM = (
+    "You are a read-only planner. You have no write, edit, or commit capability and "
+    "must not attempt to change any file. Before you produce a plan you must spawn at "
+    "least one Explore subagent to map the relevant code; do not emit a plan until you "
+    "have explored. Then output the plan as your response — it is captured as your "
+    "result, so write the plan itself rather than saving it to a file."
+)
+
+
+def planner_cli_argv(*, prompt: str, model: str) -> list[str]:
+    """Assemble the read-only headless ``claude`` argv for one in-container plan run.
+
+    Runs non-interactively (``-p`` print mode), pins the planning ``model``, and enforces
+    read-only twice over: the CLI's non-mutating ``plan`` permission mode, plus an
+    allow-list of read/search tools (and the ``Task`` tool the Explore subagent rides on)
+    against a deny-list naming every write-capable tool. The frozen planner brief mandates
+    at least one Explore subagent before a plan. No ``--output-format`` flag is set: the
+    plan is captured from the run's output rather than written to the workspace.
+
+    Args:
+        prompt: The per-run instruction naming what to plan.
+        model: The planning model id (resolve via :func:`resolve_model` with
+            :data:`Role.PLANNER`).
+
+    Returns:
+        The ``claude`` argv (a list, no shell), ready to exec in the build container.
+    """
+    return [
+        "claude",
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--permission-mode",
+        _PLANNER_PERMISSION_MODE,
+        "--allowedTools",
+        _PLANNER_ALLOWED_TOOLS,
+        "--disallowedTools",
+        _PLANNER_DISALLOWED_TOOLS,
+        "--append-system-prompt",
+        _PLANNER_SYSTEM,
+    ]

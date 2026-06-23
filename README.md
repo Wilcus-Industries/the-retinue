@@ -42,10 +42,12 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.repo_config` — the per-repo `.github/retinue.yml` schema (`RepoConfig`) and
   `load_repo_config`, which never raises on bad input.
 - `retinue.roles` — the agent-role registry: one `ROLE_REGISTRY` table mapping each
-  `Role` (slicer / implementer / resolver / reviewer) to its model id, reasoning-effort
-  tier, and invocation transport. The four role adapters resolve their model and effort
-  here via `resolve_model` / `resolve_effort` instead of hand-rolled constants;
-  `resolve_model` applies a repo's `models` override, effort stays registry-owned.
+  `Role` (slicer / implementer / resolver / reviewer / planner) to its model id,
+  reasoning-effort tier, and invocation transport. The role adapters resolve their model
+  and effort here via `resolve_model` / `resolve_effort` instead of hand-rolled constants;
+  `resolve_model` applies a repo's `models` override, effort stays registry-owned. The
+  read-only `planner` (Opus on the CLI) also owns `planner_cli_argv`, which builds its
+  explore-first, no-write invocation and captures the plan as the run's output.
 - `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
 - `retinue.worker` — the `process_prd` Arq task (gate → drive the pipeline), the
   `process_review_job` / `reap_pr_job` tasks the webhook events enqueue, the `gate_prd`
@@ -118,7 +120,7 @@ retry_cap: 3                   # max retries per unit of work (>= 0)
 max_parallel: 4                # optional concurrency cap (> 0)
 cron: "0 */6 * * *"            # optional five-field cron cadence
 models:                        # optional role -> model-id overrides; keys are the
-  implementer: claude-opus-4-8  # registry roles: slicer/implementer/resolver/reviewer
+  implementer: claude-opus-4-8  # roles: slicer/implementer/resolver/reviewer/planner
 secrets:                       # optional inline secrets + external refs
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   refs:

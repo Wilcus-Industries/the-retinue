@@ -1,10 +1,12 @@
 """Tests for the agent-role registry.
 
-The registry owns the four agent roles (slicer, implementer, conflict resolver,
-internal reviewer) and resolves each one's model id and reasoning-effort tier from a
-single table. A ``repo_config.models`` entry overrides a role's model; the effort tier
-is the registry's alone. No network, Agent SDK, or gh is touched — this is a pure
-lookup over the table.
+The registry owns the five agent roles (slicer, implementer, conflict resolver,
+internal reviewer, and read-only planner) and resolves each one's model id and
+reasoning-effort tier from a single table. A ``repo_config.models`` entry overrides a
+role's model; the effort tier is the registry's alone. The planner additionally owns a
+read-only CLI invocation builder, asserted here for its no-write/explore-first contract.
+No network, Agent SDK, or gh is touched — this is a pure lookup over the table plus
+argv string assembly.
 """
 
 from __future__ import annotations
@@ -19,13 +21,14 @@ from retinue.roles import (
     ROLE_REGISTRY,
     Role,
     Transport,
+    planner_cli_argv,
     resolve_effort,
     resolve_model,
 )
 
 
 def test_every_role_has_a_registry_entry() -> None:
-    """The registry covers exactly the four agent roles, no more, no fewer."""
+    """The registry covers exactly the agent roles, no more, no fewer."""
     assert set(ROLE_REGISTRY) == set(Role)
 
 
@@ -36,6 +39,7 @@ def test_every_role_has_a_registry_entry() -> None:
         (Role.IMPLEMENTER, "claude-sonnet-4-6", EFFORT_HIGH, Transport.CLAUDE_CLI),
         (Role.RESOLVER, "claude-opus-4-8", EFFORT_XHIGH, Transport.MESSAGES_API),
         (Role.REVIEWER, "claude-opus-4-8", EFFORT_MAX, Transport.MESSAGES_API),
+        (Role.PLANNER, "claude-opus-4-8", EFFORT_HIGH, Transport.CLAUDE_CLI),
     ],
 )
 def test_default_tiers_match_the_prd(
@@ -69,7 +73,7 @@ def test_resolve_model_applies_a_repo_config_override() -> None:
 
 def test_resolve_model_ignores_an_unrelated_override_key() -> None:
     """A ``models`` key that names no known role leaves every role on its default."""
-    config = RepoConfig(models={"planner": "claude-opus-4"})
+    config = RepoConfig(models={"nonexistent-role": "claude-opus-4"})
     for role in Role:
         assert resolve_model(role, config) == ROLE_REGISTRY[role].model
 
@@ -79,3 +83,75 @@ def test_resolve_effort_is_registry_only_and_ignores_overrides() -> None:
     config = RepoConfig(models={Role.REVIEWER.value: "claude-opus-4-8"})
     assert resolve_effort(Role.REVIEWER) == EFFORT_MAX
     assert resolve_effort(Role.REVIEWER, config) == EFFORT_MAX
+
+
+def test_planner_role_resolves_opus_high_on_the_cli_transport() -> None:
+    """The planner is Opus at the ``high`` tier, invoked on the in-container CLI."""
+    spec = ROLE_REGISTRY[Role.PLANNER]
+    assert resolve_model(Role.PLANNER) == "claude-opus-4-8"
+    assert resolve_effort(Role.PLANNER) == EFFORT_HIGH
+    assert spec.transport is Transport.CLAUDE_CLI
+
+
+def test_planner_argv_runs_headless_with_the_pinned_model() -> None:
+    """The argv runs the headless CLI in print mode and pins the planning model."""
+    argv = planner_cli_argv(prompt="plan issue #5", model="m")
+
+    assert argv[0] == "claude"
+    assert argv[1:3] == ["-p", "plan issue #5"]
+    assert "--model" in argv and "m" in argv
+
+
+def test_planner_argv_runs_read_only_with_no_write_capability() -> None:
+    """The planner is granted read/search tools only — no write/edit/commit ever.
+
+    Read-only is enforced two ways that must agree: the permission mode is the CLI's
+    non-mutating ``plan`` mode, and no write-capable tool (Write/Edit/Bash) appears in
+    the allow-list while each is named in the deny-list.
+    """
+    argv = planner_cli_argv(prompt="p", model="m")
+
+    assert "--permission-mode" in argv
+    mode = argv[argv.index("--permission-mode") + 1]
+    assert mode == "plan"
+
+    allowed = argv[argv.index("--allowedTools") + 1]
+    disallowed = argv[argv.index("--disallowedTools") + 1]
+    for write_tool in ("Write", "Edit", "Bash"):
+        assert write_tool not in allowed
+        assert write_tool in disallowed
+
+
+def test_planner_argv_permits_the_explore_subagent() -> None:
+    """The Task tool that spawns the Explore subagent is in the allow-list."""
+    argv = planner_cli_argv(prompt="p", model="m")
+
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert "Task" in allowed
+    for read_tool in ("Read", "Glob", "Grep"):
+        assert read_tool in allowed
+
+
+def test_planner_instruction_requires_an_explore_subagent_before_a_plan() -> None:
+    """The appended brief mandates ≥1 Explore subagent before any plan is emitted."""
+    argv = planner_cli_argv(prompt="p", model="m")
+    system = argv[argv.index("--append-system-prompt") + 1]
+
+    assert "Explore" in system
+    lowered = system.lower()
+    assert "at least one" in lowered
+    assert "before" in lowered and "plan" in lowered
+
+
+def test_planner_argv_writes_nothing_to_the_workspace() -> None:
+    """The plan is the captured stdout — the argv asks for no file output of its own.
+
+    The planner has no ``--output-format json`` result-file contract and grants no
+    write tool, so nothing is written to the workspace; the orchestrator captures the
+    plan from the run's output.
+    """
+    argv = planner_cli_argv(prompt="p", model="m")
+
+    assert "--output-format" not in argv
+    disallowed = argv[argv.index("--disallowedTools") + 1]
+    assert "Write" in disallowed
