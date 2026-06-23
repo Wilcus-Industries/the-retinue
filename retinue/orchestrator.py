@@ -133,7 +133,7 @@ class Implementer(Protocol):
 # CLI finishes "successfully" but that fails to satisfy the repo is still caught downstream.
 # A non-zero CLI exit (or a json result flagged ``is_error``) raises :class:`ImplementError`.
 
-_IMPLEMENT_MODEL = "claude-opus-4-8"
+_IMPLEMENT_MODEL = "claude-sonnet-4-6"
 
 # The implementer's brief, appended to the CLI's system prompt. Frozen (no per-slice
 # interpolation) so the prefix is stable; the slice specifics ride in the per-slice prompt.
@@ -237,7 +237,7 @@ class ContainerImplementer:
         credential: The Anthropic credential (API key or subscription OAuth token).
         auth_mode: ``"api_key"`` (credential rides ``ANTHROPIC_API_KEY``) or
             ``"subscription"`` (credential rides ``CLAUDE_CODE_OAUTH_TOKEN``).
-        model: The implementing model id; defaults to Opus 4.8.
+        model: The implementing model id; defaults to Sonnet 4.6.
     """
 
     credential: str

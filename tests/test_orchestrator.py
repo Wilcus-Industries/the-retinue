@@ -19,6 +19,7 @@ import pytest
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
+    _IMPLEMENT_MODEL,
     AgentSdkConflictResolver,
     AnthropicResponse,
     BuildOutcome,
@@ -741,7 +742,20 @@ async def test_container_implementer_execs_claude_with_prompt_and_model() -> Non
     cmd = next(c for c in container.commands if c and c[0] == "claude")
     prompt = cmd[cmd.index("-p") + 1]
     assert "issue-7" in prompt
-    assert "claude-opus-4-8" in cmd  # the default model is pinned
+    # Production wires ContainerImplementer with no model override, so the default
+    # constant is the source of truth. Per the PRD, implementers default to Sonnet.
+    assert "claude-sonnet-4-6" in cmd
+
+
+def test_container_implementer_defaults_to_sonnet() -> None:
+    """The production-wired implementer (no model override) defaults to Sonnet.
+
+    pipeline.py constructs ``ContainerImplementer`` with only credential + auth_mode,
+    so the default constant is the live model. Per the PRD, implementers default to
+    Sonnet (slicer/reviewer stay on Opus).
+    """
+    assert _IMPLEMENT_MODEL == "claude-sonnet-4-6"
+    assert ContainerImplementer(credential="k").model == "claude-sonnet-4-6"
 
 
 def test_container_implementer_auth_env_routes_by_mode() -> None:
