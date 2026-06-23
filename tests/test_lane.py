@@ -1,8 +1,9 @@
-"""Tests for the lane classifier (issue #15).
+"""Tests for the lane classifier (issues #15, #26).
 
-The classifier routes a GitHub issue to one of two lanes:
+The classifier routes a GitHub issue to one of three lanes:
 
 * a slice carrying ``ready-for-agent`` + ``Part of #<prd>`` -> the orchestrator lane,
+* a ``ready-for-agent`` issue with *no* ``Part of #<prd>`` link -> the ad-hoc lane,
 * a ``backlog``-labeled issue -> the cron lane.
 
 PRD work runs first by default, but a *standalone* ``priority:critical`` /
@@ -29,10 +30,28 @@ def test_ready_prd_slice_routes_to_orchestrator() -> None:
     assert classify(facts).prd_number == 1
 
 
-def test_ready_slice_needs_both_signals() -> None:
-    """``ready-for-agent`` without a ``Part of #<prd>`` link is not an orchestrator slice."""
-    # ready-for-agent alone, no PRD link and no backlog -> unroutable.
-    assert classify(_facts("ready-for-agent")).lane is Lane.NONE
+def test_ready_slice_with_part_of_is_orchestrator_not_adhoc() -> None:
+    """``ready-for-agent`` *with* a ``Part of #<prd>`` link stays on the orchestrator lane."""
+    decision = classify(_facts("ready-for-agent", body="Implements it.\n\nPart of #3\n"))
+    assert decision.lane is Lane.ORCHESTRATOR
+    assert decision.prd_number == 3
+
+
+# --- ad-hoc issues -> ad-hoc lane (issue #26) ------------------------------------
+
+
+def test_ready_without_part_of_routes_to_adhoc() -> None:
+    """``ready-for-agent`` with no ``Part of #<prd>`` link routes to the ad-hoc lane."""
+    decision = classify(_facts("ready-for-agent"))
+    assert decision.lane is Lane.ADHOC
+    assert decision.prd_number is None
+    assert decision.preempts is False
+
+
+def test_ready_with_unrelated_body_still_adhoc() -> None:
+    """A ``ready-for-agent`` issue whose body has no Part-of link is still ad-hoc."""
+    facts = _facts("ready-for-agent", body="Do the thing. No parent link here.")
+    assert classify(facts).lane is Lane.ADHOC
 
 
 # --- backlog issues -> cron lane -------------------------------------------------

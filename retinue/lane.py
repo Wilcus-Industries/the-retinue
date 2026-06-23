@@ -1,10 +1,14 @@
-"""Lane classifier: route an issue to the orchestrator lane or the cron lane (issue #15).
+"""Lane classifier: route an issue to a work lane from its labels (issues #15, #26).
 
-The retinue has two work lanes:
+``ready-for-agent`` is the single "build me" trigger; the ``Part of #<prd>`` body link is
+what tells provenance (a PRD slice) apart from pickup (ad-hoc work). The retinue has three
+work lanes:
 
 * the **orchestrator** lane — PRD slices, filed by the slicer with ``ready-for-agent``
-  and a ``Part of #<prd>`` body link (:mod:`retinue.slicer`), built by
+  *and* a ``Part of #<prd>`` body link (:mod:`retinue.slicer`), built by
   :func:`retinue.orchestrator.build_prd`,
+* the **ad-hoc** lane — a ``ready-for-agent`` issue with **no** ``Part of #<prd>`` link:
+  standalone work picked up directly, not a slice of any PRD,
 * the **cron** lane — loose ``backlog`` issues (the non-blocking heimdall nits filed by
   :mod:`retinue.loopback`), drained one at a time by :mod:`retinue.cron`.
 
@@ -41,11 +45,13 @@ _PREEMPT_THRESHOLD = Severity.HIGH
 class Lane(enum.Enum):
     """Which work lane an issue is routed to.
 
-    ``ORCHESTRATOR`` is the PRD-build lane; ``CRON`` is the backlog drainer lane;
-    ``NONE`` means the issue carries no routing signal the retinue acts on.
+    ``ORCHESTRATOR`` is the PRD-build lane; ``ADHOC`` is the standalone ``ready-for-agent``
+    (no Part-of link) lane; ``CRON`` is the backlog drainer lane; ``NONE`` means the issue
+    carries no routing signal the retinue acts on.
     """
 
     ORCHESTRATOR = "orchestrator"
+    ADHOC = "adhoc"
     CRON = "cron"
     NONE = "none"
 
@@ -114,8 +120,10 @@ def classify(facts: IssueFacts) -> LaneDecision:
        ``backlog`` label, so a critical never waits its turn in the slow cron drain.
     2. **PRD slice** — ``ready-for-agent`` plus a ``Part of #<prd>`` body link routes to
        the orchestrator lane.
-    3. **backlog** — a loose ``backlog`` issue routes to the cron lane.
-    4. otherwise ``Lane.NONE``.
+    3. **ad-hoc** — ``ready-for-agent`` with no ``Part of #<prd>`` link routes to the
+       ad-hoc lane: standalone work to build directly, not a slice of any PRD.
+    4. **backlog** — a loose ``backlog`` issue routes to the cron lane.
+    5. otherwise ``Lane.NONE``.
 
     Args:
         facts: The routing-relevant facts of the issue.
@@ -130,9 +138,11 @@ def classify(facts: IssueFacts) -> LaneDecision:
             lane=Lane.ORCHESTRATOR, preempts=True, prd_number=facts.prd_link()
         )
 
-    prd_number = facts.prd_link()
-    if facts.has_label(READY_LABEL) and prd_number is not None:
-        return LaneDecision(lane=Lane.ORCHESTRATOR, prd_number=prd_number)
+    if facts.has_label(READY_LABEL):
+        prd_number = facts.prd_link()
+        if prd_number is not None:
+            return LaneDecision(lane=Lane.ORCHESTRATOR, prd_number=prd_number)
+        return LaneDecision(lane=Lane.ADHOC)
 
     if facts.has_label(BACKLOG_LABEL):
         return LaneDecision(lane=Lane.CRON)

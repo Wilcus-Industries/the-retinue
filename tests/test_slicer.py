@@ -105,7 +105,7 @@ def _well_formed_plan() -> SlicePlan:
 
 @pytest.mark.asyncio
 async def test_well_formed_prd_creates_labeled_slices() -> None:
-    """Each slice issue carries ready-for-agent + Part of #<prd>; gh is mocked."""
+    """Each slice issue carries ready-for-agent + prd-slice + Part of #<prd>; gh is mocked."""
     rec = _Recorder()
 
     async def generate(prd_body: str) -> SlicePlan:
@@ -124,6 +124,7 @@ async def test_well_formed_prd_creates_labeled_slices() -> None:
     assert len(rec.created) == 3
     for draft in rec.created:
         assert "ready-for-agent" in draft.labels
+        assert "prd-slice" in draft.labels
         assert f"Part of #{PRD_NUMBER}" in draft.body
 
 

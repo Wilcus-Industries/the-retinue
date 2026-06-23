@@ -3,8 +3,8 @@
 :func:`slice_prd` is the entry point. It checks the PRD is substantive, runs the
 headless slice generator (the Agent SDK, injected as the ``generate`` seam) over
 the body, then creates one GitHub issue per slice via the ``create_issue`` seam
-(``gh``, injected). Every slice issue is labeled ``ready-for-agent`` and carries
-``Part of #<prd>``; a genuinely human-only slice also gets ``hitl``. Intra-PRD
+(``gh``, injected). Every slice issue is labeled ``ready-for-agent`` + ``prd-slice``
+and carries ``Part of #<prd>``; a genuinely human-only slice also gets ``hitl``. Intra-PRD
 ``blocked_by`` references are resolved to the real created issue numbers, so the
 ``## Blocked by`` graph is resolvable in dependency order.
 
@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 
 READY_LABEL = "ready-for-agent"
 HITL_LABEL = "hitl"
+# Provenance marker: a slice the slicer filed off a PRD. Stamped alongside
+# ``ready-for-agent`` so a PRD slice is distinguishable from ad-hoc ``ready-for-agent``
+# work at the label layer (the lane router reads the ``Part of #<prd>`` link, not this
+# label, but downstream tooling and humans can tell a slice apart from pickup). See
+# :mod:`retinue.lane`.
+PRD_SLICE_LABEL = "prd-slice"
 
 # The Agent-SDK model that does the slicing, and the OAuth beta header that a
 # subscription token requires. See the claude-api skill: Opus 4.8 is the default
@@ -443,11 +449,13 @@ def _finalize_draft(
 ) -> None:
     """Apply labels and render the Part-of + Blocked-by footer onto ``draft``.
 
-    Mutates ``draft`` in place: sets its labels (``ready-for-agent`` always,
-    ``hitl`` for a human-only slice) and rewrites the body to carry the
-    ``Part of #<prd>`` line plus a resolved ``## Blocked by`` block.
+    Mutates ``draft`` in place: sets its labels (``ready-for-agent`` + ``prd-slice``
+    always, ``hitl`` for a human-only slice) and rewrites the body to carry the
+    ``Part of #<prd>`` line plus a resolved ``## Blocked by`` block. The ``prd-slice``
+    provenance marker rides alongside the ``ready-for-agent`` build trigger so a slice is
+    distinguishable from ad-hoc ``ready-for-agent`` work (see :mod:`retinue.lane`).
     """
-    draft.labels = [READY_LABEL]
+    draft.labels = [READY_LABEL, PRD_SLICE_LABEL]
     if draft.hitl:
         draft.labels.append(HITL_LABEL)
 

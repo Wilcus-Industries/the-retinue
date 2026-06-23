@@ -63,9 +63,9 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   up to date with staging and opens exactly one PR into it; a failed precheck escalates
   through `Notifier` and opens no PR. The gh operations are injected seams.
 - `retinue.slicer` — `slice_prd`: runs the headless Agent-SDK slicer over a PRD
-  body to produce vertical-slice issues labeled `ready-for-agent` + `Part of #<prd>`
-  with a resolved `## Blocked by` graph, reserving `hitl` for genuinely human-only
-  slices. A thin/malformed PRD escalates through `Notifier` instead of inventing
+  body to produce vertical-slice issues labeled `ready-for-agent` + `prd-slice` +
+  `Part of #<prd>` with a resolved `## Blocked by` graph, reserving `hitl` for genuinely
+  human-only slices. A thin/malformed PRD escalates through `Notifier` instead of inventing
   slices. The Agent-SDK call and the gh issue creation are injected seams.
 - `retinue.impl_retry` — `ImplRetryStore`, the SQLite-backed per-slice
   implementer-attempt counter that persists the retry budget across worker restarts.
@@ -320,13 +320,18 @@ slice set), so only the unfinished slices rebuild — no duplicate issue, branch
 
 ## Lane classifier + cron backlog drainer
 
-`retinue.lane.classify` routes a GitHub issue to one of two lanes from its labels and
-body: a `ready-for-agent` slice carrying a `Part of #<prd>` link goes to the
-**orchestrator** lane (built by `build_prd`); a loose `backlog` issue goes to the **cron**
-lane. PRD work runs first by default, but a *standalone* `priority:critical` /
-`priority:high` issue **preempts** that ordering onto the orchestrator lane — a critical
-must not wait its turn in the slow backlog drain. The classifier is pure (labels + body
-only, no `gh`) and reuses the same `priority:<severity>` vocabulary loopback emits.
+`retinue.lane.classify` routes a GitHub issue to one of three lanes from its labels and
+body. `ready-for-agent` is the single "build me" trigger; the `Part of #<prd>` body link
+splits provenance from pickup: a `ready-for-agent` slice carrying a `Part of #<prd>` link
+goes to the **orchestrator** lane (built by `build_prd`); a `ready-for-agent` issue with
+**no** Part-of link goes to the **ad-hoc** lane (standalone work, not a slice of any PRD);
+a loose `backlog` issue goes to the **cron** lane. PRD work runs first by default, but a
+*standalone* `priority:critical` / `priority:high` issue **preempts** that ordering onto
+the orchestrator lane — a critical must not wait its turn in the slow backlog drain. The
+classifier is pure (labels + body only, no `gh`) and reuses the same `priority:<severity>`
+vocabulary loopback emits. The slicer additionally stamps `prd-slice` alongside
+`ready-for-agent` on every slice it files, so a slice is distinguishable from ad-hoc
+pickup at the label layer.
 
 `retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
 loose `backlog` issues **one at a time**. Each tick runs under an injected single-run
