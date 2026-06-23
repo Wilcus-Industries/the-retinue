@@ -103,6 +103,7 @@ async def _open(
     prd_number: int = 1,
     repo_full_name: str = "owner/repo",
     issue_number: int = 1,
+    head: str | None = None,
 ) -> PrOpenResult:
     return await open_staging_pr(
         repo_full_name=repo_full_name,
@@ -111,6 +112,7 @@ async def _open(
         config=config or RepoConfig(),
         ops=ops,
         notifier=_notifier(sinks or _RecordingSinks()),
+        head=head,
     )
 
 
@@ -131,6 +133,24 @@ async def test_built_prd_opens_exactly_one_pr_into_staging() -> None:
     assert request.base == "staging"
     assert result.pull_request is not None
     assert result.pull_request.number == 101
+
+
+@pytest.mark.asyncio
+async def test_adhoc_head_opens_issue_branch_straight_into_staging() -> None:
+    """An explicit ``head`` (the ad-hoc lane's ``issue-<N>``) opens straight into staging.
+
+    The ad-hoc lane has no integration branch: it passes its ``issue-<N>`` branch as the
+    head, so the head is synced and opened with no ``retinue/prd-<n>`` branch involved,
+    while every shared precheck still runs.
+    """
+    ops = FakePrOps()
+
+    result = await _open(ops=ops, prd_number=31, head="issue-31")
+
+    assert result.outcome is PrOpenOutcome.OPENED
+    assert ops.synced == [("issue-31", "staging")]  # the issue branch, not retinue/prd-31
+    assert ops.opened[0].head == "issue-31"
+    assert ops.opened[0].base == "staging"
 
 
 @pytest.mark.asyncio

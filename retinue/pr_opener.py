@@ -137,22 +137,32 @@ async def open_staging_pr(
     config: RepoConfig,
     ops: PrOps,
     notifier: Notifier,
+    head: str | None = None,
 ) -> PrOpenResult:
-    """Open exactly one PR ``retinue/prd-<n>`` -> ``staging`` behind a heimdall precheck.
+    """Open exactly one PR ``<head>`` -> ``staging`` behind a heimdall precheck.
 
     Applies two prechecks in order: heimdall must be installed on the repo, then the
     staging branch must exist. A failed precheck escalates through ``notifier`` (push +
-    comment + label) and opens no PR. When both pass, the integration branch is brought
-    up to date with the staging branch and exactly one PR is opened.
+    comment + label) and opens no PR. When both pass, the head branch is brought up to
+    date with the staging branch and exactly one PR is opened.
+
+    The head defaults to the PRD lane's integration branch ``retinue/prd-<prd_number>``;
+    the ad-hoc lane passes its own ``issue-<N>`` branch as ``head`` so a standalone build
+    opens its PR straight into staging with **no** integration branch — the only ad-hoc
+    difference at this seam. Both lanes share every precheck, the bring-up-to-date, and
+    the single open-PR action.
 
     Args:
         repo_full_name: The target repo, e.g. "owner/repo".
-        prd_number: The PRD number; the source branch is ``retinue/prd-<prd_number>``.
-        prd_issue_number: The PRD's tracking issue, where an escalation comments/labels.
+        prd_number: The PRD (or ad-hoc issue) number; names the default integration head.
+        prd_issue_number: The tracking issue an escalation comments/labels (the PRD's, or
+            the ad-hoc issue itself).
         config: The accepted repo config; ``staging_branch`` is the PR base and the
             sync base.
         ops: The injected gh seam (heimdall precheck, staging check, sync, open-PR).
         notifier: The shared escalation fan-out used on either precheck-failure path.
+        head: The source branch to open from; defaults to ``retinue/prd-<prd_number>``.
+            The ad-hoc lane passes ``issue-<N>`` to open straight into staging.
 
     Returns:
         A :class:`PrOpenResult`: ``OPENED`` with the created PR, or an escalation
@@ -162,7 +172,7 @@ async def open_staging_pr(
         Whatever ``ops`` raises on a real gh failure, and whatever ``notifier`` raises
         when the durable comment/label record cannot be written.
     """
-    branch = integration_branch(prd_number)
+    branch = head if head is not None else integration_branch(prd_number)
     staging = config.staging_branch
 
     if not await ops.heimdall_installed(repo_full_name):
