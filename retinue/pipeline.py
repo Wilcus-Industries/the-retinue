@@ -42,6 +42,7 @@ import retinue.loopback as _loopback_gh
 import retinue.pr_opener as _pr_gh
 import retinue.reviewer as _reviewer_gh
 import retinue.slicer as _slicer_gh
+from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
 from retinue.budget import (
     AuthMode,
     BudgetGovernor,
@@ -309,6 +310,40 @@ class Pipeline:
             return False
         return True
 
+    async def process_adhoc_pr(
+        self, issue: AdhocIssue, build: AdhocBuildResult
+    ) -> PrOpenResult | None:
+        """Open the PR for a green ad-hoc build and wire it into the shared pipeline.
+
+        After a green ad-hoc build, open exactly one PR ``issue-<N>`` -> staging — the head
+        is the ``issue-<N>`` branch itself, so **no integration branch** is created — behind
+        the *same* heimdall/staging prechecks the PRD lane uses. The PR<->issue mapping is
+        recorded in the run-state store keyed by the single ad-hoc issue (with no PRD parent
+        and no slice children), so the PR drives the existing :meth:`process_review` loopback
+        / test-and-merge handoff and a human merge reaps that one issue through the unchanged
+        :meth:`reap_pr`.
+
+        A red build pushed nothing, so there is no head to open a PR from: the step is
+        skipped and ``None`` is returned (mirroring how a build that merged no slices skips
+        the PRD staging-PR step).
+
+        Args:
+            issue: The ad-hoc issue that was built (carries the ``issue-<N>`` branch).
+            build: The build outcome; only a ``passed`` build opens a PR.
+
+        Returns:
+            The :class:`PrOpenResult` when the PR step ran, or ``None`` when the red build
+            skipped it.
+        """
+        if not build.passed:
+            logger.info(
+                "Ad-hoc build for %s failed; opening no PR", issue.branch
+            )
+            return None
+        return await self._open_pr(
+            issue.repo_full_name, issue.issue_number, head=build.branch
+        )
+
     async def process_review(self, review: HeimdallReview) -> VerdictResult:
         """Run the heimdall loopback for one review: rebuild / converge / escalate.
 
@@ -373,8 +408,16 @@ class Pipeline:
             claude_md=self.claude_md,
         )
 
-    async def _open_pr(self, repo_full_name: str, prd_number: int) -> PrOpenResult:
-        """Open the staging PR for a built PRD and record the PR<->PRD mapping."""
+    async def _open_pr(
+        self, repo_full_name: str, prd_number: int, *, head: str | None = None
+    ) -> PrOpenResult:
+        """Open the staging PR for a built round and record the PR<->round mapping.
+
+        Shared by both lanes: the PRD lane opens ``retinue/prd-<n>`` (``head`` defaults to
+        it) keyed by the PRD number, while the ad-hoc lane passes its ``issue-<N>`` branch
+        as ``head`` keyed by the single ad-hoc issue number — so both record the PR mapping
+        the loopback and reap resolve through, with no integration branch for ad-hoc work.
+        """
         result = await open_staging_pr(
             repo_full_name=repo_full_name,
             prd_number=prd_number,
@@ -382,6 +425,7 @@ class Pipeline:
             config=self.config,
             ops=self.pr_ops,
             notifier=self.notifier,
+            head=head,
         )
         if result.opened and result.pull_request is not None:
             await self._run_state.record_pr(

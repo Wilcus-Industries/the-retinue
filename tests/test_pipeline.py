@@ -340,6 +340,107 @@ async def test_reap_pr_job_closes_slices_and_reaps_prd(tmp_path: Path) -> None:
     assert 7 in reap_gh.closed  # the PRD itself
 
 
+# --- ad-hoc PR into the shared pipeline ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_green_adhoc_build_opens_one_pr_into_staging(tmp_path: Path) -> None:
+    """A green ad-hoc build opens exactly one PR ``issue-<N>`` -> staging, no integration.
+
+    The ad-hoc PR head is the ``issue-<N>`` branch itself — there is no integration
+    branch — and it reuses the shared PR-opener prechecks. The PR<->issue mapping is
+    recorded so the loopback and reap can resolve the PR back to the single ad-hoc issue.
+    """
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, pr_ops=pr_ops)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True)
+    )
+
+    assert result is not None
+    assert result.opened is True
+    assert len(pr_ops.opened) == 1
+    request = pr_ops.opened[0]
+    assert request.head == "issue-31"  # the issue branch itself, no integration branch
+    assert request.base == "staging"
+    # The mapping is recorded under the single ad-hoc issue (no PRD parent, no slices).
+    mapping = await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99)
+    assert mapping == (31, [])
+
+
+@pytest.mark.asyncio
+async def test_red_adhoc_build_opens_no_pr(tmp_path: Path) -> None:
+    """A red ad-hoc build pushed nothing, so no PR is opened and no mapping recorded."""
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, pr_ops=pr_ops)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=False)
+    )
+
+    assert result is None  # the PR step was never reached
+    assert pr_ops.opened == []
+    assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
+
+
+@pytest.mark.asyncio
+async def test_adhoc_pr_drives_loopback_handoff_and_reap(tmp_path: Path) -> None:
+    """The ad-hoc PR enters the shared loopback/handoff, and a merge reaps its issue.
+
+    After the green build opens the PR, a clean heimdall review converges through the
+    *same* loopback and fires the test-and-merge handoff; the simulated human merge reaps
+    the single ad-hoc issue closed — no PRD parent to reap.
+    """
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
+
+    handed_off: list[int] = []
+
+    async def handoff(*, repo_full_name: str, pr_number: int) -> None:
+        handed_off.append(pr_number)
+
+    reap_gh = _FakeReapGh(children=[])  # no Part-of children: ad-hoc has no PRD parent
+    pipeline = _pipeline(tmp_path, handoff=handoff, reap_gh=reap_gh)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True)
+    )
+
+    # The PR drives the shared loopback -> handoff on a clean heimdall review.
+    review = HeimdallReview(
+        repo_full_name="owner/repo",
+        pr_number=99,
+        prd_number=31,
+        prd_issue_number=31,
+        integration_branch="issue-31",
+        state=ReviewState.APPROVED,
+        findings=[],
+    )
+    verdict = await pipeline.process_review(review)
+    assert verdict.outcome is VerdictOutcome.CONVERGED
+    assert handed_off == [99]
+
+    # The simulated human merge reaps the single ad-hoc issue closed.
+    mapping = await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99)
+    assert mapping is not None
+    prd_number, slice_numbers = mapping
+    merged = MergedPullRequest(
+        repo_full_name="owner/repo",
+        pr_number=99,
+        prd_number=prd_number,
+        slice_issues=slice_numbers,
+    )
+    reap = await pipeline.reap_pr(merged)
+    assert reap.outcome is ReapOutcome.REAPED
+    assert reap_gh.closed == [31]  # the single ad-hoc issue, closed exactly once
+
+
 # --- production factory wiring ---------------------------------------------------
 
 

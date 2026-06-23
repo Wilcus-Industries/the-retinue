@@ -378,6 +378,17 @@ is the orchestrator lane's job. Every collaborator (planner, implementer, review
 container, auth, secret resolver, report sink) is an injected seam, so the flow is tested
 with no Agent SDK, Docker, gh, or network.
 
+After a green ad-hoc build, `Pipeline.process_adhoc_pr` opens **exactly one** PR
+`issue-<N>` -> `staging` and wires it into the **shared** post-build pipeline unchanged. It
+reuses `pr_opener.open_staging_pr` behind the same heimdall/staging prechecks the PRD lane
+uses, passing the `issue-<N>` branch as the PR `head` so the PR opens straight into staging
+with **no** integration branch — the one ad-hoc difference at this seam. A red build pushed
+nothing, so no PR is opened. The PR<->issue mapping is recorded in the same `RunStateStore`
+keyed by the single ad-hoc issue (no PRD parent, no slice children), so the PR drives the
+existing `process_review` heimdall loopback and `test-and-merge` handoff, and on the human's
+merge the unchanged `reap_pr` reaps the single ad-hoc issue closed (there is no PRD to reap).
+"The retinue never merges" — only a human merges; the reap reacts to that merge.
+
 `retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
 loose `backlog` issues **one at a time**. Each tick runs under an injected single-run
 **lock** (mirroring the orchestrator's `OrchestratorBusyError` guard, here `CronBusyError`)
