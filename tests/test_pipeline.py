@@ -449,6 +449,7 @@ async def test_review_reviewer_factory_diffs_round_over_integration_branch(
         token="ghs_x",
         create_issue=_created,
         diff_source=_DiffSource(),
+        config=_config(),
         generate=generate,
     )
     reviewer = factory("owner/repo", 7)
@@ -458,6 +459,39 @@ async def test_review_reviewer_factory_diffs_round_over_integration_branch(
     assert diffed == [(["issue-2", "issue-3"], "retinue/prd-7")]
     assert reviewed[0].diff == "diff-body"
     assert fixes == []  # a clean review files and enqueues nothing
+
+
+def test_review_factory_applies_repo_config_model_override(tmp_path: Path) -> None:
+    """A ``repo_config.models`` reviewer entry overrides the review generator's model.
+
+    Drives the real production review-generator construction (no ``generate`` override),
+    so the override flows end-to-end from the repo config through the role registry into
+    the live :class:`~retinue.reviewer.AgentSdkReviewGenerator`.
+    """
+    from retinue.pipeline import _build_review_reviewer_factory
+    from retinue.reviewer import AgentSdkReviewGenerator
+    from retinue.roles import Role
+    from retinue.wiring import _BoundRoundReviewer
+
+    class _DiffSource:
+        async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+            return "diff-body"
+
+    settings = _settings(tmp_path, anthropic_credential="k")
+    config = RepoConfig(models={Role.REVIEWER.value: "claude-opus-4-8-custom"})
+    factory = _build_review_reviewer_factory(
+        settings,  # type: ignore[arg-type]
+        repo_full_name="owner/repo",
+        token="ghs_x",
+        create_issue=_created,
+        diff_source=_DiffSource(),
+        config=config,
+    )
+    reviewer = factory("owner/repo", 7)
+
+    assert isinstance(reviewer, _BoundRoundReviewer)
+    assert isinstance(reviewer.generate, AgentSdkReviewGenerator)
+    assert reviewer.generate.model == "claude-opus-4-8-custom"
 
 
 def test_httpx_transport_is_the_default_review_transport() -> None:

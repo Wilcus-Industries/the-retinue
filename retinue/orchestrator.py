@@ -57,7 +57,7 @@ from retinue.done_check import (
 )
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
-from retinue.slicer import _EFFORT_XHIGH
+from retinue.roles import Role, resolve_effort, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -136,8 +136,12 @@ class Implementer(Protocol):
 # on ``slice.branch``; the orchestrator gates on the done-check that follows, so a run the
 # CLI finishes "successfully" but that fails to satisfy the repo is still caught downstream.
 # A non-zero CLI exit (or a json result flagged ``is_error``) raises :class:`ImplementError`.
-
-_IMPLEMENT_MODEL = "claude-sonnet-4-6"
+#
+# The implementing model and effort tier come from the :data:`~retinue.roles.Role.IMPLEMENTER`
+# registry entry (Sonnet 4.6 at the ``high`` tier by default), resolved at construction time
+# so a repo's ``models`` override can swap the model at the wiring site. The in-container
+# ``claude`` CLI carries no effort flag today, so the ``high`` tier is registry metadata that
+# records the PRD's intent without changing the wire.
 
 # The implementer's brief, appended to the CLI's system prompt. Frozen (no per-slice
 # interpolation) so the prefix is stable; the slice specifics ride in the per-slice prompt.
@@ -241,12 +245,14 @@ class ContainerImplementer:
         credential: The Anthropic credential (API key or subscription OAuth token).
         auth_mode: ``"api_key"`` (credential rides ``ANTHROPIC_API_KEY``) or
             ``"subscription"`` (credential rides ``CLAUDE_CODE_OAUTH_TOKEN``).
-        model: The implementing model id; defaults to Sonnet 4.6.
+        model: The implementing model id; defaults to the
+            :data:`~retinue.roles.Role.IMPLEMENTER` registry entry (Sonnet 4.6), which a
+            repo's ``models`` override can replace at the wiring site.
     """
 
     credential: str
     auth_mode: str = "api_key"
-    model: str = _IMPLEMENT_MODEL
+    model: str = field(default_factory=lambda: resolve_model(Role.IMPLEMENTER))
 
     async def implement(self, slice_: Slice, *, container: Container) -> None:
         """Exec ``claude`` in ``container`` to build ``slice_``; raise on an errored run."""
@@ -571,16 +577,16 @@ class ConflictResolver(Protocol):
 # ``x-api-key``; ``anthropic-version`` is always sent. The model must return only the
 # JSON object matching the schema — one resolved full-file body per conflicted path.
 
-_RESOLVE_MODEL = "claude-opus-4-8"
 _ANTHROPIC_VERSION = "2023-06-01"
 _RESOLVE_OAUTH_BETA = "oauth-2025-04-20"
 _ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 _RESOLVE_MAX_TOKENS = 32_000
 
-# The conflict resolver is the orchestrator's Opus reasoning call, which the PRD pins
-# to the "xhigh" effort tier — the same tier the slicer uses. It draws the shared
-# :data:`retinue.slicer._EFFORT_XHIGH` literal rather than keeping a private copy, so
-# the tier can't silently drift between the two Opus call sites.
+# The conflict resolver's model and effort tier come from the
+# :data:`~retinue.roles.Role.RESOLVER` registry entry (Opus 4.8 at the ``xhigh`` tier by
+# default — the same tier the slicer uses). Drawing both from the registry keeps the tier
+# from silently drifting between the two Opus call sites and lets a repo's ``models``
+# override swap the model at the wiring site.
 
 # Re-runs the merge (no auto-commit) so the working tree carries the conflict markers
 # the resolver reads; ``--no-commit`` keeps it stopped at the conflict even when git
@@ -714,8 +720,8 @@ def _resolve_payload(
     The frozen system brief leads; the user message carries the merge context plus each
     conflicted file's full marked-up body, fenced by path so the model can address each
     one. The strict schema forces a per-file resolved body back. The request carries the
-    "xhigh" reasoning-effort tier via ``output_config.effort`` (Opus 4.8 removed the
-    extended-thinking ``budget_tokens`` mechanism, which now returns HTTP 400).
+    resolver's registry effort tier (``xhigh``) via ``output_config.effort`` (Opus 4.8
+    removed the extended-thinking ``budget_tokens`` mechanism, which now returns HTTP 400).
     """
     blocks = "\n\n".join(
         f"### {file.path}\n```\n{file.content}\n```" for file in files
@@ -728,7 +734,7 @@ def _resolve_payload(
     return {
         "model": model,
         "max_tokens": _RESOLVE_MAX_TOKENS,
-        "output_config": {"effort": _EFFORT_XHIGH},
+        "output_config": {"effort": resolve_effort(Role.RESOLVER)},
         "system": _RESOLVE_SYSTEM,
         "messages": [{"role": "user", "content": user}],
         "response_format": {"type": "json_schema", "json_schema": _RESOLVE_SCHEMA},
@@ -778,13 +784,15 @@ class AgentSdkConflictResolver:
         container: The cloned-repo container the merge/resolution runs in.
         transport: The injected Anthropic HTTP POST seam.
         credential: The Anthropic credential (OAuth subscription token or API key).
-        model: The resolving model id; defaults to Opus 4.8.
+        model: The resolving model id; defaults to the
+            :data:`~retinue.roles.Role.RESOLVER` registry entry (Opus 4.8), which a
+            repo's ``models`` override can replace at the wiring site.
     """
 
     container: Container
     transport: AnthropicTransport
     credential: str
-    model: str = _RESOLVE_MODEL
+    model: str = field(default_factory=lambda: resolve_model(Role.RESOLVER))
 
     async def __call__(self, *, source: str, into: str) -> ConflictResolution:
         """Resolve the conflict merging ``source`` into ``into``; stage and commit it."""

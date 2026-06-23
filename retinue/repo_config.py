@@ -83,7 +83,10 @@ class RepoConfig(BaseModel):
         retry_cap: Max retries per unit of work before giving up (default ``3``).
         max_parallel: Optional cap on concurrent work; unset means no explicit cap.
         cron: Optional five-field cron cadence for scheduled runs.
-        models: Role -> model-id overrides (e.g. ``{"planner": "claude-opus-4"}``).
+        models: Role -> model-id overrides, keyed by the :class:`retinue.roles.Role`
+            value (``slicer`` / ``implementer`` / ``resolver`` / ``reviewer``), e.g.
+            ``{"implementer": "claude-opus-4-8"}``. Applied over the role registry's
+            default model by :func:`retinue.roles.resolve_model`.
         secrets: Secrets and secret-references block.
     """
 

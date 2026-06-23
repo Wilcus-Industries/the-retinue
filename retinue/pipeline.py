@@ -105,6 +105,7 @@ from retinue.reviewer import (
     GhCliBlockedByEditor,
     ReviewGenerator,
 )
+from retinue.roles import Role, resolve_model
 from retinue.slicer import (
     HITL_LABEL,
     ClaudeSliceGenerator,
@@ -697,7 +698,9 @@ def build_pipeline_factory(
             slicer_runner, token=token, repo_full_name=repo_full_name
         )
         slice_generate = ClaudeSliceGenerator(
-            token=settings.anthropic_credential, auth_mode=settings.auth_mode
+            token=settings.anthropic_credential,
+            auth_mode=settings.auth_mode,
+            model=resolve_model(Role.SLICER, config),
         ).generate
         pr_ops = GhCliPrOps(pr_runner, token=token)
         reap_gh = HandoffGh(token=token)
@@ -719,6 +722,7 @@ def build_pipeline_factory(
             notifier=notifier,
             create_issue=create_issue,
             retry_store_path=retry_store_path,
+            config=config,
         )
         return Pipeline(
             config=config,
@@ -798,6 +802,7 @@ def _bind_build_prd_for_repo(
     notifier: Notifier,
     create_issue: IssueCreator,
     retry_store_path: Path,
+    config: RepoConfig,
 ) -> BuildPrd:
     """Bind the real budget-gated, triaged orchestrator build for one repo.
 
@@ -817,6 +822,8 @@ def _bind_build_prd_for_repo(
         notifier: The escalation fan-out used by triage's escalate path.
         create_issue: The gh issue creator used by triage's reslice path.
         retry_store_path: SQLite file backing the persisted per-slice retry counter.
+        config: The repo's validated config; its ``models`` block overrides the
+            implementer's and reviewer's model per the role registry.
 
     Returns:
         The bound ``build_prd`` seam the pipeline drives.
@@ -826,7 +833,9 @@ def _bind_build_prd_for_repo(
         repo_full_name=repo_full_name, auth=auth, runtime=runtime
     )
     implementer = ContainerImplementer(
-        credential=settings.anthropic_credential, auth_mode=settings.auth_mode
+        credential=settings.anthropic_credential,
+        auth_mode=settings.auth_mode,
+        model=resolve_model(Role.IMPLEMENTER, config),
     )
     resolve_secret: SecretResolver = EnvSecretResolver()
     report: ReportSink = GhReportSink(token=token)
@@ -836,6 +845,7 @@ def _bind_build_prd_for_repo(
         token=token,
         create_issue=create_issue,
         diff_source=git,
+        config=config,
     )
     bound = bind_build_prd(
         implementer=implementer,
@@ -869,6 +879,7 @@ def _build_review_reviewer_factory(
     token: str,
     create_issue: IssueCreator,
     diff_source: RoundDiffSource,
+    config: RepoConfig,
     generate: ReviewGenerator | None = None,
 ) -> ReviewerFactory:
     """Build the per-PRD internal-reviewer factory for one repo's live build.
@@ -876,14 +887,17 @@ def _build_review_reviewer_factory(
     The reviewer is per-PRD (its ``Part of #<prd>`` footer and round diff depend on the
     PRD), but the build lane is bound per repo, so this returns a
     ``(repo_full_name, prd_number) -> RoundReviewer`` factory the build calls at run time.
-    Each reviewer wires the real Agent-SDK review generator (over the httpx transport),
-    the gh issue creator reused from the slicer, and the gh Blocked-by editor — so a live
-    build reviews every merged round and the review-fix follow-ups it files build later.
-    ``generate`` defaults to the real Agent-SDK reviewer; tests inject a fake to keep the
-    review flow off the network.
+    Each reviewer wires the real Agent-SDK review generator (over the httpx transport,
+    with its model resolved from the role registry against the repo's ``models``
+    override), the gh issue creator reused from the slicer, and the gh Blocked-by editor —
+    so a live build reviews every merged round and the review-fix follow-ups it files build
+    later. ``generate`` defaults to the real Agent-SDK reviewer; tests inject a fake to
+    keep the review flow off the network.
     """
     review_generate = generate or AgentSdkReviewGenerator(
-        credential=settings.anthropic_credential, transport=HttpxTransport()
+        credential=settings.anthropic_credential,
+        transport=HttpxTransport(),
+        model=resolve_model(Role.REVIEWER, config),
     )
     edit_blocked_by = GhCliBlockedByEditor(
         runner=SubprocessGhRunner(_reviewer_gh.GhResult), token=token
