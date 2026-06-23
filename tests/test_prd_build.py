@@ -28,6 +28,7 @@ from retinue.orchestrator import (
     PrdBuildResult,
     PrdSlice,
     Slice,
+    _topo_merge_order,
     build_prd,
 )
 from retinue.repo_config import RepoConfig
@@ -157,6 +158,28 @@ async def test_diamond_dependency_drains_in_rounds() -> None:
     assert result.merged_issues[0] == 1
     assert result.merged_issues[-1] == 4
     assert set(result.merged_issues) == {1, 2, 3, 4}
+
+
+def test_topo_merge_order_puts_in_round_blocker_before_dependent() -> None:
+    """A round's slices merge in Kahn-topological order, not by issue number.
+
+    When a higher-numbered slice blocks a lower-numbered one inside the same round,
+    the blocker must merge first even though its issue number sorts later. Sorting by
+    issue number alone (the drifted behavior) would wrongly merge #1 before #2.
+    """
+    blocker = _prd_slice(2)
+    dependent = _prd_slice(1, blocked_by=[2])
+
+    ordered = _topo_merge_order([dependent, blocker])
+
+    assert [s.issue_number for s in ordered] == [2, 1]
+
+
+def test_topo_merge_order_tiebreaks_independent_slices_by_issue_number() -> None:
+    """Mutually independent slices stay deterministic, ordered by issue number."""
+    ordered = _topo_merge_order([_prd_slice(3), _prd_slice(1), _prd_slice(2)])
+
+    assert [s.issue_number for s in ordered] == [1, 2, 3]
 
 
 @pytest.mark.asyncio

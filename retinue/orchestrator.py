@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import enum
+import heapq
 import json
 import logging
 from contextlib import AbstractAsyncContextManager
@@ -1221,19 +1222,54 @@ async def _merge_round(
 ) -> None:
     """Merge a round's green slices in dependency order, recording each outcome.
 
-    Merges are serialized (a shared integration branch) and ordered by issue number,
-    which respects the ``blocked_by`` graph since a slice is only ready once its
-    blockers merged. A red slice is recorded blocked; a conflict is resolved under the
-    done-check or escalated.
+    Merges are serialized (a shared integration branch) and ordered by a Kahn
+    topological sort over the round's ``blocked_by`` graph, so an in-round blocker
+    always merges before its dependent; issue number only breaks ties between
+    mutually independent slices, keeping the order deterministic. A red slice is
+    recorded blocked; a conflict is resolved under the done-check or escalated.
     """
-    for slice_, passed in sorted(built, key=lambda item: item[0].issue_number):
-        if not passed:
+    passed_by_number = {slice_.issue_number: passed for slice_, passed in built}
+    for slice_ in _topo_merge_order([slice_ for slice_, _ in built]):
+        if not passed_by_number[slice_.issue_number]:
             state.record(slice_, state.blocked)
             continue
         merged = await _merge_or_escalate(
             slice_, branch, config=config, git=git, resolve_conflict=resolve_conflict
         )
         state.record(slice_, state.merged if merged else state.escalated)
+
+
+def _topo_merge_order(slices: list[PrdSlice]) -> list[PrdSlice]:
+    """Order a round's slices topologically over their ``blocked_by`` graph (Kahn).
+
+    Only edges between slices *in this round* constrain the order — a blocker outside
+    the round was already merged/closed, so it imposes no in-round ordering. Among
+    mutually independent slices the lowest issue number is emitted first, so the order
+    is fully deterministic. The input is assumed acyclic (the slicer publishes a DAG);
+    if a cycle ever slipped in, its members are simply left out of the result.
+    """
+    by_number = {s.issue_number: s for s in slices}
+    blockers = {
+        s.issue_number: [b for b in s.blocked_by if b in by_number] for s in slices
+    }
+    dependents: dict[int, list[int]] = {n: [] for n in by_number}
+    for number, deps in blockers.items():
+        for blocker in deps:
+            dependents[blocker].append(number)
+
+    indegree = {number: len(deps) for number, deps in blockers.items()}
+    ready = [number for number, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+
+    ordered: list[PrdSlice] = []
+    while ready:
+        number = heapq.heappop(ready)
+        ordered.append(by_number[number])
+        for dependent in dependents[number]:
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                heapq.heappush(ready, dependent)
+    return ordered
 
 
 async def _merge_or_escalate(
