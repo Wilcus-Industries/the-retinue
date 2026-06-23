@@ -33,6 +33,8 @@ from retinue.adhoc_build import (
     _plan_prompt,
     _slice_for_issue,
     build_adhoc_issue,
+    parse_chain_depth,
+    render_chain_depth,
 )
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport
@@ -354,7 +356,7 @@ class _ReviewRecorder:
     def __init__(self) -> None:
         self.reviewed: list[AdhocIssue] = []
         self.created: list[IssueDraft] = []
-        self._next_number = 500
+        self.last_number = 500  # the most recent fresh GitHub number handed out
 
     async def review(self, issue: AdhocIssue, *, container: Container) -> None:
         self.reviewed.append(issue)
@@ -364,9 +366,9 @@ class _ReviewRecorder:
         return {}
 
     async def create_issue(self, draft: IssueDraft) -> CreatedIssue:
-        self._next_number += 1
+        self.last_number += 1
         self.created.append(draft)
-        return CreatedIssue(issue_number=self._next_number)
+        return CreatedIssue(issue_number=self.last_number)
 
 
 @pytest.mark.asyncio
@@ -492,7 +494,6 @@ def _reviewer(
     *,
     generate,
     create_issue,
-    retry_store: ImplRetryStore,
     config: RepoConfig | None = None,
 ) -> ContainerAdhocReviewer:
     return ContainerAdhocReviewer(
@@ -500,7 +501,6 @@ def _reviewer(
         config=config or RepoConfig(),
         generate=generate,
         create_issue=create_issue,
-        retry_store=retry_store,
     )
 
 
@@ -511,9 +511,7 @@ def test_issue_diff_command_uses_the_three_dot_diff_over_staging() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reviewer_files_each_finding_as_a_flat_review_fix_issue(
-    tmp_path: Path,
-) -> None:
+async def test_reviewer_files_each_finding_as_a_flat_review_fix_issue() -> None:
     """AC2: each finding is filed as a flat ``review-fix`` + ``ready-for-agent`` issue.
 
     Flat = no ``Part of #`` footer (ad-hoc work has no parent PRD) and no Blocked-by
@@ -524,8 +522,7 @@ async def test_reviewer_files_each_finding_as_a_flat_review_fix_issue(
         ReviewFinding(title="Fix off-by-one", body="total() adds a stray +1."),
         ReviewFinding(title="Stale doc", body="README still claims X."),
     )
-    store = ImplRetryStore(tmp_path / "retries.sqlite3")
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, retry_store=store)
+    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue)
     container = _DiffContainer(DEFECT_DIFF)
 
     await reviewer.review(_issue(29), container=container)
@@ -540,65 +537,118 @@ async def test_reviewer_files_each_finding_as_a_flat_review_fix_issue(
         assert READY_LABEL in draft.labels
         # Flat: no PRD back-link footer on an ad-hoc review-fix.
         assert "Part of #" not in draft.body
+        # The chain-depth marker is stamped so the next hop inherits the budget.
+        assert parse_chain_depth(draft.body) == 1
 
 
 @pytest.mark.asyncio
-async def test_clean_review_files_nothing(tmp_path: Path) -> None:
-    """A clean review (no findings) files no issue and records no retry attempt."""
+async def test_clean_review_files_nothing() -> None:
+    """A clean review (no findings) files nothing and does not extend the chain."""
     rec = _ReviewRecorder()
     generate, _ = _finding_generator()  # no findings
-    store = ImplRetryStore(tmp_path / "retries.sqlite3")
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, retry_store=store)
+    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue)
 
     await reviewer.review(_issue(29), container=_DiffContainer(""))
 
     assert rec.created == []
-    # No findings means no attempt was consumed against the cap.
-    assert await store.count(impl_retry_key(_slice_for_issue(_issue(29)))) == 0
+
+
+# --- chain-depth marker: render / parse round-trip --------------------------------
+
+
+def test_chain_depth_marker_round_trips() -> None:
+    """The chain-depth lineage marker renders into a body and parses back out."""
+    body = f"some finding text.\n\n{render_chain_depth(2)}"
+    assert parse_chain_depth(body) == 2
+
+
+def test_a_body_without_a_marker_is_chain_origin_depth_zero() -> None:
+    """A hand-filed issue carries no marker, so it starts the chain at depth 0."""
+    assert parse_chain_depth("just a plain issue body, no lineage marker") == 0
 
 
 @pytest.mark.asyncio
-async def test_review_fix_chain_is_bounded_by_the_retry_cap(tmp_path: Path) -> None:
-    """AC4: once the issue has spent its retry budget, the review files no more fixes.
+async def test_review_fix_chain_terminates_within_the_cap() -> None:
+    """AC1: a chain with a *fresh issue number per hop* terminates within the cap.
 
-    The per-unit retry cap (the same persisted counter triage uses) bounds how many
-    review passes one unit may spend filing fixes, so a review-fix issue cannot spawn
-    review fixes without limit.
+    Production files each review-fix under a brand-new GitHub number, so a key on the
+    issue number never bounds the chain. Here each hop is a distinct ``AdhocIssue`` whose
+    ``chain_depth`` is read from the prior hop's filed body — exactly how the lane would
+    rebuild it — and the loop terminates after ``retry_cap`` hops regardless of number.
     """
     rec = _ReviewRecorder()
     generate, _ = _finding_generator(
         ReviewFinding(title="Another fix", body="more to fix")
     )
-    store = ImplRetryStore(tmp_path / "retries.sqlite3")
     config = RepoConfig(retry_cap=2)
-    reviewer = _reviewer(
-        generate=generate, create_issue=rec.create_issue, retry_store=store, config=config
-    )
-    issue = _issue(29)
+    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
 
-    # Each review that files fixes consumes one unit of the retry budget.
-    await reviewer.review(issue, container=_DiffContainer(DEFECT_DIFF))
-    await reviewer.review(issue, container=_DiffContainer(DEFECT_DIFF))
-    assert len(rec.created) == 2  # two passes, cap=2 — budget now spent
+    # Walk the chain: each hop is a *new* issue number carrying the prior hop's depth + 1.
+    issue = _issue(29)  # depth 0, the chain origin
+    passes = 0
+    seen_numbers = {issue.issue_number}
+    for _ in range(10):  # generous ceiling; the bound must stop us well before this
+        before = len(rec.created)
+        await reviewer.review(issue, container=_DiffContainer(DEFECT_DIFF))
+        if len(rec.created) == before:
+            break  # the chain terminated: this hop filed no further fixes
+        passes += 1
+        # The just-filed review-fix loops back as a fresh-numbered ad-hoc issue.
+        filed = rec.created[-1]
+        next_number = rec.last_number
+        assert next_number not in seen_numbers  # production: a new number every hop
+        seen_numbers.add(next_number)
+        issue = AdhocIssue(
+            repo_full_name="owner/repo",
+            issue_number=next_number,
+            chain_depth=parse_chain_depth(filed.body),
+        )
 
-    # The third pass is over budget: the reviewer files nothing more (chain bounded).
-    rec.created.clear()
-    await reviewer.review(issue, container=_DiffContainer(DEFECT_DIFF))
-    assert rec.created == []
+    # The chain filed at most ``retry_cap`` review passes and then stopped — bounded.
+    assert passes == config.retry_cap
 
 
 @pytest.mark.asyncio
-async def test_reviewer_credential_rides_the_auth_env(tmp_path: Path) -> None:
+async def test_review_budget_does_not_share_a_key_with_triage(tmp_path: Path) -> None:
+    """AC2: build retries and review passes draw on disjoint budgets, not one counter.
+
+    The review pass bounds on the issue's own ``chain_depth`` and never touches the
+    ``ImplRetryStore`` triage uses, so an issue whose build-retry counter is already at
+    or over the cap still gets a full review (no silent skip), and a review pass spends
+    no unit triage later reads as a build attempt.
+    """
+    rec = _ReviewRecorder()
+    generate, _ = _finding_generator(
+        ReviewFinding(title="A fix", body="fix this")
+    )
+    config = RepoConfig(retry_cap=2)
+    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
+
+    # Triage has already spent this issue's *build*-retry budget on the shared store.
+    triage_store = ImplRetryStore(tmp_path / "retries.sqlite3")
+    key = impl_retry_key(_slice_for_issue(_issue(29)))
+    await triage_store.record_attempt(key)
+    await triage_store.record_attempt(key)
+    assert await triage_store.count(key) >= config.retry_cap
+
+    # The review of that same issue is NOT skipped — its budget is its chain depth (0).
+    await reviewer.review(_issue(29), container=_DiffContainer(DEFECT_DIFF))
+    assert len(rec.created) == 1  # the review filed its fix despite triage's spent budget
+
+    # And the review pass consumed nothing from triage's build-retry counter.
+    assert await triage_store.count(key) == config.retry_cap
+
+
+@pytest.mark.asyncio
+async def test_reviewer_credential_rides_the_auth_env() -> None:
     """The reviewer's credential is threaded as the container's auth env."""
     rec = _ReviewRecorder()
     generate, _ = _finding_generator()
-    store = ImplRetryStore(tmp_path / "retries.sqlite3")
     reviewer = ContainerAdhocReviewer(
         repo_full_name="owner/repo",
         config=RepoConfig(),
         generate=generate,
         create_issue=rec.create_issue,
-        retry_store=store,
         credential="tok",
         auth_mode="subscription",
     )

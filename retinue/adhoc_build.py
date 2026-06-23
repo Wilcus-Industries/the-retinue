@@ -26,9 +26,14 @@ from. The whole build runs in **one disposable container** that is destroyed on 
    :data:`~retinue.roles.Role.REVIEWER` Opus role) reviews the ``issue-<N>`` diff and
    files each finding as a flat ``review-fix`` + ``ready-for-agent`` follow-up issue that
    loops back as ordinary ad-hoc work. The review is **advisory**: it never blocks the
-   build or the push, and any error it raises is swallowed. The review-fix chain is bounded
-   by the per-unit retry cap (the same persisted counter triage uses), so a review-fix
-   issue cannot spawn review fixes without limit.
+   build or the push, and any error it raises is swallowed. The review-fix **chain** is
+   bounded by a lineage marker, not by the issue number: each filed review-fix issue
+   carries a ``Chain-depth: <n>`` line in its body (:func:`render_chain_depth`), and a
+   build whose issue is already at depth ``config.retry_cap`` files no further fixes. So
+   the chain ``#29 -> #501 -> #503 -> ...`` terminates after ``retry_cap`` hops even though
+   each hop is a fresh GitHub issue with its own number. This bound is self-carrying — it
+   lives in the issue body, touches no shared store, and so never collides with triage's
+   build-retry budget (:func:`~retinue.triage.triage_implementer`).
 
 Every side-effecting collaborator — the planner spawn, the implementer spawn, the
 reviewer, the container runtime, the auth, the secret resolver, and the report sink — is
@@ -38,12 +43,13 @@ no network. The container/git/done-check/credential mechanics are reused wholesa
 internal reviewer's :class:`~retinue.reviewer.ReviewGenerator` seam, ``review-fix`` label,
 and gh issue creator; this module only adds the planner seam, the plan materialization,
 threading :data:`PLAN_FILE` into the implementer as its ``plan_path``, the no-merge
-plan->execute ordering, and the advisory, retry-cap-bounded third review pass.
+plan->execute ordering, and the advisory, chain-depth-bounded third review pass.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -58,7 +64,6 @@ from retinue.done_check import (
     run_done_check_commands,
 )
 from retinue.github_app import InstallationAuth
-from retinue.impl_retry import ImplRetryStore, impl_retry_key
 from retinue.orchestrator import (
     _GIT_COMMITTER_ENV,
     Implementer,
@@ -87,6 +92,31 @@ logger = logging.getLogger(__name__)
 # prompt so the plan it emits is framed as "what will land in this file".
 PLAN_FILE = ".retinue/plan.md"
 
+# The lineage marker stamped into a filed review-fix issue's body and read back when that
+# issue loops in as ad-hoc work. It carries the chain's *depth* — how many review-fix hops
+# separate this issue from the chain origin — so each hop inherits one decreasing budget
+# and the chain terminates at ``config.retry_cap`` regardless of the fresh GitHub issue
+# number each hop is filed under. Rendered like the slicer's ``Part of #<prd>`` footer and
+# parsed back with :data:`_CHAIN_DEPTH_RE`. An issue with no marker is depth 0 (a chain
+# origin: a hand-filed nit or the first ad-hoc build).
+_CHAIN_DEPTH_PREFIX = "Chain-depth:"
+_CHAIN_DEPTH_RE = re.compile(rf"^{re.escape(_CHAIN_DEPTH_PREFIX)}\s*(\d+)\s*$", re.MULTILINE)
+
+
+def render_chain_depth(depth: int) -> str:
+    """Render the ``Chain-depth: <depth>`` lineage marker for a filed review-fix body."""
+    return f"{_CHAIN_DEPTH_PREFIX} {depth}"
+
+
+def parse_chain_depth(body: str) -> int:
+    """Read the chain depth from an issue ``body``; ``0`` when no marker is present.
+
+    An issue carrying no :data:`_CHAIN_DEPTH_PREFIX` marker is a chain origin (a
+    hand-filed nit or the first ad-hoc build), so it starts the chain at depth 0.
+    """
+    match = _CHAIN_DEPTH_RE.search(body)
+    return int(match.group(1)) if match else 0
+
 
 @dataclass(frozen=True)
 class AdhocIssue:
@@ -96,10 +126,16 @@ class AdhocIssue:
         repo_full_name: The target repo, e.g. "owner/repo".
         issue_number: The issue's GitHub number; the build commits to the derived
             ``issue-<N>`` branch.
+        chain_depth: How many review-fix hops separate this issue from its chain origin.
+            A hand-filed or first-built issue is depth 0; a review-fix this build files
+            is stamped (and loops back as) the next depth. The review pass uses it — not
+            the per-issue GitHub number — to bound the ``#29 -> #501 -> #503 -> ...``
+            chain, since each hop is filed under a fresh number with no shared state.
     """
 
     repo_full_name: str
     issue_number: int
+    chain_depth: int = 0
 
     @property
     def branch(self) -> str:
@@ -255,21 +291,25 @@ class ContainerAdhocReviewer:
        Blocked-by wiring, since ad-hoc work has no parent PRD; the fix loops back as
        ordinary ad-hoc work.
 
-    The review-fix chain is bounded by the **per-unit retry cap**: the reviewer reuses the
-    persisted :class:`~retinue.impl_retry.ImplRetryStore` keyed by the issue's
-    :func:`~retinue.impl_retry.impl_retry_key`. A unit that has already spent its
-    ``config.retry_cap`` review budget files nothing more, so a review-fix issue cannot
-    spawn review fixes without limit. A review that files at least one fix records one
-    attempt against the cap; a clean review consumes no budget.
+    The review-fix **chain** is bounded by the issue's :attr:`~AdhocIssue.chain_depth`, a
+    ``Chain-depth: <n>`` lineage marker each filed fix carries in its body
+    (:func:`render_chain_depth`) and the next ad-hoc build reads back
+    (:func:`parse_chain_depth`). A build whose issue is already at depth
+    ``config.retry_cap`` files no further fixes, and every fix this build files is stamped
+    one depth deeper — so the chain ``#29 -> #501 -> #503 -> ...`` terminates after
+    ``retry_cap`` hops even though each hop is a fresh GitHub issue number. The bound is
+    carried in the issue body, not in a shared counter, so it never raids — and is never
+    raided by — triage's build-retry budget
+    (:func:`~retinue.triage.triage_implementer`). A clean review (no findings) does not
+    extend the chain.
 
     Attributes:
         repo_full_name: The target repo the review-fix issues are filed against.
         config: The accepted repo config; ``staging_branch`` is the diff base and
-            ``retry_cap`` bounds the review-fix chain.
+            ``retry_cap`` bounds the review-fix chain depth.
         generate: The headless Agent-SDK reviewer (the :class:`ReviewGenerator` seam).
         create_issue: The gh issue creator filing each flat review-fix issue (slicer's
             seam, reused from the internal reviewer).
-        retry_store: The persisted per-unit attempt counter bounding the chain.
         credential: The reviewing model's credential; for seam symmetry with the planner
             and implementer (the generator holds its own credential over HTTP).
         auth_mode: ``"api_key"`` or ``"subscription"``; routes :meth:`auth_env`.
@@ -279,21 +319,20 @@ class ContainerAdhocReviewer:
     config: RepoConfig
     generate: ReviewGenerator
     create_issue: IssueCreator
-    retry_store: ImplRetryStore
     credential: str = ""
     auth_mode: str = "api_key"
 
     async def review(self, issue: AdhocIssue, *, container: Container) -> None:
         """Review ``issue``'s diff and file each finding as a flat review-fix issue."""
-        key = impl_retry_key(_slice_for_issue(issue))
-        spent = await self.retry_store.count(key)
-        if spent >= self.config.retry_cap:
-            # The unit has spent its whole review budget; do not file more fixes — this
-            # bounds the review-fix chain so it cannot loop without limit.
+        if issue.chain_depth >= self.config.retry_cap:
+            # The chain has reached its bound; do not file more fixes. Keyed on the
+            # issue's own lineage depth, not the GitHub number, so a freshly-numbered
+            # review-fix issue still inherits the chain's spent budget and the loop
+            # ``#29 -> #501 -> #503 -> ...`` terminates.
             logger.info(
-                "Skipping ad-hoc review of %s: retry budget spent (%d/%d)",
+                "Skipping ad-hoc review of %s: chain depth reached (%d/%d)",
                 issue.branch,
-                spent,
+                issue.chain_depth,
                 self.config.retry_cap,
             )
             return
@@ -309,21 +348,20 @@ class ContainerAdhocReviewer:
         if not plan.findings:
             logger.info("Ad-hoc review of %s found nothing to fix", issue.branch)
             return
+        next_depth = issue.chain_depth + 1
         for finding in plan.findings:
             await self.create_issue(
                 IssueDraft(
                     title=finding.title,
-                    body=finding.body.rstrip(),
+                    body=f"{finding.body.rstrip()}\n\n{render_chain_depth(next_depth)}",
                     labels=[READY_LABEL, REVIEW_FIX_LABEL],
                 )
             )
-        # One review pass that filed fixes spends one unit of the retry budget, so a
-        # review-fix issue that loops back gets at most ``retry_cap`` review passes.
-        await self.retry_store.record_attempt(key)
         logger.info(
-            "Ad-hoc review of %s filed %d review-fix follow-up(s)",
+            "Ad-hoc review of %s filed %d review-fix follow-up(s) at chain depth %d",
             issue.branch,
             len(plan.findings),
+            next_depth,
         )
 
     async def _issue_diff(self, issue: AdhocIssue, container: Container) -> str:
