@@ -26,8 +26,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from retinue.roles import Role, resolve_effort, resolve_model
 from retinue.slicer import (
-    _EFFORT_MAX,
     READY_LABEL,
     CreatedIssue,
     IssueCreator,
@@ -126,13 +126,14 @@ BlockedByEditor = Callable[[EditBlockedByRequest], Awaitable[None]]
 # httpx-style client, tests inject a fake. The pure parts — auth header build,
 # request payload assembly, and response parsing — are exercised without network.
 #
-# SDK conventions match the slicer: Opus 4.8 is the default model; a subscription
-# OAuth token goes on ``Authorization: Bearer`` with the ``oauth-2025-04-20`` beta
-# header, while a raw API key goes on ``x-api-key``; ``anthropic-version`` is
-# always sent. The model must return only the JSON object matching the schema.
+# SDK conventions match the slicer: the model and effort tier come from the
+# :data:`~retinue.roles.Role.REVIEWER` registry entry (Opus 4.8 at the ``max`` tier by
+# default); a subscription OAuth token goes on ``Authorization: Bearer`` with the
+# ``oauth-2025-04-20`` beta header, while a raw API key goes on ``x-api-key``;
+# ``anthropic-version`` is always sent. The model must return only the JSON object
+# matching the schema.
 # ---------------------------------------------------------------------------
 
-_REVIEW_MODEL = "claude-opus-4-8"
 _ANTHROPIC_VERSION = "2023-06-01"
 _OAUTH_BETA = "oauth-2025-04-20"
 _MESSAGES_URL = "https://api.anthropic.com/v1/messages"
@@ -215,12 +216,14 @@ class AgentSdkReviewGenerator:
             OAuth beta header; any other value is treated as a raw API key on
             ``x-api-key``.
         transport: The injected HTTP POST seam.
-        model: The reviewing model id; defaults to Opus 4.8.
+        model: The reviewing model id; defaults to the
+            :data:`~retinue.roles.Role.REVIEWER` registry entry (Opus 4.8), which a
+            repo's ``models`` override can replace at the wiring site.
     """
 
     credential: str
     transport: HttpTransport
-    model: str = _REVIEW_MODEL
+    model: str = field(default_factory=lambda: resolve_model(Role.REVIEWER))
 
     async def __call__(self, review_input: ReviewInput) -> ReviewPlan:
         """Review ``review_input``'s diff and return the parsed :class:`ReviewPlan`."""
@@ -251,9 +254,10 @@ class AgentSdkReviewGenerator:
     def _payload(self, review_input: ReviewInput) -> dict[str, Any]:
         """Assemble the Messages API request body for one round's review.
 
-        The internal reviewer is the highest-rigor Opus role, so the request carries
-        the "max" reasoning-effort tier via ``output_config.effort`` (Opus 4.8 removed
-        the extended-thinking ``budget_tokens`` mechanism, which now returns HTTP 400).
+        The internal reviewer is the highest-rigor Opus role, so the request carries the
+        role's registry effort tier (``max``) via ``output_config.effort`` (Opus 4.8
+        removed the extended-thinking ``budget_tokens`` mechanism, which now returns
+        HTTP 400).
         """
         merged = ", ".join(f"#{n}" for n in review_input.merged_issues) or "(none)"
         user = (
@@ -267,7 +271,7 @@ class AgentSdkReviewGenerator:
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
-            "output_config": {"effort": _EFFORT_MAX},
+            "output_config": {"effort": resolve_effort(Role.REVIEWER)},
             "system": _REVIEW_SYSTEM,
             "messages": [{"role": "user", "content": user}],
             "response_format": {"type": "json_schema", "json_schema": _REVIEW_SCHEMA},

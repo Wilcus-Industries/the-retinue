@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from retinue.notify import Notification, Notifier
+from retinue.roles import EFFORT_MAX, EFFORT_XHIGH, Role, resolve_effort, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -38,23 +39,18 @@ HITL_LABEL = "hitl"
 # :mod:`retinue.lane`.
 PRD_SLICE_LABEL = "prd-slice"
 
-# The Agent-SDK model that does the slicing, and the OAuth beta header that a
-# subscription token requires. See the claude-api skill: Opus 4.8 is the default
-# model, OAuth tokens go on Authorization: Bearer with the oauth beta header.
-_SLICE_MODEL = "claude-opus-4-8"
+# The OAuth beta header a subscription token requires. See the claude-api skill: OAuth
+# tokens go on Authorization: Bearer with the oauth beta header. The slicing model and
+# effort tier are owned by :mod:`retinue.roles` (the :data:`Role.SLICER` registry entry),
+# resolved at construction/request time rather than pinned to a local constant.
 _OAUTH_BETA = "oauth-2025-04-20"
 _MAX_TOKENS = 16_000
 
-# Per-role reasoning effort, expressed as the ``output_config.effort`` tier the Messages
-# API call carries. Opus 4.8 (the model every Opus role pins) removed the extended-
-# thinking ``budget_tokens`` mechanism — it returns HTTP 400 — so effort is the current
-# control (see the claude-api skill). The PRD pins the orchestrator/slicer to the "xhigh"
-# tier and the internal reviewer to the highest "max" tier; these two constants are the
-# shared tiers every Opus role draws from so the effort stays consistent across call
-# sites (the slicer, the internal reviewer, and the conflict resolver). The literal tier
-# strings are self-documenting, so no numeric budget bookkeeping is needed.
-_EFFORT_XHIGH = "xhigh"
-_EFFORT_MAX = "max"
+# Re-exported from :mod:`retinue.roles` so the conflict resolver and internal reviewer
+# keep importing the shared effort tiers from the slicer; the registry is the source of
+# truth, these names are aliases that preserve the existing import surface.
+_EFFORT_XHIGH = EFFORT_XHIGH
+_EFFORT_MAX = EFFORT_MAX
 
 # Strict JSON schema the headless slicer must emit: an ordered list of vertical
 # slices, each with its 1-based intra-PRD blocked_by indices and a hitl flag.
@@ -194,12 +190,14 @@ class ClaudeSliceGenerator:
         token: The API key (``api_key`` mode) or OAuth bearer token
             (``subscription`` mode).
         auth_mode: ``"api_key"`` or ``"subscription"``.
-        model: The model the headless slicer runs on.
+        model: The model the headless slicer runs on; defaults to the
+            :data:`~retinue.roles.Role.SLICER` registry entry, which a repo's
+            ``models`` override can replace at the wiring site.
     """
 
     token: str
     auth_mode: str = "api_key"
-    model: str = _SLICE_MODEL
+    model: str = field(default_factory=lambda: resolve_model(Role.SLICER))
 
     async def generate(self, prd_body: str) -> SlicePlan:
         """Run the headless slicer over ``prd_body`` and return its :class:`SlicePlan`.
@@ -261,7 +259,7 @@ class ClaudeSliceGenerator:
             "max_tokens": _MAX_TOKENS,
             "system": _SLICE_SYSTEM,
             "output_config": {
-                "effort": _EFFORT_XHIGH,
+                "effort": resolve_effort(Role.SLICER),
                 "format": {"type": "json_schema", "schema": _SLICE_SCHEMA},
             },
             "messages": [{"role": "user", "content": _build_user_content(prd_body)}],

@@ -19,7 +19,6 @@ import pytest
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
-    _IMPLEMENT_MODEL,
     AgentSdkConflictResolver,
     AnthropicResponse,
     BuildOutcome,
@@ -47,6 +46,7 @@ from retinue.orchestrator import (
     integration_branch,
 )
 from retinue.repo_config import RepoConfig, SecretsConfig
+from retinue.roles import ROLE_REGISTRY, Role
 from retinue.slicer import _EFFORT_XHIGH
 from tests.test_done_check import (
     CLAUDE_MD,
@@ -856,11 +856,11 @@ async def test_container_implementer_execs_claude_with_prompt_and_model() -> Non
 def test_container_implementer_defaults_to_sonnet() -> None:
     """The production-wired implementer (no model override) defaults to Sonnet.
 
-    pipeline.py constructs ``ContainerImplementer`` with only credential + auth_mode,
-    so the default constant is the live model. Per the PRD, implementers default to
-    Sonnet (slicer/reviewer stay on Opus).
+    pipeline.py constructs ``ContainerImplementer`` with only credential + auth_mode, so
+    the registry's ``IMPLEMENTER`` entry is the live model. Per the PRD, implementers
+    default to Sonnet (slicer/reviewer/resolver stay on Opus).
     """
-    assert _IMPLEMENT_MODEL == "claude-sonnet-4-6"
+    assert ROLE_REGISTRY[Role.IMPLEMENTER].model == "claude-sonnet-4-6"
     assert ContainerImplementer(credential="k").model == "claude-sonnet-4-6"
 
 

@@ -41,6 +41,11 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   stored on `app.state.arq_pool`.
 - `retinue.repo_config` — the per-repo `.github/retinue.yml` schema (`RepoConfig`) and
   `load_repo_config`, which never raises on bad input.
+- `retinue.roles` — the agent-role registry: one `ROLE_REGISTRY` table mapping each
+  `Role` (slicer / implementer / resolver / reviewer) to its model id, reasoning-effort
+  tier, and invocation transport. The four role adapters resolve their model and effort
+  here via `resolve_model` / `resolve_effort` instead of hand-rolled constants;
+  `resolve_model` applies a repo's `models` override, effort stays registry-owned.
 - `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
 - `retinue.worker` — the `process_prd` Arq task (gate → drive the pipeline), the
   `process_review_job` / `reap_pr_job` tasks the webhook events enqueue, the `gate_prd`
@@ -112,8 +117,8 @@ staging_branch: staging        # branch the retinue integrates onto
 retry_cap: 3                   # max retries per unit of work (>= 0)
 max_parallel: 4                # optional concurrency cap (> 0)
 cron: "0 */6 * * *"            # optional five-field cron cadence
-models:                        # optional role -> model-id overrides
-  planner: claude-opus-4
+models:                        # optional role -> model-id overrides; keys are the
+  implementer: claude-opus-4-8  # registry roles: slicer/implementer/resolver/reviewer
 secrets:                       # optional inline secrets + external refs
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   refs:
