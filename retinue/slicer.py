@@ -184,9 +184,9 @@ class ClaudeSliceGenerator:
         JSON payload into ordered :class:`IssueDraft` slices. Raises on a response
         the slicer can't parse; an empty plan is a valid result the caller escalates.
         """
-        # Lazy import keeps the module (and its unit tests) import-clean without the
-        # SDK installed; type-ignored because ``anthropic`` is an optional runtime dep.
-        from anthropic import AsyncAnthropic  # type: ignore[import-not-found]
+        # Lazy import keeps the module (and its unit tests) import-clean: the heavy
+        # ``anthropic`` client is only pulled in when a real slice generation runs.
+        from anthropic import AsyncAnthropic
 
         client = AsyncAnthropic(**self._client_kwargs())
         async with client.messages.stream(**self._build_request_kwargs(prd_body)) as stream:
