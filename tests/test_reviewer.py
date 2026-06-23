@@ -34,7 +34,7 @@ from retinue.reviewer import (
     add_blocked_by,
     review_round,
 )
-from retinue.slicer import CreatedIssue, IssueDraft
+from retinue.slicer import _EFFORT_MAX, CreatedIssue, IssueDraft
 from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
 from tests.test_orchestrator import FakeGitOps, FakeImplementer
 from tests.test_prd_build import OneAtATimeLock
@@ -276,6 +276,18 @@ def test_payload_carries_model_schema_diff_and_merged_issues() -> None:
     assert "#2, #3" in user
     assert "off-by-one planted defect" in user
     assert f"PRD #{PRD_NUMBER}" in user
+
+
+def test_payload_carries_max_effort_thinking() -> None:
+    """The internal reviewer (Opus) runs at the max effort tier via extended thinking."""
+    gen = AgentSdkReviewGenerator(
+        credential="k", transport=_FakeTransport(_text_response({"findings": []}))
+    )
+
+    payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
+
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": _EFFORT_MAX}
+    assert payload["max_tokens"] > _EFFORT_MAX
 
 
 @pytest.mark.asyncio

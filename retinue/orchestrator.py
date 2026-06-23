@@ -545,6 +545,13 @@ _RESOLVE_OAUTH_BETA = "oauth-2025-04-20"
 _ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 _RESOLVE_MAX_TOKENS = 32_000
 
+# Reasoning-effort tier for the conflict resolver: this is the orchestrator's Opus
+# reasoning call, which the PRD pins to the "xhigh" tier. Expressed as the extended-
+# thinking ``budget_tokens`` (kept under ``_RESOLVE_MAX_TOKENS`` so the API leaves room
+# for the response). The slicer keeps its own copy of this budget so the orchestrator
+# layer stays edit-isolated (mirroring the GhRunner/GhResult duplication above).
+_EFFORT_XHIGH = 12_000
+
 # Re-runs the merge (no auto-commit) so the working tree carries the conflict markers
 # the resolver reads; ``--no-commit`` keeps it stopped at the conflict even when git
 # could otherwise auto-resolve, so the agent always sees the full picture.
@@ -676,7 +683,9 @@ def _resolve_payload(
 
     The frozen system brief leads; the user message carries the merge context plus each
     conflicted file's full marked-up body, fenced by path so the model can address each
-    one. The strict schema forces a per-file resolved body back.
+    one. The strict schema forces a per-file resolved body back. The request carries the
+    "xhigh" reasoning-effort tier via the extended-thinking ``budget_tokens`` (kept under
+    ``_RESOLVE_MAX_TOKENS`` so the API has room for the response).
     """
     blocks = "\n\n".join(
         f"### {file.path}\n```\n{file.content}\n```" for file in files
@@ -689,6 +698,7 @@ def _resolve_payload(
     return {
         "model": model,
         "max_tokens": _RESOLVE_MAX_TOKENS,
+        "thinking": {"type": "enabled", "budget_tokens": _EFFORT_XHIGH},
         "system": _RESOLVE_SYSTEM,
         "messages": [{"role": "user", "content": user}],
         "response_format": {"type": "json_schema", "json_schema": _RESOLVE_SCHEMA},

@@ -20,6 +20,7 @@ from retinue.notify import (
     PushRequest,
 )
 from retinue.slicer import (
+    _EFFORT_XHIGH,
     ClaudeSliceGenerator,
     CreatedIssue,
     GhCliIssueCreator,
@@ -256,6 +257,17 @@ def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:
     assert fmt["type"] == "json_schema"
     assert fmt["schema"]["properties"]["slices"]["type"] == "array"
     assert kwargs["max_tokens"] > 0
+
+
+def test_request_kwargs_carry_xhigh_effort_thinking() -> None:
+    """The slicer (Opus) runs at the xhigh effort tier via extended thinking."""
+    gen = ClaudeSliceGenerator(token="sk-ant-123")
+
+    kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
+
+    assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": _EFFORT_XHIGH}
+    # The thinking budget must leave room for the response under max_tokens.
+    assert kwargs["max_tokens"] > _EFFORT_XHIGH
 
 
 def test_parse_plan_maps_payload_to_ordered_drafts() -> None:

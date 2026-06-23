@@ -26,7 +26,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from retinue.slicer import READY_LABEL, CreatedIssue, IssueCreator, IssueDraft
+from retinue.slicer import (
+    _EFFORT_MAX,
+    READY_LABEL,
+    CreatedIssue,
+    IssueCreator,
+    IssueDraft,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +249,12 @@ class AgentSdkReviewGenerator:
         return headers
 
     def _payload(self, review_input: ReviewInput) -> dict[str, Any]:
-        """Assemble the Messages API request body for one round's review."""
+        """Assemble the Messages API request body for one round's review.
+
+        The internal reviewer is the highest-rigor Opus role, so the request carries
+        the "max" reasoning-effort tier via the extended-thinking ``budget_tokens``
+        (kept under ``max_tokens`` so the API has room for the response).
+        """
         merged = ", ".join(f"#{n}" for n in review_input.merged_issues) or "(none)"
         user = (
             f"Merged round of PRD #{review_input.prd_number} in "
@@ -256,6 +267,7 @@ class AgentSdkReviewGenerator:
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
+            "thinking": {"type": "enabled", "budget_tokens": _EFFORT_MAX},
             "system": _REVIEW_SYSTEM,
             "messages": [{"role": "user", "content": user}],
             "response_format": {"type": "json_schema", "json_schema": _REVIEW_SCHEMA},

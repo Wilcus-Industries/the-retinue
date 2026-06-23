@@ -39,6 +39,16 @@ _SLICE_MODEL = "claude-opus-4-8"
 _OAUTH_BETA = "oauth-2025-04-20"
 _MAX_TOKENS = 16_000
 
+# Per-role reasoning effort, expressed as the extended-thinking budget the Messages
+# API call carries (``thinking={"type": "enabled", "budget_tokens": N}``). The PRD
+# pins the orchestrator/slicer to an "xhigh" tier and the internal reviewer to a
+# "max" tier; these two constants are the shared budgets every role draws from so the
+# tiers stay consistent across call sites. Each must stay strictly below the request's
+# ``max_tokens`` (the API rejects a thinking budget that doesn't leave room for the
+# response), so the slicer/reviewer (16k max) and resolver (32k max) all clear it.
+_EFFORT_XHIGH = 12_000
+_EFFORT_MAX = 14_000
+
 # Strict JSON schema the headless slicer must emit: an ordered list of vertical
 # slices, each with its 1-based intra-PRD blocked_by indices and a hitl flag.
 _SLICE_SCHEMA: dict[str, Any] = {
@@ -220,10 +230,16 @@ class ClaudeSliceGenerator:
         return {}
 
     def _build_request_kwargs(self, prd_body: str) -> dict[str, Any]:
-        """Assemble the streaming-request kwargs for one PRD slice run."""
+        """Assemble the streaming-request kwargs for one PRD slice run.
+
+        The slicer is the PRD-decision Opus role, so the request carries the "xhigh"
+        reasoning-effort tier via the extended-thinking ``budget_tokens`` (kept under
+        ``max_tokens`` so the API has room for the response).
+        """
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
+            "thinking": {"type": "enabled", "budget_tokens": _EFFORT_XHIGH},
             "system": _SLICE_SYSTEM,
             "output_config": {"format": {"type": "json_schema", "schema": _SLICE_SCHEMA}},
             "messages": [{"role": "user", "content": prd_body}],

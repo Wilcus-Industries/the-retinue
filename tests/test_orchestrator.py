@@ -19,6 +19,7 @@ import pytest
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
+    _EFFORT_XHIGH,
     _IMPLEMENT_MODEL,
     AgentSdkConflictResolver,
     AnthropicResponse,
@@ -608,6 +609,16 @@ def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
     assert "### a.py" in user and "### b.py" in user
     assert "<<<<<<< ours" in user and "conflict-b" in user
     assert "issue-7" in user and "retinue/prd-1" in user
+
+
+def test_resolve_payload_carries_xhigh_effort_thinking() -> None:
+    """The conflict resolver (the orchestrator's Opus call) runs at the xhigh tier."""
+    files = [_ConflictedFile(path="a.py", content="conflict-a")]
+
+    payload = _resolve_payload(files, source="issue-7", into="retinue/prd-1", model="m")
+
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": _EFFORT_XHIGH}
+    assert payload["max_tokens"] > _EFFORT_XHIGH
 
 
 def test_parse_resolution_maps_paths_to_resolved_bodies() -> None:
