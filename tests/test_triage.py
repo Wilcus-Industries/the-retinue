@@ -19,6 +19,7 @@ no push service, no network.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -46,7 +47,9 @@ from retinue.triage import (
 class _NoContainer:
     """A do-nothing build container the triage threads to the implementer (unused here)."""
 
-    async def run_command(self, command: list[str]) -> RunResult:
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
         return RunResult(exit_code=0)
 
     async def destroy(self) -> None:

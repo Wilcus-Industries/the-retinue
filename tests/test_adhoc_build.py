@@ -15,6 +15,7 @@ done-check pushes nothing.
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -303,7 +304,9 @@ class ScriptedContainer:
         self._result = result
         self.commands: list[list[str]] = []
 
-    async def run_command(self, command: list[str]) -> RunResult:
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
         self.commands.append(command)
         return self._result
 
@@ -463,7 +466,9 @@ class _DiffContainer:
         self._diff = diff
         self.commands: list[list[str]] = []
 
-    async def run_command(self, command: list[str]) -> RunResult:
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
         self.commands.append(command)
         if command[:2] == ["git", "diff"]:
             return RunResult(exit_code=0, stdout=self._diff)
@@ -488,7 +493,9 @@ class _RefAwareDiffContainer:
         self._known_refs = known_refs
         self.commands: list[list[str]] = []
 
-    async def run_command(self, command: list[str]) -> RunResult:
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
         self.commands.append(command)
         if command[:2] == ["git", "diff"]:
             base = command[2].split("...", 1)[0]

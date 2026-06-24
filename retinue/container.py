@@ -20,6 +20,7 @@ import base64
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -50,8 +51,14 @@ class RunResult:
 class Container(Protocol):
     """A running disposable container the orchestrator drives then destroys."""
 
-    async def run_command(self, command: list[str]) -> RunResult:
-        """Run ``command`` inside the container and return its captured result."""
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
+        """Run ``command`` inside the container and return its captured result.
+
+        ``env`` overrides the container's environment for this command only (e.g. the
+        done-check blanks the Anthropic auth credential so it never enters pytest's env).
+        """
         ...
 
     async def destroy(self) -> None:
@@ -114,14 +121,25 @@ def _create_container_payload(*, image: str, env: dict[str, str]) -> dict[str, A
     }
 
 
-def _exec_create_payload(command: list[str]) -> dict[str, Any]:
-    """Assemble the ``POST /containers/{id}/exec`` body, capturing both output streams."""
-    return {
+def _exec_create_payload(
+    command: list[str], env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Assemble the ``POST /containers/{id}/exec`` body, capturing both output streams.
+
+    ``env`` is layered over the container's own environment for this exec only (Docker
+    merges exec env on top of container env, last wins), so a caller can blank a
+    container-level secret for a single command — e.g. the done-check unsets the
+    Anthropic auth credential so it never reaches pytest's environment.
+    """
+    payload: dict[str, Any] = {
         "Cmd": command,
         "AttachStdout": True,
         "AttachStderr": True,
         "WorkingDir": WORKSPACE_DIR,
     }
+    if env:
+        payload["Env"] = [f"{key}={value}" for key, value in env.items()]
+    return payload
 
 
 def _demux_stream(raw: bytes) -> tuple[str, str]:
@@ -311,10 +329,19 @@ class DockerContainer:
         self._runtime = runtime
         self._destroyed = False
 
-    async def run_command(self, command: list[str]) -> RunResult:
-        """Exec ``command`` inside the container, returning its captured result."""
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
+        """Exec ``command`` inside the container, returning its captured result.
+
+        ``env`` is layered over the container env for this exec only, so a caller can
+        blank a container-level secret for one command (the done-check unsets the
+        Anthropic credential so it never reaches the checked repo's test process).
+        """
         status, body = await self._runtime._request(
-            "POST", f"/containers/{self._id}/exec", body=_exec_create_payload(command)
+            "POST",
+            f"/containers/{self._id}/exec",
+            body=_exec_create_payload(command, env),
         )
         if status not in (200, 201):
             raise DockerError(f"exec create failed ({status}): {body.decode(errors='replace')}")

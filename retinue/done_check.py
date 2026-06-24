@@ -207,6 +207,31 @@ _STATUS_PASSED = "Done-check passed"
 _STATUS_FAILED = "Done-check failed"
 _STATUS_ESCALATED = "Done-check escalated"
 
+# Credential shapes scrubbed from a report body before it is posted to GitHub. The report
+# echoes a failed command's output, which can carry a secret a test printed (the dogfood
+# leak: pytest read the live Anthropic token from env and the failure detail posted it).
+# This is the last gate before a value reaches GitHub, so known credential shapes — and any
+# PEM private-key block — are replaced wholesale.
+_REDACTION = "[REDACTED]"
+_SECRET_PATTERNS = (
+    # PEM private-key blocks (DOTALL: spans the base64 body across newlines). Matched
+    # first so the whole block collapses to one marker rather than per-line noise.
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+    re.compile(r"sk-ant-[A-Za-z0-9._-]+"),  # Anthropic api / oat tokens
+    re.compile(r"github_pat_[A-Za-z0-9_]+"),  # GitHub fine-grained PAT
+    re.compile(r"gh[pousr]_[A-Za-z0-9]+"),  # GitHub classic / app / refresh tokens
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace credential-shaped substrings in ``text`` with a redaction marker."""
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(_REDACTION, text)
+    return text
+
 
 def render_report_body(report: DoneCheckReport) -> str:
     """Render a :class:`DoneCheckReport` into the Markdown body posted to GitHub.
@@ -227,7 +252,7 @@ def render_report_body(report: DoneCheckReport) -> str:
         status = _STATUS_PASSED
     else:
         status = _STATUS_FAILED
-    return f"## {status}\n\n{report.detail}"
+    return f"## {status}\n\n{_redact_secrets(report.detail)}"
 
 
 def render_report_argv(report: DoneCheckReport) -> list[str]:
@@ -383,6 +408,13 @@ async def _resolve_secrets(
     return env
 
 
+# The implementer's Anthropic credential rides the build container's env so claude can
+# authenticate; the done-check commands (pytest/ruff/mypy) never need it. Blanking these
+# names per command keeps the live token out of the checked repo's process env — the
+# dogfood leak was a test reading CLAUDE_CODE_OAUTH_TOKEN from env and echoing it.
+_AUTH_ENV_VARS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+
+
 async def run_done_check_commands(
     container: Container, commands: list[list[str]]
 ) -> tuple[bool, str]:
@@ -390,13 +422,16 @@ async def run_done_check_commands(
 
     The container is owned by the caller (the orchestrator's per-slice build container,
     which has already cloned the repo and let the implementer commit the slice), so the
-    commands run over the *real* changes rather than a pristine clone.
+    commands run over the *real* changes rather than a pristine clone. Each command runs
+    with the Anthropic auth credential blanked in its environment (it is the implementer's,
+    not the check's), so a test can never read it back out of the env.
 
     Returns:
         ``(passed, detail)`` — ``passed`` is True only if every command exited 0.
     """
+    scrub_env = {name: "" for name in _AUTH_ENV_VARS}
     for command in commands:
-        result: RunResult = await container.run_command(command)
+        result: RunResult = await container.run_command(command, env=scrub_env)
         if not result.ok:
             return False, _format_failure_detail(command, result)
     return True, "all done-check commands passed"

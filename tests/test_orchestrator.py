@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Mapping
 
 import pytest
 
@@ -423,7 +424,9 @@ class ScriptedContainer:
         self._results = results or {}
         self.commands: list[list[str]] = []
 
-    async def run_command(self, command: list[str]) -> RunResult:
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
         self.commands.append(command)
         joined = " ".join(command)
         for marker, result in self._results.items():

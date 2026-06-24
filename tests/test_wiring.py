@@ -9,6 +9,7 @@ everything else is a real adapter, exercised here with fakes — no Docker, gh, 
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -422,7 +423,9 @@ class _RedContainer:
     pushed). The implementer is a fake (it does not exec ``claude`` against this container).
     """
 
-    async def run_command(self, command: list[str]) -> object:
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> object:
         from retinue.container import RunResult
 
         if command and command[0] == "git":

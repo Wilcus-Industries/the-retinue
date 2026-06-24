@@ -14,6 +14,8 @@ reviewer tests, so they live here.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import pytest
 
 from retinue.container import Container, RunResult
@@ -73,9 +75,16 @@ class FakeContainer:
         self._log = log
         self._results = results
         self.destroyed = False
+        # Per-command exec env overrides, keyed by the first argv token, so a test can
+        # assert the done-check blanks the Anthropic credential before running pytest.
+        self.command_env: dict[str, Mapping[str, str]] = {}
 
-    async def run_command(self, command: list[str]) -> RunResult:
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
         self._log.append("run:" + " ".join(command))
+        if env is not None:
+            self.command_env[command[0]] = env
         return self._results.get(command[0], RunResult(exit_code=0))
 
     async def destroy(self) -> None:
@@ -199,6 +208,25 @@ async def test_failure_detail_includes_stdout_failure_summary() -> None:
 
     assert passed is False
     assert "FAILED tests/test_widget.py::test_frobnicate" in detail
+
+
+@pytest.mark.asyncio
+async def test_done_check_blanks_anthropic_credential_for_each_command() -> None:
+    """Each done-check command runs with the Anthropic auth credential unset.
+
+    The build container carries the implementer's CLAUDE_CODE_OAUTH_TOKEN /
+    ANTHROPIC_API_KEY so claude can authenticate; pytest must NOT inherit it (the
+    dogfood leak: ``test_adapter_settings_default`` read the live token from env and
+    printed it into the report). Blanking it per-command is the source fix.
+    """
+    log: list[str] = []
+    container = FakeContainer(log, {})
+
+    await run_done_check_commands(container, [["uv", "run", "pytest"]])
+
+    env = container.command_env["uv"]
+    assert env["ANTHROPIC_API_KEY"] == ""
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
 
 
 @pytest.mark.asyncio
@@ -360,6 +388,36 @@ def test_render_report_body_headers_each_outcome() -> None:
     assert escalated.startswith("## Done-check escalated")
     # The report detail always rides along in the body.
     assert "all done-check commands passed" in render_report_body(_report())
+
+
+def test_render_report_body_redacts_secret_shaped_strings() -> None:
+    """The posted body scrubs credential-shaped strings — defense in depth.
+
+    Even with the env-strip in place, a test could echo some other secret; the report
+    is the last gate before a value reaches GitHub, so it redacts Anthropic keys,
+    GitHub tokens, and PEM private-key blocks rather than posting them.
+    """
+    detail = (
+        "auth failed with sk-ant-oat01-K_0RRfidvjYPNy2KfcFJ-DUUBjQAA\n"
+        "clone used ghp_abcdEFGH1234567890abcdEFGH1234567890\n"
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK\n-----END RSA PRIVATE KEY-----"
+    )
+    report = DoneCheckReport(
+        repo_full_name="owner/repo",
+        issue_number=47,
+        passed=False,
+        escalated=False,
+        detail=detail,
+    )
+
+    body = render_report_body(report)
+
+    assert "sk-ant-oat01-K_0RRfidvjYPNy2KfcFJ-DUUBjQAA" not in body
+    assert "ghp_abcdEFGH1234567890abcdEFGH1234567890" not in body
+    assert "MIIEowIBAAK" not in body
+    assert "[REDACTED]" in body
+    # The non-secret context around the secrets survives so the report stays useful.
+    assert "auth failed" in body
 
 
 def test_render_report_argv_targets_repo_and_passes_body_via_flag() -> None:
