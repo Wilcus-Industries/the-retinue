@@ -506,13 +506,17 @@ async def build_adhoc_issue(
     env = await resolve_secrets_or_escalate(
         issue.repo_full_name, issue.issue_number, config, resolve_secret, report
     )
-    start_env = {
-        **env,
-        **_GIT_COMMITTER_ENV,
-        **planner.auth_env(),
-        **implementer.auth_env(),
-        **(reviewer.auth_env() if reviewer is not None else {}),
-    }
+    auth_envs = [
+        planner.auth_env(),
+        implementer.auth_env(),
+        *([reviewer.auth_env()] if reviewer is not None else []),
+    ]
+    start_env = {**env, **_GIT_COMMITTER_ENV}
+    for auth_env in auth_envs:
+        start_env.update(auth_env)
+    # The exact secret values injected into the container, so a failing done-check has
+    # them scrubbed from its report — repo-declared secrets plus the auth credential.
+    secret_values = [*env.values(), *(v for a in auth_envs for v in a.values())]
     token = await auth.installation_token(issue.repo_full_name)
     container = await runtime.start(image=image, env=start_env)
     try:
@@ -527,7 +531,9 @@ async def build_adhoc_issue(
         await implementer.implement(
             _slice_for_issue(issue), container=container, plan_path=PLAN_FILE
         )
-        passed, detail = await run_done_check_commands(container, commands)
+        passed, detail = await run_done_check_commands(
+            container, commands, secret_values=secret_values
+        )
         if passed:
             await _push_branch(container, issue.branch)
         await report(

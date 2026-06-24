@@ -1021,7 +1021,11 @@ async def _build_slice_in_container(
     env = await resolve_secrets_or_escalate(
         slice_.repo_full_name, slice_.issue_number, config, resolve_secret, report
     )
-    start_env = {**env, **_GIT_COMMITTER_ENV, **implementer.auth_env()}
+    auth_env = implementer.auth_env()
+    start_env = {**env, **_GIT_COMMITTER_ENV, **auth_env}
+    # The exact secret values injected into the container, scrubbed from a failing
+    # done-check's report (repo-declared secrets plus the auth credential).
+    secret_values = [*env.values(), *auth_env.values()]
     token = await auth.installation_token(slice_.repo_full_name)
     container = await runtime.start(image=image, env=start_env)
     try:
@@ -1029,7 +1033,9 @@ async def _build_slice_in_container(
             container, token.clone_url, branch=slice_.branch, base=base
         )
         await implementer.implement(slice_, container=container)
-        passed, detail = await run_done_check_commands(container, commands)
+        passed, detail = await run_done_check_commands(
+            container, commands, secret_values=secret_values
+        )
         if passed:
             await _push_branch(container, slice_.branch)
         await report(

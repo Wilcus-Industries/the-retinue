@@ -25,7 +25,7 @@ import logging
 import os
 import re
 import shlex
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from retinue.container import Container, RunResult
@@ -233,6 +233,26 @@ def _redact_secrets(text: str) -> str:
     return text
 
 
+# Below this length a "secret" value is treated as too short to redact safely: it would
+# match common substrings in unrelated output (e.g. a 3-char value nuking real text).
+# Real credentials are far longer, so the floor loses nothing.
+_MIN_REDACT_LEN = 4
+
+
+def _redact_values(text: str, secret_values: Iterable[str]) -> str:
+    """Replace exact occurrences of each injected secret value with the marker.
+
+    Shape-based redaction only catches known credential shapes; value redaction catches
+    *any* secret the retinue injected (a repo-declared secret, the webhook secret) by its
+    literal value, regardless of shape. Longest-first so a value that contains another is
+    redacted whole rather than leaving a fragment.
+    """
+    for value in sorted(set(secret_values), key=len, reverse=True):
+        if len(value) >= _MIN_REDACT_LEN:
+            text = text.replace(value, _REDACTION)
+    return text
+
+
 def render_report_body(report: DoneCheckReport) -> str:
     """Render a :class:`DoneCheckReport` into the Markdown body posted to GitHub.
 
@@ -416,7 +436,10 @@ _AUTH_ENV_VARS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
 
 
 async def run_done_check_commands(
-    container: Container, commands: list[list[str]]
+    container: Container,
+    commands: list[list[str]],
+    *,
+    secret_values: Iterable[str] = (),
 ) -> tuple[bool, str]:
     """Run each done-check command in order in ``container``; stop at the first failure.
 
@@ -426,6 +449,14 @@ async def run_done_check_commands(
     with the Anthropic auth credential blanked in its environment (it is the implementer's,
     not the check's), so a test can never read it back out of the env.
 
+    Args:
+        container: The build container the commands exec in.
+        commands: The done-check commands, run in order until one fails.
+        secret_values: The exact secret values injected into the container (repo secrets,
+            the auth credential). A failing command's output is scrubbed of these before
+            it is returned, so the detail — and the report built from it — never carries a
+            secret, whatever shape it has.
+
     Returns:
         ``(passed, detail)`` — ``passed`` is True only if every command exited 0.
     """
@@ -433,7 +464,8 @@ async def run_done_check_commands(
     for command in commands:
         result: RunResult = await container.run_command(command, env=scrub_env)
         if not result.ok:
-            return False, _format_failure_detail(command, result)
+            detail = _format_failure_detail(command, result)
+            return False, _redact_values(detail, secret_values)
     return True, "all done-check commands passed"
 
 

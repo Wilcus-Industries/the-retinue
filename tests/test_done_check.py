@@ -230,6 +230,30 @@ async def test_done_check_blanks_anthropic_credential_for_each_command() -> None
 
 
 @pytest.mark.asyncio
+async def test_done_check_redacts_injected_secret_values_from_detail() -> None:
+    """An injected secret echoed by a failing command is scrubbed from the detail.
+
+    Shape-based redaction only catches known credential shapes; a repo-declared secret
+    or the webhook secret has no shape. The retinue knows the exact values it injected,
+    so it redacts those literally — the report never even holds the value.
+    """
+    log: list[str] = []
+    secret = "wh00k-Sup3r-S3cret-value-no-shape"
+    container = FakeContainer(
+        log,
+        {"uv": RunResult(exit_code=1, stdout=f"assert '{secret}' == ''")},
+    )
+
+    passed, detail = await run_done_check_commands(
+        container, [["uv", "run", "pytest"]], secret_values=[secret]
+    )
+
+    assert passed is False
+    assert secret not in detail
+    assert "[REDACTED]" in detail
+
+
+@pytest.mark.asyncio
 async def test_failure_detail_keeps_tail_not_head() -> None:
     """When output is long, the detail keeps the tail — pytest's summary prints last."""
     log: list[str] = []
