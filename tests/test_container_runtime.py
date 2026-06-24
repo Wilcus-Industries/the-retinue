@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import Any
+
+import pytest
 
 from retinue.container import (
     DockerContainer,
+    DockerError,
     DockerRuntime,
     RunResult,
     _create_container_payload,
@@ -125,3 +129,67 @@ def test_docker_types_satisfy_protocols() -> None:
     _: type[Container] = DockerContainer
     _r: RunResult = RunResult(exit_code=0)
     assert _r.ok
+
+
+# --- pull fallback: a locally-built image not in any registry ---------------------
+
+
+def _scripted_request(responses: dict[str, tuple[int, bytes]], calls: list[str]) -> Any:
+    """An async stand-in for ``DockerRuntime._request`` keyed on the path prefix.
+
+    ``responses`` maps a substring of the request path to a ``(status, body)`` pair;
+    every call is appended to ``calls`` so a test can assert which Engine endpoints
+    were hit (e.g. that the image-inspect fallback fired).
+    """
+
+    async def fake_request(method, path, body=None, headers=None):  # type: ignore[no-untyped-def]
+        calls.append(f"{method} {path}")
+        for needle, resp in responses.items():
+            if needle in path:
+                return resp
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    return fake_request
+
+
+@pytest.mark.asyncio
+async def test_pull_falls_back_to_local_image_when_pull_denied() -> None:
+    """A registry-denied pull must NOT fail the build when the image is present locally.
+
+    Local single-host deploys build the runner image on the host daemon and never push
+    it to a registry, so ``/images/create`` is denied. The runtime must then inspect the
+    daemon, find the image, and proceed (``docker run --pull=missing`` semantics) instead
+    of raising. The orchestrator drives the host socket, so a local-only image is valid.
+    """
+    runtime = DockerRuntime()
+    calls: list[str] = []
+    runtime._request = _scripted_request(  # type: ignore[method-assign]
+        {
+            "/images/create": (500, b'{"message":"error from registry: denied"}'),
+            "/json": (200, b'{"Id":"sha256:abc"}'),  # image-inspect: present locally
+        },
+        calls,
+    )
+
+    # Must not raise: the image is present locally.
+    await runtime._pull_image("ghcr.io/the-retinue/done-check-runner:latest")
+
+    assert any("/images/create" in c for c in calls)
+    assert any("/json" in c for c in calls), "must inspect the local daemon after a failed pull"
+
+
+@pytest.mark.asyncio
+async def test_pull_raises_when_denied_and_image_absent() -> None:
+    """A denied pull with no local image is a real failure — surface it."""
+    runtime = DockerRuntime()
+    calls: list[str] = []
+    runtime._request = _scripted_request(  # type: ignore[method-assign]
+        {
+            "/images/create": (500, b'{"message":"error from registry: denied"}'),
+            "/json": (404, b'{"message":"no such image"}'),
+        },
+        calls,
+    )
+
+    with pytest.raises(DockerError, match="image pull failed"):
+        await runtime._pull_image("ghcr.io/the-retinue/done-check-runner:latest")

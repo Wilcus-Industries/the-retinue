@@ -279,8 +279,28 @@ class DockerRuntime:
         status, body = await self._request(
             "POST", f"/images/create?fromImage={quote(image, safe='')}", headers=headers
         )
-        if status != 200:
-            raise DockerError(f"image pull failed ({status}): {body.decode(errors='replace')}")
+        if status == 200:
+            return
+        # The pull failed. Before treating that as fatal, fall back to a locally-present
+        # image — `docker run --pull=missing` semantics. A local single-host deploy builds
+        # the runner image on the same daemon the worker drives and never pushes it to a
+        # registry, so the pull is denied even though the image is right there. Only raise
+        # when the daemon has no such image either.
+        if await self._image_exists_locally(image):
+            logger.warning(
+                "image pull failed (%s) but %s is present locally; using the local image",
+                status,
+                image,
+            )
+            return
+        raise DockerError(f"image pull failed ({status}): {body.decode(errors='replace')}")
+
+    async def _image_exists_locally(self, image: str) -> bool:
+        """Whether the daemon already has ``image`` (inspect returns 200)."""
+        status, _ = await self._request(
+            "GET", f"/images/{quote(image, safe='')}/json"
+        )
+        return status == 200
 
 
 class DockerContainer:
