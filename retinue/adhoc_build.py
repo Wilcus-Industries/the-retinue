@@ -504,7 +504,7 @@ async def build_adhoc_issue(
     """
     commands = parse_done_check(claude_md)
     env = await resolve_secrets_or_escalate(
-        issue.repo_full_name, config, resolve_secret, report
+        issue.repo_full_name, issue.issue_number, config, resolve_secret, report
     )
     start_env = {
         **env,
@@ -533,6 +533,7 @@ async def build_adhoc_issue(
         await report(
             DoneCheckReport(
                 repo_full_name=issue.repo_full_name,
+                issue_number=issue.issue_number,
                 passed=passed,
                 escalated=False,
                 detail=detail,

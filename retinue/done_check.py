@@ -165,12 +165,15 @@ class DoneCheckReport:
 
     Attributes:
         repo_full_name: The repo the check ran against, e.g. "owner/repo".
+        issue_number: The issue the outcome comment is posted on (``gh issue comment``
+            requires it as a positional).
         passed: True only when every done-check command exited 0.
         escalated: True when a required secret was missing (the check never ran).
         detail: Human-readable summary for the commit status / issue comment.
     """
 
     repo_full_name: str
+    issue_number: int
     passed: bool
     escalated: bool
     detail: str
@@ -230,14 +233,17 @@ def render_report_body(report: DoneCheckReport) -> str:
 def render_report_argv(report: DoneCheckReport) -> list[str]:
     """Assemble the ``gh issue comment`` argv that posts ``report`` to its repo.
 
-    Posts to the repo's tracking issue numbered by the report; the body comes from
-    :func:`render_report_body` and is passed via ``--body`` so it is never interpolated
-    into a shell. Pure, so command assembly is unit-testable without a real ``gh``.
+    Posts to the issue numbered by the report; the issue number is the required
+    positional ``gh issue comment`` takes (it errors "accepts 1 arg(s), received 0"
+    without it), and the body comes from :func:`render_report_body`, passed via
+    ``--body`` so it is never interpolated into a shell. Pure, so command assembly is
+    unit-testable without a real ``gh``.
     """
     return [
         "gh",
         "issue",
         "comment",
+        str(report.issue_number),
         "--repo",
         report.repo_full_name,
         "--body",
@@ -399,6 +405,7 @@ async def run_done_check_commands(
 
 async def resolve_secrets_or_escalate(
     repo_full_name: str,
+    issue_number: int,
     config: RepoConfig,
     resolve_secret: SecretResolver,
     report: ReportSink,
@@ -413,6 +420,7 @@ async def resolve_secrets_or_escalate(
 
     Args:
         repo_full_name: The repo whose secrets are being resolved (for the escalation).
+        issue_number: The issue the escalation comment is posted on.
         config: The accepted repo config (its ``secrets`` block is resolved).
         resolve_secret: Resolves declared secret names/refs to values.
         report: Sink the escalation is posted to on a miss.
@@ -430,6 +438,7 @@ async def resolve_secrets_or_escalate(
         await report(
             DoneCheckReport(
                 repo_full_name=repo_full_name,
+                issue_number=issue_number,
                 passed=False,
                 escalated=True,
                 detail=f"escalated: required secret {exc.secret_name!r} is missing",

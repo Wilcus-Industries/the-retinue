@@ -193,7 +193,7 @@ async def test_resolve_secrets_returns_env_when_all_resolved() -> None:
     )
 
     env = await resolve_secrets_or_escalate(
-        "owner/repo", config, resolver, _sink(captured)
+        "owner/repo", 47, config, resolver, _sink(captured)
     )
 
     assert env == {"OPENAI_API_KEY": "sk-real", "vault://team/token": "vault-secret"}
@@ -208,11 +208,12 @@ async def test_resolve_secrets_escalates_and_raises_on_missing() -> None:
 
     with pytest.raises(MissingSecretError):
         await resolve_secrets_or_escalate(
-            "owner/repo", config, _resolver({}), _sink(captured)
+            "owner/repo", 47, config, _resolver({}), _sink(captured)
         )
 
     assert len(captured) == 1
     assert captured[0].escalated and not captured[0].passed
+    assert captured[0].issue_number == 47  # the escalation comment targets the issue
     assert "OPENAI_API_KEY" in captured[0].detail
 
 
@@ -223,7 +224,7 @@ async def test_real_env_resolver_drops_into_resolve_secrets() -> None:
     resolve_secret: SecretResolver = EnvSecretResolver(environ={"API_KEY": "sk-real"})
 
     env = await resolve_secrets_or_escalate(
-        "owner/repo", config, resolve_secret, _sink([])
+        "owner/repo", 47, config, resolve_secret, _sink([])
     )
 
     assert env == {"API_KEY": "sk-real"}
@@ -301,6 +302,7 @@ class FakeGhRunner:
 def _report(*, passed: bool = True, escalated: bool = False) -> DoneCheckReport:
     return DoneCheckReport(
         repo_full_name="owner/repo",
+        issue_number=47,
         passed=passed,
         escalated=escalated,
         detail="all done-check commands passed",
@@ -318,11 +320,16 @@ def test_render_report_body_headers_each_outcome() -> None:
 
 
 def test_render_report_argv_targets_repo_and_passes_body_via_flag() -> None:
-    """The argv is a no-shell ``gh issue comment`` with the body behind ``--body``."""
+    """The argv is a no-shell ``gh issue comment <number>`` with the body behind ``--body``.
+
+    ``gh issue comment`` requires the issue number as a positional (it errors
+    "accepts 1 arg(s), received 0" without it), so the report's ``issue_number`` must
+    ride in the argv ahead of the flags.
+    """
     argv = render_report_argv(_report())
-    assert argv[:5] == ["gh", "issue", "comment", "--repo", "owner/repo"]
-    assert argv[5] == "--body"
-    assert argv[6] == render_report_body(_report())
+    assert argv[:6] == ["gh", "issue", "comment", "47", "--repo", "owner/repo"]
+    assert argv[6] == "--body"
+    assert argv[7] == render_report_body(_report())
 
 
 @pytest.mark.asyncio

@@ -1019,7 +1019,7 @@ async def _build_slice_in_container(
     """
     commands = parse_done_check(claude_md)
     env = await resolve_secrets_or_escalate(
-        slice_.repo_full_name, config, resolve_secret, report
+        slice_.repo_full_name, slice_.issue_number, config, resolve_secret, report
     )
     start_env = {**env, **_GIT_COMMITTER_ENV, **implementer.auth_env()}
     token = await auth.installation_token(slice_.repo_full_name)
@@ -1035,6 +1035,7 @@ async def _build_slice_in_container(
         await report(
             DoneCheckReport(
                 repo_full_name=slice_.repo_full_name,
+                issue_number=slice_.issue_number,
                 passed=passed,
                 escalated=False,
                 detail=detail,
