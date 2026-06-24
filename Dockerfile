@@ -7,8 +7,19 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.6 /uv /uvx /usr/local/bin/
 
 # git: the worker clones/operates on repos. docker CLI: the worker drives the mounted
 # host docker.sock to spin up disposable done-check containers as sibling containers.
+# gh: the worker shells out to the GitHub CLI on the host (not in the runner) to list
+# ready-for-agent issues, file fix/backlog issues, and open staging PRs — installed from
+# GitHub's own apt repo (the slim base has no `gh`). curl/gnupg/ca-certificates bootstrap
+# that repo's signing key.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git docker.io \
+    && apt-get install -y --no-install-recommends git docker.io curl gnupg ca-certificates \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
