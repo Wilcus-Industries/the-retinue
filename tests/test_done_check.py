@@ -175,6 +175,49 @@ async def test_run_done_check_commands_stops_at_first_failure() -> None:
     assert log == ["run:uv run pytest"]
 
 
+@pytest.mark.asyncio
+async def test_failure_detail_includes_stdout_failure_summary() -> None:
+    """The failure detail must carry stdout, where pytest writes which test failed.
+
+    pytest/ruff/mypy print findings to stdout; uv prints setup/download progress to
+    stderr. A detail built from stderr alone shows only setup noise (the real dogfood
+    bug), so the actual failing-test line on stdout has to ride along.
+    """
+    log: list[str] = []
+    container = FakeContainer(
+        log,
+        {
+            "uv": RunResult(
+                exit_code=1,
+                stdout="FAILED tests/test_widget.py::test_frobnicate - assert 1 == 2",
+                stderr="Downloading mypy (14.4MiB)\nInstalled 62 packages",
+            )
+        },
+    )
+
+    passed, detail = await run_done_check_commands(container, [["uv", "run", "pytest"]])
+
+    assert passed is False
+    assert "FAILED tests/test_widget.py::test_frobnicate" in detail
+
+
+@pytest.mark.asyncio
+async def test_failure_detail_keeps_tail_not_head() -> None:
+    """When output is long, the detail keeps the tail — pytest's summary prints last."""
+    log: list[str] = []
+    head = "\n".join(f"setup line {i}" for i in range(500))
+    container = FakeContainer(
+        log,
+        {"uv": RunResult(exit_code=1, stdout=f"{head}\n=== 1 failed, 622 passed ===")},
+    )
+
+    passed, detail = await run_done_check_commands(container, [["uv", "run", "pytest"]])
+
+    assert passed is False
+    assert "=== 1 failed, 622 passed ===" in detail
+    assert "setup line 0" not in detail
+
+
 # --- resolve_secrets_or_escalate -------------------------------------------------
 
 

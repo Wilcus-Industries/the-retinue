@@ -398,9 +398,44 @@ async def run_done_check_commands(
     for command in commands:
         result: RunResult = await container.run_command(command)
         if not result.ok:
-            joined = " ".join(command)
-            return False, f"`{joined}` failed (exit {result.exit_code})\n{result.stderr}"
+            return False, _format_failure_detail(command, result)
     return True, "all done-check commands passed"
+
+
+# The failure detail is capped to a readable tail: GitHub comments allow ~65k chars, but
+# the diagnostic value is in the last lines, and a wall of setup output buries it.
+_DETAIL_MAX_LINES = 80
+_DETAIL_MAX_CHARS = 8000
+
+
+def _format_failure_detail(command: Sequence[str], result: RunResult) -> str:
+    """Render a failed command's output into the report detail.
+
+    pytest/ruff/mypy write their findings to *stdout*; setup tooling (uv) writes
+    download/venv progress to *stderr*. Ordering stderr-then-stdout and keeping the
+    *tail* puts the actual failure summary — printed last, on stdout — at the end of
+    the detail instead of burying it under setup noise (the dogfood bug: a failure
+    comment that showed only ``Installed 62 packages``).
+    """
+    joined = " ".join(command)
+    output = "\n".join(
+        part for part in (result.stderr.strip(), result.stdout.strip()) if part
+    )
+    tail = _tail(output, max_lines=_DETAIL_MAX_LINES, max_chars=_DETAIL_MAX_CHARS)
+    if not tail:
+        return f"`{joined}` failed (exit {result.exit_code})"
+    return f"`{joined}` failed (exit {result.exit_code})\n```\n{tail}\n```"
+
+
+def _tail(text: str, *, max_lines: int, max_chars: int) -> str:
+    """Keep the last ``max_lines`` lines of ``text``, then clamp to ``max_chars``."""
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    clipped = "\n".join(lines)
+    if len(clipped) > max_chars:
+        clipped = clipped[-max_chars:]
+    return clipped
 
 
 async def resolve_secrets_or_escalate(
