@@ -17,7 +17,7 @@ import pytest
 import retinue.github_app as github_app
 import retinue.worker as worker
 from retinue.dedupe import PrdDedupeStore
-from retinue.github_app import InstallationToken
+from retinue.github_app import InstallationAuthError, InstallationToken
 from retinue.handoff import MergedPullRequest, ReapOutcome, ReapResult
 from retinue.loopback import (
     HeimdallReview,
@@ -457,6 +457,35 @@ async def test_on_startup_without_auth_installs_no_pipeline(
     await on_startup(ctx)
 
     # No auth -> no pipeline; the fetcher is the not-opted-in fallback.
+    assert "pipeline_factory" not in ctx
+    assert await ctx["fetch_config"]("owner/repo") is None
+
+
+@pytest.mark.asyncio
+async def test_on_startup_with_unconfigured_auth_falls_back_to_not_opted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A present-but-unconfigured auth builder must degrade, not crash the worker.
+
+    Production wires a concrete ``build_installation_auth`` that raises
+    ``InstallationAuthError`` when ``github_app_id``/key path are unset — a fresh deploy
+    with no GitHub App registered yet. ``on_startup`` must catch that and install the
+    safe not-opted-in fetcher so the worker boots and logs SKIPs (the graceful fallback
+    DEPLOY.md promises), rather than the builder's exception killing worker startup.
+    """
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+
+    def _raise_unconfigured() -> object:
+        raise InstallationAuthError(
+            "GitHub App auth is unconfigured: set github_app_id and "
+            "github_app_private_key_path"
+        )
+
+    monkeypatch.setattr(github_app, "build_installation_auth", _raise_unconfigured)
+
+    ctx: dict[str, Any] = {}
+    await on_startup(ctx)
+
     assert "pipeline_factory" not in ctx
     assert await ctx["fetch_config"]("owner/repo") is None
 

@@ -888,19 +888,26 @@ async def _no_config_fetcher(repo_full_name: str) -> str | None:
 def _load_github_client() -> tuple[InstallationAuth, httpx.AsyncClient] | None:
     """Construct the production GitHub installation auth and HTTP client, if available.
 
-    Returns ``None`` when no concrete :class:`~retinue.github_app.InstallationAuth`
-    builder is wired yet — its production implementation is owned by a separate
-    seam/layer (:mod:`retinue.github_app` exposes only the protocol today). In that
-    case the worker falls back to the safe not-opted-in default rather than crashing.
-    Resolved lazily so registering the task (e.g. in tests) needs no GitHub App
-    credentials and opens no network client at import time.
+    Returns ``None`` in two cases, both of which make the worker fall back to the safe
+    not-opted-in default rather than crashing: when no concrete ``build_installation_auth``
+    is wired at all, and — the fresh-deploy case — when the builder exists but raises
+    :class:`~retinue.github_app.InstallationAuthError` because the GitHub App is not yet
+    configured (no ``github_app_id`` / private-key path). A deploy with only
+    ``WEBHOOK_SECRET`` set must boot and log SKIPs (see DEPLOY.md), so an unconfigured App
+    is graceful degradation, not a startup failure. Resolved lazily so registering the
+    task (e.g. in tests) needs no GitHub App credentials and opens no network client at
+    import time.
     """
     import retinue.github_app as github_app
 
     builder = getattr(github_app, "build_installation_auth", None)
     if builder is None:
         return None
-    return builder(), httpx.AsyncClient(timeout=30.0)
+    try:
+        auth = builder()
+    except github_app.InstallationAuthError:
+        return None
+    return auth, httpx.AsyncClient(timeout=30.0)
 
 
 # Module-level settings, loaded lazily in main() so importing this module does
