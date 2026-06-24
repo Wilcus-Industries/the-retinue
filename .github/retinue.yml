@@ -1,0 +1,5 @@
+# The retinue opt-in for this repo. Presence of this file = opted in.
+# Schema: retinue/repo_config.py (RepoConfig). All fields optional; an empty
+# file is a valid opt-in (all defaults).
+staging_branch: staging  # the retinue integrates slice PRs onto this branch
+retry_cap: 3             # max implementer retries per slice before escalating
