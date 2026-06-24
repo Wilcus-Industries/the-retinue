@@ -78,10 +78,12 @@ cp .env.example .env
 
 - Fill `WEBHOOK_SECRET` with the exact secret you set on the App in step (a).
 - Set `WEEKLY_BUDGET` to a real cap before going live (it defaults to `0`).
-- Drop the private key from step (a) at the path the worker expects. The intended mount
-  is `/secrets/app.pem` (see `GITHUB_APP_PRIVATE_KEY_PATH` in `.env.example`). The
+- Drop the private key from step (a) at **`./secrets/app.pem`** (next to this compose
+  file). `docker-compose.yml` bind-mounts `./secrets` read-only into the worker at
+  `/secrets`, which is where `GITHUB_APP_PRIVATE_KEY_PATH` points (`.env.example`). The
   GitHub-App adapter reads this PEM at startup to mint installation tokens, so the worker
-  will not do real work without it.
+  will not do real work without it. The `secrets/` dir is gitignored — **never commit the
+  PEM.**
 - Set the Anthropic credential the build lane spends: `ANTHROPIC_API_KEY` (api_key mode)
   or `CLAUDE_CODE_OAUTH_TOKEN` (subscription mode), matching `AUTH_MODE`.
 

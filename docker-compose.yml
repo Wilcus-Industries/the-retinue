@@ -46,6 +46,11 @@ services:
       # The disposable done-check container runtime drives the host daemon: the worker
       # launches sibling containers via the mounted host socket, not Docker-in-Docker.
       - /var/run/docker.sock:/var/run/docker.sock
+      # The GitHub App private key (PEM) is a mounted secret, never baked into the image
+      # or inlined in env. Drop app.pem under ./secrets; the worker reads it at the path
+      # GITHUB_APP_PRIVATE_KEY_PATH points to (default /secrets/app.pem in .env.example).
+      # Read-only: the worker only needs to read the key to mint installation tokens.
+      - ./secrets:/secrets:ro
     depends_on:
       redis:
         condition: service_healthy

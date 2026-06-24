@@ -13,3 +13,6 @@ dist/
 *.sqlite3
 # Secrets — .env carries the webhook secret and Anthropic/GitHub credentials
 .env
+# The GitHub App private key and anything else dropped in the mounted secrets dir.
+secrets/
+*.pem
