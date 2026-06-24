@@ -936,6 +936,9 @@ def main() -> None:
     if settings is None:
         settings = _load_settings()
     WorkerSettings.redis_settings = RedisSettings.from_dsn(settings.redis_url)
+    # arq reads job_timeout off the class before on_startup; its 300s default cancels a
+    # real build mid-implement, so override it here at process start (issue: dogfood).
+    WorkerSettings.job_timeout = settings.job_timeout_seconds
 
     run_worker(WorkerSettings)  # type: ignore[arg-type]
 
@@ -956,6 +959,10 @@ class WorkerSettings:
     cron_jobs = [cron(heartbeat_tick, minute=set(HEARTBEAT_MINUTES))]
     on_startup = on_startup
     on_shutdown = on_shutdown
+    # Overridden from JOB_TIMEOUT_SECONDS in main() at process start; the default here must
+    # already outlast a real build, since arq reads it before on_startup and its own 300s
+    # default would cancel the drain mid-implement.
+    job_timeout: int = 1800
     # Overridden from the configured REDIS_URL in main() at process start (arq
     # reads this attribute before on_startup runs); the localhost default keeps it
     # a valid RedisSettings for the ``arq retinue.worker.WorkerSettings`` launch.

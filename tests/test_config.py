@@ -66,6 +66,29 @@ def test_budget_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.weekly_budget == 1_000_000.0
 
 
+def test_job_timeout_default_exceeds_arq_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real claude build outlasts arq's 300s default, so the job timeout must be larger.
+
+    A drain kicked at the default 300s is cancelled mid-implement (the build needs many
+    minutes), so the worker-global ``job_timeout`` is driven from this setting with a
+    default well above 300.
+    """
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.job_timeout_seconds > 300
+    assert settings.job_timeout_seconds == 1800
+
+
+def test_job_timeout_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The job timeout loads from the environment for longer or shorter builds."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("JOB_TIMEOUT_SECONDS", "3600")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.job_timeout_seconds == 3600
+
+
 def test_adapter_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """The new adapter wiring fields default to empty (opt-in, never required)."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")

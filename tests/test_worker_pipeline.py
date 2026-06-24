@@ -253,6 +253,29 @@ def test_worker_registers_the_adhoc_drain_task() -> None:
     assert run_adhoc_drain_job.__name__ == RUN_ADHOC_DRAIN_TASK
 
 
+def test_main_drives_job_timeout_from_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``main`` overrides ``WorkerSettings.job_timeout`` from the configured setting.
+
+    Arq reads ``job_timeout`` off the class before ``on_startup`` runs, so — like
+    ``redis_settings`` — it is applied at process start. The arq default (300s) cancels a
+    real claude build mid-implement; this override is what keeps the build alive.
+    """
+
+    class _FakeSettings:
+        redis_url = "redis://localhost:6379"
+        job_timeout_seconds = 1234
+
+    monkeypatch.setattr(worker, "settings", _FakeSettings())
+    monkeypatch.setattr("arq.worker.run_worker", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "_configure_logging", lambda: None)
+
+    worker.main()
+
+    assert WorkerSettings.job_timeout == 1234
+
+
 # --- parse_heimdall_review ------------------------------------------------------
 
 

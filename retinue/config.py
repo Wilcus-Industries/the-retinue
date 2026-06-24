@@ -46,6 +46,14 @@ class Settings(BaseSettings):
         description="Fraction of the weekly budget spendable per rolling-24h window",
     )
 
+    # A real claude build (plan -> implement -> done-check) runs many minutes, far past
+    # arq's 300s default job_timeout, which would cancel the drain mid-implement. This
+    # drives WorkerSettings.job_timeout (applied in worker.main at process start).
+    job_timeout_seconds: int = Field(
+        default=1800,
+        description="Arq worker-global job timeout in seconds; must outlast a full build",
+    )
+
     # GitHub App identity (issue #16). The worker authenticates as the App installation
     # to mint clone/issue tokens; the private key is read from a file path (never inlined
     # into env) so the PEM stays a mounted secret rather than a leaked literal.
