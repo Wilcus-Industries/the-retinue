@@ -370,22 +370,68 @@ async def test_failed_gh_invocation_raises_with_stderr() -> None:
 
 
 @pytest.mark.asyncio
-async def test_heimdall_installed_true_when_check_in_rulesets() -> None:
-    """heimdall_installed parses the ruleset contexts and membership-tests the name."""
-    runner = _FakeGhRunner([GhResult(exit_code=0, stdout='["ci", "heimdall", "lint"]')])
+async def test_heimdall_installed_reads_each_rulesets_detail() -> None:
+    """heimdall_installed lists ruleset ids, then reads each ruleset's *detail* for the check.
+
+    The repo-rulesets *list* endpoint omits each ruleset's ``rules``, so the required-check
+    contexts must be read per-ruleset from the detail endpoint — querying ``.rules`` on the
+    list response always yields nothing (the prior bug that left no PR ever opened).
+    """
+    runner = _FakeGhRunner(
+        [
+            GhResult(exit_code=0, stdout="[7, 9]"),  # list: ruleset ids
+            GhResult(exit_code=0, stdout='["ci", "heimdall"]'),  # detail of 7: match
+        ]
+    )
 
     assert await _ops(runner).heimdall_installed("owner/repo") is True
-    args, _ = runner.calls[0]
-    assert args[0] == "api"
-    assert args[1] == "repos/owner/repo/rulesets"
+    list_args, _ = runner.calls[0]
+    assert list_args[0] == "api"
+    assert list_args[1] == "repos/owner/repo/rulesets"
+    assert list_args[list_args.index("--jq") + 1] == "[.[].id]"
+    detail_args, _ = runner.calls[1]
+    assert detail_args[1] == "repos/owner/repo/rulesets/7"
 
 
 @pytest.mark.asyncio
-async def test_heimdall_installed_false_when_absent() -> None:
-    """A ruleset list without the heimdall context reads as not installed."""
-    runner = _FakeGhRunner([GhResult(exit_code=0, stdout='["ci", "lint"]')])
+async def test_heimdall_installed_scans_every_ruleset_until_found() -> None:
+    """The check may live in a later ruleset; each ruleset's detail is scanned until matched."""
+    runner = _FakeGhRunner(
+        [
+            GhResult(exit_code=0, stdout="[7, 9]"),
+            GhResult(exit_code=0, stdout='["ci"]'),  # detail 7: no heimdall
+            GhResult(exit_code=0, stdout='["heimdall"]'),  # detail 9: match
+        ]
+    )
+
+    assert await _ops(runner).heimdall_installed("owner/repo") is True
+    assert [c[0][1] for c in runner.calls] == [
+        "repos/owner/repo/rulesets",
+        "repos/owner/repo/rulesets/7",
+        "repos/owner/repo/rulesets/9",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_heimdall_installed_false_when_no_ruleset_requires_it() -> None:
+    """Every ruleset read, none requiring the heimdall check, reads as not installed."""
+    runner = _FakeGhRunner(
+        [
+            GhResult(exit_code=0, stdout="[7]"),
+            GhResult(exit_code=0, stdout='["ci", "lint"]'),
+        ]
+    )
 
     assert await _ops(runner).heimdall_installed("owner/repo") is False
+
+
+@pytest.mark.asyncio
+async def test_heimdall_installed_false_and_no_detail_call_when_no_rulesets() -> None:
+    """No rulesets at all reads as not installed, with no per-ruleset detail call made."""
+    runner = _FakeGhRunner([GhResult(exit_code=0, stdout="[]")])
+
+    assert await _ops(runner).heimdall_installed("owner/repo") is False
+    assert len(runner.calls) == 1  # only the list call
 
 
 @pytest.mark.asyncio

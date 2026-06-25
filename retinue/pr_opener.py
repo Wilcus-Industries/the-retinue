@@ -413,19 +413,30 @@ class GhCliPrOps:
         return result
 
     async def heimdall_installed(self, repo_full_name: str) -> bool:
-        """Return True when a check named ``heimdall`` exists on the repo's rulesets."""
-        result = await self._gh(
-            [
-                "api",
-                f"repos/{repo_full_name}/rulesets",
-                "--jq",
-                # Surface the required-check contexts across every ruleset; the
-                # adapter then membership-tests the heimdall name against them.
-                "[.[].rules[]?.parameters.required_status_checks[]?.context]",
-            ]
+        """Return True when a check named ``heimdall`` is required by any repo ruleset.
+
+        The repo-rulesets *list* endpoint omits each ruleset's ``rules`` (it returns only
+        summaries: id, name, target, enforcement), so the required-check contexts must be
+        read from each ruleset's *detail* endpoint. List the ruleset ids, then membership-
+        test the heimdall context across each ruleset's rules, short-circuiting on the first
+        hit. (Querying ``.rules`` on the list response always yields nothing — the prior bug
+        that left ``heimdall_installed`` permanently False, so no PR ever opened.)
+        """
+        listed = await self._gh(
+            ["api", f"repos/{repo_full_name}/rulesets", "--jq", "[.[].id]"]
         )
-        contexts = json.loads(result.stdout or "[]")
-        return self._heimdall_check_name in contexts
+        for ruleset_id in json.loads(listed.stdout or "[]"):
+            detail = await self._gh(
+                [
+                    "api",
+                    f"repos/{repo_full_name}/rulesets/{ruleset_id}",
+                    "--jq",
+                    "[.rules[]?.parameters.required_status_checks[]?.context]",
+                ]
+            )
+            if self._heimdall_check_name in json.loads(detail.stdout or "[]"):
+                return True
+        return False
 
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         """Return True when ``branch`` resolves to a ref on ``repo_full_name``."""
