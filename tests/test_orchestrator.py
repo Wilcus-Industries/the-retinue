@@ -20,6 +20,8 @@ import pytest
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
+    _DEFAULT_IMPLEMENT_MAX_TURNS,
+    _IMPLEMENT_SYSTEM,
     AgentSdkConflictResolver,
     AnthropicResponse,
     BuildOutcome,
@@ -838,13 +840,45 @@ def test_implement_env_subscription_mode_uses_oauth_token() -> None:
 
 def test_claude_argv_assembles_headless_invocation() -> None:
     """The argv runs the headless CLI: print mode, model, acceptEdits, json output."""
-    argv = _claude_argv(prompt="do it", model="m")
+    argv = _claude_argv(prompt="do it", model="m", max_turns=80)
 
     assert argv[0] == "claude"
     assert argv[1:3] == ["-p", "do it"]
     assert "--model" in argv and "m" in argv
     assert "--permission-mode" in argv and "acceptEdits" in argv
     assert "--output-format" in argv and "json" in argv
+
+
+def test_claude_argv_caps_the_agent_loop_with_max_turns() -> None:
+    """The argv pins ``--max-turns`` so an uncapped implement loop cannot run unbounded.
+
+    Without this cap, a thrashing run (e.g. a doc task that re-runs the full check suite
+    each turn) is bounded only by the arq job_timeout, which kills the whole job — including
+    the done-check — rather than the agent stopping and letting the done-check report.
+    """
+    argv = _claude_argv(prompt="do it", model="m", max_turns=42)
+
+    assert argv[argv.index("--max-turns") + 1] == "42"
+
+
+def test_implement_system_prompt_excuses_doc_only_tasks_from_tdd() -> None:
+    """The system brief no longer mandates a failing test for untestable doc/config work.
+
+    The hard TDD mandate made a documentation-only issue (no behavior to test) thrash —
+    hunting for a test that cannot exist. The brief now keeps TDD the default for testable
+    changes but excuses doc/config-only changes from inventing one.
+    """
+    assert "documentation" in _IMPLEMENT_SYSTEM
+    assert "config" in _IMPLEMENT_SYSTEM
+    assert "nothing to test" in _IMPLEMENT_SYSTEM
+
+
+def test_implement_prompt_excuses_doc_only_tasks_from_tdd() -> None:
+    """The per-slice prompt likewise excuses a doc/config-only change from a test."""
+    prompt = _implement_prompt(_slice(issue_number=7, prd_number=1))
+
+    assert "documentation" in prompt
+    assert "no test" in prompt
 
 
 def test_claude_result_is_error_reads_json_flag() -> None:
@@ -869,6 +903,21 @@ async def test_container_implementer_execs_claude_with_prompt_and_model() -> Non
     # Production wires ContainerImplementer with no model override, so the default
     # constant is the source of truth. Per the PRD, implementers default to Sonnet.
     assert "claude-sonnet-4-6" in cmd
+
+
+@pytest.mark.asyncio
+async def test_container_implementer_threads_max_turns_into_the_argv() -> None:
+    """The implementer caps its exec at its ``max_turns`` (overridable; sane default)."""
+    container = ScriptedContainer()
+    await ContainerImplementer(credential="k", max_turns=7).implement(
+        _slice(), container=container
+    )
+
+    cmd = next(c for c in container.commands if c and c[0] == "claude")
+    assert cmd[cmd.index("--max-turns") + 1] == "7"
+    # A bare production-wired implementer still carries a positive cap.
+    assert ContainerImplementer(credential="k").max_turns == _DEFAULT_IMPLEMENT_MAX_TURNS
+    assert _DEFAULT_IMPLEMENT_MAX_TURNS > 0
 
 
 def test_container_implementer_defaults_to_sonnet() -> None:

@@ -887,6 +887,7 @@ def _bind_build_prd_for_repo(
         credential=settings.anthropic_credential,
         auth_mode=settings.auth_mode,
         model=resolve_model(Role.IMPLEMENTER, config),
+        max_turns=settings.implement_max_turns,
     )
     resolve_secret: SecretResolver = EnvSecretResolver()
     report: ReportSink = GhReportSink(token=token)
@@ -966,6 +967,7 @@ async def build_cron_slice_builder(
         credential=settings.anthropic_credential,
         auth_mode=settings.auth_mode,
         model=resolve_model(Role.IMPLEMENTER, config),
+        max_turns=settings.implement_max_turns,
     )
     builder = SliceBuilder(
         config=config,
@@ -1036,6 +1038,7 @@ def bind_adhoc_build(
         credential=settings.anthropic_credential,
         auth_mode=settings.auth_mode,
         model=resolve_model(Role.IMPLEMENTER, config),
+        max_turns=settings.implement_max_turns,
     )
     review_generate = AgentSdkReviewGenerator(
         credential=settings.anthropic_credential,

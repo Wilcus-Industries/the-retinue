@@ -54,6 +54,16 @@ class Settings(BaseSettings):
         description="Arq worker-global job timeout in seconds; must outlast a full build",
     )
 
+    # Caps the headless implementer's agent loop (``claude --max-turns``). Without a cap a
+    # thrashing build runs until the arq job_timeout kills the whole job — including the
+    # done-check; the cap stops the agent and lets the done-check report. Mirrors the
+    # orchestrator's _DEFAULT_IMPLEMENT_MAX_TURNS so a bare implementer and the wired one
+    # agree. Tunable via env (no rebuild — worker recreate only).
+    implement_max_turns: int = Field(
+        default=80,
+        description="Hard cap on the implementer's agent loop (claude --max-turns)",
+    )
+
     # GitHub App identity (issue #16). The worker authenticates as the App installation
     # to mint clone/issue tokens; the private key is read from a file path (never inlined
     # into env) so the PEM stays a mounted secret rather than a leaked literal.

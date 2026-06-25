@@ -155,11 +155,21 @@ class Implementer(Protocol):
 # interpolation) so the prefix is stable; the slice specifics ride in the per-slice prompt.
 _IMPLEMENT_SYSTEM = (
     "You are an autonomous implementer. Build the requested GitHub issue inside the "
-    "repository you are running in, test-driven: write or update a failing test first, "
-    "then write code until it passes and the repo's own checks are green. Make the "
-    "smallest change that satisfies the issue; do not refactor unrelated code. When the "
-    "work is complete and committed to the issue's branch, stop."
+    "repository you are running in. Default to test-driven development: when the change "
+    "has testable behavior, write or update a failing test first, then write code until "
+    "it passes. A documentation- or config-only change has nothing to test — make the "
+    "change directly rather than inventing a test for it. Either way, ensure the repo's "
+    "own checks pass before you commit. Make the smallest change that satisfies the "
+    "issue; do not refactor unrelated code. When the work is complete and committed to "
+    "the issue's branch, stop."
 )
+
+# Hard cap on the implementer's agent loop. Without it the headless ``claude`` run is
+# bounded only by the arq job_timeout, which cancels the *whole* job (container and all)
+# mid-implement — so a thrashing run (e.g. a doc task re-running the full check suite each
+# turn) is killed before the done-check ever runs. The cap makes the agent stop and lets
+# the done-check report on whatever was committed. Tunable via ``implement_max_turns``.
+_DEFAULT_IMPLEMENT_MAX_TURNS = 80
 
 
 def _implement_prompt(slice_: Slice, *, plan_path: str | None = None) -> str:
@@ -180,7 +190,9 @@ def _implement_prompt(slice_: Slice, *, plan_path: str | None = None) -> str:
         f"{plan_preamble}"
         f"Implement issue #{slice_.issue_number} of {slice_.repo_full_name}. "
         f"Commit your work to the '{slice_.branch}' branch (already checked out). "
-        "Implement test-driven and ensure the repo's checks pass before committing."
+        "Implement it test-driven when the change has testable behavior; a documentation- "
+        "or config-only change needs no test. Ensure the repo's checks pass before "
+        "committing."
     )
 
 
@@ -197,14 +209,16 @@ def _implement_env(credential: str, auth_mode: str) -> dict[str, str]:
     return {"ANTHROPIC_API_KEY": credential}
 
 
-def _claude_argv(*, prompt: str, model: str) -> list[str]:
+def _claude_argv(*, prompt: str, model: str, max_turns: int) -> list[str]:
     """Assemble the headless ``claude`` CLI argv for one in-container implement run.
 
     Runs non-interactively (``-p`` print mode), pins the implementing ``model``, accepts
     edits without a human in the loop (``--permission-mode acceptEdits`` — the run is
-    autonomous), appends the frozen implementer brief to the system prompt, and emits a
-    machine-readable json result so the exit can be cross-checked. The CLI runs in the
-    container's working dir (the cloned repo), so no cwd flag is needed.
+    autonomous), caps the agent loop at ``max_turns`` so a runaway/thrashing run stops
+    instead of being killed mid-implement by the arq job_timeout, appends the frozen
+    implementer brief to the system prompt, and emits a machine-readable json result so the
+    exit can be cross-checked. The CLI runs in the container's working dir (the cloned
+    repo), so no cwd flag is needed.
     """
     return [
         "claude",
@@ -214,6 +228,8 @@ def _claude_argv(*, prompt: str, model: str) -> list[str]:
         model,
         "--permission-mode",
         "acceptEdits",
+        "--max-turns",
+        str(max_turns),
         "--append-system-prompt",
         _IMPLEMENT_SYSTEM,
         "--output-format",
@@ -264,11 +280,15 @@ class ContainerImplementer:
         model: The implementing model id; defaults to the
             :data:`~retinue.roles.Role.IMPLEMENTER` registry entry (Sonnet 4.6), which a
             repo's ``models`` override can replace at the wiring site.
+        max_turns: Hard cap on the agent loop, threaded to ``claude --max-turns`` so a
+            runaway implement stops itself rather than being killed (with its done-check)
+            by the arq job_timeout. The wiring site passes ``settings.implement_max_turns``.
     """
 
     credential: str
     auth_mode: str = "api_key"
     model: str = field(default_factory=lambda: resolve_model(Role.IMPLEMENTER))
+    max_turns: int = _DEFAULT_IMPLEMENT_MAX_TURNS
 
     async def implement(
         self, slice_: Slice, *, container: Container, plan_path: str | None = None
@@ -279,7 +299,7 @@ class ContainerImplementer:
         the subagent to read before building (the ad-hoc lane); the PRD lane passes nothing.
         """
         prompt = _implement_prompt(slice_, plan_path=plan_path)
-        argv = _claude_argv(prompt=prompt, model=self.model)
+        argv = _claude_argv(prompt=prompt, model=self.model, max_turns=self.max_turns)
         result = await container.run_command(argv)
         if not result.ok:
             raise ImplementError(
