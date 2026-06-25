@@ -36,6 +36,8 @@ from retinue.adhoc_drain import (
     AdhocDrainBusyError,
     AdhocDrainLock,
     AdhocGh,
+    AdhocPrOpen,
+    FlightState,
     GhCli,
     ReadyIssue,
     run_adhoc_drain,
@@ -116,6 +118,7 @@ async def _drain(
     *,
     gh: AdhocGh,
     build: AdhocBuild,
+    open_pr: AdhocPrOpen | None = None,
     config: RepoConfig | None = None,
     governor: BudgetGovernor | None = None,
     tmp_path: Path | None = None,
@@ -135,6 +138,7 @@ async def _drain(
         repo_full_name="owner/repo",
         gh=gh,
         build=build,
+        open_pr=open_pr or RecordingPrOpen(),
         config=config or RepoConfig(),
         governor=governor,
         estimated_amount=estimated_amount,
@@ -144,28 +148,57 @@ async def _drain(
 
 
 class FakeAdhocGh:
-    """In-memory ready-for-agent query + in-flight truth: returns the scripted issues.
+    """In-memory ready-for-agent query + flight-state truth: returns the scripted issues.
 
-    ``in_flight`` answers the dedup question from GitHub truth: an issue whose number is
-    in ``in_flight_numbers`` has an ``issue-<N>`` branch or an open PR, so the drain skips
-    it. Mirrors the reconcile-style source-of-truth seam (faked here, real in ``GhCli``).
+    ``flight_state`` answers the dedup + stranded-recovery question from GitHub truth: an
+    issue in ``in_flight_numbers`` has a branch *and* an open PR (a build under way or
+    landed -> :attr:`FlightState.IN_FLIGHT`, skip); an issue in ``stranded_numbers`` has a
+    pushed ``issue-<N>`` branch but *no* open PR (a green build whose PR never opened ->
+    :attr:`FlightState.STRANDED`, open its PR without rebuilding); every other issue is
+    :attr:`FlightState.ABSENT` (build it). Mirrors the reconcile-style source-of-truth
+    seam (faked here, real in ``GhCli``).
     """
 
     def __init__(
-        self, issues: list[ReadyIssue], *, in_flight_numbers: set[int] | None = None
+        self,
+        issues: list[ReadyIssue],
+        *,
+        in_flight_numbers: set[int] | None = None,
+        stranded_numbers: set[int] | None = None,
     ) -> None:
         self._issues = issues
         self._in_flight = in_flight_numbers or set()
+        self._stranded = stranded_numbers or set()
         self.calls: list[str] = []
-        self.in_flight_calls: list[int] = []
+        self.flight_state_calls: list[int] = []
 
     async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
         self.calls.append(repo_full_name)
         return list(self._issues)
 
-    async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
-        self.in_flight_calls.append(issue_number)
-        return issue_number in self._in_flight
+    async def flight_state(
+        self, *, repo_full_name: str, issue_number: int
+    ) -> FlightState:
+        self.flight_state_calls.append(issue_number)
+        if issue_number in self._in_flight:
+            return FlightState.IN_FLIGHT
+        if issue_number in self._stranded:
+            return FlightState.STRANDED
+        return FlightState.ABSENT
+
+
+class RecordingPrOpen:
+    """Records each AdhocIssue whose stranded PR the drain opened (the PR-open-only seam).
+
+    The drain drives this instead of the build for a :attr:`FlightState.STRANDED` issue —
+    a green branch pushed by a prior build but never PR'd — so the PR opens with no rebuild.
+    """
+
+    def __init__(self) -> None:
+        self.opened: list[AdhocIssue] = []
+
+    async def __call__(self, issue: AdhocIssue, *, repo_full_name: str) -> None:
+        self.opened.append(issue)
 
 
 class RecordingAdhocBuild:
@@ -316,20 +349,23 @@ async def test_an_empty_ready_set_drives_no_build(tmp_path: Path) -> None:
     assert build.built == []
 
 
-# --- AC1 dedup: an in-flight issue (branch or open PR) is not rebuilt --------------
+# --- AC1 dedup: an in-flight issue (branch AND open PR) is not rebuilt --------------
 
 
 @pytest.mark.asyncio
 async def test_an_in_flight_issue_is_not_rebuilt(tmp_path: Path) -> None:
-    """AC1: an issue with an ``issue-<N>`` branch or open PR is skipped (dedup)."""
+    """AC1: an issue whose branch AND open PR exist is skipped — no rebuild, no PR."""
     gh = FakeAdhocGh([_ready(7), _ready(9)], in_flight_numbers={9})
     build = RecordingAdhocBuild()
+    open_pr = RecordingPrOpen()
 
-    await _drain(gh=gh, build=build, tmp_path=tmp_path)
+    await _drain(gh=gh, build=build, open_pr=open_pr, tmp_path=tmp_path)
 
     assert [issue.issue_number for issue in build.built] == [7]
-    # The in-flight truth was consulted for every surviving ad-hoc candidate.
-    assert set(gh.in_flight_calls) == {7, 9}
+    # A truly in-flight issue gets neither a rebuild nor a (duplicate) PR open.
+    assert open_pr.opened == []
+    # The flight-state truth was consulted for every surviving ad-hoc candidate.
+    assert set(gh.flight_state_calls) == {7, 9}
 
 
 @pytest.mark.asyncio
@@ -341,6 +377,104 @@ async def test_all_in_flight_drives_no_build(tmp_path: Path) -> None:
     await _drain(gh=gh, build=build, tmp_path=tmp_path)
 
     assert build.built == []
+
+
+# --- stranded recovery: a green branch with no PR gets its PR opened, not rebuilt ---
+
+
+@pytest.mark.asyncio
+async def test_a_stranded_branch_opens_its_pr_without_rebuilding(tmp_path: Path) -> None:
+    """A pushed (green) ``issue-<N>`` branch with no open PR gets its PR opened, no rebuild.
+
+    The regression target: a green build that pushed its branch but never opened a PR
+    (e.g. the PR-open precheck failed) must not be wrongly treated as "in flight" and
+    dropped forever. The drain recognizes the stranded branch and opens its PR through the
+    PR-open-only seam — skipping the (wasteful, and budget-spending) rebuild.
+    """
+    gh = FakeAdhocGh([_ready(48)], stranded_numbers={48})
+    build = RecordingAdhocBuild()
+    open_pr = RecordingPrOpen()
+
+    await _drain(gh=gh, build=build, open_pr=open_pr, tmp_path=tmp_path)
+
+    assert build.built == []  # no rebuild
+    assert [issue.issue_number for issue in open_pr.opened] == [48]  # PR opened instead
+
+
+@pytest.mark.asyncio
+async def test_stranded_pr_open_is_not_budget_metered(tmp_path: Path) -> None:
+    """Opening a stranded branch's PR does no model work, so it spends no shared budget.
+
+    A spent (zero-headroom) governor would decline any *build*, but opening the PR for an
+    already-green branch is a free gh call — so it still happens even when the budget is
+    exhausted.
+    """
+    governor = _governor(tmp_path, weekly=0.0)  # cap 0 -> any build is declined
+    gh = FakeAdhocGh([_ready(48)], stranded_numbers={48})
+    build = RecordingAdhocBuild()
+    open_pr = RecordingPrOpen()
+
+    await _drain(gh=gh, build=build, open_pr=open_pr, governor=governor)
+
+    assert build.built == []
+    assert [issue.issue_number for issue in open_pr.opened] == [48]
+
+
+@pytest.mark.asyncio
+async def test_absent_stranded_and_in_flight_are_handled_independently(
+    tmp_path: Path,
+) -> None:
+    """The three flight states fan out: build absent, open-PR stranded, skip in-flight."""
+    gh = FakeAdhocGh(
+        [_ready(7), _ready(8), _ready(9)],
+        stranded_numbers={8},
+        in_flight_numbers={9},
+    )
+    build = RecordingAdhocBuild()
+    open_pr = RecordingPrOpen()
+
+    await _drain(gh=gh, build=build, open_pr=open_pr, tmp_path=tmp_path)
+
+    assert [issue.issue_number for issue in build.built] == [7]  # absent -> build
+    assert [issue.issue_number for issue in open_pr.opened] == [8]  # stranded -> open PR
+    # #9 (in flight) is neither built nor PR'd.
+
+
+@pytest.mark.asyncio
+async def test_only_stranded_issues_still_open_their_prs(tmp_path: Path) -> None:
+    """With no buildable issue, the drain still opens every stranded branch's PR.
+
+    Guards the early-exit: a drain whose only ready issues are stranded must not return
+    empty-handed before recovering them — their PRs still open.
+    """
+    gh = FakeAdhocGh([_ready(48), _ready(49)], stranded_numbers={48, 49})
+    build = RecordingAdhocBuild()
+    open_pr = RecordingPrOpen()
+
+    await _drain(gh=gh, build=build, open_pr=open_pr, tmp_path=tmp_path)
+
+    assert build.built == []
+    assert {issue.issue_number for issue in open_pr.opened} == {48, 49}
+
+
+@pytest.mark.asyncio
+async def test_a_stranded_pr_is_opened_through_from_fetched_issue(tmp_path: Path) -> None:
+    """A stranded issue is materialized via ``from_fetched_issue`` (chain depth stays live).
+
+    The recovery path must build its :class:`AdhocIssue` the same way the build path does,
+    so a recovered review-fix issue keeps its ``Chain-depth:`` lineage rather than
+    defaulting to a chain origin.
+    """
+    body = f"a review-fix to apply.\n\n{render_chain_depth(2)}"
+    gh = FakeAdhocGh([_ready(503, body=body)], stranded_numbers={503})
+    build = RecordingAdhocBuild()
+    open_pr = RecordingPrOpen()
+
+    await _drain(gh=gh, build=build, open_pr=open_pr, tmp_path=tmp_path)
+
+    assert open_pr.opened == [
+        AdhocIssue(repo_full_name="owner/repo", issue_number=503, chain_depth=2)
+    ]
 
 
 # --- AC2 single-run lock: two concurrent drains never overlap ---------------------
@@ -611,14 +745,14 @@ async def test_ghcli_rejects_a_non_array_payload() -> None:
         await gh.list_ready(repo_full_name="owner/repo")
 
 
-# --- real GhCli in-flight: branch-or-open-PR dedup truth via gh --------------------
+# --- real GhCli flight state: branch + open-PR truth via gh ------------------------
 
 
 class SequencedGhRunner:
     """Returns a queued stdout per call, recording each argv it was handed.
 
-    The in-flight check fans out to two gh calls (branch-existence, then open-PR); a
-    queue of canned payloads lets a test script each leg's answer independently.
+    The flight-state check fans out to up to two gh calls (branch-existence, then open-PR);
+    a queue of canned payloads lets a test script each leg's answer independently.
     """
 
     def __init__(self, stdouts: list[bytes]) -> None:
@@ -631,44 +765,58 @@ class SequencedGhRunner:
 
 
 @pytest.mark.asyncio
-async def test_ghcli_in_flight_true_when_the_issue_branch_exists() -> None:
-    """An existing ``issue-<N>`` branch makes the issue in flight (no PR call needed)."""
+async def test_ghcli_flight_state_in_flight_when_branch_and_open_pr() -> None:
+    """A branch *and* an open ``issue-<N>`` PR -> IN_FLIGHT (a build is under way/landed)."""
     branch_ref = json.dumps({"ref": "refs/heads/issue-7"}).encode()
-    runner = SequencedGhRunner([branch_ref])
+    open_pr = json.dumps([{"number": 88}]).encode()
+    runner = SequencedGhRunner([branch_ref, open_pr])
     gh = GhCli(runner=runner)
 
-    assert await gh.in_flight(repo_full_name="owner/repo", issue_number=7) is True
+    assert (
+        await gh.flight_state(repo_full_name="owner/repo", issue_number=7)
+        is FlightState.IN_FLIGHT
+    )
 
-    # Branch existence short-circuits: only the ref lookup ran.
-    assert len(runner.argvs) == 1
+    # Both legs ran: the branch ref lookup, then the open-PR list for its head.
+    assert len(runner.argvs) == 2
     branch_argv = list(runner.argvs[0])
     assert branch_argv[0] == "gh" and branch_argv[1] == "api"
     assert "repos/owner/repo/git/ref/heads/issue-7" in branch_argv
-
-
-@pytest.mark.asyncio
-async def test_ghcli_in_flight_true_when_an_open_pr_exists() -> None:
-    """No branch but an open ``issue-<N>`` PR still makes the issue in flight."""
-    no_branch = b""  # the ref lookup 404s -> non-zero exit, surfaced as "no branch"
-    open_pr = json.dumps([{"number": 88}]).encode()
-    runner = _RunnerWithBranchMiss(open_pr_payload=open_pr)
-    gh = GhCli(runner=runner)
-
-    assert await gh.in_flight(repo_full_name="owner/repo", issue_number=7) is True
-    assert no_branch == b""  # the branch leg returned a miss; the PR leg decided
-    pr_argv = list(runner.pr_argv or [])
+    pr_argv = list(runner.argvs[1])
     assert "pr" in pr_argv and "list" in pr_argv
     assert pr_argv[pr_argv.index("--head") + 1] == "issue-7"
     assert pr_argv[pr_argv.index("--state") + 1] == "open"
 
 
 @pytest.mark.asyncio
-async def test_ghcli_in_flight_false_when_no_branch_and_no_open_pr() -> None:
-    """No ``issue-<N>`` branch and no open PR means the issue is buildable."""
+async def test_ghcli_flight_state_stranded_when_branch_but_no_open_pr() -> None:
+    """A pushed ``issue-<N>`` branch with no open PR -> STRANDED (green build, PR never opened)."""
+    branch_ref = json.dumps({"ref": "refs/heads/issue-7"}).encode()
+    runner = SequencedGhRunner([branch_ref, b"[]"])
+    gh = GhCli(runner=runner)
+
+    assert (
+        await gh.flight_state(repo_full_name="owner/repo", issue_number=7)
+        is FlightState.STRANDED
+    )
+
+
+@pytest.mark.asyncio
+async def test_ghcli_flight_state_absent_when_no_branch() -> None:
+    """No ``issue-<N>`` branch -> ABSENT, and the open-PR leg is skipped.
+
+    An open PR keeps its head branch alive, so a missing branch proves no open PR exists:
+    the adapter short-circuits to ABSENT without the second gh call.
+    """
     runner = _RunnerWithBranchMiss(open_pr_payload=b"[]")
     gh = GhCli(runner=runner)
 
-    assert await gh.in_flight(repo_full_name="owner/repo", issue_number=7) is False
+    assert (
+        await gh.flight_state(repo_full_name="owner/repo", issue_number=7)
+        is FlightState.ABSENT
+    )
+    # The branch miss short-circuits: the open-PR leg was never queried.
+    assert runner.pr_argv is None
 
 
 class _RunnerWithBranchMiss:

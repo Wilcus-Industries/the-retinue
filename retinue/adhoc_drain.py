@@ -20,9 +20,12 @@ The gh list seam therefore surfaces each issue's ``body`` alongside its labels.
 
 The drain is hardened for production (#33) with four guards:
 
-* **dedup via GitHub truth** — :meth:`AdhocGh.in_flight` skips any issue whose
-  ``issue-<N>`` branch or open PR already exists, mirroring the reconcile-style
-  source-of-truth approach (:mod:`retinue.reconcile`) so no duplicate branch/PR is opened;
+* **dedup + stranded recovery via GitHub truth** — :meth:`AdhocGh.flight_state` classifies
+  each issue against the reconcile-style source of truth (:mod:`retinue.reconcile`): an
+  issue with a branch *and* an open PR is in flight (skip it, no duplicate branch/PR); an
+  issue with a pushed ``issue-<N>`` branch but *no* open PR is **stranded** — a prior green
+  build (push-only-on-green) whose PR never opened — so the drain opens its PR without
+  rebuilding; every other issue is built fresh;
 * **single-run lock** — the whole drain runs under an injected lock so two drains for a
   repo never overlap (a second entry raises :class:`AdhocDrainBusyError`); the lock is
   *separate* from the orchestrator's, so the drain still runs alongside a PRD build;
@@ -45,6 +48,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 from retinue.adhoc_build import AdhocIssue
@@ -176,12 +180,32 @@ class ReadyIssue:
         return preempts_prd_first(self.severity())
 
 
+class FlightState(Enum):
+    """GitHub's verdict on an issue's ``issue-<N>`` branch and open PR — the drain's truth.
+
+    The drain reads this to decide what to do with each ready issue:
+
+    * :attr:`ABSENT` — no ``issue-<N>`` branch and no open PR: nothing was built, so build
+      it fresh.
+    * :attr:`STRANDED` — the ``issue-<N>`` branch exists but no open PR: a prior build
+      pushed the branch (push-only-on-green, so the branch is provably green) yet never
+      opened its PR — e.g. the PR-open precheck failed. The drain opens the PR **without
+      rebuilding** (the rebuild would waste budget re-deriving a known-green branch).
+    * :attr:`IN_FLIGHT` — an open PR exists: a build is under way or already landed, so the
+      drain skips the issue (the original branch-or-PR dedup, now narrowed to "PR exists").
+    """
+
+    ABSENT = "absent"
+    STRANDED = "stranded"
+    IN_FLIGHT = "in_flight"
+
+
 class AdhocGh(Protocol):
     """The gh queries behind the ad-hoc drain. The ad-hoc lane's gh seam.
 
     A production implementation runs ``gh issue list --label ready-for-agent`` (with each
     issue's labels and body) for :meth:`list_ready`, and the branch-existence + open-PR
-    lookups for :meth:`in_flight`; tests inject a fake that scripts both. Modeled as one
+    lookups for :meth:`flight_state`; tests inject a fake that scripts both. Modeled as one
     protocol so the whole drain injects through a single collaborator, mirroring the
     gh-seam style of :mod:`retinue.cron` / :mod:`retinue.reconcile`.
     """
@@ -190,13 +214,17 @@ class AdhocGh(Protocol):
         """Return the repo's open ``ready-for-agent`` issues with their labels and body."""
         ...
 
-    async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
-        """Return True when GitHub shows the issue is already being built.
+    async def flight_state(
+        self, *, repo_full_name: str, issue_number: int
+    ) -> FlightState:
+        """Classify the issue against GitHub truth: absent, stranded, or in flight.
 
-        The dedup source of truth, mirroring the reconcile-style GitHub-truth approach
-        (:mod:`retinue.reconcile`): an issue is in flight when its ``issue-<N>`` branch
-        exists OR an open PR for it exists. Either proves a build is already under way (or
-        landed), so the drain skips it rather than rebuilding a duplicate branch/PR.
+        The dedup + stranded-recovery source of truth, mirroring the reconcile-style
+        GitHub-truth approach (:mod:`retinue.reconcile`): reads whether the issue's
+        ``issue-<N>`` branch exists and whether an open PR for it exists, and returns the
+        matching :class:`FlightState`. The drain builds an :attr:`~FlightState.ABSENT`
+        issue, opens the PR for a :attr:`~FlightState.STRANDED` one, and skips an
+        :attr:`~FlightState.IN_FLIGHT` one.
         """
         ...
 
@@ -248,22 +276,30 @@ class GhCli:
         stdout = await self._runner(argv, self._auth_env())
         return [_parse_ready_issue(entry) for entry in _parse_json_array(stdout)]
 
-    async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
-        """Return True when the ``issue-<N>`` branch exists or an open PR for it exists.
+    async def flight_state(
+        self, *, repo_full_name: str, issue_number: int
+    ) -> FlightState:
+        """Classify the issue from GitHub truth: absent, stranded, or in flight.
 
-        Queries GitHub truth in two legs, short-circuiting on the first that proves the
-        issue is already in flight: the branch-ref lookup (a missing ref 404s, surfaced by
-        the runner as :class:`GhCliError`, read here as "no branch"), then the open-PR list
-        for the ``issue-<N>`` head. Mirrors the reconcile-style source-of-truth dedup.
+        Queries GitHub truth in two legs. First the branch-ref lookup (a missing ref 404s,
+        surfaced by the runner as :class:`GhCliError`, read here as "no branch"): no branch
+        short-circuits to :attr:`FlightState.ABSENT` — an open PR keeps its head branch
+        alive, so a missing branch proves no open PR can exist, and the second leg is
+        skipped. When the branch exists, the open-PR list for the ``issue-<N>`` head
+        decides: an open PR means :attr:`FlightState.IN_FLIGHT`, none means the branch is
+        :attr:`FlightState.STRANDED` (pushed green, PR never opened). Mirrors the
+        reconcile-style source-of-truth dedup.
 
         Raises:
             ValueError: the open-PR query returned a payload that did not parse as a JSON
                 array.
         """
         branch = _issue_branch(issue_number)
-        if await self._branch_exists(repo_full_name, branch):
-            return True
-        return await self._open_pr_exists(repo_full_name, branch)
+        if not await self._branch_exists(repo_full_name, branch):
+            return FlightState.ABSENT
+        if await self._open_pr_exists(repo_full_name, branch):
+            return FlightState.IN_FLIGHT
+        return FlightState.STRANDED
 
     async def _branch_exists(self, repo_full_name: str, branch: str) -> bool:
         """Whether ``branch`` resolves to a ref on the repo (a 404 means it does not)."""
@@ -380,19 +416,27 @@ def _parse_ready_issue(entry: object) -> ReadyIssue:
 # ``from_fetched_issue``, so its ``chain_depth`` is live) and the repo name.
 AdhocBuild = Callable[..., Awaitable[None]]
 
+# The PR-open-only recovery the drain drives for a :attr:`FlightState.STRANDED` issue: open
+# the PR for an already-pushed (green) ``issue-<N>`` branch without rebuilding it. Same
+# ``(issue, *, repo_full_name) -> None`` shape as :data:`AdhocBuild`, injected and faked so
+# the drain runs with no gh or network; bound in production to the repo pipeline's
+# :meth:`retinue.pipeline.Pipeline.process_adhoc_pr` over a synthesized green result.
+AdhocPrOpen = Callable[..., Awaitable[None]]
+
 
 async def run_adhoc_drain(
     *,
     repo_full_name: str,
     gh: AdhocGh,
     build: AdhocBuild,
+    open_pr: AdhocPrOpen,
     config: RepoConfig,
     governor: BudgetGovernor,
     estimated_amount: float,
     lock: AbstractAsyncContextManager[object],
     prd_in_flight: bool = False,
 ) -> list[AdhocIssue]:
-    """Drain the repo's ad-hoc work, hardened for production: list, filter, dedup, build.
+    """Drain the repo's ad-hoc work, hardened for production: list, filter, classify, act.
 
     The whole drain runs under ``lock`` so two drains for the same repo never overlap (a
     second entry raises :class:`AdhocDrainBusyError`); the lock is *separate* from the
@@ -407,9 +451,14 @@ async def run_adhoc_drain(
        :func:`retinue.lane.classify` preempts on) builds — ordinary ad-hoc work waits for
        the PRD to finish,
     4. **rank** the survivors by ``priority:<severity>`` (no-priority lowest),
-    5. **dedup** against GitHub truth: skip any issue already in flight (an ``issue-<N>``
-       branch or open PR exists, :meth:`AdhocGh.in_flight`), so no duplicate branch/PR,
-    6. **drive** the injected ``build`` for each survivor — materialized through
+    5. **classify** each survivor against GitHub truth (:meth:`AdhocGh.flight_state`) and
+       partition: an in-flight issue (open PR) is skipped, a **stranded** one (pushed green
+       ``issue-<N>`` branch, no open PR) goes to the PR-open-only recovery, and the rest are
+       buildable,
+    6. **recover** every stranded issue by driving ``open_pr`` — opening the PR for its
+       already-green branch with **no rebuild** and no budget charge (opening a PR does no
+       model work), so a build whose PR-open step once failed is not stranded forever,
+    7. **build** each buildable survivor — materialized through
        :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (so the ``Chain-depth:``
        marker stays live) — concurrently but capped at ``config.max_parallel`` live builds,
        each metered against the **one shared** :class:`~retinue.budget.BudgetGovernor` (the
@@ -418,10 +467,12 @@ async def run_adhoc_drain(
 
     Args:
         repo_full_name: The target repo, e.g. ``"owner/repo"``.
-        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues; answers the in-flight
-            dedup query).
-        build: The downstream ad-hoc build+PR primitive run per surviving issue, injected
+        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues; answers the flight-state
+            classification query).
+        build: The downstream ad-hoc build+PR primitive run per buildable issue, injected
             so the drain runs with no Docker, gh, the Agent SDK, or network.
+        open_pr: The PR-open-only recovery run per stranded issue — opens the PR for an
+            already-green ``issue-<N>`` branch without rebuilding. Injected and faked too.
         config: The accepted repo config; ``max_parallel`` bounds the concurrent builds.
         governor: The shared service-level budget governor; each build is metered through
             it and skipped when the rolling-24h cap leaves no room.
@@ -434,7 +485,9 @@ async def run_adhoc_drain(
 
     Returns:
         The :class:`~retinue.adhoc_build.AdhocIssue` objects actually driven through
-        ``build`` (dedup-skipped and budget-skipped issues excluded), in rank order.
+        ``build`` (in-flight-skipped, stranded, and budget-skipped issues excluded), in
+        rank order. Stranded issues whose PR was opened are not "built", so they are not
+        included.
 
     Raises:
         AdhocDrainBusyError: A drain for this repo is already in flight (from the lock).
@@ -442,23 +495,26 @@ async def run_adhoc_drain(
     async with lock:
         listed = await gh.list_ready(repo_full_name=repo_full_name)
         candidates = _select_candidates(repo_full_name, prd_in_flight, listed)
-        buildable = await _drop_in_flight(repo_full_name, candidates, gh)
-        if not buildable:
+        plan = await _partition_candidates(repo_full_name, candidates, gh)
+        await _open_stranded_prs(repo_full_name, plan.stranded, open_pr)
+        if not plan.buildable:
             logger.info(
-                "Ad-hoc drain idle: no buildable ready-for-agent issues for %s",
+                "Ad-hoc drain idle: no buildable ready-for-agent issues for %s "
+                "(%d stranded PR(s) recovered)",
                 repo_full_name,
+                len(plan.stranded),
             )
             return []
 
         logger.info(
             "Ad-hoc drain building up to %d issue(s) for %s (cap=%s)",
-            len(buildable),
+            len(plan.buildable),
             repo_full_name,
             config.max_parallel,
         )
         return await _build_metered(
             repo_full_name,
-            buildable,
+            plan.buildable,
             build=build,
             config=config,
             governor=governor,
@@ -485,27 +541,67 @@ def _select_candidates(
     ]
 
 
-async def _drop_in_flight(
-    repo_full_name: str, issues: list[AdhocIssue], gh: AdhocGh
-) -> list[AdhocIssue]:
-    """Drop issues already in flight (an ``issue-<N>`` branch or open PR exists).
+@dataclass(frozen=True)
+class _DrainPlan:
+    """How the drain will act on its ranked candidates, partitioned by flight state.
 
-    Mirrors the reconcile-style GitHub-truth dedup: a build already under way (or landed)
-    is skipped so the drain never opens a duplicate branch or PR. Order is preserved.
+    Attributes:
+        buildable: :attr:`FlightState.ABSENT` issues — nothing built yet, so build them
+            (metered against the shared budget). In rank order.
+        stranded: :attr:`FlightState.STRANDED` issues — a green branch with no open PR, so
+            open the PR without rebuilding (no budget charge). In rank order.
+    """
+
+    buildable: list[AdhocIssue]
+    stranded: list[AdhocIssue]
+
+
+async def _partition_candidates(
+    repo_full_name: str, issues: list[AdhocIssue], gh: AdhocGh
+) -> _DrainPlan:
+    """Classify each candidate against GitHub truth and split build vs PR-open recovery.
+
+    Mirrors the reconcile-style GitHub-truth source of truth (:meth:`AdhocGh.flight_state`):
+    an :attr:`~FlightState.IN_FLIGHT` issue (open PR) is dropped so the drain opens no
+    duplicate; a :attr:`~FlightState.STRANDED` issue (pushed green branch, no PR) routes to
+    the PR-open-only recovery rather than a wasteful rebuild; the rest are buildable. Rank
+    order is preserved within each bucket.
     """
     buildable: list[AdhocIssue] = []
+    stranded: list[AdhocIssue] = []
     for issue in issues:
-        if await gh.in_flight(
+        state = await gh.flight_state(
             repo_full_name=repo_full_name, issue_number=issue.issue_number
-        ):
+        )
+        if state is FlightState.IN_FLIGHT:
             logger.info(
                 "Ad-hoc drain skipping issue #%d (%s): already in flight",
                 issue.issue_number,
                 repo_full_name,
             )
-            continue
-        buildable.append(issue)
-    return buildable
+        elif state is FlightState.STRANDED:
+            logger.info(
+                "Ad-hoc drain recovering issue #%d (%s): green branch with no PR; "
+                "opening its PR without rebuilding",
+                issue.issue_number,
+                repo_full_name,
+            )
+            stranded.append(issue)
+        else:
+            buildable.append(issue)
+    return _DrainPlan(buildable=buildable, stranded=stranded)
+
+
+async def _open_stranded_prs(
+    repo_full_name: str, stranded: list[AdhocIssue], open_pr: AdhocPrOpen
+) -> None:
+    """Open the PR for each stranded green branch, in rank order, without rebuilding.
+
+    Opening a PR for an already-green branch does no model work, so it is not metered
+    against the shared budget — a stranded build is recovered even when the cap is spent.
+    """
+    for issue in stranded:
+        await open_pr(issue, repo_full_name=repo_full_name)
 
 
 async def _build_metered(

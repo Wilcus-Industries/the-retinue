@@ -406,7 +406,7 @@ async def test_on_startup_adhoc_drain_drives_one_issue_to_the_pipeline(
     import retinue.adhoc_drain as adhoc_drain_mod
     import retinue.pipeline as pipeline_mod
     from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
-    from retinue.adhoc_drain import ReadyIssue
+    from retinue.adhoc_drain import FlightState, ReadyIssue
 
     monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
     monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
@@ -422,8 +422,10 @@ async def test_on_startup_adhoc_drain_drives_one_issue_to_the_pipeline(
         async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
             return [ReadyIssue(number=31, labels=["ready-for-agent"], body="")]
 
-        async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
-            return False
+        async def flight_state(
+            self, *, repo_full_name: str, issue_number: int
+        ) -> FlightState:
+            return FlightState.ABSENT
 
     monkeypatch.setattr(adhoc_drain_mod, "GhCli", _FakeGhCli)
 
@@ -615,7 +617,7 @@ async def test_on_startup_heartbeat_tick_drives_run_heartbeat(
     import retinue.cron as cron_mod
     import retinue.pipeline as pipeline_mod
     from retinue.adhoc_build import AdhocIssue
-    from retinue.adhoc_drain import ReadyIssue
+    from retinue.adhoc_drain import FlightState, ReadyIssue
     from retinue.heartbeat import heartbeat_tick
 
     monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
@@ -643,8 +645,10 @@ async def test_on_startup_heartbeat_tick_drives_run_heartbeat(
         async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
             return [ReadyIssue(number=31, labels=["ready-for-agent"], body="")]
 
-        async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
-            return False
+        async def flight_state(
+            self, *, repo_full_name: str, issue_number: int
+        ) -> FlightState:
+            return FlightState.ABSENT
 
     monkeypatch.setattr(adhoc_drain_mod, "GhCli", _FakeAdhocGh)
 

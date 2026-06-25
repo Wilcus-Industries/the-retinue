@@ -17,7 +17,7 @@ from typing import cast
 
 import pytest
 
-from retinue.adhoc_drain import AdhocGh
+from retinue.adhoc_drain import AdhocGh, FlightState
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
 from retinue.container import ContainerRuntime
 from retinue.cron import CronGh
@@ -316,6 +316,7 @@ async def test_adhoc_drain_drives_run_adhoc_drain_with_its_collaborators(
     drain = bind_adhoc_drain(
         gh=cast(AdhocGh, gh),
         build=build,
+        open_pr=_noop_open_pr,
         governor=governor,
         estimated_amount=3.0,
         lock=lock,
@@ -357,6 +358,7 @@ async def test_adhoc_drain_skips_the_build_when_the_shared_budget_is_spent(
     drain = bind_adhoc_drain(
         gh=cast(AdhocGh, gh),
         build=build,
+        open_pr=_noop_open_pr,
         governor=governor,
         estimated_amount=1.0,
         lock=_AdhocLock(),
@@ -378,8 +380,14 @@ class _FakeAdhocGh:
         self.calls.append(repo_full_name)
         return list(self.issues)
 
-    async def in_flight(self, *, repo_full_name: str, issue_number: int) -> bool:
-        return False
+    async def flight_state(
+        self, *, repo_full_name: str, issue_number: int
+    ) -> FlightState:
+        return FlightState.ABSENT
+
+
+async def _noop_open_pr(issue: object, *, repo_full_name: str) -> None:
+    """The PR-open-only recovery seam; never reached when no issue is stranded."""
 
 
 class _AdhocLock:

@@ -1074,6 +1074,36 @@ def bind_adhoc_build(
     return build
 
 
+def bind_adhoc_pr_open(pipeline: Pipeline) -> Callable[..., Awaitable[None]]:
+    """Bind the PR-open-only recovery for a stranded green ``issue-<N>`` branch.
+
+    Returns an async ``(issue, *, repo_full_name) -> None`` — the
+    :data:`retinue.adhoc_drain.AdhocPrOpen` shape — the drain drives for a
+    :attr:`~retinue.adhoc_drain.FlightState.STRANDED` issue: a branch a prior build pushed
+    (push-only-on-green, so it is provably green) but whose PR never opened (e.g. the
+    PR-open precheck failed). It synthesizes the green :class:`AdhocBuildResult` for that
+    branch and drives the *same* :meth:`Pipeline.process_adhoc_pr` the build's PR step uses
+    — so the ``issue-<N>`` -> staging PR opens behind the same prechecks and the PR<->issue
+    run-state mapping is recorded identically, with no rebuild and no done-check (the push
+    already proved the branch green).
+
+    Args:
+        pipeline: The repo's constructed pipeline; its ``process_adhoc_pr`` opens the PR and
+            records the PR<->issue mapping.
+
+    Returns:
+        The bound :data:`retinue.adhoc_drain.AdhocPrOpen` callable the drain runs per
+        stranded issue.
+    """
+
+    async def open_pr(issue: AdhocIssue, *, repo_full_name: str) -> None:
+        await pipeline.process_adhoc_pr(
+            issue, AdhocBuildResult(branch=issue.branch, passed=True)
+        )
+
+    return open_pr
+
+
 def _build_review_reviewer_factory(
     settings: Settings,
     *,

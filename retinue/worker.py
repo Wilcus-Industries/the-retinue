@@ -694,7 +694,8 @@ def _bind_adhoc_drain(
     Each call mints a per-repo installation token, then constructs the per-repo gh seam
     (:class:`retinue.adhoc_drain.GhCli`), reuses the worker's ``pipeline_factory`` to build
     the repo's pipeline (its ``process_adhoc_pr`` opens the PR), binds the real ad-hoc
-    build+PR primitive (:func:`retinue.pipeline.bind_adhoc_build`), and drives
+    build+PR primitive (:func:`retinue.pipeline.bind_adhoc_build`) and the PR-open-only
+    stranded-branch recovery (:func:`retinue.pipeline.bind_adhoc_pr_open`), and drives
     :func:`retinue.adhoc_drain.run_adhoc_drain` via :func:`retinue.wiring.bind_adhoc_drain`.
 
     Args:
@@ -709,7 +710,7 @@ def _bind_adhoc_drain(
     """
     from retinue.adhoc_drain import AdhocDrainLock, GhCli
     from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
-    from retinue.pipeline import bind_adhoc_build
+    from retinue.pipeline import bind_adhoc_build, bind_adhoc_pr_open
     from retinue.wiring import bind_adhoc_drain
 
     governor = BudgetGovernor(
@@ -739,6 +740,7 @@ def _bind_adhoc_drain(
         bound = bind_adhoc_drain(
             gh=gh,
             build=build,
+            open_pr=bind_adhoc_pr_open(pipeline),
             governor=governor,
             estimated_amount=_ADHOC_DRAIN_ESTIMATED_AMOUNT,
             lock=locks.setdefault(repo_full_name, AdhocDrainLock()),

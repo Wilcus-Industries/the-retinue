@@ -42,7 +42,7 @@ from retinue.done_check import DoneCheckReport
 from retinue.handoff import MergedPullRequest, ReapOutcome
 from retinue.loopback import HeimdallReview, ReviewState, VerdictOutcome
 from retinue.orchestrator import ContainerImplementer
-from retinue.pipeline import Pipeline
+from retinue.pipeline import Pipeline, bind_adhoc_pr_open
 from retinue.queue import AdhocDrainJob, enqueue_adhoc_drain
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import AgentSdkReviewGenerator, HttpResponse
@@ -188,6 +188,7 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
             ]
         ),
         build=adhoc_build,
+        open_pr=bind_adhoc_pr_open(pipeline),
         governor=governor,
         estimated_amount=1.0,
         lock=AdhocDrainLock(),

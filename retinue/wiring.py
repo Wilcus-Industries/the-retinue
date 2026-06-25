@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from retinue.adhoc_drain import AdhocBuild, AdhocGh, run_adhoc_drain
+from retinue.adhoc_drain import AdhocBuild, AdhocGh, AdhocPrOpen, run_adhoc_drain
 from retinue.budget import BudgetGovernor, Clock
 from retinue.container import Container, ContainerRuntime
 from retinue.cron import CronBuild, CronGh, CronTickResult, run_cron_tick
@@ -378,6 +378,7 @@ def bind_adhoc_drain(
     *,
     gh: AdhocGh,
     build: AdhocBuild,
+    open_pr: AdhocPrOpen,
     governor: BudgetGovernor,
     estimated_amount: float,
     lock: AbstractAsyncContextManager[object],
@@ -400,9 +401,11 @@ def bind_adhoc_drain(
     observe — PRD-first preemption stays a heartbeat-side refinement.
 
     Args:
-        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues; answers the in-flight
-            dedup query).
-        build: The downstream ad-hoc build+PR primitive run per surviving issue.
+        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues; answers the flight-state
+            classification query).
+        build: The downstream ad-hoc build+PR primitive run per buildable issue.
+        open_pr: The PR-open-only recovery run per stranded issue (a green branch with no
+            PR), opening its PR without a rebuild.
         governor: The shared service-level budget governor each build meters through.
         estimated_amount: The per-build charge metered against the shared cap.
         lock: The single-run lock; a second concurrent drain for the repo raises
@@ -417,6 +420,7 @@ def bind_adhoc_drain(
             repo_full_name=repo_full_name,
             gh=gh,
             build=build,
+            open_pr=open_pr,
             config=config,
             governor=governor,
             estimated_amount=estimated_amount,
