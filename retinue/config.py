@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     # drives WorkerSettings.job_timeout (applied in worker.main at process start).
     job_timeout_seconds: int = Field(
         default=1800,
+        gt=0,
         description="Arq worker-global job timeout in seconds; must outlast a full build",
     )
 
@@ -61,6 +62,7 @@ class Settings(BaseSettings):
     # agree. Tunable via env (no rebuild — worker recreate only).
     implement_max_turns: int = Field(
         default=80,
+        gt=0,
         description="Hard cap on the implementer's agent loop (claude --max-turns)",
     )
 
