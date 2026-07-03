@@ -49,6 +49,28 @@ EFFORT_HIGH = "high"
 EFFORT_XHIGH = "xhigh"
 EFFORT_MAX = "max"
 
+# Subscription OAuth tokens are only entitled to premium models over the raw Messages
+# API when the request's FIRST system block is the Claude Code identity string.
+# Without it Anthropic rejects the request as a mislabeled 429 rate_limit_error
+# (bare 'Error' message, no anthropic-ratelimit-* headers). See issue #52.
+CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def oauth_system(role_system: str, *, is_oauth: bool) -> str | list[dict[str, str]]:
+    """Build a role's ``system`` value, prepending the Claude Code identity in OAuth mode.
+
+    In OAuth (subscription) mode the Messages API only grants premium-model access when
+    the first system block is the Claude Code identity, so the role prompt is demoted to
+    the second text block. ``api_key`` mode returns the role prompt unchanged as a plain
+    string.
+    """
+    if is_oauth:
+        return [
+            {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+            {"type": "text", "text": role_system},
+        ]
+    return role_system
+
 
 class Transport(enum.Enum):
     """How a role's model is invoked.

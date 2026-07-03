@@ -26,7 +26,14 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from retinue.notify import Notification, Notifier
-from retinue.roles import EFFORT_MAX, EFFORT_XHIGH, Role, resolve_effort, resolve_model
+from retinue.roles import (
+    EFFORT_MAX,
+    EFFORT_XHIGH,
+    Role,
+    oauth_system,
+    resolve_effort,
+    resolve_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -253,11 +260,15 @@ class ClaudeSliceGenerator:
         it is extracted and prepended as an explicit, labeled block instructing the model
         to honor it; the full PRD body follows. A PRD without that section keeps the body
         verbatim (and the caller escalates a thin/malformed PRD before reaching here).
+
+        In ``subscription`` (OAuth) mode the Claude Code identity is prepended as the
+        first system block (see :func:`retinue.roles.oauth_system`); ``api_key`` mode is
+        unaffected.
         """
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
-            "system": _SLICE_SYSTEM,
+            "system": oauth_system(_SLICE_SYSTEM, is_oauth=self.auth_mode == "subscription"),
             "output_config": {
                 "effort": resolve_effort(Role.SLICER),
                 "format": {"type": "json_schema", "schema": _SLICE_SCHEMA},

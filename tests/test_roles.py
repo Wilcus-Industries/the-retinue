@@ -15,12 +15,14 @@ import pytest
 
 from retinue.repo_config import RepoConfig
 from retinue.roles import (
+    CLAUDE_CODE_IDENTITY,
     EFFORT_HIGH,
     EFFORT_MAX,
     EFFORT_XHIGH,
     ROLE_REGISTRY,
     Role,
     Transport,
+    oauth_system,
     planner_cli_argv,
     resolve_effort,
     resolve_model,
@@ -141,6 +143,25 @@ def test_planner_instruction_requires_an_explore_subagent_before_a_plan() -> Non
     lowered = system.lower()
     assert "at least one" in lowered
     assert "before" in lowered and "plan" in lowered
+
+
+def test_oauth_system_prepends_claude_code_identity_in_oauth_mode() -> None:
+    """OAuth mode demotes the role prompt to a second system block behind the identity.
+
+    Subscription OAuth tokens only unlock premium models over the raw Messages API when
+    the first system block is the Claude Code identity string (issue #52).
+    """
+    system = oauth_system("role brief", is_oauth=True)
+
+    assert system == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": "role brief"},
+    ]
+
+
+def test_oauth_system_passes_role_prompt_through_in_api_key_mode() -> None:
+    """api_key mode is unaffected: the role prompt rides as a plain string, unchanged."""
+    assert oauth_system("role brief", is_oauth=False) == "role brief"
 
 
 def test_planner_argv_writes_nothing_to_the_workspace() -> None:

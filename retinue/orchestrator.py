@@ -57,7 +57,7 @@ from retinue.done_check import (
 )
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
-from retinue.roles import Role, resolve_effort, resolve_model
+from retinue.roles import Role, oauth_system, resolve_effort, resolve_model
 
 logger = logging.getLogger(__name__)
 
@@ -618,7 +618,10 @@ class ConflictResolver(Protocol):
 # subscription token (``sk-ant-oat...``) rides ``Authorization: Bearer`` with the
 # ``oauth-2025-04-20`` beta header, any other credential is a raw API key on
 # ``x-api-key``; ``anthropic-version`` is always sent. The model must return only the
-# JSON object matching the schema — one resolved full-file body per conflicted path.
+# JSON object matching the schema — one resolved full-file body per conflicted path. In
+# OAuth mode the Claude Code identity is also prepended as the first system block
+# (:func:`retinue.roles.oauth_system`), or Anthropic rejects the premium-model request
+# as a mislabeled 429 (issue #52).
 
 _ANTHROPIC_VERSION = "2023-06-01"
 _RESOLVE_OAUTH_BETA = "oauth-2025-04-20"
@@ -756,7 +759,7 @@ def _resolve_headers(credential: str) -> dict[str, str]:
 
 
 def _resolve_payload(
-    files: list[_ConflictedFile], *, source: str, into: str, model: str
+    files: list[_ConflictedFile], *, source: str, into: str, model: str, is_oauth: bool
 ) -> dict[str, Any]:
     """Assemble the Messages API request body for one conflict resolution.
 
@@ -765,6 +768,8 @@ def _resolve_payload(
     one. The strict schema forces a per-file resolved body back. The request carries the
     resolver's registry effort tier (``xhigh``) via ``output_config.effort`` (Opus 4.8
     removed the extended-thinking ``budget_tokens`` mechanism, which now returns HTTP 400).
+    ``is_oauth`` prepends the Claude Code identity as the first system block (see
+    :func:`retinue.roles.oauth_system`) when the caller is a subscription OAuth credential.
     """
     blocks = "\n\n".join(
         f"### {file.path}\n```\n{file.content}\n```" for file in files
@@ -778,7 +783,7 @@ def _resolve_payload(
         "model": model,
         "max_tokens": _RESOLVE_MAX_TOKENS,
         "output_config": {"effort": resolve_effort(Role.RESOLVER)},
-        "system": _RESOLVE_SYSTEM,
+        "system": oauth_system(_RESOLVE_SYSTEM, is_oauth=is_oauth),
         "messages": [{"role": "user", "content": user}],
         "response_format": {"type": "json_schema", "json_schema": _RESOLVE_SCHEMA},
     }
@@ -870,7 +875,13 @@ class AgentSdkConflictResolver:
         response = await self.transport.post(
             _ANTHROPIC_MESSAGES_URL,
             headers=_resolve_headers(self.credential),
-            json=_resolve_payload(files, source=source, into=into, model=self.model),
+            json=_resolve_payload(
+                files,
+                source=source,
+                into=into,
+                model=self.model,
+                is_oauth=self.credential.startswith("sk-ant-oat"),
+            ),
         )
         if response.status_code != 200:
             raise ConflictResolutionError(

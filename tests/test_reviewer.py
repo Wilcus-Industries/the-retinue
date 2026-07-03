@@ -20,6 +20,7 @@ import pytest
 from retinue.orchestrator import PrdBuildResult, PrdSlice, build_prd
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
+    _REVIEW_SYSTEM,
     AgentSdkReviewGenerator,
     EditBlockedByRequest,
     GhCliBlockedByEditor,
@@ -34,6 +35,7 @@ from retinue.reviewer import (
     add_blocked_by,
     review_round,
 )
+from retinue.roles import CLAUDE_CODE_IDENTITY
 from retinue.slicer import _EFFORT_MAX, CreatedIssue, IssueDraft
 from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
 from tests.test_orchestrator import FakeGitOps, FakeImplementer
@@ -294,6 +296,36 @@ def test_payload_carries_max_effort() -> None:
     assert payload["output_config"]["effort"] == _EFFORT_MAX
     assert _EFFORT_MAX == "max"
     assert "thinking" not in payload
+
+
+def test_payload_prepends_claude_code_identity_for_oauth_credential() -> None:
+    """A ``sk-ant-oat...`` credential sends the identity as the first system block.
+
+    Without it, Anthropic rejects a subscription-OAuth premium-model request as a
+    mislabeled 429 rate_limit_error (issue #52).
+    """
+    gen = AgentSdkReviewGenerator(
+        credential="sk-ant-oat-abc",
+        transport=_FakeTransport(_text_response({"findings": []})),
+    )
+
+    payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
+
+    system = payload["system"]
+    assert isinstance(system, list)
+    assert system[0]["text"] == CLAUDE_CODE_IDENTITY
+    assert system[1]["text"] == _REVIEW_SYSTEM
+
+
+def test_payload_keeps_plain_system_string_for_api_key_credential() -> None:
+    """A raw API key credential is unaffected: the system value stays a plain string."""
+    gen = AgentSdkReviewGenerator(
+        credential="k", transport=_FakeTransport(_text_response({"findings": []}))
+    )
+
+    payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
+
+    assert payload["system"] == _REVIEW_SYSTEM
 
 
 @pytest.mark.asyncio

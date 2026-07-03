@@ -22,6 +22,7 @@ from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
     _DEFAULT_IMPLEMENT_MAX_TURNS,
     _IMPLEMENT_SYSTEM,
+    _RESOLVE_SYSTEM,
     AgentSdkConflictResolver,
     AnthropicResponse,
     BuildOutcome,
@@ -49,7 +50,7 @@ from retinue.orchestrator import (
     integration_branch,
 )
 from retinue.repo_config import RepoConfig, SecretsConfig
-from retinue.roles import ROLE_REGISTRY, Role
+from retinue.roles import CLAUDE_CODE_IDENTITY, ROLE_REGISTRY, Role
 from retinue.slicer import _EFFORT_XHIGH
 from tests.test_done_check import (
     CLAUDE_MD,
@@ -644,7 +645,9 @@ def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
         _ConflictedFile(path="a.py", content="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"),
         _ConflictedFile(path="b.py", content="conflict-b"),
     ]
-    payload = _resolve_payload(files, source="issue-7", into="retinue/prd-1", model="m")
+    payload = _resolve_payload(
+        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+    )
 
     assert payload["model"] == "m"
     assert payload["response_format"]["type"] == "json_schema"
@@ -664,11 +667,42 @@ def test_resolve_payload_carries_xhigh_effort() -> None:
     """
     files = [_ConflictedFile(path="a.py", content="conflict-a")]
 
-    payload = _resolve_payload(files, source="issue-7", into="retinue/prd-1", model="m")
+    payload = _resolve_payload(
+        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+    )
 
     assert payload["output_config"]["effort"] == _EFFORT_XHIGH
     assert _EFFORT_XHIGH == "xhigh"
     assert "thinking" not in payload
+
+
+def test_resolve_payload_prepends_claude_code_identity_when_oauth() -> None:
+    """``is_oauth=True`` sends the identity as the first system block (issue #52).
+
+    Without it, Anthropic rejects a subscription-OAuth premium-model request as a
+    mislabeled 429 rate_limit_error.
+    """
+    files = [_ConflictedFile(path="a.py", content="conflict-a")]
+
+    payload = _resolve_payload(
+        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=True
+    )
+
+    system = payload["system"]
+    assert isinstance(system, list)
+    assert system[0]["text"] == CLAUDE_CODE_IDENTITY
+    assert system[1]["text"] == _RESOLVE_SYSTEM
+
+
+def test_resolve_payload_keeps_plain_system_string_when_not_oauth() -> None:
+    """``is_oauth=False`` is unaffected: the system value stays a plain string."""
+    files = [_ConflictedFile(path="a.py", content="conflict-a")]
+
+    payload = _resolve_payload(
+        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+    )
+
+    assert payload["system"] == _RESOLVE_SYSTEM
 
 
 def test_parse_resolution_maps_paths_to_resolved_bodies() -> None:
@@ -753,6 +787,37 @@ async def test_resolver_recreates_merge_resolves_and_commits() -> None:
     # The resolved body was written byte-exact via the base64 round-trip.
     write = next(cmd for cmd in container.commands if cmd[0] == "sh")
     assert base64.b64decode(write[-2]).decode() == "merged"
+
+
+@pytest.mark.asyncio
+async def test_resolver_sends_claude_code_identity_for_oauth_credential() -> None:
+    """A ``sk-ant-oat...`` credential sends the two-block identity system on the wire.
+
+    Subscription OAuth tokens only unlock premium models over the raw Messages API when
+    the first system block is the Claude Code identity string (issue #52).
+    """
+    container = ScriptedContainer(
+        {
+            "diff --name-only": RunResult(exit_code=1, stdout="a.py\n"),
+            "cat a.py": RunResult(
+                exit_code=0, stdout="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"
+            ),
+        }
+    )
+    transport = FakeAnthropicTransport(
+        _text_response({"resolved": [{"path": "a.py", "content": "merged"}]})
+    )
+    resolver = AgentSdkConflictResolver(
+        container=container, transport=transport, credential="sk-ant-oat-abc"
+    )
+
+    await resolver(source="issue-7", into="retinue/prd-1")
+
+    _, _, sent_json = transport.calls[0]
+    system = sent_json["system"]
+    assert isinstance(system, list)
+    assert system[0]["text"] == CLAUDE_CODE_IDENTITY
+    assert system[1]["text"] == _RESOLVE_SYSTEM
 
 
 @pytest.mark.asyncio

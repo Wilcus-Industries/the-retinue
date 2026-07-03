@@ -19,8 +19,10 @@ from retinue.notify import (
     Notifier,
     PushRequest,
 )
+from retinue.roles import CLAUDE_CODE_IDENTITY
 from retinue.slicer import (
     _EFFORT_XHIGH,
+    _SLICE_SYSTEM,
     ClaudeSliceGenerator,
     CreatedIssue,
     GhCliIssueCreator,
@@ -242,6 +244,31 @@ def test_subscription_mode_uses_bearer_token_and_oauth_beta_header() -> None:
         "auth_token": "oauth-tok",
         "default_headers": {"anthropic-beta": "oauth-2025-04-20"},
     }
+
+
+def test_request_kwargs_prepend_claude_code_identity_in_subscription_mode() -> None:
+    """OAuth (subscription) mode sends the identity as the first system block (issue #52).
+
+    Without it, Anthropic rejects a subscription-OAuth premium-model request as a
+    mislabeled 429 rate_limit_error.
+    """
+    gen = ClaudeSliceGenerator(token="oauth-tok", auth_mode="subscription")
+
+    kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
+
+    system = kwargs["system"]
+    assert isinstance(system, list)
+    assert system[0]["text"] == CLAUDE_CODE_IDENTITY
+    assert system[1]["text"] == _SLICE_SYSTEM
+
+
+def test_request_kwargs_keep_plain_system_string_in_api_key_mode() -> None:
+    """api_key mode is unaffected: the system value stays the plain role-brief string."""
+    gen = ClaudeSliceGenerator(token="sk-ant-123", auth_mode="api_key")
+
+    kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
+
+    assert kwargs["system"] == _SLICE_SYSTEM
 
 
 def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:

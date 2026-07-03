@@ -26,7 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from retinue.roles import Role, resolve_effort, resolve_model
+from retinue.roles import Role, oauth_system, resolve_effort, resolve_model
 from retinue.slicer import (
     READY_LABEL,
     CreatedIssue,
@@ -131,7 +131,9 @@ BlockedByEditor = Callable[[EditBlockedByRequest], Awaitable[None]]
 # default); a subscription OAuth token goes on ``Authorization: Bearer`` with the
 # ``oauth-2025-04-20`` beta header, while a raw API key goes on ``x-api-key``;
 # ``anthropic-version`` is always sent. The model must return only the JSON object
-# matching the schema.
+# matching the schema. In OAuth mode the Claude Code identity is also prepended as the
+# first system block (:func:`retinue.roles.oauth_system`), or Anthropic rejects the
+# premium-model request as a mislabeled 429 (issue #52).
 # ---------------------------------------------------------------------------
 
 _ANTHROPIC_VERSION = "2023-06-01"
@@ -257,7 +259,8 @@ class AgentSdkReviewGenerator:
         The internal reviewer is the highest-rigor Opus role, so the request carries the
         role's registry effort tier (``max``) via ``output_config.effort`` (Opus 4.8
         removed the extended-thinking ``budget_tokens`` mechanism, which now returns
-        HTTP 400).
+        HTTP 400). A subscription OAuth credential prepends the Claude Code identity as
+        the first system block (see :func:`retinue.roles.oauth_system`).
         """
         merged = ", ".join(f"#{n}" for n in review_input.merged_issues) or "(none)"
         user = (
@@ -272,7 +275,9 @@ class AgentSdkReviewGenerator:
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
             "output_config": {"effort": resolve_effort(Role.REVIEWER)},
-            "system": _REVIEW_SYSTEM,
+            "system": oauth_system(
+                _REVIEW_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")
+            ),
             "messages": [{"role": "user", "content": user}],
             "response_format": {"type": "json_schema", "json_schema": _REVIEW_SCHEMA},
         }
