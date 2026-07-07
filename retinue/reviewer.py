@@ -26,7 +26,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from retinue.roles import Role, oauth_system, resolve_model, structured_output_config
+from retinue.roles import (
+    Role,
+    is_oauth_credential,
+    oauth_system,
+    resolve_model,
+    structured_output_config,
+)
 from retinue.slicer import (
     READY_LABEL,
     CreatedIssue,
@@ -266,7 +272,7 @@ class AgentSdkReviewGenerator:
             "anthropic-version": _ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
-        if self.credential.startswith("sk-ant-oat"):
+        if is_oauth_credential(self.credential):
             headers["authorization"] = f"Bearer {self.credential}"
             headers["anthropic-beta"] = _OAUTH_BETA
         else:
@@ -298,7 +304,7 @@ class AgentSdkReviewGenerator:
             "max_tokens": _MAX_TOKENS,
             "output_config": structured_output_config(Role.REVIEWER, _REVIEW_SCHEMA),
             "system": oauth_system(
-                _REVIEW_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")
+                _REVIEW_SYSTEM, is_oauth=is_oauth_credential(self.credential)
             ),
             "messages": [{"role": "user", "content": user}],
         }

@@ -61,7 +61,13 @@ from retinue.done_check import (
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import ReviewGenerationError
-from retinue.roles import Role, oauth_system, resolve_model, structured_output_config
+from retinue.roles import (
+    Role,
+    is_oauth_credential,
+    oauth_system,
+    resolve_model,
+    structured_output_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -757,7 +763,7 @@ def _resolve_headers(credential: str) -> dict[str, str]:
         "anthropic-version": _ANTHROPIC_VERSION,
         "content-type": "application/json",
     }
-    if credential.startswith("sk-ant-oat"):
+    if is_oauth_credential(credential):
         headers["authorization"] = f"Bearer {credential}"
         headers["anthropic-beta"] = _RESOLVE_OAUTH_BETA
     else:
@@ -890,7 +896,7 @@ class AgentSdkConflictResolver:
                 source=source,
                 into=into,
                 model=self.model,
-                is_oauth=self.credential.startswith("sk-ant-oat"),
+                is_oauth=is_oauth_credential(self.credential),
             ),
         )
         if response.status_code != 200:
