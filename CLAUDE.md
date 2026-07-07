@@ -17,6 +17,19 @@ uv run ruff check .
 uv run mypy .
 ```
 
+## Heimdall staging-PR review loop
+
+Every `retinue/prd-<n>` → staging PR is reviewed by heimdall; the retinue **awaits and
+acts on** that verdict (`retinue/loopback.py`):
+
+- **Approved** (no blocking findings): nits are filed as `backlog` + `priority:<severity>`
+  issues, then the PR proceeds to reap/handoff.
+- **Changes requested**: each blocking finding becomes a fix-issue (`ready-for-agent`,
+  `Part of #<prd>`) rebuilt onto the **same** PR branch, re-triggering heimdall review —
+  looped up to `retry_cap` rounds (count persisted, survives a worker restart).
+- **Round cap exhausted while still blocked**: escalate — comment the PRD, apply `hitl`,
+  push-notify, and leave the PR open for a human.
+
 ## Keep these docs current
 
 Treat `CLAUDE.md` and `STYLEGUIDE.md` as living docs, not write-once boilerplate. As part
