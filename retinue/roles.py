@@ -246,6 +246,11 @@ def resolve_effort(
 CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 
+def is_oauth_credential(credential: str) -> bool:
+    """True when ``credential`` is a subscription OAuth token (``sk-ant-oat...``)."""
+    return credential.startswith("sk-ant-oat")
+
+
 def oauth_system(role_system: str, *, is_oauth: bool) -> str | list[dict[str, str]]:
     """Build a role's Messages-API ``system`` field, adding the identity block for OAuth.
 

@@ -28,6 +28,7 @@ from typing import Any, Protocol
 
 from retinue.roles import (
     Role,
+    is_oauth_credential,
     oauth_system,
     resolve_effort,
     resolve_model,
@@ -276,7 +277,7 @@ class AgentSdkReviewGenerator:
             "anthropic-version": _ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
-        if self.credential.startswith("sk-ant-oat"):
+        if is_oauth_credential(self.credential):
             headers["authorization"] = f"Bearer {self.credential}"
             headers["anthropic-beta"] = _OAUTH_BETA
         else:
@@ -310,7 +311,7 @@ class AgentSdkReviewGenerator:
                 Role.REVIEWER, _REVIEW_SCHEMA, model=self.model, effort=self.effort
             ),
             "system": oauth_system(
-                _REVIEW_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")
+                _REVIEW_SYSTEM, is_oauth=is_oauth_credential(self.credential)
             ),
             "messages": [{"role": "user", "content": user}],
         }
