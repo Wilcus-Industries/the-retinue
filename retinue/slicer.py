@@ -26,7 +26,14 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from retinue.notify import Notification, Notifier
-from retinue.roles import EFFORT_MAX, EFFORT_XHIGH, Role, resolve_effort, resolve_model
+from retinue.roles import (
+    EFFORT_MAX,
+    EFFORT_XHIGH,
+    Role,
+    oauth_system,
+    resolve_effort,
+    resolve_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +264,9 @@ class ClaudeSliceGenerator:
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
-            "system": _SLICE_SYSTEM,
+            "system": oauth_system(
+                _SLICE_SYSTEM, is_oauth=self.auth_mode == "subscription"
+            ),
             "output_config": {
                 "effort": resolve_effort(Role.SLICER),
                 "format": {"type": "json_schema", "schema": _SLICE_SCHEMA},

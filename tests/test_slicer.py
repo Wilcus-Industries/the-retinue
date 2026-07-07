@@ -19,8 +19,10 @@ from retinue.notify import (
     Notifier,
     PushRequest,
 )
+from retinue.roles import CLAUDE_CODE_IDENTITY
 from retinue.slicer import (
     _EFFORT_XHIGH,
+    _SLICE_SYSTEM,
     ClaudeSliceGenerator,
     CreatedIssue,
     GhCliIssueCreator,
@@ -258,6 +260,33 @@ def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:
     assert fmt["type"] == "json_schema"
     assert fmt["schema"]["properties"]["slices"]["type"] == "array"
     assert kwargs["max_tokens"] > 0
+
+
+def test_subscription_mode_request_system_leads_with_claude_code_identity() -> None:
+    """In subscription (OAuth) mode the system field leads with the identity block.
+
+    A subscription OAuth token reaches the premium slicing model over the raw Messages
+    API only when the first system block is the Claude Code identity string; the slicer's
+    own brief follows it as the second block.
+    """
+    gen = ClaudeSliceGenerator(token="oauth-tok", auth_mode="subscription")
+
+    system = gen._build_request_kwargs("body")["system"]
+
+    assert system == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": _SLICE_SYSTEM},
+    ]
+
+
+def test_api_key_mode_request_system_stays_the_plain_role_prompt() -> None:
+    """In api_key mode the system field stays the unchanged plain role brief."""
+    gen = ClaudeSliceGenerator(token="sk-ant-123", auth_mode="api_key")
+
+    system = gen._build_request_kwargs("body")["system"]
+
+    assert system == _SLICE_SYSTEM
+    assert isinstance(system, str)
 
 
 def test_request_injects_prd_testing_decisions_as_authoritative_seam() -> None:
