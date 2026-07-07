@@ -15,12 +15,14 @@ import pytest
 
 from retinue.repo_config import RepoConfig
 from retinue.roles import (
+    CLAUDE_CODE_IDENTITY,
     EFFORT_HIGH,
     EFFORT_MAX,
     EFFORT_XHIGH,
     ROLE_REGISTRY,
     Role,
     Transport,
+    oauth_system,
     planner_cli_argv,
     resolve_effort,
     resolve_model,
@@ -155,3 +157,35 @@ def test_planner_argv_writes_nothing_to_the_workspace() -> None:
     assert "--output-format" not in argv
     disallowed = argv[argv.index("--disallowedTools") + 1]
     assert "Write" in disallowed
+
+
+def test_oauth_system_prepends_identity_block_in_oauth_mode() -> None:
+    """OAuth mode turns the system field into a two-block list, identity block first.
+
+    A subscription OAuth token may only reach a premium model over the raw Messages API
+    when the request's leading ``system`` block is the Claude Code identity string; the
+    role's own brief follows it as the second block.
+    """
+    assert oauth_system("role prompt", is_oauth=True) == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": "role prompt"},
+    ]
+
+
+def test_oauth_system_passes_plain_string_through_in_api_key_mode() -> None:
+    """api_key mode leaves the role prompt as the unchanged plain string (never a list)."""
+    result = oauth_system("role prompt", is_oauth=False)
+    assert result == "role prompt"
+    assert not isinstance(result, list)
+
+
+def test_claude_code_identity_is_the_exact_cli_string() -> None:
+    """The identity block is the exact Claude Code CLI system string.
+
+    The entitlement match is exact-string, so this pins the literal the CLI sends —
+    any drift would silently lose premium-model access for the OAuth roles.
+    """
+    assert (
+        CLAUDE_CODE_IDENTITY
+        == "You are Claude Code, Anthropic's official CLI for Claude."
+    )

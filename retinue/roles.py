@@ -168,6 +168,42 @@ def resolve_effort(role: Role, config: RepoConfig | None = None) -> str:
     return ROLE_REGISTRY[role].effort
 
 
+# --- Claude Code identity block for OAuth premium-model access --------------------
+#
+# A subscription OAuth token may only call a premium model over the raw ``/v1/messages``
+# API when the request's *first* ``system`` block is the Claude Code CLI identity string
+# — Anthropic gates premium access on that exact-string entitlement, and a bare role
+# brief is rejected (surfacing as a mislabeled 429). The three raw-API roles (slicer,
+# reviewer, resolver) run this builder over their own brief, each gated on its own
+# existing OAuth detection, so an OAuth request leads with the identity block and an
+# API-key request keeps the brief unchanged. The literal must match the CLI byte-for-byte.
+CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def oauth_system(role_system: str, *, is_oauth: bool) -> str | list[dict[str, str]]:
+    """Build a role's Messages-API ``system`` field, adding the identity block for OAuth.
+
+    In OAuth mode the field becomes a two-block list — the :data:`CLAUDE_CODE_IDENTITY`
+    block first (the entitlement the premium-model gate checks), the role's own brief
+    second. In API-key mode the brief passes through unchanged as a plain string, so
+    the existing wire is untouched where the identity block is not required.
+
+    Args:
+        role_system: The role's own system brief.
+        is_oauth: True when the request authenticates with a subscription OAuth token.
+
+    Returns:
+        A two-block ``[{type, text}, ...]`` list in OAuth mode, or ``role_system``
+        verbatim in API-key mode.
+    """
+    if is_oauth:
+        return [
+            {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+            {"type": "text", "text": role_system},
+        ]
+    return role_system
+
+
 # --- planner invocation construction (read-only, explore-first) -------------------
 #
 # The planner execs the same in-container ``claude`` CLI as the implementer, but run

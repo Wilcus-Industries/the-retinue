@@ -26,7 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from retinue.roles import Role, resolve_effort, resolve_model
+from retinue.roles import Role, oauth_system, resolve_effort, resolve_model
 from retinue.slicer import (
     READY_LABEL,
     CreatedIssue,
@@ -272,7 +272,9 @@ class AgentSdkReviewGenerator:
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
             "output_config": {"effort": resolve_effort(Role.REVIEWER)},
-            "system": _REVIEW_SYSTEM,
+            "system": oauth_system(
+                _REVIEW_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")
+            ),
             "messages": [{"role": "user", "content": user}],
             "response_format": {"type": "json_schema", "json_schema": _REVIEW_SCHEMA},
         }

@@ -20,6 +20,7 @@ import pytest
 from retinue.orchestrator import PrdBuildResult, PrdSlice, build_prd
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
+    _REVIEW_SYSTEM,
     AgentSdkReviewGenerator,
     EditBlockedByRequest,
     GhCliBlockedByEditor,
@@ -34,6 +35,7 @@ from retinue.reviewer import (
     add_blocked_by,
     review_round,
 )
+from retinue.roles import CLAUDE_CODE_IDENTITY
 from retinue.slicer import _EFFORT_MAX, CreatedIssue, IssueDraft
 from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
 from tests.test_orchestrator import FakeGitOps, FakeImplementer
@@ -294,6 +296,39 @@ def test_payload_carries_max_effort() -> None:
     assert payload["output_config"]["effort"] == _EFFORT_MAX
     assert _EFFORT_MAX == "max"
     assert "thinking" not in payload
+
+
+def test_payload_oauth_credential_leads_system_with_claude_code_identity() -> None:
+    """An OAuth credential makes the system field lead with the identity block.
+
+    A subscription OAuth token reaches the premium reviewing model over the raw Messages
+    API only when the first system block is the Claude Code identity string; the
+    reviewer's own brief follows it as the second block.
+    """
+    gen = AgentSdkReviewGenerator(
+        credential="sk-ant-oat-abc",
+        transport=_FakeTransport(_text_response({"findings": []})),
+    )
+
+    payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
+
+    assert payload["system"] == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": _REVIEW_SYSTEM},
+    ]
+
+
+def test_payload_api_key_credential_keeps_plain_string_system() -> None:
+    """A raw API-key credential keeps the system field as the unchanged plain brief."""
+    gen = AgentSdkReviewGenerator(
+        credential="sk-ant-api-xyz",
+        transport=_FakeTransport(_text_response({"findings": []})),
+    )
+
+    payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
+
+    assert payload["system"] == _REVIEW_SYSTEM
+    assert isinstance(payload["system"], str)
 
 
 @pytest.mark.asyncio

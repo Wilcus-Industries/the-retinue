@@ -22,6 +22,7 @@ from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
     _DEFAULT_IMPLEMENT_MAX_TURNS,
     _IMPLEMENT_SYSTEM,
+    _RESOLVE_SYSTEM,
     AgentSdkConflictResolver,
     AnthropicResponse,
     BuildOutcome,
@@ -49,7 +50,7 @@ from retinue.orchestrator import (
     integration_branch,
 )
 from retinue.repo_config import RepoConfig, SecretsConfig
-from retinue.roles import ROLE_REGISTRY, Role
+from retinue.roles import CLAUDE_CODE_IDENTITY, ROLE_REGISTRY, Role
 from retinue.slicer import _EFFORT_XHIGH
 from tests.test_done_check import (
     CLAUDE_MD,
@@ -644,7 +645,9 @@ def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
         _ConflictedFile(path="a.py", content="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"),
         _ConflictedFile(path="b.py", content="conflict-b"),
     ]
-    payload = _resolve_payload(files, source="issue-7", into="retinue/prd-1", model="m")
+    payload = _resolve_payload(
+        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+    )
 
     assert payload["model"] == "m"
     assert payload["response_format"]["type"] == "json_schema"
@@ -664,11 +667,44 @@ def test_resolve_payload_carries_xhigh_effort() -> None:
     """
     files = [_ConflictedFile(path="a.py", content="conflict-a")]
 
-    payload = _resolve_payload(files, source="issue-7", into="retinue/prd-1", model="m")
+    payload = _resolve_payload(
+        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+    )
 
     assert payload["output_config"]["effort"] == _EFFORT_XHIGH
     assert _EFFORT_XHIGH == "xhigh"
     assert "thinking" not in payload
+
+
+def test_resolve_payload_oauth_leads_system_with_claude_code_identity() -> None:
+    """With an OAuth credential the system field leads with the identity block.
+
+    A subscription OAuth token reaches the premium resolving model over the raw Messages
+    API only when the first system block is the Claude Code identity string; the
+    resolver's own brief follows it as the second block.
+    """
+    files = [_ConflictedFile(path="a.py", content="conflict-a")]
+
+    payload = _resolve_payload(
+        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=True
+    )
+
+    assert payload["system"] == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": _RESOLVE_SYSTEM},
+    ]
+
+
+def test_resolve_payload_api_key_keeps_plain_string_system() -> None:
+    """With an API-key credential the system field stays the unchanged plain brief."""
+    files = [_ConflictedFile(path="a.py", content="conflict-a")]
+
+    payload = _resolve_payload(
+        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+    )
+
+    assert payload["system"] == _RESOLVE_SYSTEM
+    assert isinstance(payload["system"], str)
 
 
 def test_parse_resolution_maps_paths_to_resolved_bodies() -> None:
