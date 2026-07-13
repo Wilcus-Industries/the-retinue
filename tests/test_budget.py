@@ -434,6 +434,74 @@ async def test_defer_until_waits_until_window_frees_enough_for_the_amount(
     assert readmit.deferred is False
 
 
+@pytest.mark.asyncio
+async def test_gate_charges_the_admitted_estimate_to_the_ledger(db_path: Path) -> None:
+    """An admitted run's estimate is recorded, so the shared window learns the spend.
+
+    The PRD and cron lanes gate through this path and never meter separately; without
+    the gate charging the ledger, their real spend would be invisible to the rolling-24h
+    cap (the 12%/24h governor would be decorative for the primary lanes).
+    """
+    ledger = BudgetLedger(
+        db_path, clock=FakeClock(), auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    governor = BudgetGovernor(ledger)
+
+    decision = await governor.gate(estimated_amount=5.0)
+
+    assert decision == GateDecision(deferred=False, defer_until=None)
+    assert await ledger.trailing_24h_spend() == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_gate_records_nothing_when_deferred(db_path: Path) -> None:
+    """A deferred run charges nothing: the estimate lands only when the run is admitted."""
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=12.0)  # the cap is fully spent
+    governor = BudgetGovernor(ledger)
+
+    decision = await governor.gate(estimated_amount=1.0)
+
+    assert decision.deferred is True
+    assert await ledger.trailing_24h_spend() == pytest.approx(12.0)
+
+
+@pytest.mark.asyncio
+async def test_gate_is_atomic_across_concurrent_lanes(db_path: Path) -> None:
+    """Two lanes gating concurrently for the last room admit exactly one.
+
+    cap = 12, trailing = 11 (1.0 of room). Two governors on the shared ledger both gate
+    a 1.0 estimate at once; the check-and-record serializes on the write lock, so the
+    second sees the first's charge and defers — the cap is never overshot by a
+    read-then-write race between the PRD and cron lanes.
+    """
+    clock = FakeClock()
+    prd_lane = BudgetGovernor(
+        BudgetLedger(
+            db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+        )
+    )
+    cron_lane = BudgetGovernor(
+        BudgetLedger(
+            db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+        )
+    )
+    await prd_lane._ledger.record_spend(amount=11.0)
+
+    decisions = await asyncio.gather(
+        prd_lane.gate(estimated_amount=1.0),
+        cron_lane.gate(estimated_amount=1.0),
+    )
+
+    assert sorted(d.deferred for d in decisions) == [False, True]
+    trailing = await prd_lane._ledger.trailing_24h_spend()
+    assert trailing == pytest.approx(12.0)
+    assert trailing <= prd_lane._ledger.cap()
+
+
 # --- meter mid-run: pause + checkpoint, then resume ------------------------------
 
 

@@ -12,7 +12,9 @@ Two enforcement points:
 * **gate at run start** (:meth:`BudgetGovernor.gate`) — if the run's estimated charge
   would push the trailing-24h spend over the cap, the run is *deferred* until the window
   frees enough room for that estimate (the charges expire oldest-first until the trailing
-  spend leaves room for the estimate under the cap).
+  spend leaves room for the estimate under the cap). An admitted run's estimate is
+  *charged* to the ledger atomically with the check, so the PRD and cron lanes' spend
+  counts against the shared window.
 * **meter mid-run** (:meth:`BudgetGovernor.meter`) — a charge that would cross the cap
   *pauses* the run and checkpoints it (the owned slice set is recorded in the reconcile
   :class:`~retinue.reconcile.RunStateStore`). :meth:`BudgetGovernor.try_resume` resumes
@@ -368,7 +370,8 @@ class BudgetGovernor:
     """Gates a run at start and meters it mid-flight against the rolling-24h cap.
 
     Wraps a :class:`BudgetLedger`. :meth:`gate` defers a run that would start over the
-    cap. :meth:`meter` pauses and checkpoints a run whose next charge would cross the cap,
+    cap and charges an admitted run's estimate to the shared ledger. :meth:`meter`
+    pauses and checkpoints a run whose next charge would cross the cap,
     recording the owned slice set in the reconcile :class:`~retinue.reconcile.RunStateStore`
     so :meth:`try_resume` can rebuild only the unfinished work via
     :func:`~retinue.reconcile.reconcile_run` once the window frees.
@@ -393,26 +396,36 @@ class BudgetGovernor:
         self._blocked_by: dict[str, dict[int, list[int]]] = {}
 
     async def gate(self, *, estimated_amount: float) -> GateDecision:
-        """Admit or defer a run by its estimated charge against the rolling-24h cap.
+        """Admit-and-charge or defer a run by its estimated charge against the 24h cap.
+
+        An admitted run's estimate is *recorded* to the shared ledger inside the same
+        write-locked transaction that verified the room
+        (:meth:`BudgetLedger.try_record_if_within_cap`), so the PRD and cron lanes'
+        spend counts against the rolling window — and two lanes gating concurrently
+        serialize on the write lock and can never jointly overshoot the cap. A deferred
+        run records nothing.
 
         Args:
             estimated_amount: The run's estimated total charge in the ledger's unit.
+                Only call once the run will actually build on admission — the charge
+                lands at the gate.
 
         Returns:
             A :class:`GateDecision`: ``deferred`` with a ``defer_until`` when the charge
-            would start the run over the cap, else an admitted decision.
+            would start the run over the cap (nothing recorded), else an admitted
+            decision with the estimate charged.
         """
-        if await self._ledger.would_exceed(amount=estimated_amount):
-            defer_until = await self._ledger.window_frees_at(amount=estimated_amount)
-            logger.info(
-                "Budget gate deferring run: estimated %.4g would exceed the 24h cap "
-                "(%.4g); defer until %s",
-                estimated_amount,
-                self._ledger.cap(),
-                defer_until,
-            )
-            return GateDecision(deferred=True, defer_until=defer_until)
-        return GateDecision(deferred=False, defer_until=None)
+        if await self._ledger.try_record_if_within_cap(amount=estimated_amount):
+            return GateDecision(deferred=False, defer_until=None)
+        defer_until = await self._ledger.window_frees_at(amount=estimated_amount)
+        logger.info(
+            "Budget gate deferring run: estimated %.4g would exceed the 24h cap "
+            "(%.4g); defer until %s",
+            estimated_amount,
+            self._ledger.cap(),
+            defer_until,
+        )
+        return GateDecision(deferred=True, defer_until=defer_until)
 
     async def meter_adhoc(self, *, amount: float) -> bool:
         """Meter one ad-hoc build's flat charge against the shared rolling-24h cap.
