@@ -43,6 +43,7 @@ import json
 import logging
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
 
 import httpx
@@ -1197,6 +1198,9 @@ class PrdBuildResult:
         skipped_issues: Issue numbers that never became ready because an upstream
             slice they transitively depend on was blocked or escalated, pruning the
             subtree. Reported here rather than silently dropped.
+        deferred: True when the budget gate held the run back — nothing built, every
+            bucket empty. Carried so the caller can re-enqueue rather than lose the run.
+        defer_until: When the budget window frees on a deferred run; ``None`` otherwise.
     """
 
     integration_branch: str
@@ -1204,6 +1208,8 @@ class PrdBuildResult:
     blocked_issues: list[int]
     escalated_issues: list[int]
     skipped_issues: list[int]
+    deferred: bool = False
+    defer_until: datetime | None = None
 
 
 async def build_prd(

@@ -37,6 +37,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -100,10 +101,12 @@ from retinue.orchestrator import (
     PrdBuildResult,
     PrdSlice,
     RoundReviewer,
+    integration_branch,
 )
 from retinue.pr_opener import GhCliPrOps, PrOpenResult, PrOps, open_staging_pr
 from retinue.reconcile import (
     GhCliReconcile,
+    PrState,
     ReconcileGh,
     ReconcileResult,
     ResumePhase,
@@ -161,6 +164,9 @@ class PrdJobResult:
         pr_open: The PR-open result, or ``None`` when the PR step was not reached.
         done_check_missing: True when the repo had no parseable done-check gate, so the
             build was escalated and skipped (a clean terminal skip, not a crash).
+        deferred: True when the budget gate deferred the build — the worker re-enqueues
+            the round's resume for when the window frees instead of losing the PRD.
+        defer_until: When the budget window frees on a deferred build; ``None`` otherwise.
     """
 
     sliced: bool
@@ -168,6 +174,24 @@ class PrdJobResult:
     prd_build: PrdBuildResult | None = None
     pr_open: PrOpenResult | None = None
     done_check_missing: bool = False
+    deferred: bool = False
+    defer_until: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ResumeRoundOutcome:
+    """Outcome of resuming one persisted PRD round.
+
+    Attributes:
+        reconcile: The reconcile result the round was routed on.
+        deferred: True when the resume's BUILD phase was budget-deferred (nothing ran);
+            the caller re-schedules the resume for when the window frees.
+        defer_until: When the budget window frees on a deferred resume; ``None`` otherwise.
+    """
+
+    reconcile: ReconcileResult
+    deferred: bool = False
+    defer_until: datetime | None = None
 
 
 @dataclass
@@ -270,9 +294,15 @@ class Pipeline:
         build = await self._build(repo_full_name, prd_number, slices)
         if not build.merged_issues:
             # Budget-deferred or all-blocked: no integration branch was pushed, so there
-            # is no head to open a PR from. Surface the build (its deferral is visible in
-            # the empty merged_issues) without attempting the doomed PR open.
-            return PrdJobResult(sliced=True, pr_opened=False, prd_build=build)
+            # is no head to open a PR from. Surface the build — and the deferral, so the
+            # worker can re-enqueue the round — without attempting the doomed PR open.
+            return PrdJobResult(
+                sliced=True,
+                pr_opened=False,
+                prd_build=build,
+                deferred=build.deferred,
+                defer_until=build.defer_until,
+            )
 
         pr_open = await self._open_pr(repo_full_name, prd_number)
         return PrdJobResult(
@@ -404,6 +434,20 @@ class Pipeline:
             repo_full_name=repo_full_name, pr_number=pr_number
         )
 
+    async def has_round(self, *, repo_full_name: str, prd_number: int) -> bool:
+        """True when the PRD's round persisted its slice set (durable state exists).
+
+        The worker's failure path routes on this: a crash *before* any slice persisted
+        releases the PRD's dedupe claim (nothing durable exists, so a redelivery must
+        get through), while a crash after leaves the claim in place for the resume
+        sweep to pick the round up.
+        """
+        return bool(
+            await self._run_state.slices_of(
+                repo_full_name=repo_full_name, prd_number=prd_number
+            )
+        )
+
     async def reconcile(
         self, *, repo_full_name: str, prd_number: int, slices: list[PrdSlice]
     ) -> ReconcileResult:
@@ -417,8 +461,14 @@ class Pipeline:
 
     async def resume_round(
         self, *, repo_full_name: str, prd_number: int
-    ) -> ReconcileResult:
+    ) -> ResumeRoundOutcome:
         """Resume one persisted PRD round after a restart: reconcile, then re-drive it.
+
+        A round with a *recorded* PR is first routed on that PR's lifecycle state
+        (:meth:`_route_recorded_pr`): a MERGED PR is reaped (the missed-webhook reap)
+        and a CLOSED one ends the round quietly — a human rejected the work, so the
+        resume must not re-open a PR for it on every restart. Only an OPEN (or
+        unrecorded) PR falls through to the reconcile below.
 
         The round's slices are rebuilt from the numbers the run-state store persisted —
         with an empty ``blocked_by`` graph, the sanctioned cross-restart fallback (the
@@ -427,7 +477,9 @@ class Pipeline:
         GitHub truth and this method routes into it:
 
         - ``BUILD``: rebuild only the unfinished slices, then open the staging PR when
-          the resumed build merged anything (mirroring :meth:`process_prd_job`).
+          the resumed build merged anything (mirroring :meth:`process_prd_job`). A
+          budget-deferred rebuild is surfaced on the outcome so the caller can
+          re-schedule the resume.
         - ``PR_OPEN``: every slice landed but no PR exists — open it.
         - ``LOOPBACK``: the PR is open and heimdall's verdict arrives by webhook, so
           nothing is re-driven; the PR<->PRD mapping is re-recorded (self-healing a
@@ -440,8 +492,21 @@ class Pipeline:
             prd_number: The PRD's tracking issue number.
 
         Returns:
-            The :class:`ReconcileResult` the round was routed on.
+            The :class:`ResumeRoundOutcome` — the reconcile the round was routed on,
+            plus the deferral when the resumed build was budget-gated away.
         """
+        recorded_pr = await self._run_state.pr_of(
+            repo_full_name=repo_full_name, prd_number=prd_number
+        )
+        if recorded_pr is not None:
+            terminal = await self._route_recorded_pr(
+                repo_full_name=repo_full_name,
+                prd_number=prd_number,
+                pr_number=recorded_pr,
+            )
+            if terminal is not None:
+                return terminal
+
         slice_numbers = await self._run_state.slices_of(
             repo_full_name=repo_full_name, prd_number=prd_number
         )
@@ -449,10 +514,13 @@ class Pipeline:
         result = await self.reconcile(
             repo_full_name=repo_full_name, prd_number=prd_number, slices=slices
         )
+        deferred = False
+        defer_until: datetime | None = None
         if result.phase is ResumePhase.BUILD:
             build = await self._build(
                 repo_full_name, prd_number, result.unfinished_slices
             )
+            deferred, defer_until = build.deferred, build.defer_until
             if build.merged_issues:
                 await self._open_pr(repo_full_name, prd_number)
         elif result.phase is ResumePhase.PR_OPEN:
@@ -467,7 +535,64 @@ class Pipeline:
             await self._run_state.delete_round(
                 repo_full_name=repo_full_name, prd_number=prd_number
             )
-        return result
+        return ResumeRoundOutcome(
+            reconcile=result, deferred=deferred, defer_until=defer_until
+        )
+
+    async def _route_recorded_pr(
+        self, *, repo_full_name: str, prd_number: int, pr_number: int
+    ) -> ResumeRoundOutcome | None:
+        """Terminal routing for a round whose recorded PR left the OPEN state.
+
+        The reconcile's ``staging_pr`` query only sees *open* PRs, so without this a
+        merged-but-webhook-missed round reads as "all slices landed, no PR" and re-opens
+        a PR for finished work, and a human-rejected (closed) round is re-opened on
+        every restart — the zombie-PR loop. Routes on GitHub's lifecycle state for the
+        recorded PR: MERGED drives the same reap the merge webhook would have
+        (:meth:`reap_pr` closes the slices and deletes the row); CLOSED logs and deletes
+        the round's row without reaping (rejected work is not done work); OPEN returns
+        ``None`` so the caller proceeds with the normal reconcile.
+        """
+        state = await self._require_reconcile_gh().pr_state(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+        if state is PrState.OPEN:
+            return None
+        if state is PrState.MERGED:
+            logger.info(
+                "Resume of %s PRD #%d: recorded PR #%d is merged; reaping",
+                repo_full_name,
+                prd_number,
+                pr_number,
+            )
+            slice_issues = await self._run_state.slices_of(
+                repo_full_name=repo_full_name, prd_number=prd_number
+            )
+            await self.reap_pr(
+                MergedPullRequest(
+                    repo_full_name=repo_full_name,
+                    pr_number=pr_number,
+                    prd_number=prd_number,
+                    slice_issues=slice_issues,
+                )
+            )
+        else:
+            logger.info(
+                "Resume of %s PRD #%d: recorded PR #%d was closed unmerged "
+                "(human rejected); dropping the round",
+                repo_full_name,
+                prd_number,
+                pr_number,
+            )
+            await self._run_state.delete_round(
+                repo_full_name=repo_full_name, prd_number=prd_number
+            )
+        return ResumeRoundOutcome(
+            reconcile=ReconcileResult(
+                phase=ResumePhase.DONE,
+                integration_branch=integration_branch(prd_number),
+            )
+        )
 
     async def _build(
         self, repo_full_name: str, prd_number: int, slices: list[PrdSlice]
@@ -1219,13 +1344,12 @@ def _prd_build_from_bound(
     """Adapt a :class:`BoundBuildResult` to the pipeline's :class:`PrdBuildResult` seam.
 
     ``bind_build_prd`` returns the budget-gate-aware :class:`BoundBuildResult`, but the
-    pipeline's ``build_prd`` seam is a :class:`PrdBuildResult` (nothing in the pipeline
-    consumes the deferral flag). A run that built yields its inner ``prd_build``; a run the
-    budget gate *deferred* yields an empty build on the integration branch — honest: the
-    deferred PRD merged nothing — so the staging-PR step sees no merged slices.
+    pipeline's ``build_prd`` seam is a :class:`PrdBuildResult`. A run that built yields
+    its inner ``prd_build``; a run the budget gate *deferred* yields an empty build on
+    the integration branch — honest: the deferred PRD merged nothing — carrying the
+    deferral and its window so the worker re-enqueues the round's resume for when the
+    budget frees.
     """
-    from retinue.orchestrator import integration_branch
-
     if result.prd_build is not None:
         return result.prd_build
     number = prd_number if isinstance(prd_number, int) else 0
@@ -1235,6 +1359,8 @@ def _prd_build_from_bound(
         blocked_issues=[],
         escalated_issues=[],
         skipped_issues=[],
+        deferred=result.deferred,
+        defer_until=result.defer_until,
     )
 
 
