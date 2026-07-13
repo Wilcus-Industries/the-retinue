@@ -57,6 +57,23 @@ CREATE TABLE IF NOT EXISTS run_state (
 """
 
 
+@dataclass(frozen=True)
+class PersistedRound:
+    """One persisted PRD round as the startup sweep reads it from the run-state store.
+
+    Attributes:
+        repo_full_name: The round's repo, e.g. "owner/repo".
+        prd_number: The PRD's tracking issue number.
+        slice_numbers: The slice issue numbers the round owns (order preserved).
+        pr_number: The staging PR recorded for the round, or ``None`` before one opened.
+    """
+
+    repo_full_name: str
+    prd_number: int
+    slice_numbers: list[int]
+    pr_number: int | None
+
+
 def run_state_key(repo_full_name: str, prd_number: int) -> str:
     """Return the run-state identity of a PRD round: its repo and PRD number.
 
@@ -208,10 +225,53 @@ class RunStateStore:
         prd_number = int(str(row[0]).rsplit("#", 1)[-1])
         return prd_number, _decode_slices(row[1])
 
+    async def all_rounds(self) -> list[PersistedRound]:
+        """Enumerate every persisted round — the startup sweep's read.
+
+        Returns:
+            Every recorded round as a :class:`PersistedRound`, ordered by key
+            (repo, then PRD) so the sweep's resume order is deterministic.
+        """
+        async with self._connect() as db:
+            await db.execute(_SCHEMA)
+            async with db.execute(
+                "SELECT prd_key, slices, pr_number FROM run_state ORDER BY prd_key"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [_persisted_round(row) for row in rows]
+
+    async def delete_round(
+        self, *, repo_full_name: str, prd_number: int
+    ) -> None:
+        """Delete a round's row — its terminal event, so no sweep re-reconciles it.
+
+        Deleting a round never recorded is a no-op, so the cleanup is safe to repeat.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            prd_number: The PRD's tracking issue number.
+        """
+        key = run_state_key(repo_full_name, prd_number)
+        async with self._connect() as db:
+            await db.execute(_SCHEMA)
+            await db.execute("DELETE FROM run_state WHERE prd_key = ?", (key,))
+            await db.commit()
+
     def _connect(self) -> aiosqlite.Connection:
         """Open a fresh DB connection, ensuring the parent dir exists first."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         return aiosqlite.connect(self._db_path)
+
+
+def _persisted_round(row: aiosqlite.Row) -> PersistedRound:
+    """Decode one run-state row into a :class:`PersistedRound`."""
+    repo_full_name, _, prd = str(row[0]).rpartition("#")
+    return PersistedRound(
+        repo_full_name=repo_full_name,
+        prd_number=int(prd),
+        slice_numbers=_decode_slices(row[1]),
+        pr_number=None if row[2] is None else int(row[2]),
+    )
 
 
 def _encode_slices(issue_numbers: list[int]) -> str:

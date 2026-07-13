@@ -16,6 +16,7 @@ PROCESS_PRD_TASK = "process_prd"
 PROCESS_REVIEW_TASK = "process_review_job"
 REAP_PR_TASK = "reap_pr_job"
 RUN_ADHOC_DRAIN_TASK = "run_adhoc_drain_job"
+RESUME_ROUNDS_TASK = "resume_rounds_job"
 
 
 @dataclass(frozen=True)

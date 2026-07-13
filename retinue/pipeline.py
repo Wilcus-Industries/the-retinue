@@ -19,7 +19,9 @@ The PRD path, in order, mirrors the build pipeline the rest of the modules docum
 The webhook-driven events route to their own entry points: a ``pull_request_review``
 to :meth:`Pipeline.process_review` (:func:`retinue.loopback.process_review`) and a
 merged ``pull_request`` to :meth:`Pipeline.reap_pr` (:func:`retinue.handoff.reap_merged_pr`).
-A worker restart resumes through :meth:`Pipeline.reconcile` (:func:`reconcile_run`).
+A worker restart resumes through :meth:`Pipeline.resume_round` — the startup sweep
+(:func:`retinue.worker.resume_rounds_job`) enumerates the persisted rounds and each one
+reconciles against GitHub truth (:func:`reconcile_run`), then re-drives its phase.
 
 The orchestrator ``build_prd`` call is an injected seam (so a fake drops in for tests),
 but production now binds it to the real, budget-gated, triaged build over the
@@ -104,6 +106,7 @@ from retinue.reconcile import (
     GhCliReconcile,
     ReconcileGh,
     ReconcileResult,
+    ResumePhase,
     RunStateStore,
     reconcile_run,
 )
@@ -375,8 +378,17 @@ class Pipeline:
         )
 
     async def reap_pr(self, merged: MergedPullRequest) -> ReapResult:
-        """React to a human-merged PR: close its slice issues, then reap the PRD."""
-        return await reap_merged_pr(merged, gh=self.reap_gh)
+        """React to a human-merged PR: close its slice issues, then reap the PRD.
+
+        The merge is the round's terminal event, so its run-state row is deleted —
+        otherwise every startup sweep would re-reconcile the landed round (all slices
+        closed, no open PR) and try to re-open a PR for finished work.
+        """
+        result = await reap_merged_pr(merged, gh=self.reap_gh)
+        await self._run_state.delete_round(
+            repo_full_name=merged.repo_full_name, prd_number=merged.prd_number
+        )
+        return result
 
     async def round_for_pr(
         self, *, repo_full_name: str, pr_number: int
@@ -402,6 +414,60 @@ class Pipeline:
             slices=slices,
             gh=self._require_reconcile_gh(),
         )
+
+    async def resume_round(
+        self, *, repo_full_name: str, prd_number: int
+    ) -> ReconcileResult:
+        """Resume one persisted PRD round after a restart: reconcile, then re-drive it.
+
+        The round's slices are rebuilt from the numbers the run-state store persisted —
+        with an empty ``blocked_by`` graph, the sanctioned cross-restart fallback (the
+        slicer resolved the real edges into the issue bodies; see
+        :func:`_slices_from_numbers`) — then :meth:`reconcile` picks the phase from
+        GitHub truth and this method routes into it:
+
+        - ``BUILD``: rebuild only the unfinished slices, then open the staging PR when
+          the resumed build merged anything (mirroring :meth:`process_prd_job`).
+        - ``PR_OPEN``: every slice landed but no PR exists — open it.
+        - ``LOOPBACK``: the PR is open and heimdall's verdict arrives by webhook, so
+          nothing is re-driven; the PR<->PRD mapping is re-recorded (self-healing a
+          crash between the PR open and its record) so the verdict resolves.
+        - ``DONE``: nothing to resume — the round's row is deleted so no later sweep
+          re-reconciles it.
+
+        Args:
+            repo_full_name: The round's repo, e.g. "owner/repo".
+            prd_number: The PRD's tracking issue number.
+
+        Returns:
+            The :class:`ReconcileResult` the round was routed on.
+        """
+        slice_numbers = await self._run_state.slices_of(
+            repo_full_name=repo_full_name, prd_number=prd_number
+        )
+        slices = _slices_from_numbers(repo_full_name, prd_number, slice_numbers)
+        result = await self.reconcile(
+            repo_full_name=repo_full_name, prd_number=prd_number, slices=slices
+        )
+        if result.phase is ResumePhase.BUILD:
+            build = await self._build(
+                repo_full_name, prd_number, result.unfinished_slices
+            )
+            if build.merged_issues:
+                await self._open_pr(repo_full_name, prd_number)
+        elif result.phase is ResumePhase.PR_OPEN:
+            await self._open_pr(repo_full_name, prd_number)
+        elif result.phase is ResumePhase.LOOPBACK and result.pr_number is not None:
+            await self._run_state.record_pr(
+                repo_full_name=repo_full_name,
+                prd_number=prd_number,
+                pr_number=result.pr_number,
+            )
+        elif result.phase is ResumePhase.DONE:
+            await self._run_state.delete_round(
+                repo_full_name=repo_full_name, prd_number=prd_number
+            )
+        return result
 
     async def _build(
         self, repo_full_name: str, prd_number: int, slices: list[PrdSlice]
@@ -786,7 +852,7 @@ def build_pipeline_factory(
             reap_gh=reap_gh,
             round_store_path=state_dir / "heimdall-rounds.sqlite3",
             retry_store_path=retry_store_path,
-            run_state_path=state_dir / "run-state.sqlite3",
+            run_state_path=run_state_store_path(settings),
             build_prd=bound_build_prd,
             rebuild=rebuild,
             reconcile_gh=reconcile_gh,
@@ -1180,3 +1246,18 @@ def _state_dir(settings: Settings) -> Path:
     volume holds all of the worker's durable state.
     """
     return Path(settings.dedupe_db_path).resolve().parent
+
+
+def run_state_store_path(settings: Settings) -> Path:
+    """The run-state SQLite file the factory's pipelines and the startup sweep share.
+
+    The sweep (:func:`retinue.worker.resume_rounds_job`) enumerates the same store every
+    factory-built :class:`Pipeline` records into, so the path is derived in one place.
+
+    Args:
+        settings: The runtime settings locating the worker's durable state directory.
+
+    Returns:
+        The run-state database path.
+    """
+    return _state_dir(settings) / "run-state.sqlite3"

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -23,18 +24,20 @@ from retinue.loopback import (
     Severity,
     VerdictOutcome,
 )
-from retinue.orchestrator import PrdBuildResult
+from retinue.orchestrator import PrdBuildResult, PrdSlice
 from retinue.pipeline import Pipeline
 from retinue.pr_opener import (
     OpenPrRequest,
     PullRequest,
 )
+from retinue.reconcile import ResumePhase, RunStateStore
 from retinue.repo_config import RepoConfig
 from retinue.slicer import (
     CreatedIssue,
     IssueDraft,
     SlicePlan,
 )
+from tests.test_reconcile import FakeReconcileGh
 
 
 class _FixedClock:
@@ -338,6 +341,155 @@ async def test_reap_pr_job_closes_slices_and_reaps_prd(tmp_path: Path) -> None:
     assert result.outcome is ReapOutcome.REAPED
     assert 100 in reap_gh.closed and 101 in reap_gh.closed
     assert 7 in reap_gh.closed  # the PRD itself
+
+
+# --- crash-resume: resume_round routes a persisted round to its phase ------------
+
+
+def _run_state(tmp_path: Path) -> RunStateStore:
+    """The same run-state file the ``_pipeline`` helper binds, for seeding rounds."""
+    return RunStateStore(tmp_path / "runstate.sqlite3")
+
+
+@pytest.mark.asyncio
+async def test_resume_round_mid_build_rebuilds_only_unfinished_slices(
+    tmp_path: Path,
+) -> None:
+    """A BUILD-phase resume rebuilds only the unfinished slices, then opens the PR.
+
+    The store persists only slice numbers, so the rebuilt slices carry an empty
+    ``blocked_by`` graph (the sanctioned cross-restart fallback). Slice 100 already
+    landed on GitHub; only 101 reaches the build, and the merged build opens the PR.
+    """
+    built: list[dict[str, Any]] = []
+
+    async def build_prd(**kwargs: Any) -> PrdBuildResult:
+        built.append(kwargs)
+        return PrdBuildResult("retinue/prd-7", merged_issues=[101], blocked_issues=[],
+                              escalated_issues=[], skipped_issues=[])
+
+    gh = FakeReconcileGh(closed_issues={100}, pr=None)
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, build_prd=build_prd, reconcile_gh=gh, pr_ops=pr_ops)
+    await _run_state(tmp_path).record_slices(
+        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
+    )
+
+    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
+
+    assert result.phase is ResumePhase.BUILD
+    assert len(built) == 1
+    resumed: list[PrdSlice] = built[0]["slices"]
+    assert [s.issue_number for s in resumed] == [101]
+    assert all(s.blocked_by == [] for s in resumed)
+    assert pr_ops.opened  # the merged resume-build opened the staging PR
+
+
+@pytest.mark.asyncio
+async def test_resume_round_at_pr_open_opens_the_pr_and_records_it(
+    tmp_path: Path,
+) -> None:
+    """A PR_OPEN-phase resume opens the staging PR without rebuilding anything."""
+    built: list[object] = []
+
+    async def build_prd(**kwargs: object) -> PrdBuildResult:
+        built.append(kwargs)
+        return PrdBuildResult("retinue/prd-7", [], [], [], [])
+
+    gh = FakeReconcileGh(closed_issues={100, 101}, pr=None)
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, build_prd=build_prd, reconcile_gh=gh, pr_ops=pr_ops)
+    await _run_state(tmp_path).record_slices(
+        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
+    )
+
+    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
+
+    assert result.phase is ResumePhase.PR_OPEN
+    assert built == []  # the landed round is never rebuilt
+    assert len(pr_ops.opened) == 1
+    assert pr_ops.opened[0].head == "retinue/prd-7"
+    # The opened PR's mapping is recorded so the loopback/reap can resolve it.
+    assert await pipeline.round_for_pr(
+        repo_full_name="owner/repo", pr_number=99
+    ) == (7, [100, 101])
+
+
+@pytest.mark.asyncio
+async def test_resume_round_at_loopback_awaits_the_verdict(tmp_path: Path) -> None:
+    """A LOOPBACK-phase resume re-records the PR mapping and drives nothing else.
+
+    Heimdall verdicts arrive by webhook, so nothing is actively re-driven — but the
+    PR<->PRD mapping is re-recorded (self-healing a crash between the PR open and its
+    record) so the arriving verdict resolves back to the PRD.
+    """
+    built: list[object] = []
+
+    async def build_prd(**kwargs: object) -> PrdBuildResult:
+        built.append(kwargs)
+        return PrdBuildResult("retinue/prd-7", [], [], [], [])
+
+    gh = FakeReconcileGh(pr=55)
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, build_prd=build_prd, reconcile_gh=gh, pr_ops=pr_ops)
+    # The crash hit between the PR open and record_pr: only the slices are persisted.
+    await _run_state(tmp_path).record_slices(
+        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
+    )
+
+    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
+
+    assert result.phase is ResumePhase.LOOPBACK
+    assert built == []
+    assert pr_ops.opened == []  # the PR already exists; nothing is re-opened
+    # The mapping self-healed: the webhook's verdict for PR #55 now resolves.
+    assert await pipeline.round_for_pr(
+        repo_full_name="owner/repo", pr_number=55
+    ) == (7, [100, 101])
+
+
+@pytest.mark.asyncio
+async def test_resume_round_done_cleans_up_the_run_state_row(tmp_path: Path) -> None:
+    """A DONE-phase resume deletes the round's row so no sweep re-reconciles it."""
+    gh = FakeReconcileGh(pr=None)
+    pipeline = _pipeline(tmp_path, reconcile_gh=gh)
+    store = _run_state(tmp_path)
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=7, issue_numbers=[]
+    )
+
+    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
+
+    assert result.phase is ResumePhase.DONE
+    assert await store.all_rounds() == []
+
+
+@pytest.mark.asyncio
+async def test_reap_pr_deletes_the_round_run_state(tmp_path: Path) -> None:
+    """The merge reap deletes the round's run-state row (the round's terminal event).
+
+    Without this, every startup sweep would re-reconcile the landed round — all slices
+    closed, no open PR — and try to re-open a PR for finished work.
+    """
+    reap_gh = _FakeReapGh(children=[])
+    pipeline = _pipeline(tmp_path, reap_gh=reap_gh)
+    store = _run_state(tmp_path)
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
+    )
+    await store.record_pr(repo_full_name="owner/repo", prd_number=7, pr_number=99)
+
+    merged = MergedPullRequest(
+        repo_full_name="owner/repo",
+        pr_number=99,
+        prd_number=7,
+        slice_issues=[100, 101],
+    )
+    result = await pipeline.reap_pr(merged)
+
+    assert result.outcome is ReapOutcome.REAPED
+    assert await store.all_rounds() == []
+    assert await store.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
 
 
 # --- ad-hoc PR into the shared pipeline ------------------------------------------

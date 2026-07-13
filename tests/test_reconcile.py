@@ -20,6 +20,7 @@ import pytest
 from retinue.orchestrator import PrdSlice
 from retinue.reconcile import (
     GhCliReconcile,
+    PersistedRound,
     ReconcileResult,
     ResumePhase,
     RunStateStore,
@@ -181,6 +182,85 @@ async def test_distinct_prds_track_independently(db_path: Path) -> None:
     await store.record_pr(repo_full_name="owner/repo", prd_number=1, pr_number=101)
     assert await store.slices_of(repo_full_name="owner/repo", prd_number=2) == []
     assert await store.pr_of(repo_full_name="owner/repo", prd_number=2) is None
+
+
+# --- run-state store: enumeration + cleanup (the startup sweep's reads) -----------
+
+
+@pytest.mark.asyncio
+async def test_all_rounds_lists_every_persisted_round(db_path: Path) -> None:
+    """all_rounds enumerates every persisted round with its slices and PR mapping."""
+    store = RunStateStore(db_path)
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=1, issue_numbers=[2, 3]
+    )
+    await store.record_pr(repo_full_name="owner/repo", prd_number=1, pr_number=101)
+    await store.record_slices(
+        repo_full_name="other/repo", prd_number=9, issue_numbers=[40]
+    )
+
+    rounds = await store.all_rounds()
+
+    assert rounds == [
+        PersistedRound(
+            repo_full_name="other/repo",
+            prd_number=9,
+            slice_numbers=[40],
+            pr_number=None,
+        ),
+        PersistedRound(
+            repo_full_name="owner/repo",
+            prd_number=1,
+            slice_numbers=[2, 3],
+            pr_number=101,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_all_rounds_on_a_fresh_store_is_empty(db_path: Path) -> None:
+    """A store never written enumerates no rounds, not an error."""
+    assert await RunStateStore(db_path).all_rounds() == []
+
+
+@pytest.mark.asyncio
+async def test_delete_round_removes_the_row(db_path: Path) -> None:
+    """Deleting a round removes its row: no slices, no PR mapping, not enumerated."""
+    store = RunStateStore(db_path)
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=1, issue_numbers=[2, 3]
+    )
+    await store.record_pr(repo_full_name="owner/repo", prd_number=1, pr_number=101)
+
+    await store.delete_round(repo_full_name="owner/repo", prd_number=1)
+
+    assert await store.all_rounds() == []
+    assert await store.slices_of(repo_full_name="owner/repo", prd_number=1) == []
+    assert await store.round_for_pr(repo_full_name="owner/repo", pr_number=101) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_round_leaves_other_rounds_alone(db_path: Path) -> None:
+    """Deleting one round never touches another PRD's row."""
+    store = RunStateStore(db_path)
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=1, issue_numbers=[2]
+    )
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=9, issue_numbers=[40]
+    )
+
+    await store.delete_round(repo_full_name="owner/repo", prd_number=1)
+
+    assert await store.slices_of(repo_full_name="owner/repo", prd_number=9) == [40]
+
+
+@pytest.mark.asyncio
+async def test_delete_round_of_unknown_prd_is_a_noop(db_path: Path) -> None:
+    """Deleting a round never recorded neither raises nor writes anything."""
+    store = RunStateStore(db_path)
+    await store.delete_round(repo_full_name="owner/repo", prd_number=9)
+    assert await store.all_rounds() == []
 
 
 # --- reconcile: PR already open -> resume at loopback, not from scratch -----------

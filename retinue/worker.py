@@ -42,8 +42,14 @@ from retinue.loopback import (
     ReviewState,
     Severity,
 )
-from retinue.pipeline import ClaudeMdFetcher, Pipeline, build_pipeline_factory
-from retinue.queue import PrdJob
+from retinue.pipeline import (
+    ClaudeMdFetcher,
+    Pipeline,
+    build_pipeline_factory,
+    run_state_store_path,
+)
+from retinue.queue import RESUME_ROUNDS_TASK, PrdJob
+from retinue.reconcile import RunStateStore
 from retinue.repo_config import RepoConfig, load_repo_config
 
 logger = logging.getLogger(__name__)
@@ -347,6 +353,60 @@ async def run_adhoc_drain_job(
     await drain(repo_full_name=repo_full_name, config=config)
 
 
+async def resume_rounds_job(ctx: dict[str, Any]) -> None:
+    """Arq task: the crash-resume startup sweep over every persisted PRD round.
+
+    Enqueued by :func:`on_startup` (``RESUME_ROUNDS_TASK``) so a restart resumes the
+    rounds a crash left in flight without blocking worker boot. Each round from the
+    run-state store is resumed through its repo's pipeline
+    (:meth:`retinue.pipeline.Pipeline.resume_round` — reconcile against GitHub truth,
+    then re-drive the phase). The sweep is crash-safe per round: one round's failure is
+    logged and skipped so the rest still resume, and its row survives for a later sweep.
+    A round of a repo no longer opted in is skipped the same way. With no run-state or
+    pipeline wired (a bare worker) the sweep logs and returns.
+
+    Args:
+        ctx: Arq worker context; may carry ``run_state``, ``fetch_config``, and
+            ``pipeline_factory``.
+    """
+    run_state: RunStateStore | None = ctx.get("run_state")
+    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
+    if run_state is None or pipeline_factory is None:
+        logger.info("No run-state/pipeline wired; skipping the resume sweep")
+        return
+
+    rounds = await run_state.all_rounds()
+    logger.info("Resume sweep: %d persisted round(s) to reconcile", len(rounds))
+    for round_ in rounds:
+        config = await _config_for(ctx, round_.repo_full_name)
+        if config is None:
+            logger.info(
+                "Skipping resume of %s PRD #%d: repo no longer opted in",
+                round_.repo_full_name,
+                round_.prd_number,
+            )
+            continue
+        try:
+            pipeline = await pipeline_factory(round_.repo_full_name, config)
+            result = await pipeline.resume_round(
+                repo_full_name=round_.repo_full_name, prd_number=round_.prd_number
+            )
+        except Exception:
+            # Crash-safe per round: the row survives for a later sweep to retry.
+            logger.exception(
+                "Resume of %s PRD #%d failed; continuing the sweep",
+                round_.repo_full_name,
+                round_.prd_number,
+            )
+            continue
+        logger.info(
+            "Resumed %s PRD #%d at %s",
+            round_.repo_full_name,
+            round_.prd_number,
+            result.phase.value,
+        )
+
+
 async def _config_for(ctx: dict[str, Any], repo_full_name: str) -> RepoConfig | None:
     """Fetch and parse a repo's opt-in config the same way the PRD gate does.
 
@@ -620,7 +680,9 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     same auth branch binds the webhook's ad-hoc drain *and* the worker-global heartbeat's
     four collaborators (:func:`retinue.heartbeat.heartbeat_tick` reads them from ``ctx``):
     the real wall-clock, the installed-and-opted-in repo enumerator, the *same* bound
-    ad-hoc drain the kick fires, and a bound :func:`retinue.cron.run_cron_tick`. With no
+    ad-hoc drain the kick fires, and a bound :func:`retinue.cron.run_cron_tick`. The same
+    branch installs the run-state store and enqueues the crash-resume sweep
+    (:func:`resume_rounds_job`) so rounds a crash left in flight are re-driven. With no
     auth wired, the fetcher defaults to not-opted-in and neither the pipeline nor the
     heartbeat is installed (so the registered cron tick safely no-ops).
     """
@@ -671,6 +733,17 @@ async def on_startup(ctx: dict[str, Any]) -> None:
             pipeline_factory=pipeline_factory,
             fetch_claude_md=fetch_claude_md,
         )
+        # Crash-resume: install the run-state store the sweep enumerates (the same file
+        # every factory-built pipeline records into) and kick the sweep as a normal Arq
+        # job so resuming stranded rounds never blocks worker boot.
+        ctx["run_state"] = RunStateStore(run_state_store_path(settings))
+        redis = ctx.get("redis")
+        if redis is not None:
+            await redis.enqueue_job(RESUME_ROUNDS_TASK)
+        else:
+            logger.warning(
+                "No redis on the worker context; the resume sweep was not enqueued"
+            )
     ctx["dedupe"] = PrdDedupeStore(settings.dedupe_db_path)
 
 
@@ -952,7 +1025,13 @@ class WorkerSettings:
         arq retinue.worker.WorkerSettings
     """
 
-    functions = [process_prd, process_review_job, reap_pr_job, run_adhoc_drain_job]
+    functions = [
+        process_prd,
+        process_review_job,
+        reap_pr_job,
+        run_adhoc_drain_job,
+        resume_rounds_job,
+    ]
     # The worker-global cron heartbeat: fires every Nth minute as the safety-net sweep for
     # issues labeled while the webhook was missed (firing the ad-hoc drain for each due repo)
     # and drives the backlog cron lane (``run_cron_tick``) — the first runtime caller of the

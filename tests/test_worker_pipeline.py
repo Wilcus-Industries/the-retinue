@@ -27,7 +27,8 @@ from retinue.loopback import (
     VerdictResult,
 )
 from retinue.pipeline import PrdJobResult
-from retinue.queue import RUN_ADHOC_DRAIN_TASK
+from retinue.queue import RESUME_ROUNDS_TASK, RUN_ADHOC_DRAIN_TASK
+from retinue.reconcile import ReconcileResult, ResumePhase, RunStateStore
 from retinue.repo_config import RepoConfig
 from retinue.worker import (
     WorkerSettings,
@@ -37,6 +38,7 @@ from retinue.worker import (
     process_prd,
     process_review_job,
     reap_pr_job,
+    resume_rounds_job,
     run_adhoc_drain_job,
 )
 
@@ -51,6 +53,8 @@ class _RecordingPipeline:
     reviews: list[HeimdallReview] = field(default_factory=list)
     reaps: list[MergedPullRequest] = field(default_factory=list)
     pr_round: tuple[int, list[int]] | None = (7, [100, 101])
+    resume_calls: list[tuple[str, int]] = field(default_factory=list)
+    resume_failures: set[int] = field(default_factory=set)
 
     async def process_prd_job(
         self, *, repo_full_name: str, prd_number: int, prd_body: str
@@ -72,6 +76,16 @@ class _RecordingPipeline:
         self, *, repo_full_name: str, pr_number: int
     ) -> tuple[int, list[int]] | None:
         return self.pr_round
+
+    async def resume_round(
+        self, *, repo_full_name: str, prd_number: int
+    ) -> ReconcileResult:
+        self.resume_calls.append((repo_full_name, prd_number))
+        if prd_number in self.resume_failures:
+            raise RuntimeError(f"resume of PRD #{prd_number} exploded")
+        return ReconcileResult(
+            phase=ResumePhase.DONE, integration_branch=f"retinue/prd-{prd_number}"
+        )
 
 
 def _ctx(tmp_path: Path, pipeline: _RecordingPipeline, *, body: str = "") -> dict[str, Any]:
@@ -188,6 +202,85 @@ async def test_reap_pr_job_skips_unknown_pr(tmp_path: Path) -> None:
     await reap_pr_job(ctx, repo_full_name="owner/repo", pr_number=5)
 
     assert pipeline.reaps == []
+
+
+# --- resume sweep (crash-resume on restart) ---------------------------------------
+
+
+async def _seeded_run_state(tmp_path: Path) -> RunStateStore:
+    """A run-state store persisting two in-flight rounds, as a crash left them."""
+    store = RunStateStore(tmp_path / "run-state.sqlite3")
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
+    )
+    await store.record_slices(
+        repo_full_name="owner/repo", prd_number=9, issue_numbers=[200]
+    )
+    return store
+
+
+@pytest.mark.asyncio
+async def test_resume_rounds_job_resumes_every_persisted_round(tmp_path: Path) -> None:
+    """The sweep resumes each persisted round through the repo's pipeline."""
+    pipeline = _RecordingPipeline()
+    ctx = _ctx(tmp_path, pipeline)
+    ctx["run_state"] = await _seeded_run_state(tmp_path)
+
+    await resume_rounds_job(ctx)
+
+    assert pipeline.resume_calls == [("owner/repo", 7), ("owner/repo", 9)]
+
+
+@pytest.mark.asyncio
+async def test_resume_rounds_job_skips_a_failing_round_and_continues(
+    tmp_path: Path,
+) -> None:
+    """One round's resume crashing is logged and skipped; the sweep still finishes."""
+    pipeline = _RecordingPipeline(resume_failures={7})
+    ctx = _ctx(tmp_path, pipeline)
+    ctx["run_state"] = await _seeded_run_state(tmp_path)
+
+    await resume_rounds_job(ctx)  # must not raise
+
+    assert pipeline.resume_calls == [("owner/repo", 7), ("owner/repo", 9)]
+
+
+@pytest.mark.asyncio
+async def test_resume_rounds_job_without_run_state_is_a_noop(tmp_path: Path) -> None:
+    """A bare worker (no run-state/pipeline wired) logs and returns, never crashing."""
+    pipeline = _RecordingPipeline()
+    ctx = _ctx(tmp_path, pipeline)
+    assert "run_state" not in ctx
+
+    await resume_rounds_job(ctx)
+
+    assert pipeline.resume_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_rounds_job_skips_a_deopted_repo(tmp_path: Path) -> None:
+    """A persisted round of a repo no longer opted in is skipped, its row left alone."""
+    pipeline = _RecordingPipeline()
+    ctx = _ctx(tmp_path, pipeline)
+    store = await _seeded_run_state(tmp_path)
+    ctx["run_state"] = store
+
+    async def no_config(repo_full_name: str) -> str | None:
+        return None
+
+    ctx["fetch_config"] = no_config
+
+    await resume_rounds_job(ctx)
+
+    assert pipeline.resume_calls == []
+    assert len(await store.all_rounds()) == 2  # the rows survive for a later sweep
+
+
+def test_worker_registers_the_resume_task() -> None:
+    """WorkerSettings registers ``resume_rounds_job`` under the enqueue-side task name."""
+    names = {fn.__name__ for fn in WorkerSettings.functions}
+    assert RESUME_ROUNDS_TASK in names
+    assert resume_rounds_job.__name__ == RESUME_ROUNDS_TASK
 
 
 # --- ad-hoc drain kick ----------------------------------------------------------
@@ -386,6 +479,38 @@ async def test_on_startup_wires_a_live_pipeline(
             "owner/repo", RepoConfig(staging_branch="staging", retry_cap=2)
         )
         assert pipeline.build_prd is not None
+    finally:
+        await on_shutdown(ctx)
+
+
+@pytest.mark.asyncio
+async def test_on_startup_kicks_the_resume_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under live auth, on_startup installs the run-state store and enqueues the sweep.
+
+    The sweep runs as a normal Arq task (``RESUME_ROUNDS_TASK``) so a crash-resume never
+    blocks worker startup; on_startup's job is to install ``ctx['run_state']`` (the store
+    the sweep enumerates) and kick the job on the worker's own queue.
+    """
+    monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
+    monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
+    monkeypatch.setattr(
+        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+    )
+
+    enqueued: list[str] = []
+
+    class _FakeRedis:
+        async def enqueue_job(self, task_name: str, *args: Any, **kwargs: Any) -> None:
+            enqueued.append(task_name)
+
+    ctx: dict[str, Any] = {"redis": _FakeRedis()}
+    try:
+        await on_startup(ctx)
+
+        assert isinstance(ctx["run_state"], RunStateStore)
+        assert enqueued == [RESUME_ROUNDS_TASK]
     finally:
         await on_shutdown(ctx)
 
