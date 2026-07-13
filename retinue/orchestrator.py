@@ -61,7 +61,7 @@ from retinue.done_check import (
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import ReviewGenerationError
-from retinue.roles import Role, oauth_system, resolve_effort, resolve_model
+from retinue.roles import Role, oauth_system, resolve_model, structured_output_config
 
 logger = logging.getLogger(__name__)
 
@@ -772,9 +772,10 @@ def _resolve_payload(
 
     The frozen system brief leads; the user message carries the merge context plus each
     conflicted file's full marked-up body, fenced by path so the model can address each
-    one. The strict schema forces a per-file resolved body back. The request carries the
-    resolver's registry effort tier (``xhigh``) via ``output_config.effort`` (Opus 4.8
-    removed the extended-thinking ``budget_tokens`` mechanism, which now returns HTTP 400).
+    one. The shared :func:`~retinue.roles.structured_output_config` helper carries the
+    resolver's registry effort tier (``xhigh``) and the strict per-file schema on one
+    ``output_config`` dict — the canonical Messages API structured-output shape (the
+    OpenAI-style top-level ``response_format`` is not a Claude API parameter and 400s).
 
     ``is_oauth`` is required, not defaulted: a subscription OAuth token reaches the premium
     resolving model only when the leading ``system`` block is the Claude Code identity
@@ -792,10 +793,9 @@ def _resolve_payload(
     return {
         "model": model,
         "max_tokens": _RESOLVE_MAX_TOKENS,
-        "output_config": {"effort": resolve_effort(Role.RESOLVER)},
+        "output_config": structured_output_config(Role.RESOLVER, _RESOLVE_SCHEMA),
         "system": oauth_system(_RESOLVE_SYSTEM, is_oauth=is_oauth),
         "messages": [{"role": "user", "content": user}],
-        "response_format": {"type": "json_schema", "json_schema": _RESOLVE_SCHEMA},
     }
 
 

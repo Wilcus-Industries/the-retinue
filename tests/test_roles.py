@@ -26,6 +26,7 @@ from retinue.roles import (
     planner_cli_argv,
     resolve_effort,
     resolve_model,
+    structured_output_config,
 )
 
 
@@ -177,6 +178,40 @@ def test_oauth_system_passes_plain_string_through_in_api_key_mode() -> None:
     result = oauth_system("role prompt", is_oauth=False)
     assert result == "role prompt"
     assert not isinstance(result, list)
+
+
+def test_structured_output_config_carries_effort_and_json_schema_format() -> None:
+    """The shared helper emits the canonical ``output_config`` wire shape.
+
+    The Messages API accepts structured output only as
+    ``output_config.format = {type: json_schema, schema: ...}`` — the OpenAI-style
+    top-level ``response_format`` is not a Claude API parameter and 400s. The helper
+    is the single place that shape lives, with the role's registry effort riding the
+    same dict so a role sends exactly one output_config.
+    """
+    schema = {"type": "object", "required": [], "additionalProperties": False}
+
+    config = structured_output_config(Role.REVIEWER, schema)
+
+    assert config == {
+        "effort": EFFORT_MAX,
+        "format": {"type": "json_schema", "schema": schema},
+    }
+
+
+@pytest.mark.parametrize(
+    ("role", "effort"),
+    [
+        (Role.SLICER, EFFORT_XHIGH),
+        (Role.RESOLVER, EFFORT_XHIGH),
+        (Role.REVIEWER, EFFORT_MAX),
+    ],
+)
+def test_structured_output_config_resolves_effort_per_role(
+    role: Role, effort: str
+) -> None:
+    """Each Messages-API role's effort tier comes from the registry, not the caller."""
+    assert structured_output_config(role, {"type": "object"})["effort"] == effort
 
 
 def test_claude_code_identity_is_the_exact_cli_string() -> None:

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
+from typing import Any
 
 from retinue.repo_config import RepoConfig
 
@@ -202,6 +203,31 @@ def oauth_system(role_system: str, *, is_oauth: bool) -> str | list[dict[str, st
             {"type": "text", "text": role_system},
         ]
     return role_system
+
+
+def structured_output_config(role: Role, schema: dict[str, Any]) -> dict[str, Any]:
+    """Build a Messages-API ``output_config`` carrying a role's effort + JSON schema.
+
+    The Messages API accepts structured output only as ``output_config.format =
+    {"type": "json_schema", "schema": ...}``; the OpenAI-style top-level
+    ``response_format`` parameter does not exist on the Claude wire and is rejected
+    with HTTP 400. This helper is the single place that shape lives, so the three
+    Messages-API roles (slicer, reviewer, resolver) cannot drift onto incompatible
+    encodings again. The role's registry effort tier rides the same dict — one
+    ``output_config`` per request, never two.
+
+    Args:
+        role: The Messages-API role whose registry effort tier the request carries.
+        schema: The strict JSON schema the model must emit (callers keep
+            ``required`` + ``additionalProperties: false`` on every object).
+
+    Returns:
+        The ``output_config`` dict for the Messages API request body.
+    """
+    return {
+        "effort": resolve_effort(role),
+        "format": {"type": "json_schema", "schema": schema},
+    }
 
 
 # --- planner invocation construction (read-only, explore-first) -------------------

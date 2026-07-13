@@ -643,7 +643,12 @@ def test_resolve_headers_routes_api_key_to_x_api_key() -> None:
 
 
 def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
-    """The request payload fences each conflicted file and forces the strict schema."""
+    """The request payload fences each conflicted file and forces the strict schema.
+
+    The schema must ride ``output_config.format`` (the canonical Messages API shape);
+    the OpenAI-style top-level ``response_format`` is not a Claude API parameter and
+    400s on the live wire.
+    """
     files = [
         _ConflictedFile(path="a.py", content="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"),
         _ConflictedFile(path="b.py", content="conflict-b"),
@@ -653,7 +658,10 @@ def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
     )
 
     assert payload["model"] == "m"
-    assert payload["response_format"]["type"] == "json_schema"
+    fmt = payload["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"]["required"] == ["resolved"]
+    assert "response_format" not in payload
     user = payload["messages"][0]["content"]
     # Both paths and both blobs ride in the user message, fenced by path.
     assert "### a.py" in user and "### b.py" in user

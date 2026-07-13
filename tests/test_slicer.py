@@ -259,6 +259,7 @@ def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:
     fmt = kwargs["output_config"]["format"]
     assert fmt["type"] == "json_schema"
     assert fmt["schema"]["properties"]["slices"]["type"] == "array"
+    assert "response_format" not in kwargs
     assert kwargs["max_tokens"] > 0
 
 
