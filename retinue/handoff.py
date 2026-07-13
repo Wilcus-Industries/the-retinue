@@ -162,7 +162,8 @@ class ReapResult:
     Attributes:
         outcome: ``REAPED`` when the PRD was closed (all non-``hitl`` children closed),
             ``KEPT_OPEN`` when an open non-``hitl`` child still blocks it.
-        closed_slice_issues: The slice issue numbers closed on this merge, in order.
+        closed_slice_issues: The slice issue numbers closed *successfully* on this merge,
+            in the input order (a slice whose close failed is omitted).
         prd_closed: True only when the PRD itself was closed.
     """
 
@@ -190,18 +191,17 @@ async def reap_merged_pr(merged: MergedPullRequest, *, gh: Handoff) -> ReapResul
     Raises:
         Whatever ``gh`` raises on a real gh failure.
     """
-    for issue_number in merged.slice_issues:
-        await gh.close_issue(
-            repo_full_name=merged.repo_full_name, issue_number=issue_number
-        )
+    closed = await _close_slice_issues(merged, gh)
+    closed_in_order = [n for n in merged.slice_issues if n in closed]
     logger.info(
-        "Merged PR #%d (%s): closed %d slice issue(s)",
+        "Merged PR #%d (%s): closed %d of %d slice issue(s)",
         merged.pr_number,
         merged.repo_full_name,
+        len(closed),
         len(merged.slice_issues),
     )
 
-    if not await _all_non_hitl_children_closed(merged, gh):
+    if not await _all_non_hitl_children_closed(merged, gh, just_closed=closed):
         logger.info(
             "PRD #%d (%s) kept open: a non-hitl child is still open",
             merged.prd_number,
@@ -209,7 +209,7 @@ async def reap_merged_pr(merged: MergedPullRequest, *, gh: Handoff) -> ReapResul
         )
         return ReapResult(
             outcome=ReapOutcome.KEPT_OPEN,
-            closed_slice_issues=list(merged.slice_issues),
+            closed_slice_issues=closed_in_order,
         )
 
     await gh.close_issue(
@@ -222,21 +222,55 @@ async def reap_merged_pr(merged: MergedPullRequest, *, gh: Handoff) -> ReapResul
     )
     return ReapResult(
         outcome=ReapOutcome.REAPED,
-        closed_slice_issues=list(merged.slice_issues),
+        closed_slice_issues=closed_in_order,
         prd_closed=True,
     )
 
 
+async def _close_slice_issues(merged: MergedPullRequest, gh: Handoff) -> set[int]:
+    """Close every slice issue concurrently; return the ones that closed cleanly.
+
+    The closes are fanned out with :func:`asyncio.gather` (``return_exceptions=True``) so a
+    transient per-issue ``gh`` failure does not abort the closes for the other slices — each
+    failure is logged with context and skipped. Only the issues that closed without error
+    are returned, since a failed close means the issue is genuinely still open and must not
+    be credited to the reap gate.
+    """
+    results = await asyncio.gather(
+        *(
+            gh.close_issue(
+                repo_full_name=merged.repo_full_name, issue_number=issue_number
+            )
+            for issue_number in merged.slice_issues
+        ),
+        return_exceptions=True,
+    )
+    closed: set[int] = set()
+    for issue_number, result in zip(merged.slice_issues, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Failed to close slice issue #%d (%s) on merge of PR #%d; continuing",
+                issue_number,
+                merged.repo_full_name,
+                merged.pr_number,
+                exc_info=result,
+            )
+        else:
+            closed.add(issue_number)
+    return closed
+
+
 async def _all_non_hitl_children_closed(
-    merged: MergedPullRequest, gh: Handoff
+    merged: MergedPullRequest, gh: Handoff, *, just_closed: set[int]
 ) -> bool:
     """Whether every non-``hitl`` child of the PRD is closed (the reap gate).
 
     A ``hitl`` child is excluded from the gate — it is a deliberately human-only slice
-    that must not hold the PRD open. A child the merge just closed is treated as closed
-    even if the children query still reports it open, since the close already ran.
+    that must not hold the PRD open. A child in ``just_closed`` (a slice this merge closed
+    *successfully*) is treated as closed even if the children query still reports it open,
+    since the close already ran; a slice whose close *failed* is not in that set, so it
+    correctly keeps the PRD open.
     """
-    just_closed = set(merged.slice_issues)
     children = await gh.children_of(
         repo_full_name=merged.repo_full_name, prd_number=merged.prd_number
     )
@@ -259,15 +293,27 @@ _CHILD_JSON_FIELDS = "number,state,labels"
 GhRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[str]]
 
 
-def _auth_env(token: str | None) -> dict[str, str]:
-    """Build the ``gh`` subprocess environment, injecting the token when supplied.
+# The only parent-environment variables the ``gh`` child needs: ``PATH`` to locate the
+# ``gh`` executable (and the ``git`` it shells out to) and ``HOME`` for its config / the
+# host's own ``gh auth`` state. The rest of the worker's environment — Anthropic
+# credentials and the like — is deliberately NOT forwarded to a ``gh`` subprocess.
+_GH_PASSTHROUGH_ENV = ("PATH", "HOME")
 
-    ``gh`` reads its credential from ``GH_TOKEN`` (preferred over the host's
-    ``gh auth`` state), so a per-call installation token is threaded in via that env
-    var rather than a literal ``Authorization`` header. With no token the host's own
-    ``gh`` auth is used and the parent environment passes through unchanged.
+
+def _auth_env(token: str | None) -> dict[str, str]:
+    """Build the minimal ``gh`` subprocess environment, injecting the token when supplied.
+
+    Only the variables ``gh`` actually needs are forwarded — ``PATH`` (to locate the
+    ``gh`` executable) and ``HOME`` (its config and the host's own ``gh auth`` state) — so
+    the worker's wider environment (its Anthropic credentials, etc.) never leaks into the
+    child. ``gh`` reads its credential from ``GH_TOKEN`` (preferred over the host's
+    ``gh auth`` state), so a per-call installation token is threaded in via that env var
+    rather than a literal ``Authorization`` header. With no token the host's own ``gh``
+    auth is used, found via ``HOME``.
     """
-    env = dict(os.environ)
+    env = {
+        name: os.environ[name] for name in _GH_PASSTHROUGH_ENV if name in os.environ
+    }
     if token is not None:
         env["GH_TOKEN"] = token
     return env

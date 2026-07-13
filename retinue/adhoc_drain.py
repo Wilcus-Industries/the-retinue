@@ -20,12 +20,15 @@ The gh list seam therefore surfaces each issue's ``body`` alongside its labels.
 
 The drain is hardened for production (#33) with four guards:
 
-* **dedup + stranded recovery via GitHub truth** — :meth:`AdhocGh.flight_state` classifies
-  each issue against the reconcile-style source of truth (:mod:`retinue.reconcile`): an
-  issue with a branch *and* an open PR is in flight (skip it, no duplicate branch/PR); an
-  issue with a pushed ``issue-<N>`` branch but *no* open PR is **stranded** — a prior green
-  build (push-only-on-green) whose PR never opened — so the drain opens its PR without
-  rebuilding; every other issue is built fresh;
+* **dedup + stranded recovery via GitHub truth** — the drain classifies each issue against
+  the reconcile-style source of truth (:mod:`retinue.reconcile`): an issue with a branch
+  *and* an open PR is in flight (skip it, no duplicate branch/PR); an issue with a pushed
+  ``issue-<N>`` branch but *no* open PR is **stranded** — a prior green build
+  (push-only-on-green) whose PR never opened — so the drain opens its PR without rebuilding;
+  every other issue is built fresh. Truth is read once per drain through
+  :meth:`SupportsFlightSnapshot.flight_snapshot` (two whole-repo ``gh`` queries), then each
+  candidate is classified in memory (:meth:`FlightSnapshot.state_for`); a seam offering only
+  the per-issue :meth:`AdhocGh.flight_state` is classified through that fallback;
 * **single-run lock** — the whole drain runs under an injected lock so two drains for a
   repo never overlap (a second entry raises :class:`AdhocDrainBusyError`); the lock is
   *separate* from the orchestrator's, so the drain still runs alongside a PRD build;
@@ -49,7 +52,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from retinue.adhoc_build import AdhocIssue
 from retinue.budget import BudgetGovernor
@@ -200,6 +203,41 @@ class FlightState(Enum):
     IN_FLIGHT = "in_flight"
 
 
+@dataclass(frozen=True)
+class FlightSnapshot:
+    """Whole-repo GitHub truth for flight-state classification, fetched once per drain.
+
+    Carries the two whole-repo sets the drain classifies every candidate against in memory,
+    replacing the per-issue branch-ref + open-PR spawns (:meth:`AdhocGh.flight_state`) with a
+    single prefetch: the head branch names of the repo's open PRs, and the existing
+    ``issue-<N>`` branch names. :meth:`state_for` applies the exact :class:`FlightState`
+    rule, preserving the stranded-branch recovery (commit cea5d14).
+
+    Attributes:
+        open_pr_heads: The head branch names of the repo's open PRs (an open PR keeps its
+            head alive, so these are a subset of ``issue_branches``).
+        issue_branches: The existing ``issue-<N>`` branch names on the repo.
+    """
+
+    open_pr_heads: frozenset[str]
+    issue_branches: frozenset[str]
+
+    def state_for(self, issue_number: int) -> FlightState:
+        """Classify one issue from the snapshot, mirroring per-issue ``flight_state``.
+
+        The same order the per-issue query used: a missing ``issue-<N>`` branch is
+        :attr:`FlightState.ABSENT`; a branch with an open PR is :attr:`FlightState.IN_FLIGHT`;
+        a branch with no open PR is :attr:`FlightState.STRANDED` (pushed green, PR never
+        opened).
+        """
+        branch = _issue_branch(issue_number)
+        if branch not in self.issue_branches:
+            return FlightState.ABSENT
+        if branch in self.open_pr_heads:
+            return FlightState.IN_FLIGHT
+        return FlightState.STRANDED
+
+
 class AdhocGh(Protocol):
     """The gh queries behind the ad-hoc drain. The ad-hoc lane's gh seam.
 
@@ -207,7 +245,9 @@ class AdhocGh(Protocol):
     issue's labels and body) for :meth:`list_ready`, and the branch-existence + open-PR
     lookups for :meth:`flight_state`; tests inject a fake that scripts both. Modeled as one
     protocol so the whole drain injects through a single collaborator, mirroring the
-    gh-seam style of :mod:`retinue.cron` / :mod:`retinue.reconcile`.
+    gh-seam style of :mod:`retinue.cron` / :mod:`retinue.reconcile`. A production seam should
+    also implement :class:`SupportsFlightSnapshot` so the drain classifies flight state with
+    one whole-repo prefetch instead of a per-issue :meth:`flight_state` spawn.
     """
 
     async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
@@ -225,7 +265,27 @@ class AdhocGh(Protocol):
         matching :class:`FlightState`. The drain builds an :attr:`~FlightState.ABSENT`
         issue, opens the PR for a :attr:`~FlightState.STRANDED` one, and skips an
         :attr:`~FlightState.IN_FLIGHT` one.
+
+        This is the *per-issue* fallback; a seam that also implements
+        :class:`SupportsFlightSnapshot` is classified with one whole-repo query instead.
         """
+        ...
+
+
+@runtime_checkable
+class SupportsFlightSnapshot(Protocol):
+    """An optional whole-repo flight-state prefetch the drain prefers over per-issue calls.
+
+    A gh seam that can answer the flight-state question for the *whole* repo in one shot
+    (rather than a branch-ref + open-PR spawn per issue) implements this. The production
+    :class:`GhCli` does — collapsing the old N-issue x 2-spawn classification into two
+    whole-repo ``gh`` queries — while a seam offering only per-issue :meth:`AdhocGh.flight_state`
+    (e.g. a minimal test fake) is classified through that fallback instead. Runtime-checkable
+    so :func:`run_adhoc_drain` can pick the fast path with ``isinstance``.
+    """
+
+    async def flight_snapshot(self, *, repo_full_name: str) -> FlightSnapshot:
+        """Fetch the repo's whole flight-state truth in one prefetch (open PRs + branches)."""
         ...
 
 
@@ -300,6 +360,38 @@ class GhCli:
         if await self._open_pr_exists(repo_full_name, branch):
             return FlightState.IN_FLIGHT
         return FlightState.STRANDED
+
+    async def flight_snapshot(self, *, repo_full_name: str) -> FlightSnapshot:
+        """Fetch whole-repo flight-state truth in two queries, for in-memory classification.
+
+        Replaces the per-issue branch-ref + open-PR spawns with two repo-wide ``gh`` calls:
+        ``gh pr list --state open --json headRefName`` for every open PR's head branch, and
+        ``gh api .../git/matching-refs/heads/issue-`` enumerating every existing ``issue-*``
+        branch ref. The drain then classifies each candidate in memory
+        (:meth:`FlightSnapshot.state_for`), preserving the exact :class:`FlightState`
+        semantics — including the stranded-branch recovery.
+
+        Raises:
+            ValueError: a ``gh`` payload did not parse as the expected JSON array (or an
+                entry was missing its head/ref field).
+        """
+        open_pr_heads = await self._open_pr_heads(repo_full_name)
+        issue_branches = await self._issue_branches(repo_full_name)
+        return FlightSnapshot(
+            open_pr_heads=open_pr_heads, issue_branches=issue_branches
+        )
+
+    async def _open_pr_heads(self, repo_full_name: str) -> frozenset[str]:
+        """The head branch names of every open PR on the repo (the whole in-flight set)."""
+        argv = _open_pr_heads_argv(repo_full_name, limit=self._list_limit)
+        stdout = await self._runner(argv, self._auth_env())
+        return frozenset(_parse_pr_heads(stdout))
+
+    async def _issue_branches(self, repo_full_name: str) -> frozenset[str]:
+        """Every existing ``issue-<N>`` branch name on the repo (the whole branch set)."""
+        argv = _issue_refs_argv(repo_full_name)
+        stdout = await self._runner(argv, self._auth_env())
+        return frozenset(_parse_issue_branches(stdout))
 
     async def _branch_exists(self, repo_full_name: str, branch: str) -> bool:
         """Whether ``branch`` resolves to a ref on the repo (a 404 means it does not)."""
@@ -390,6 +482,80 @@ def _open_pr_argv(repo_full_name: str, head: str) -> list[str]:
         "--json",
         "number",
     ]
+
+
+# The ``git`` ref prefix a branch name sits behind in the matching-refs payload, and the
+# ``issue-`` prefix the whole-repo branch enumeration matches on.
+_REF_HEADS_PREFIX = "refs/heads/"
+_ISSUE_BRANCH_PREFIX = "issue-"
+
+
+def _open_pr_heads_argv(repo_full_name: str, *, limit: int) -> list[str]:
+    """Assemble the ``gh pr list`` argv for every open PR's head branch (whole-repo).
+
+    One repo-wide query returning just ``headRefName`` for the open PRs, so the drain can
+    classify every candidate's in-flight state in memory rather than a ``gh pr list --head``
+    per issue.
+    """
+    return [
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        repo_full_name,
+        "--state",
+        "open",
+        "--json",
+        "headRefName",
+        "--limit",
+        str(limit),
+    ]
+
+
+def _issue_refs_argv(repo_full_name: str) -> list[str]:
+    """Assemble the ``gh api`` argv enumerating every existing ``issue-*`` branch ref.
+
+    Hits ``repos/<repo>/git/matching-refs/heads/issue-``, which returns *all* refs under
+    ``heads/issue-`` (an empty array when none, never a 404), so one paginated query lists
+    every ``issue-<N>`` branch instead of a branch-ref lookup per issue.
+    """
+    return [
+        "gh",
+        "api",
+        "--paginate",
+        f"repos/{repo_full_name}/git/matching-refs/heads/{_ISSUE_BRANCH_PREFIX}",
+    ]
+
+
+def _parse_pr_heads(stdout: bytes) -> set[str]:
+    """Parse ``gh pr list --json headRefName`` into the set of open-PR head branch names.
+
+    A malformed entry (not an object, or missing ``headRefName``) raises :class:`ValueError`
+    rather than silently dropping an in-flight PR — which would risk a duplicate build.
+    """
+    heads: set[str] = set()
+    for entry in _parse_json_array(stdout):
+        if not isinstance(entry, dict) or "headRefName" not in entry:
+            raise ValueError(f"gh pr list entry is malformed: {entry!r}")
+        heads.add(str(entry["headRefName"]))
+    return heads
+
+
+def _parse_issue_branches(stdout: bytes) -> set[str]:
+    """Parse a matching-refs payload into the set of existing ``issue-<N>`` branch names.
+
+    Each entry's ``ref`` (``refs/heads/issue-<N>``) is stripped of the ``refs/heads/``
+    prefix. A malformed entry (not an object, or missing ``ref``) raises :class:`ValueError`
+    rather than silently dropping a branch — which would risk a duplicate build.
+    """
+    branches: set[str] = set()
+    for entry in _parse_json_array(stdout):
+        if not isinstance(entry, dict) or "ref" not in entry:
+            raise ValueError(f"gh matching-refs entry is malformed: {entry!r}")
+        ref = str(entry["ref"])
+        if ref.startswith(_REF_HEADS_PREFIX):
+            branches.add(ref[len(_REF_HEADS_PREFIX) :])
+    return branches
 
 
 def _parse_ready_issue(entry: object) -> ReadyIssue:
@@ -567,12 +733,11 @@ async def _partition_candidates(
     the PR-open-only recovery rather than a wasteful rebuild; the rest are buildable. Rank
     order is preserved within each bucket.
     """
+    states = await _flight_states(repo_full_name, issues, gh)
     buildable: list[AdhocIssue] = []
     stranded: list[AdhocIssue] = []
     for issue in issues:
-        state = await gh.flight_state(
-            repo_full_name=repo_full_name, issue_number=issue.issue_number
-        )
+        state = states[issue.issue_number]
         if state is FlightState.IN_FLIGHT:
             logger.info(
                 "Ad-hoc drain skipping issue #%d (%s): already in flight",
@@ -590,6 +755,31 @@ async def _partition_candidates(
         else:
             buildable.append(issue)
     return _DrainPlan(buildable=buildable, stranded=stranded)
+
+
+async def _flight_states(
+    repo_full_name: str, issues: list[AdhocIssue], gh: AdhocGh
+) -> dict[int, FlightState]:
+    """Resolve each candidate's :class:`FlightState`, preferring one whole-repo query.
+
+    A seam that supports the whole-repo :class:`FlightSnapshot` (the production
+    :class:`GhCli`) is queried once and every candidate is classified in memory — two ``gh``
+    queries total rather than up to two subprocess spawns per issue. A seam offering only the
+    per-issue :meth:`AdhocGh.flight_state` (a minimal fake) is classified one issue at a
+    time. Both paths yield the identical verdicts.
+    """
+    if isinstance(gh, SupportsFlightSnapshot):
+        snapshot = await gh.flight_snapshot(repo_full_name=repo_full_name)
+        return {
+            issue.issue_number: snapshot.state_for(issue.issue_number)
+            for issue in issues
+        }
+    return {
+        issue.issue_number: await gh.flight_state(
+            repo_full_name=repo_full_name, issue_number=issue.issue_number
+        )
+        for issue in issues
+    }
 
 
 async def _open_stranded_prs(
@@ -621,7 +811,7 @@ async def _build_metered(
     overshot. Returns the issues that actually built, in rank order.
     """
     semaphore = asyncio.Semaphore(config.max_parallel or len(issues))
-    built: list[AdhocIssue] = []
+    built: set[AdhocIssue] = set()
 
     async def build_one(issue: AdhocIssue) -> None:
         async with semaphore:
@@ -633,9 +823,10 @@ async def _build_metered(
                 )
                 return
             await build(issue, repo_full_name=repo_full_name)
-            built.append(issue)
+            built.add(issue)
 
     await asyncio.gather(*(build_one(issue) for issue in issues))
+    # Return in rank order (``issues``); a set membership test keeps the filter O(n).
     return [issue for issue in issues if issue in built]
 
 

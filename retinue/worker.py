@@ -11,10 +11,12 @@ or via the ``retinue-worker`` console script.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import enum
 import logging
+import re
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -41,6 +43,7 @@ from retinue.loopback import (
     HeimdallReview,
     ReviewState,
     Severity,
+    round_key,
 )
 from retinue.pipeline import (
     ClaudeMdFetcher,
@@ -264,7 +267,13 @@ async def process_review_job(
         review_state=review_state,
         review_body=review_body,
     )
-    result = await pipeline.process_review(review)
+    # GitHub redelivers review webhooks; serializing per PR keeps the loopback's
+    # read-count-then-record-round window atomic so two deliveries cannot both see a
+    # stale round count and double-consume the rebuild budget.
+    locks: dict[str, asyncio.Lock] = ctx.setdefault("review_locks", {})
+    lock = locks.setdefault(round_key(repo_full_name, pr_number), asyncio.Lock())
+    async with lock:
+        result = await pipeline.process_review(review)
     logger.info(
         "Loopback for %s PR #%d: %s", repo_full_name, pr_number, result.outcome.value
     )
@@ -490,18 +499,27 @@ def parse_heimdall_review(
     )
 
 
+# A finding line is ``<severity>: <summary>``, tolerating common markdown dressing —
+# a leading bullet (``-``/``*``/``+``) or ordinal (``1.``/``2)``), and ``**bold**``
+# around the severity — so a prose-formatted heimdall review still parses instead of
+# silently reading as zero findings.
+_FINDING_LINE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])?\s*\*{0,2}(low|medium|high|critical)\*{0,2}\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
 def _parse_findings(review_body: str) -> list[HeimdallFinding]:
     """Parse ``<severity>: <summary>`` lines from a review body into findings."""
     findings: list[HeimdallFinding] = []
     for line in review_body.splitlines():
-        prefix, sep, summary = line.partition(":")
-        if not sep or not summary.strip():
+        match = _FINDING_LINE.match(line)
+        if match is None:
             continue
-        try:
-            severity = Severity[prefix.strip().upper()]
-        except KeyError:
-            continue
-        findings.append(HeimdallFinding(summary=summary.strip(), severity=severity))
+        severity = Severity[match.group(1).upper()]
+        findings.append(
+            HeimdallFinding(summary=match.group(2).strip(), severity=severity)
+        )
     return findings
 
 

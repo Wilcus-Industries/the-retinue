@@ -823,7 +823,6 @@ def build_pipeline_factory(
         reap_gh = HandoffGh(token=token)
         rebuild = GhCliRebuilder(
             loopback_runner,
-            create_issue=create_issue,
             token=token,
             reviewer_login=settings.heimdall_bot_login,
         )

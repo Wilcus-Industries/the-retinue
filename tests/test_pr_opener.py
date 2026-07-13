@@ -69,17 +69,26 @@ class FakePrOps:
         *,
         heimdall_installed: bool = True,
         staging_exists: bool = True,
+        existing_pr: PullRequest | None = None,
     ) -> None:
         self._heimdall_installed = heimdall_installed
         self._staging_exists = staging_exists
+        self._existing_pr = existing_pr
         self.synced: list[tuple[str, str]] = []
         self.opened: list[OpenPrRequest] = []
+        self.existing_queries: list[tuple[str, str]] = []
 
     async def heimdall_installed(self, repo_full_name: str) -> bool:
         return self._heimdall_installed
 
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         return self._staging_exists
+
+    async def existing_open_pr(
+        self, *, repo_full_name: str, head: str, base: str
+    ) -> PullRequest | None:
+        self.existing_queries.append((head, base))
+        return self._existing_pr
 
     async def bring_up_to_date(
         self, *, repo_full_name: str, branch: str, base: str
@@ -151,6 +160,27 @@ async def test_adhoc_head_opens_issue_branch_straight_into_staging() -> None:
     assert ops.synced == [("issue-31", "staging")]  # the issue branch, not retinue/prd-31
     assert ops.opened[0].head == "issue-31"
     assert ops.opened[0].base == "staging"
+
+
+@pytest.mark.asyncio
+async def test_existing_open_pr_short_circuits_to_it() -> None:
+    """An already-open head -> staging PR is returned instead of opening a second.
+
+    Webhook redelivery, an arq retry, or a startup-sweep double-resume must never
+    stack duplicate PRs onto staging — the opener is idempotent, as the reconcile
+    contract assumes.
+    """
+    existing = PullRequest(number=88, url="https://gh/existing")
+    ops = FakePrOps(existing_pr=existing)
+
+    result = await _open(ops=ops, prd_number=7)
+
+    assert result.outcome is PrOpenOutcome.OPENED
+    assert result.pull_request == existing
+    # No second PR was opened, and the branch wasn't re-synced under the open PR.
+    assert ops.opened == []
+    assert ops.synced == []
+    assert ops.existing_queries == [("retinue/prd-7", "staging")]
 
 
 @pytest.mark.asyncio

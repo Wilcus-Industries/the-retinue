@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections.abc import Mapping
 
 import pytest
@@ -554,11 +555,13 @@ async def test_merge_hard_error_is_gitops_error_not_conflict() -> None:
 
 
 @pytest.mark.asyncio
-async def test_round_diff_fetches_then_diffs_each_branch_over_base() -> None:
-    """The round diff fetches each merged branch then diffs it (3-dot) over the base.
+async def test_round_diff_diffs_each_branch_without_refetching() -> None:
+    """The round diff diffs each merged branch (3-dot) over the base, fetching nothing.
 
     Feeds the internal reviewer the round's merged surface: each ``issue-<N>`` branch's
-    contribution since it diverged from the integration branch, concatenated.
+    contribution since it diverged from the integration branch, concatenated. Only merged
+    branches are diffed and :meth:`merge` already fetched each one's tip into this same
+    container, so ``round_diff`` must not re-fetch — a redundant ``git fetch`` per branch.
     """
     container = ScriptedContainer(
         {"diff retinue/prd-1...origin/issue-7": RunResult(exit_code=0, stdout="DIFF-7")}
@@ -570,10 +573,10 @@ async def test_round_diff_fetches_then_diffs_each_branch_over_base() -> None:
     )
 
     cmds = _joined(container)
-    assert "git fetch origin issue-7" in cmds
     assert "git diff retinue/prd-1...origin/issue-7" in cmds
-    assert "git fetch origin issue-8" in cmds
     assert "git diff retinue/prd-1...origin/issue-8" in cmds
+    # The merge already fetched each branch tip; round_diff issues no fetch of its own.
+    assert not any(c.startswith("git fetch") for c in cmds)
     # The matched branch's diff body is carried through into the concatenated result.
     assert "DIFF-7" in diff
 
@@ -923,6 +926,24 @@ def test_claude_result_is_error_reads_json_flag() -> None:
     assert _claude_result_is_error('{"is_error": false}') is False
     assert _claude_result_is_error("not json") is False
     assert _claude_result_is_error("") is False
+
+
+def test_claude_result_is_error_warns_on_unparseable_stdout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unparseable/empty CLI stdout is not an error but is logged, not swallowed silently.
+
+    ``--output-format json`` was requested, so a non-json or empty result is unexpected:
+    the exit code stays authoritative (returns not-an-error), but the anomaly is surfaced
+    as a warning rather than passing silently.
+    """
+    with caplog.at_level(logging.WARNING, logger="retinue.orchestrator"):
+        assert _claude_result_is_error("not json") is False
+        assert _claude_result_is_error("") is False
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert all("not parseable JSON" in r.getMessage() for r in warnings)
 
 
 @pytest.mark.asyncio

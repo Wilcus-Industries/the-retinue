@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 
-from retinue.container import RunResult
+from retinue.container import Container, RunResult
 from retinue.orchestrator import (
+    _DEFAULT_MAX_PARALLEL,
     ConflictResolution,
+    ImplementError,
     OrchestratorBusyError,
     PrdBuildResult,
     PrdSlice,
@@ -32,6 +35,7 @@ from retinue.orchestrator import (
     build_prd,
 )
 from retinue.repo_config import RepoConfig
+from retinue.reviewer import ReviewGenerationError
 from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
 from tests.test_orchestrator import FakeGitOps, FakeImplementer
 
@@ -241,15 +245,32 @@ async def test_fan_out_respects_max_parallel() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unset_max_parallel_allows_full_round_concurrency() -> None:
-    """With max_parallel unset, every ready slice in a round runs concurrently."""
-    slices = [_prd_slice(n) for n in range(1, 4)]
+async def test_unset_max_parallel_runs_up_to_the_default_cap() -> None:
+    """With max_parallel unset, a ready set at/under the default cap runs fully parallel."""
+    slices = [_prd_slice(n) for n in range(1, _DEFAULT_MAX_PARALLEL + 1)]
     implementer = RecordingImplementer()
 
     await _build_prd(slices, implementer=implementer, config=RepoConfig())
 
-    # All three were ready together and unbounded, so all three ran at once.
-    assert implementer.peak == 3
+    # Exactly ``_DEFAULT_MAX_PARALLEL`` slices were ready, so all ran at once.
+    assert implementer.peak == _DEFAULT_MAX_PARALLEL
+
+
+@pytest.mark.asyncio
+async def test_unset_max_parallel_caps_fan_out_at_the_default() -> None:
+    """With max_parallel unset, a large ready set is bounded by the default cap, not run all.
+
+    A default-config repo previously sized its round semaphore to the whole ready set, so
+    every slice's container started at once. The unset case now falls back to
+    ``_DEFAULT_MAX_PARALLEL`` so a big ready set cannot exhaust the host.
+    """
+    slices = [_prd_slice(n) for n in range(1, _DEFAULT_MAX_PARALLEL + 4)]
+    implementer = RecordingImplementer()
+
+    result = await _build_prd(slices, implementer=implementer, config=RepoConfig())
+
+    assert implementer.peak == _DEFAULT_MAX_PARALLEL
+    assert set(result.merged_issues) == {s.issue_number for s in slices}
 
 
 # --- a red slice blocks its dependents -------------------------------------------
@@ -294,6 +315,64 @@ async def test_transitively_blocked_slices_are_skipped_not_dropped() -> None:
         + result.skipped_issues
     )
     assert sorted(all_buckets) == [1, 2, 3]
+
+
+# --- one slice's build raising must not cancel its siblings ----------------------
+
+
+class FlakyImplementer(FakeImplementer):
+    """Builds every slice cleanly except one, whose ``implement`` raises.
+
+    Models a transient per-slice build failure (a Docker/clone/implement error): the
+    round must not let it cancel the sibling builds, so the raised slice escalates while
+    the green siblings still merge.
+    """
+
+    def __init__(self, *, fail_for: int) -> None:
+        super().__init__()
+        self._fail_for = fail_for
+
+    async def implement(
+        self, slice_: Slice, *, container: Container, plan_path: str | None = None
+    ) -> None:
+        if slice_.issue_number == self._fail_for:
+            raise ImplementError(f"boom building {slice_.branch}")
+        await super().implement(slice_, container=container, plan_path=plan_path)
+
+
+@pytest.mark.asyncio
+async def test_one_slice_build_raising_escalates_it_but_siblings_still_merge() -> None:
+    """A build that raises escalates only that slice; its green siblings still merge.
+
+    Sibling builds run concurrently in a round; gathering them without isolating
+    exceptions would let one transient failure cancel the rest and abort the round,
+    discarding their work. Slice 1's build raises, but 2 and 3 must still merge.
+    """
+    slices = [_prd_slice(1), _prd_slice(2), _prd_slice(3)]
+    git = FakeGitOps()
+    implementer = FlakyImplementer(fail_for=1)
+
+    result = await _build_prd(slices, git=git, implementer=implementer)
+
+    assert result.escalated_issues == [1]
+    assert set(result.merged_issues) == {2, 3}
+    assert 1 not in result.merged_issues
+    # The green siblings really merged onto the integration branch.
+    assert ("issue-2", "retinue/prd-1") in git.merges
+    assert ("issue-3", "retinue/prd-1") in git.merges
+
+
+@pytest.mark.asyncio
+async def test_raised_build_does_not_block_its_dependents_via_a_green_path() -> None:
+    """A raised upstream slice escalates; its dependents are pruned to skipped, not lost."""
+    slices = [_prd_slice(1), _prd_slice(2, blocked_by=[1])]
+    implementer = FlakyImplementer(fail_for=1)
+
+    result = await _build_prd(slices, implementer=implementer)
+
+    assert result.escalated_issues == [1]
+    assert result.skipped_issues == [2]
+    assert result.merged_issues == []
 
 
 # --- merge conflict: resolve under done-check or escalate ------------------------
@@ -441,6 +520,49 @@ async def test_reviewer_runs_after_each_round_and_fix_builds_in_a_later_round() 
     assert 201 in result.merged_issues
     assert result.merged_issues.index(201) > result.merged_issues.index(1)
     assert ("issue-201", "retinue/prd-1") in git.merges
+
+
+class RaisingReviewer:
+    """A RoundReviewer whose ``review`` always raises the given error.
+
+    Models an advisory reviewer that fails *after* the round's slices are merged and
+    pushed (e.g. an HTTP 400 from the Messages API, or a leaked httpx transport error).
+    """
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.calls = 0
+
+    async def review(self, *, merged_issues: list[int]) -> list[PrdSlice]:
+        self.calls += 1
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ReviewGenerationError("Messages API returned 400"),
+        httpx.ConnectError("connection refused"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_advisory_review_failure_does_not_discard_the_merged_build(
+    error: Exception,
+) -> None:
+    """A reviewer failure is swallowed: the already-merged round is not thrown away.
+
+    The per-round review is advisory (it only files follow-ups, never edits code) yet runs
+    after the round merges and pushes, so a raised ReviewGenerationError/httpx error must
+    not fail the whole build. The reviewer is invoked, its error logged, and the build
+    completes with its merged slices intact and no review-fix slices enqueued.
+    """
+    slices = [_prd_slice(1)]
+    reviewer = RaisingReviewer(error)
+
+    result = await _build_prd(slices, review_round=reviewer)
+
+    assert reviewer.calls == 1
+    assert result.merged_issues == [1]
 
 
 @pytest.mark.asyncio

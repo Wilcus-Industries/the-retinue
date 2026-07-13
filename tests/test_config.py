@@ -66,6 +66,27 @@ def test_budget_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.weekly_budget == 1_000_000.0
 
 
+@pytest.mark.parametrize("value", ["-1", "-0.5"])
+def test_negative_weekly_budget_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """A negative weekly budget is a config error; only 0.0 (disabled) or >0 are valid."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("WEEKLY_BUDGET", value)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_zero_weekly_budget_is_the_disabled_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WEEKLY_BUDGET=0 loads cleanly: it is the metering-disabled sentinel, not an error."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("WEEKLY_BUDGET", "0")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.weekly_budget == 0.0
+
+
 def test_job_timeout_default_exceeds_arq_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

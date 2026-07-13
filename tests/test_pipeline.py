@@ -65,6 +65,11 @@ class _FakePrOps:
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         return self.staging
 
+    async def existing_open_pr(
+        self, *, repo_full_name: str, head: str, base: str
+    ) -> PullRequest | None:
+        return None
+
     async def bring_up_to_date(
         self, *, repo_full_name: str, branch: str, base: str
     ) -> None:

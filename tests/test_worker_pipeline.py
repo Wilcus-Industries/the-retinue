@@ -8,6 +8,7 @@ Anthropic, Docker, or network.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -170,6 +171,45 @@ async def test_process_review_job_skips_unknown_pr(tmp_path: Path) -> None:
     )
 
     assert pipeline.reviews == []
+
+
+@pytest.mark.asyncio
+async def test_process_review_job_serializes_per_pr(tmp_path: Path) -> None:
+    """Two review jobs for the same PR run one at a time, never interleaved.
+
+    GitHub redelivers ``pull_request_review`` webhooks; without a per-PR lock two
+    deliveries both read a stale round count and double-consume the rebuild budget.
+    """
+
+    class _SlowPipeline(_RecordingPipeline):
+        def __init__(self) -> None:
+            super().__init__(pr_round=(7, [100]))
+            self.active = 0
+            self.max_active = 0
+
+        async def process_review(self, review: HeimdallReview) -> VerdictResult:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0)
+            self.active -= 1
+            return await super().process_review(review)
+
+    pipeline = _SlowPipeline()
+    ctx = _ctx(tmp_path, pipeline)
+
+    def job() -> Any:
+        return process_review_job(
+            ctx,
+            repo_full_name="owner/repo",
+            pr_number=99,
+            review_state="changes_requested",
+            review_body="high: a blocking problem",
+        )
+
+    await asyncio.gather(job(), job())
+
+    assert len(pipeline.reviews) == 2
+    assert pipeline.max_active == 1
 
 
 # --- reap -----------------------------------------------------------------------
@@ -400,6 +440,34 @@ def test_parse_heimdall_review_unknown_state_is_commented() -> None:
     )
     assert review.state is ReviewState.COMMENTED
     assert review.findings == []
+
+
+def test_parse_heimdall_review_tolerates_markdown_finding_lines() -> None:
+    """Finding lines survive common markdown dressing: bullets, bold, numbering.
+
+    Heimdall writes prose reviews; a bullet like ``- **high**: broken auth`` must
+    parse as a HIGH finding rather than silently reading as zero findings (which
+    would previously converge a rejected PR).
+    """
+    body = (
+        "- **high**: broken auth check\n"
+        "* medium: slow query\n"
+        "1. low: rename this\n"
+        "2. **critical**: drops the table\n"
+    )
+    review = parse_heimdall_review(
+        repo_full_name="owner/repo",
+        pr_number=99,
+        prd_number=7,
+        review_state="changes_requested",
+        review_body=body,
+    )
+    assert [(f.severity, f.summary) for f in review.findings] == [
+        (Severity.HIGH, "broken auth check"),
+        (Severity.MEDIUM, "slow query"),
+        (Severity.LOW, "rename this"),
+        (Severity.CRITICAL, "drops the table"),
+    ]
 
 
 # --- on_startup: the production wiring path -------------------------------------

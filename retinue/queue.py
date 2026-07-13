@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from arq import ArqRedis
+from arq.constants import result_key_prefix
 
 # The Arq task names the worker registers; the enqueue side and the worker must agree on
 # these strings, so they live here as the single source of truth.
@@ -139,6 +140,15 @@ async def enqueue_adhoc_drain(pool: ArqRedis, job: AdhocDrainJob) -> str:
     Mirrors :func:`enqueue_prd` but pins a per-repo ``_job_id`` so concurrent kicks for
     the same repo collapse to one in-flight drain (Arq dedups on the id).
 
+    Arq's enqueue dedups on both the queued/running job key *and* the completed-job
+    *result* key, which lingers for the worker's ``keep_result`` window (1h by default).
+    Without intervention a kick arriving in that post-completion window is silently
+    dropped, so a repo could wait up to an hour for its next drain. We delete any stale
+    result key for this job id first: while a drain is actually queued or running the
+    result key does not yet exist (the live job key still coalesces the kick), so this
+    narrows coalescing to the genuinely-in-flight window without letting a burst enqueue
+    duplicate drains.
+
     Args:
         pool: The connected Arq Redis pool.
         job: The ad-hoc drain kick to enqueue.
@@ -147,10 +157,12 @@ async def enqueue_adhoc_drain(pool: ArqRedis, job: AdhocDrainJob) -> str:
         The Arq job ID, or an empty string when Arq coalesced this kick against an
         already-queued drain for the same repo.
     """
+    job_id = _adhoc_drain_job_id(job.repo_full_name)
+    await pool.delete(result_key_prefix + job_id)
     arq_job = await pool.enqueue_job(
         RUN_ADHOC_DRAIN_TASK,
         repo_full_name=job.repo_full_name,
-        _job_id=_adhoc_drain_job_id(job.repo_full_name),
+        _job_id=job_id,
     )
     return arq_job.job_id if arq_job is not None else ""
 

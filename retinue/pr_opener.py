@@ -89,6 +89,12 @@ class PrOps(Protocol):
         """Return True when ``branch`` (the staging branch) exists on the repo."""
         ...
 
+    async def existing_open_pr(
+        self, *, repo_full_name: str, head: str, base: str
+    ) -> PullRequest | None:
+        """Return the already-open ``head`` -> ``base`` PR, or None when none exists."""
+        ...
+
     async def bring_up_to_date(
         self, *, repo_full_name: str, branch: str, base: str
     ) -> None:
@@ -203,6 +209,25 @@ async def open_staging_pr(
                 f"`{staging}` does not exist on `{repo_full_name}`. Create it, then "
                 "the retinue can open the PR. No PR was opened."
             ),
+        )
+
+    existing = await ops.existing_open_pr(
+        repo_full_name=repo_full_name, head=branch, base=staging
+    )
+    if existing is not None:
+        # Idempotency: a webhook redelivery, arq retry, or startup-sweep double-resume
+        # must never stack a second PR onto staging for the same head.
+        logger.info(
+            "PR #%d already open for %s: %s -> %s; not opening another",
+            existing.number,
+            repo_full_name,
+            branch,
+            staging,
+        )
+        return PrOpenResult(
+            outcome=PrOpenOutcome.OPENED,
+            integration_branch=branch,
+            pull_request=existing,
         )
 
     return await _bring_up_to_date_and_open(
@@ -447,6 +472,33 @@ class GhCliPrOps:
         # A missing branch is a 404, which gh reports as a non-zero exit — not an
         # error to raise on, just a False answer to the existence question.
         return result.ok
+
+    async def existing_open_pr(
+        self, *, repo_full_name: str, head: str, base: str
+    ) -> PullRequest | None:
+        """Return the open ``head`` -> ``base`` PR via ``gh pr list``, or None."""
+        result = await self._gh(
+            [
+                "pr",
+                "list",
+                "--repo",
+                repo_full_name,
+                "--head",
+                head,
+                "--base",
+                base,
+                "--state",
+                "open",
+                "--json",
+                "number,url",
+            ]
+        )
+        payload = json.loads(result.stdout or "[]")
+        if not payload:
+            return None
+        return PullRequest(
+            number=int(payload[0]["number"]), url=str(payload[0]["url"])
+        )
 
     async def bring_up_to_date(
         self, *, repo_full_name: str, branch: str, base: str

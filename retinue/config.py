@@ -34,8 +34,12 @@ class Settings(BaseSettings):
     )
     weekly_budget: float = Field(
         default=0.0,
+        ge=0.0,
         description="Service-level weekly budget — dollars in api_key mode, tokens in "
-        "subscription mode. The 24h cap is a fraction of this.",
+        "subscription mode. The 24h cap is a fraction of this. The default 0.0 is the "
+        "disabled sentinel: budget metering is off and every build is admitted "
+        "uncharged. Set a positive value to enforce spend caps; a negative value is "
+        "rejected at load.",
     )
     budget_db_path: str = Field(
         default="retinue-budget.sqlite3",

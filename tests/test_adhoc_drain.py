@@ -37,6 +37,7 @@ from retinue.adhoc_drain import (
     AdhocDrainLock,
     AdhocGh,
     AdhocPrOpen,
+    FlightSnapshot,
     FlightState,
     GhCli,
     ReadyIssue,
@@ -148,15 +149,16 @@ async def _drain(
 
 
 class FakeAdhocGh:
-    """In-memory ready-for-agent query + flight-state truth: returns the scripted issues.
+    """In-memory ready-for-agent query + whole-repo flight-state truth (the fast path).
 
-    ``flight_state`` answers the dedup + stranded-recovery question from GitHub truth: an
-    issue in ``in_flight_numbers`` has a branch *and* an open PR (a build under way or
-    landed -> :attr:`FlightState.IN_FLIGHT`, skip); an issue in ``stranded_numbers`` has a
-    pushed ``issue-<N>`` branch but *no* open PR (a green build whose PR never opened ->
-    :attr:`FlightState.STRANDED`, open its PR without rebuilding); every other issue is
-    :attr:`FlightState.ABSENT` (build it). Mirrors the reconcile-style source-of-truth
-    seam (faked here, real in ``GhCli``).
+    ``flight_snapshot`` answers the dedup + stranded-recovery question for the whole repo in
+    one shot (the query the drain prefers): an issue in ``in_flight_numbers`` has a branch
+    *and* an open PR (a build under way or landed -> :attr:`FlightState.IN_FLIGHT`, skip); an
+    issue in ``stranded_numbers`` has a pushed ``issue-<N>`` branch but *no* open PR (a green
+    build whose PR never opened -> :attr:`FlightState.STRANDED`, open its PR without
+    rebuilding); every other issue is :attr:`FlightState.ABSENT` (build it). ``flight_state``
+    is retained so this fake still satisfies :class:`AdhocGh`, but the drain classifies from
+    the snapshot, so ``flight_state`` is not exercised on the fast path.
     """
 
     def __init__(
@@ -170,10 +172,53 @@ class FakeAdhocGh:
         self._in_flight = in_flight_numbers or set()
         self._stranded = stranded_numbers or set()
         self.calls: list[str] = []
+        self.snapshot_calls: list[str] = []
         self.flight_state_calls: list[int] = []
 
     async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
         self.calls.append(repo_full_name)
+        return list(self._issues)
+
+    async def flight_snapshot(self, *, repo_full_name: str) -> FlightSnapshot:
+        self.snapshot_calls.append(repo_full_name)
+        return FlightSnapshot(
+            open_pr_heads=frozenset(f"issue-{n}" for n in self._in_flight),
+            issue_branches=frozenset(
+                f"issue-{n}" for n in self._in_flight | self._stranded
+            ),
+        )
+
+    async def flight_state(
+        self, *, repo_full_name: str, issue_number: int
+    ) -> FlightState:
+        self.flight_state_calls.append(issue_number)
+        if issue_number in self._in_flight:
+            return FlightState.IN_FLIGHT
+        if issue_number in self._stranded:
+            return FlightState.STRANDED
+        return FlightState.ABSENT
+
+
+class _FlightStateOnlyGh:
+    """A seam offering only per-issue ``flight_state`` (no whole-repo snapshot).
+
+    Exercises the drain's fallback: a gh seam that does not implement
+    :class:`SupportsFlightSnapshot` is classified one issue at a time via ``flight_state``.
+    """
+
+    def __init__(
+        self,
+        issues: list[ReadyIssue],
+        *,
+        in_flight_numbers: set[int] | None = None,
+        stranded_numbers: set[int] | None = None,
+    ) -> None:
+        self._issues = issues
+        self._in_flight = in_flight_numbers or set()
+        self._stranded = stranded_numbers or set()
+        self.flight_state_calls: list[int] = []
+
+    async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
         return list(self._issues)
 
     async def flight_state(
@@ -364,8 +409,52 @@ async def test_an_in_flight_issue_is_not_rebuilt(tmp_path: Path) -> None:
     assert [issue.issue_number for issue in build.built] == [7]
     # A truly in-flight issue gets neither a rebuild nor a (duplicate) PR open.
     assert open_pr.opened == []
-    # The flight-state truth was consulted for every surviving ad-hoc candidate.
-    assert set(gh.flight_state_calls) == {7, 9}
+    # The flight-state truth was read once for the whole repo, not per issue.
+    assert gh.snapshot_calls == ["owner/repo"]
+    assert gh.flight_state_calls == []
+
+
+@pytest.mark.asyncio
+async def test_flight_state_is_classified_with_one_whole_repo_query(
+    tmp_path: Path,
+) -> None:
+    """The drain reads flight-state truth once for the whole repo — not a query per issue.
+
+    The N+1 regression target: classification must be a single ``flight_snapshot`` call and
+    then in-memory classification, not an ``flight_state`` spawn per candidate.
+    """
+    gh = FakeAdhocGh(
+        [_ready(7), _ready(8), _ready(9)],
+        stranded_numbers={8},
+        in_flight_numbers={9},
+    )
+    build = RecordingAdhocBuild()
+    open_pr = RecordingPrOpen()
+
+    await _drain(gh=gh, build=build, open_pr=open_pr, tmp_path=tmp_path)
+
+    assert gh.snapshot_calls == ["owner/repo"]  # exactly one whole-repo query
+    assert gh.flight_state_calls == []  # never per-issue
+    assert [issue.issue_number for issue in build.built] == [7]
+    assert [issue.issue_number for issue in open_pr.opened] == [8]
+
+
+@pytest.mark.asyncio
+async def test_drain_falls_back_to_per_issue_flight_state(tmp_path: Path) -> None:
+    """A seam without a whole-repo snapshot is classified per issue via ``flight_state``.
+
+    Keeps the drain working with a minimal gh seam (e.g. the wiring test's fake) that only
+    implements the per-issue ``flight_state`` — the fallback preserves the same semantics.
+    """
+    gh = _FlightStateOnlyGh([_ready(7), _ready(8)], stranded_numbers={8})
+    build = RecordingAdhocBuild()
+    open_pr = RecordingPrOpen()
+
+    await _drain(gh=gh, build=build, open_pr=open_pr, tmp_path=tmp_path)
+
+    assert [issue.issue_number for issue in build.built] == [7]
+    assert [issue.issue_number for issue in open_pr.opened] == [8]
+    assert set(gh.flight_state_calls) == {7, 8}
 
 
 @pytest.mark.asyncio
@@ -839,3 +928,76 @@ class _RunnerWithBranchMiss:
             raise GhCliError(argv, returncode=1, stderr="Not Found")
         self.pr_argv = argv
         return self._open_pr_payload
+
+
+# --- FlightSnapshot: in-memory classification preserves FlightState semantics ------
+
+
+def test_flight_snapshot_classifies_each_state() -> None:
+    """The whole-repo snapshot classifies absent / stranded / in-flight exactly as before."""
+    snapshot = FlightSnapshot(
+        open_pr_heads=frozenset({"issue-7"}),
+        issue_branches=frozenset({"issue-7", "issue-8"}),
+    )
+
+    assert snapshot.state_for(7) is FlightState.IN_FLIGHT  # branch + open PR
+    assert snapshot.state_for(8) is FlightState.STRANDED  # branch, no open PR
+    assert snapshot.state_for(9) is FlightState.ABSENT  # no branch
+
+
+# --- real GhCli.flight_snapshot: two whole-repo queries ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_ghcli_flight_snapshot_uses_two_whole_repo_queries() -> None:
+    """One ``gh pr list`` for open-PR heads + one ``gh api`` matching-refs enumeration.
+
+    Replaces the per-issue branch-ref + open-PR spawns with two repo-wide queries, then
+    classifies in memory — the same FlightState verdicts, without the N+1 spawn fan-out.
+    """
+    open_prs = json.dumps([{"headRefName": "issue-7"}]).encode()
+    refs = json.dumps(
+        [{"ref": "refs/heads/issue-7"}, {"ref": "refs/heads/issue-48"}]
+    ).encode()
+    runner = SequencedGhRunner([open_prs, refs])
+    gh = GhCli(runner=runner)
+
+    snapshot = await gh.flight_snapshot(repo_full_name="owner/repo")
+
+    # Exactly two whole-repo queries, no per-issue calls.
+    assert len(runner.argvs) == 2
+    pr_argv = list(runner.argvs[0])
+    assert pr_argv[:3] == ["gh", "pr", "list"]
+    assert pr_argv[pr_argv.index("--repo") + 1] == "owner/repo"
+    assert pr_argv[pr_argv.index("--state") + 1] == "open"
+    assert pr_argv[pr_argv.index("--json") + 1] == "headRefName"
+    refs_argv = list(runner.argvs[1])
+    assert refs_argv[:2] == ["gh", "api"]
+    assert any("git/matching-refs/heads/issue-" in part for part in refs_argv)
+    # And the parsed snapshot classifies each candidate with the preserved semantics.
+    assert snapshot.state_for(7) is FlightState.IN_FLIGHT
+    assert snapshot.state_for(48) is FlightState.STRANDED
+    assert snapshot.state_for(99) is FlightState.ABSENT
+
+
+@pytest.mark.asyncio
+async def test_ghcli_flight_snapshot_puts_the_token_in_the_env() -> None:
+    """Both whole-repo queries authenticate via GH_TOKEN in the child env, never on argv."""
+    runner = SequencedGhRunner([b"[]", b"[]"])
+    gh = GhCli(token="s3cret", runner=runner)
+
+    await gh.flight_snapshot(repo_full_name="owner/repo")
+
+    for argv in runner.argvs:
+        assert "s3cret" not in list(argv)
+
+
+@pytest.mark.asyncio
+async def test_ghcli_flight_snapshot_handles_an_empty_repo() -> None:
+    """No open PRs and no issue branches -> every issue classifies ABSENT."""
+    runner = SequencedGhRunner([b"[]", b"[]"])
+    gh = GhCli(runner=runner)
+
+    snapshot = await gh.flight_snapshot(repo_full_name="owner/repo")
+
+    assert snapshot.state_for(7) is FlightState.ABSENT

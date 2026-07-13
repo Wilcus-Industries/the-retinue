@@ -115,7 +115,7 @@ def _governor(tmp_path: Path, clock: _Clock, *, weekly: float = 1000.0) -> Budge
 async def test_build_prd_defers_when_budget_spent(tmp_path: Path) -> None:
     """An estimate over the rolling-24h cap defers the run; nothing is implemented."""
     clock = _Clock()
-    governor = _governor(tmp_path, clock, weekly=0.0)  # cap is 0 -> any estimate defers
+    governor = _governor(tmp_path, clock, weekly=1.0)  # cap 0.12 < the 1.0 estimate -> defers
     implementer = _Implementer()
     build_prd = bind_build_prd(
         implementer=cast(Implementer, implementer),
@@ -217,7 +217,7 @@ async def test_build_prd_charges_the_shared_ledger(tmp_path: Path) -> None:
 async def test_deferred_build_prd_charges_nothing(tmp_path: Path) -> None:
     """A deferred PRD run leaves the ledger untouched: no phantom charge without a build."""
     clock = _Clock()
-    governor = _governor(tmp_path, clock, weekly=0.0)  # cap is 0 -> any estimate defers
+    governor = _governor(tmp_path, clock, weekly=1.0)  # cap 0.12 < the 1.0 estimate -> defers
     build_prd = bind_build_prd(
         implementer=cast(Implementer, _Implementer()),
         governor=governor,
@@ -413,7 +413,7 @@ async def test_adhoc_drain_skips_the_build_when_the_shared_budget_is_spent(
     from retinue.adhoc_drain import ReadyIssue
 
     clock = _Clock()
-    governor = _governor(tmp_path, clock, weekly=0.0)  # cap is 0 -> every build is declined
+    governor = _governor(tmp_path, clock, weekly=1.0)  # cap 0.12 < the 1.0 estimate -> declined
     gh = _FakeAdhocGh([ReadyIssue(number=7, labels=["ready-for-agent"], body="")])
     built: list[AdhocIssue] = []
 

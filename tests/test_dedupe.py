@@ -6,6 +6,7 @@ redelivered or duplicate ``issues`` event for an already-processed PRD is ignore
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -54,3 +55,43 @@ async def test_dedupe_persists_across_store_instances(db_path: Path) -> None:
     assert await PrdDedupeStore(db_path).claim("owner/repo#7") is True
     # A brand-new store object pointed at the same file must see the prior claim.
     assert await PrdDedupeStore(db_path).claim("owner/repo#7") is False
+
+
+@pytest.mark.asyncio
+async def test_release_lets_a_burned_prd_be_reclaimed(db_path: Path) -> None:
+    """Releasing a claim deletes the row so a crashed-mid-flight PRD can retry.
+
+    A worker that claims a PRD then dies before its run state persists must not lose
+    the PRD forever; the failure path releases the claim so a redelivery re-claims it.
+    """
+    store = PrdDedupeStore(db_path)
+    assert await store.claim("owner/repo#7") is True
+    await store.release("owner/repo#7")
+    assert await store.claim("owner/repo#7") is True
+
+
+@pytest.mark.asyncio
+async def test_release_of_unclaimed_key_is_a_noop(db_path: Path) -> None:
+    """Releasing a key that was never claimed neither raises nor claims it."""
+    store = PrdDedupeStore(db_path)
+    await store.release("never/claimed#1")  # must not raise
+    assert await store.claim("never/claimed#1") is True
+
+
+@pytest.mark.asyncio
+async def test_store_reuses_a_single_connection(db_path: Path) -> None:
+    """The store opens one long-lived connection, not a fresh one per call."""
+    store = PrdDedupeStore(db_path)
+    await store.claim("owner/repo#1")
+    connection = store._db
+    assert connection is not None
+    await store.claim("owner/repo#2")
+    assert store._db is connection
+
+
+@pytest.mark.asyncio
+async def test_concurrent_claims_of_one_key_have_a_single_winner(db_path: Path) -> None:
+    """The per-store lock keeps concurrent claims of one key to exactly one winner."""
+    store = PrdDedupeStore(db_path)
+    results = await asyncio.gather(*[store.claim("owner/repo#7") for _ in range(25)])
+    assert sum(results) == 1

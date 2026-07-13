@@ -240,6 +240,10 @@ class DockerRuntime:
         )
         self._registry_username = registry_username
         self._registry_password = registry_password
+        # Images confirmed present on the daemon this run. A single-host deploy builds the
+        # runner image once and never changes it, so a start after the first can skip the
+        # inspect (and the pull) entirely.
+        self._present_images: set[str] = set()
 
     async def _request(
         self,
@@ -270,7 +274,7 @@ class DockerRuntime:
             await writer.wait_closed()
 
     async def start(self, *, image: str, env: dict[str, str]) -> Container:
-        await self._pull_image(image)
+        await self._ensure_image(image)
         status, body = await self._request(
             "POST", "/containers/create", body=_create_container_payload(image=image, env=env)
         )
@@ -288,6 +292,22 @@ class DockerRuntime:
             )
         return DockerContainer(container_id, self)
 
+    async def _ensure_image(self, image: str) -> None:
+        """Make sure the daemon has ``image``, pulling only on a local miss.
+
+        Check-local-first (``docker run --pull=missing`` semantics): a single-host deploy
+        builds the runner image on the same daemon the worker drives and never pushes it
+        to a registry, so pulling on every start is pure latency (and would be denied).
+        Presence is cached per runtime instance, so repeated starts skip the check.
+        """
+        if image in self._present_images:
+            return
+        if await self._image_exists_locally(image):
+            self._present_images.add(image)
+            return
+        await self._pull_image(image)
+        self._present_images.add(image)
+
     async def _pull_image(self, image: str) -> None:
         headers: dict[str, str] = {}
         if self._registry_username is not None and self._registry_password is not None:
@@ -298,18 +318,6 @@ class DockerRuntime:
             "POST", f"/images/create?fromImage={quote(image, safe='')}", headers=headers
         )
         if status == 200:
-            return
-        # The pull failed. Before treating that as fatal, fall back to a locally-present
-        # image — `docker run --pull=missing` semantics. A local single-host deploy builds
-        # the runner image on the same daemon the worker drives and never pushes it to a
-        # registry, so the pull is denied even though the image is right there. Only raise
-        # when the daemon has no such image either.
-        if await self._image_exists_locally(image):
-            logger.warning(
-                "image pull failed (%s) but %s is present locally; using the local image",
-                status,
-                image,
-            )
             return
         raise DockerError(f"image pull failed ({status}): {body.decode(errors='replace')}")
 

@@ -118,3 +118,26 @@ async def test_enqueue_adhoc_drain_deduplicated_returns_empty() -> None:
     mock_pool = AsyncMock()
     mock_pool.enqueue_job = AsyncMock(return_value=None)
     assert await enqueue_adhoc_drain(mock_pool, AdhocDrainJob("owner/repo")) == ""
+
+
+@pytest.mark.asyncio
+async def test_enqueue_adhoc_drain_clears_stale_result_before_enqueue() -> None:
+    """A kick clears any completed drain's result key so it coalesces only in-flight.
+
+    Arq's enqueue dedups on both the queued/running job key AND the *result* key, which
+    lingers for ``keep_result`` seconds after a drain finishes — so without clearing it
+    a post-completion kick is silently dropped for up to an hour. The kick deletes the
+    stale result key first (a no-op while queued/running, where the job key still
+    coalesces), so coalescing is bounded to the actually-in-flight window.
+    """
+    parent = MagicMock()
+    parent.delete = AsyncMock()
+    parent.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-d"))
+
+    assert await enqueue_adhoc_drain(parent, AdhocDrainJob("owner/repo")) == "jid-d"
+
+    parent.delete.assert_awaited_once_with("arq:result:adhoc-drain:owner/repo")
+    # The result key must be cleared BEFORE the enqueue, never after.
+    assert [c[0] for c in parent.mock_calls].index("delete") < [
+        c[0] for c in parent.mock_calls
+    ].index("enqueue_job")

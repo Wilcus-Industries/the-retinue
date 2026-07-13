@@ -11,6 +11,7 @@ repo + issue, mirroring the durable-SQLite style of
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import aiosqlite
@@ -23,6 +24,32 @@ CREATE TABLE IF NOT EXISTS impl_retries (
     attempts  INTEGER NOT NULL DEFAULT 0
 )
 """
+
+# A fresh ImplRetryStore is constructed per build binding, so it is NOT long-lived and
+# must not hold a persistent connection (that would leak a connection/thread per event).
+# The one-time cost — mkdir, schema, and the persistent WAL mode — is instead memoised
+# per db-path so it runs once per process per file, not on every call. WAL is a durable
+# property of the db file, so setting it once is enough.
+_initialized_paths: set[Path] = set()
+# Serialises only the one-time WAL switch + schema create per path: concurrent
+# first-calls must not race the journal-mode transition (which errors "database is
+# locked"). Steady state hits the in-set fast path and never touches this lock.
+_init_lock = asyncio.Lock()
+
+
+async def _ensure_initialized(db_path: Path) -> None:
+    """Create the parent dir, schema, and WAL mode once per db-path per process."""
+    if db_path in _initialized_paths:
+        return
+    async with _init_lock:
+        if db_path in _initialized_paths:
+            return
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(_SCHEMA)
+            await db.commit()
+        _initialized_paths.add(db_path)
 
 
 def impl_retry_key(slice_: Slice) -> str:
@@ -61,13 +88,14 @@ class ImplRetryStore:
         Returns:
             The persisted attempt count, or ``0`` for a slice never recorded.
         """
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(_SCHEMA)
-            async with db.execute(
+        await _ensure_initialized(self._db_path)
+        async with (
+            aiosqlite.connect(self._db_path) as db,
+            db.execute(
                 "SELECT attempts FROM impl_retries WHERE slice_key = ?", (key,)
-            ) as cursor:
-                row = await cursor.fetchone()
+            ) as cursor,
+        ):
+            row = await cursor.fetchone()
         return int(row[0]) if row is not None else 0
 
     async def record_attempt(self, key: str) -> int:
@@ -82,9 +110,8 @@ class ImplRetryStore:
         Returns:
             The attempt count after this increment.
         """
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        await _ensure_initialized(self._db_path)
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(_SCHEMA)
             await db.execute(
                 """
                 INSERT INTO impl_retries (slice_key, attempts) VALUES (?, 1)
