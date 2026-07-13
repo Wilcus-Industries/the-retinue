@@ -14,6 +14,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from retinue.db import connect_daemon
 from retinue.queue import PrdJob
 
 _SCHEMA = """
@@ -64,8 +65,7 @@ class PrdDedupeStore:
         are applied exactly once, when the connection is first opened.
         """
         if self._db is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            db = await aiosqlite.connect(self._db_path)
+            db = await connect_daemon(self._db_path)
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA synchronous=NORMAL")
             await db.execute(_SCHEMA)

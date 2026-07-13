@@ -330,6 +330,24 @@ async def test_concurrent_try_record_on_one_instance_is_serialized(
 
 
 @pytest.mark.asyncio
+async def test_ledger_connection_thread_is_a_daemon(db_path: Path) -> None:
+    """The connection's worker thread must not block interpreter exit.
+
+    aiosqlite runs each connection on a thread; a ledger leaked without close()
+    (crash paths, test teardown) would otherwise hang process shutdown forever on
+    the non-daemon thread join.
+    """
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=1.0)
+    assert ledger._db is not None
+    assert ledger._db._thread.daemon is True
+    await ledger.close()
+
+
+@pytest.mark.asyncio
 async def test_ledger_close_is_reusable_and_persists(db_path: Path) -> None:
     """close() releases the connection; data persists and a later call lazily reconnects."""
     clock = FakeClock()

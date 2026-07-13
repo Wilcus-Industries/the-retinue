@@ -135,17 +135,23 @@ async def _drain(
     if governor is None:
         assert tmp_path is not None, "pass a governor or a tmp_path for a default one"
         governor = _governor(tmp_path)
-    return await run_adhoc_drain(
-        repo_full_name="owner/repo",
-        gh=gh,
-        build=build,
-        open_pr=open_pr or RecordingPrOpen(),
-        config=config or RepoConfig(),
-        governor=governor,
-        estimated_amount=estimated_amount,
-        lock=lock or _nolock(),
-        prd_in_flight=prd_in_flight,
-    )
+    try:
+        return await run_adhoc_drain(
+            repo_full_name="owner/repo",
+            gh=gh,
+            build=build,
+            open_pr=open_pr or RecordingPrOpen(),
+            config=config or RepoConfig(),
+            governor=governor,
+            estimated_amount=estimated_amount,
+            lock=lock or _nolock(),
+            prd_in_flight=prd_in_flight,
+        )
+    finally:
+        # Release the governor's SQLite connection on this test's own event loop; a
+        # leaked one is torn down at GC against whatever loop is current then. close()
+        # reconnects lazily, so tests that meter the governor afterwards still work.
+        await governor.close()
 
 
 class FakeAdhocGh:

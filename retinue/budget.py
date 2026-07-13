@@ -47,6 +47,7 @@ from typing import Protocol
 
 import aiosqlite
 
+from retinue.db import connect_daemon
 from retinue.orchestrator import PrdSlice
 from retinue.reconcile import (
     ReconcileGh,
@@ -227,8 +228,7 @@ class BudgetLedger:
         must hold :attr:`_lock` around this and the statements that follow.
         """
         if self._db is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._db = await aiosqlite.connect(self._db_path, isolation_level=None)
+            self._db = await connect_daemon(self._db_path, isolation_level=None)
             await self._db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             await self._db.execute("PRAGMA journal_mode=WAL")
             await self._db.execute("PRAGMA synchronous=NORMAL")
@@ -449,8 +449,7 @@ class BudgetGovernor:
         statements that follow.
         """
         if self._db is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._db = await aiosqlite.connect(self._db_path, isolation_level=None)
+            self._db = await connect_daemon(self._db_path, isolation_level=None)
             await self._db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
             await self._db.execute("PRAGMA journal_mode=WAL")
             await self._db.execute("PRAGMA synchronous=NORMAL")

@@ -1117,10 +1117,17 @@ _ADHOC_DRAIN_ESTIMATED_AMOUNT = 1.0
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
-    """Close the shared GitHub HTTP client opened in :func:`on_startup`, if any."""
+    """Close what :func:`on_startup` opened: the GitHub HTTP client and dedupe store.
+
+    The dedupe store's SQLite connection rides an aiosqlite worker thread; skipping
+    its close would strand that thread past shutdown.
+    """
     client: httpx.AsyncClient | None = ctx.get("github_client")
     if client is not None:
         await client.aclose()
+    dedupe: PrdDedupeStore | None = ctx.get("dedupe")
+    if dedupe is not None:
+        await dedupe.close()
 
 
 async def _no_config_fetcher(repo_full_name: str) -> str | None:
