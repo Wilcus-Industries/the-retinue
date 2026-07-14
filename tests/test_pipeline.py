@@ -1053,6 +1053,9 @@ class _RecordingAdhocPipeline:
 
     pr_calls: list[tuple[object, object]] = field(default_factory=list)
     pr_result: object | None = None
+    # The shared budget governor the per-issue classify hop meters on; ``None`` is fine
+    # for the table-less chain tests (they never classify) and for tests that fake the hop.
+    governor: object | None = None
 
     async def process_adhoc_pr(self, issue: object, build: object) -> object | None:
         self.pr_calls.append((issue, build))
@@ -1169,18 +1172,20 @@ async def test_bind_adhoc_build_still_chains_process_adhoc_pr_on_a_red_build(
     assert pipeline.pr_calls == [(issue, red)]
 
 
-def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
+@pytest.mark.asyncio
+async def test_bind_adhoc_build_resolves_each_role_model_at_the_issue_level(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each role's model in the ad-hoc build resolves against the repo config override.
+    """Each ad-hoc role is constructed *per issue* at the issue's resolved routing level.
 
-    A routing table whose ``default:`` level names the planner/implementer/reviewer roles
-    must flow into the constructed adapters' models — proving the ad-hoc lane runs the
-    repo's chosen models, not the registry defaults. The adapter constructors are captured
-    so the ``model=`` each receives is asserted against the routing override.
+    Issue #65: the ad-hoc lane classifies each issue once at build start and constructs its
+    planner/implementer/reviewer at that resolved level (not at bind time, and not at the
+    table default). The per-issue classify hop is faked to resolve ``standard`` — a level
+    whose ``roles:`` map overrides all three models — so the captured ``model=`` each
+    adapter receives proves the resolved level flowed into the construction.
     """
     import retinue.pipeline as pipeline_mod
-    from retinue.adhoc_build import ContainerPlanner
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ContainerPlanner
     from retinue.orchestrator import ContainerImplementer
     from retinue.pipeline import bind_adhoc_build
     from retinue.reviewer import AgentSdkReviewGenerator
@@ -1208,6 +1213,20 @@ def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
     monkeypatch.setattr(
         pipeline_mod, "AgentSdkReviewGenerator", _record("reviewer", AgentSdkReviewGenerator)
     )
+    # Fake the classify hop (resolves to ``standard``) and the container build, so the
+    # closure runs offline — no gh, no classifier HTTP, no Docker.
+    resolved: list[object] = []
+
+    async def _fake_level(issue: object, config: object, **kwargs: object) -> str:
+        resolved.append(issue)
+        return "standard"
+
+    monkeypatch.setattr(pipeline_mod, "_resolve_adhoc_level", _fake_level)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "build_adhoc_issue",
+        _fake_build_adhoc_issue({}, AdhocBuildResult(branch="issue-31", passed=True)),
+    )
 
     config = RepoConfig(
         staging_branch="staging",
@@ -1227,7 +1246,7 @@ def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
         ),
     )
     settings = _settings(tmp_path, anthropic_credential="k")
-    bind_adhoc_build(
+    build = bind_adhoc_build(
         settings,  # type: ignore[arg-type]
         _FakeAuth(),  # type: ignore[arg-type]
         pipeline=_RecordingAdhocPipeline(),  # type: ignore[arg-type]
@@ -1237,6 +1256,14 @@ def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
         claude_md="## Definition of done\n```\nuv run pytest\n```\n",
     )
 
+    # No role is constructed at bind time — construction is deferred into the per-issue build.
+    assert captured == {}
+
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    await build(issue, repo_full_name="owner/repo")
+
+    # The issue was classified exactly once, and each role was built at that level's model.
+    assert resolved == [issue]
     assert captured == {
         "planner": "planner-custom",
         "implementer": "implementer-custom",

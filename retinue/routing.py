@@ -15,6 +15,11 @@ call that actually runs is metered after the fact on the shared budget ledger vi
 runs no classifier and records nothing). A classification failure builds the slice at the
 table's ``default`` level and posts an explanatory issue comment naming that level.
 
+The classify-one-issue-to-a-level hop is factored into :func:`resolve_issue_level`, the
+single seam both this PRD-lane router and the ad-hoc lane
+(:func:`retinue.pipeline._resolve_adhoc_level`) route through, so a PRD slice and a
+standalone ad-hoc issue classify, meter, label, and comment identically.
+
 The two seams — :data:`IssueFactsSource` (fetch one issue's :class:`ClassifyInput`) and
 :data:`PerIssueImplementer` (resolve the implementer for one slice) — are injected so the
 production ``gh`` adapter fakes out in tests. No import of :mod:`retinue.wiring` or
@@ -104,6 +109,71 @@ class GhCliIssueFacts:
         return _parse_issue_facts(stdout)
 
 
+async def resolve_issue_level(
+    repo_full_name: str,
+    issue_number: int,
+    config: RepoConfig,
+    *,
+    classify: Classifier,
+    label_sink: LabelSink,
+    comment_sink: CommentSink,
+    issue_facts: IssueFactsSource,
+    governor: BudgetGovernor,
+    classifier_charge: float,
+) -> str:
+    """Classify one issue to a routing level, the shared per-issue routing hop.
+
+    Fetches the issue's facts, resolves the level (honoring a pre-existing ``level:``
+    label via :func:`retinue.level.resolve_level`), meters each classifier call that
+    actually ran on the shared ledger, and posts the failure comment on a classification
+    failure. Returns the resolved level name — always one of the table's declared levels.
+
+    The PRD build lane (:class:`PerIssueImplementerRouter`) and the ad-hoc lane
+    (:func:`retinue.pipeline._resolve_adhoc_level`) both route through this one hop, so a
+    slice and a standalone issue classify and meter identically. A facts-fetch, label, or
+    comment error propagates; each lane's caller decides the fallback (both fall back to
+    the table's ``default`` level rather than escalating).
+
+    Args:
+        repo_full_name: ``"owner/repo"``.
+        issue_number: The issue number being routed.
+        config: The repo config; its ``routing:`` table supplies the level set.
+        classify: The classifier seam (``ClaudeIssueClassifier.__call__`` in production).
+        label_sink: Applies the resolved ``level:`` label (best-effort).
+        comment_sink: Posts the classification-failure explanation.
+        issue_facts: Fetches one issue's :class:`ClassifyInput`.
+        governor: The shared budget governor each classifier charge is recorded on.
+        classifier_charge: The estimated charge one classifier call meters.
+
+    Returns:
+        The resolved routing level name.
+    """
+    routing = config.routing
+    # The helper is only reached for routing repos; assert narrows for mypy and fails
+    # loudly on misuse.
+    assert routing is not None
+    facts = await issue_facts(repo_full_name, issue_number)
+    resolution = await resolve_level(
+        facts,
+        routing,
+        classify=classify,
+        label_sink=label_sink,
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+    )
+    if resolution.classified:
+        await governor.record_charge(amount=classifier_charge)
+    if resolution.failed:
+        await comment_sink(
+            CommentRequest(
+                repo_full_name=repo_full_name,
+                issue_number=issue_number,
+                body=_FAILURE_COMMENT.format(level=resolution.level),
+            )
+        )
+    return resolution.level
+
+
 @dataclass(frozen=True)
 class PerIssueImplementerRouter:
     """A :data:`PerIssueImplementer`: classify one slice and route its implementer model.
@@ -166,32 +236,16 @@ class PerIssueImplementerRouter:
 
     async def _resolve(self, slice_: Slice) -> Implementer:
         """Classify one slice and route its implementer model; may raise on any hop."""
-        routing = self.config.routing
-        # The router is only constructed for routing repos; assert narrows for mypy and
-        # fails loudly on misuse.
-        assert routing is not None
-        facts = await self.issue_facts(slice_.repo_full_name, slice_.issue_number)
-        resolution = await resolve_level(
-            facts,
-            routing,
+        level = await resolve_issue_level(
+            slice_.repo_full_name,
+            slice_.issue_number,
+            self.config,
             classify=self.classify,
             label_sink=self.label_sink,
-            repo_full_name=slice_.repo_full_name,
-            issue_number=slice_.issue_number,
+            comment_sink=self.comment_sink,
+            issue_facts=self.issue_facts,
+            governor=self.governor,
+            classifier_charge=self.classifier_charge,
         )
-        if resolution.classified:
-            await self.governor.record_charge(amount=self.classifier_charge)
-        if resolution.failed:
-            await self._post_failure_comment(slice_, resolution.level)
-        model = resolve_model(Role.IMPLEMENTER, self.config, level=resolution.level)
+        model = resolve_model(Role.IMPLEMENTER, self.config, level=level)
         return replace(self.base_implementer, model=model)
-
-    async def _post_failure_comment(self, slice_: Slice, level: str) -> None:
-        """Post the classification-failure explanation naming the applied ``level``."""
-        await self.comment_sink(
-            CommentRequest(
-                repo_full_name=slice_.repo_full_name,
-                issue_number=slice_.issue_number,
-                body=_FAILURE_COMMENT.format(level=level),
-            )
-        )
