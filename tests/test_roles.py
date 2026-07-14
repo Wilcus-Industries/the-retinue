@@ -171,6 +171,41 @@ def test_resolve_at_unknown_level_falls_back_to_registry_defaults() -> None:
         )
 
 
+def test_resolve_at_unknown_explicit_level_warns_with_the_level_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An explicit level naming no declared level logs a warning naming it.
+
+    The silent registry fallback hides typos and stale level names (e.g. a hand-applied
+    ``level:`` label for a level since removed from the table); the warning surfaces them
+    without changing the fallback behavior.
+    """
+    config = _routing_config()
+    with caplog.at_level("WARNING", logger="retinue.roles"):
+        assert (
+            resolve_model(Role.IMPLEMENTER, config, level="nonexistent")
+            == ROLE_REGISTRY[Role.IMPLEMENTER].model
+        )
+    assert "nonexistent" in caplog.text
+
+
+def test_resolve_at_a_known_level_missing_the_role_does_not_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A declared level whose ``roles:`` map omits the role falls back quietly.
+
+    Only an unknown *level name* signals a typo; a level that simply doesn't override a
+    role is the table working as designed, so it must not log.
+    """
+    config = _routing_config()
+    with caplog.at_level("WARNING", logger="retinue.roles"):
+        assert (
+            resolve_model(Role.SLICER, config, level="standard")
+            == ROLE_REGISTRY[Role.SLICER].model
+        )
+    assert caplog.text == ""
+
+
 def test_planner_role_resolves_opus_high_on_the_cli_transport() -> None:
     """The planner is Opus at the ``high`` tier, invoked on the in-container CLI."""
     spec = ROLE_REGISTRY[Role.PLANNER]

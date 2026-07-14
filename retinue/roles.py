@@ -40,11 +40,14 @@ changing the wire.
 from __future__ import annotations
 
 import enum
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from retinue.repo_config import ModelEffort, RepoConfig
+
+logger = logging.getLogger(__name__)
 
 # Reasoning-effort tiers, expressed as the ``output_config.effort`` string the Messages
 # API call carries. Opus 4.8 (the model every Opus role pins) removed the extended-
@@ -163,6 +166,16 @@ def _routed_override(
     level_name = level if level is not None else config.routing.default
     routing_level = config.routing.levels.get(level_name)
     if routing_level is None:
+        # Only reachable with an explicit level (the default is validated against the
+        # table at config load); an unknown name is a typo or a stale ``level:`` label,
+        # so surface it rather than silently resolving the registry default.
+        if level is not None:
+            logger.warning(
+                "Unknown explicit routing level %r for role %s; falling back to the "
+                "registry default",
+                level,
+                role.value,
+            )
         return None
     return routing_level.roles.get(role.value)
 
