@@ -257,13 +257,17 @@ class ClaudeIssueClassifier:
         """Parse a Messages API response into the chosen level name.
 
         Concatenates the ``text`` content blocks, loads them as the schema JSON, and
-        reads ``level``. Empty text, malformed JSON, a non-object payload, or a level
-        outside the table raises :class:`ClassificationError` — enforcing the enum a
-        second time so non-conforming output triggers the retry.
+        reads ``level``. Empty text, malformed JSON, a non-object payload, or a ``level``
+        that is not a table name raises :class:`ClassificationError` — enforcing the enum
+        a second time so non-conforming output triggers the retry. Every guard tolerates a
+        degenerate 200 body (non-list ``content``, unhashable ``level``) so no shape of a
+        200 response can raise anything but :class:`ClassificationError`.
         """
+        content = body.get("content")
+        blocks = content if isinstance(content, list) else []
         text = "".join(
             block.get("text", "")
-            for block in body.get("content", [])
+            for block in blocks
             if isinstance(block, dict) and block.get("type") == "text"
         )
         if not text.strip():
@@ -276,8 +280,8 @@ class ClaudeIssueClassifier:
         if not isinstance(parsed, dict):
             raise ClassificationError("Classifier JSON is not an object")
         level = parsed.get("level")
-        if level not in self.routing.levels:
+        if not isinstance(level, str) or level not in self.routing.levels:
             raise ClassificationError(
                 f"Classifier chose {level!r}, not one of {sorted(self.routing.levels)}"
             )
-        return str(level)
+        return level

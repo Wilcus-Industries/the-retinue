@@ -247,6 +247,44 @@ async def test_non_conforming_output_retries_once_then_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unhashable_level_retries_once_then_fails() -> None:
+    """A degenerate non-string ``level`` (e.g. a list) fails without raising.
+
+    ``level not in self.routing.levels`` would raise ``TypeError`` on an unhashable
+    value; the type check must turn it into a retried :class:`ClassificationError`.
+    """
+    transport = _FakeTransport(
+        [
+            _text_response({"level": ["trivial"]}),
+            _text_response({"level": ["trivial"]}),
+        ]
+    )
+    gen = _classifier(transport)
+
+    result = await gen(_issue())
+
+    assert result == ClassifyResult(level=None)
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_non_list_content_retries_once_then_fails() -> None:
+    """A 200 body whose ``content`` is not a list fails without raising."""
+    transport = _FakeTransport(
+        [
+            HttpResponse(status_code=200, body={"content": 42}),
+            HttpResponse(status_code=200, body={"content": 42}),
+        ]
+    )
+    gen = _classifier(transport)
+
+    result = await gen(_issue())
+
+    assert result == ClassifyResult(level=None)
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_retry_succeeds_after_a_first_failure() -> None:
     """A first-attempt non-200 then a valid response yields the level in two calls."""
     transport = _FakeTransport(
