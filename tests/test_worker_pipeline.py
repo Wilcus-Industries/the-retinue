@@ -8,11 +8,14 @@ Anthropic, Docker, or network.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
+import pytest_asyncio
 
 import retinue.github_app as github_app
 import retinue.worker as worker
@@ -26,8 +29,8 @@ from retinue.loopback import (
     VerdictOutcome,
     VerdictResult,
 )
-from retinue.pipeline import PrdJobResult
-from retinue.queue import RESUME_ROUNDS_TASK, RUN_ADHOC_DRAIN_TASK
+from retinue.pipeline import PrdJobResult, ResumeRoundOutcome
+from retinue.queue import RESUME_ROUND_TASK, RESUME_ROUNDS_TASK, RUN_ADHOC_DRAIN_TASK
 from retinue.reconcile import ReconcileResult, ResumePhase, RunStateStore
 from retinue.repo_config import RepoConfig
 from retinue.worker import (
@@ -38,6 +41,7 @@ from retinue.worker import (
     process_prd,
     process_review_job,
     reap_pr_job,
+    resume_round_job,
     resume_rounds_job,
     run_adhoc_drain_job,
 )
@@ -55,6 +59,10 @@ class _RecordingPipeline:
     pr_round: tuple[int, list[int]] | None = (7, [100, 101])
     resume_calls: list[tuple[str, int]] = field(default_factory=list)
     resume_failures: set[int] = field(default_factory=set)
+    prd_result: PrdJobResult | None = None
+    prd_exception: Exception | None = None
+    rounds: set[tuple[str, int]] = field(default_factory=set)
+    resume_deferred: bool = False
 
     async def process_prd_job(
         self, *, repo_full_name: str, prd_number: int, prd_body: str
@@ -62,7 +70,9 @@ class _RecordingPipeline:
         self.prd_calls.append(
             {"repo": repo_full_name, "prd": prd_number, "body": prd_body}
         )
-        return PrdJobResult(sliced=True, pr_opened=True)
+        if self.prd_exception is not None:
+            raise self.prd_exception
+        return self.prd_result or PrdJobResult(sliced=True, pr_opened=True)
 
     async def process_review(self, review: HeimdallReview) -> VerdictResult:
         self.reviews.append(review)
@@ -77,14 +87,21 @@ class _RecordingPipeline:
     ) -> tuple[int, list[int]] | None:
         return self.pr_round
 
+    async def has_round(self, *, repo_full_name: str, prd_number: int) -> bool:
+        return (repo_full_name, prd_number) in self.rounds
+
     async def resume_round(
         self, *, repo_full_name: str, prd_number: int
-    ) -> ReconcileResult:
+    ) -> ResumeRoundOutcome:
         self.resume_calls.append((repo_full_name, prd_number))
         if prd_number in self.resume_failures:
             raise RuntimeError(f"resume of PRD #{prd_number} exploded")
-        return ReconcileResult(
-            phase=ResumePhase.DONE, integration_branch=f"retinue/prd-{prd_number}"
+        return ResumeRoundOutcome(
+            reconcile=ReconcileResult(
+                phase=ResumePhase.DONE,
+                integration_branch=f"retinue/prd-{prd_number}",
+            ),
+            deferred=self.resume_deferred,
         )
 
 
@@ -106,15 +123,39 @@ def _ctx(tmp_path: Path, pipeline: _RecordingPipeline, *, body: str = "") -> dic
     }
 
 
+CtxFactory = Callable[..., dict[str, Any]]
+
+
+@pytest_asyncio.fixture()
+async def make_ctx(tmp_path: Path) -> AsyncIterator[CtxFactory]:
+    """A :func:`_ctx` factory that closes each ctx's dedupe store at teardown.
+
+    A leaked store's aiosqlite thread races the test's already-closed event loop at
+    GC time; closing here keeps teardown deterministic.
+    """
+    stores: list[PrdDedupeStore] = []
+
+    def _make(pipeline: _RecordingPipeline, *, body: str = "") -> dict[str, Any]:
+        ctx = _ctx(tmp_path, pipeline, body=body)
+        stores.append(ctx["dedupe"])
+        return ctx
+
+    yield _make
+    for store in stores:
+        await store.close()
+
+
 # --- process_prd ----------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_process_prd_drives_pipeline_with_fetched_body(tmp_path: Path) -> None:
+async def test_process_prd_drives_pipeline_with_fetched_body(
+    make_ctx: CtxFactory,
+) -> None:
     """An accepted PRD reaches the pipeline with its fetched issue body."""
     pipeline = _RecordingPipeline()
     body = "Implement the thing with enough body text to slice it responsibly here."
-    ctx = _ctx(tmp_path, pipeline, body=body)
+    ctx = make_ctx(pipeline, body=body)
 
     await process_prd(ctx, repo_full_name="owner/repo", issue_number=7, action="opened")
 
@@ -122,10 +163,10 @@ async def test_process_prd_drives_pipeline_with_fetched_body(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_process_prd_without_pipeline_is_a_noop(tmp_path: Path) -> None:
+async def test_process_prd_without_pipeline_is_a_noop(make_ctx: CtxFactory) -> None:
     """With no pipeline_factory wired the accepted PRD stops after the gate."""
     pipeline = _RecordingPipeline()
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
     del ctx["pipeline_factory"]
 
     await process_prd(ctx, repo_full_name="owner/repo", issue_number=7, action="opened")
@@ -133,14 +174,193 @@ async def test_process_prd_without_pipeline_is_a_noop(tmp_path: Path) -> None:
     assert pipeline.prd_calls == []
 
 
+@pytest.mark.asyncio
+async def test_process_prd_releases_dedupe_on_a_pre_slice_crash(
+    make_ctx: CtxFactory,
+) -> None:
+    """A pipeline crash before any durable slice releases the PRD's dedupe claim.
+
+    The claim is recorded at the gate, before any run state persists; without the
+    release a pre-slice crash burns the PRD forever — every redelivery reads as a
+    duplicate and the PRD is never processed.
+    """
+    pipeline = _RecordingPipeline(prd_exception=RuntimeError("boom before slicing"))
+    ctx = make_ctx(pipeline)
+
+    with pytest.raises(RuntimeError, match="boom before slicing"):
+        await process_prd(
+            ctx, repo_full_name="owner/repo", issue_number=7, action="opened"
+        )
+
+    # The claim was released: a redelivery claims the key afresh.
+    assert await ctx["dedupe"].claim("owner/repo#7") is True
+
+
+@pytest.mark.asyncio
+async def test_process_prd_keeps_the_claim_when_the_round_persisted(
+    make_ctx: CtxFactory,
+) -> None:
+    """A crash *after* slices persisted keeps the claim — the resume sweep owns it.
+
+    Once the round's slice set is durable, the startup sweep will resume it; releasing
+    the claim would let a redelivery re-slice the same PRD into duplicate issues.
+    """
+    pipeline = _RecordingPipeline(prd_exception=RuntimeError("boom after slicing"))
+    pipeline.rounds.add(("owner/repo", 7))
+    ctx = make_ctx(pipeline)
+
+    with pytest.raises(RuntimeError, match="boom after slicing"):
+        await process_prd(
+            ctx, repo_full_name="owner/repo", issue_number=7, action="opened"
+        )
+
+    assert await ctx["dedupe"].claim("owner/repo#7") is False  # still claimed
+
+
+# --- budget-deferred PRD re-enqueue ----------------------------------------------
+
+
+class _RecordingRedis:
+    """A fake Arq pool recording every enqueue_job call's task name and kwargs."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, dict[str, Any]]] = []
+
+    async def enqueue_job(self, task_name: str, *args: Any, **kwargs: Any) -> object:
+        self.enqueued.append((task_name, kwargs))
+        return object()
+
+
+@pytest.mark.asyncio
+async def test_process_prd_enqueues_a_resume_for_a_deferred_build(
+    make_ctx: CtxFactory,
+) -> None:
+    """A budget-deferred PRD enqueues resume_round_job for when the window frees.
+
+    Re-enqueueing PROCESS_PRD_TASK instead would re-slice the PRD into duplicate
+    issues; the resume task reconciles and re-drives only the unbuilt phase.
+    """
+    from datetime import UTC, datetime
+
+    when = datetime(2026, 6, 23, tzinfo=UTC)
+    pipeline = _RecordingPipeline(
+        prd_result=PrdJobResult(
+            sliced=True, pr_opened=False, deferred=True, defer_until=when
+        )
+    )
+    ctx = make_ctx(pipeline)
+    redis = _RecordingRedis()
+    ctx["redis"] = redis
+
+    await process_prd(ctx, repo_full_name="owner/repo", issue_number=7, action="opened")
+
+    assert redis.enqueued == [
+        (
+            RESUME_ROUND_TASK,
+            {
+                "repo_full_name": "owner/repo",
+                "prd_number": 7,
+                "_job_id": "resume-round:owner/repo#7",
+                "_defer_until": when,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_prd_deferral_without_a_window_falls_back_an_hour(
+    make_ctx: CtxFactory,
+) -> None:
+    """A deferral with no ``defer_until`` re-enqueues on the one-hour fallback."""
+    pipeline = _RecordingPipeline(
+        prd_result=PrdJobResult(sliced=True, pr_opened=False, deferred=True)
+    )
+    ctx = make_ctx(pipeline)
+    redis = _RecordingRedis()
+    ctx["redis"] = redis
+
+    await process_prd(ctx, repo_full_name="owner/repo", issue_number=7, action="opened")
+
+    assert len(redis.enqueued) == 1
+    task, kwargs = redis.enqueued[0]
+    assert task == RESUME_ROUND_TASK
+    assert kwargs["_defer_by"] == 3600
+    assert "_defer_until" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_process_prd_without_deferral_enqueues_no_resume(
+    make_ctx: CtxFactory,
+) -> None:
+    """An undeferred PRD run enqueues nothing extra."""
+    pipeline = _RecordingPipeline()
+    ctx = make_ctx(pipeline)
+    redis = _RecordingRedis()
+    ctx["redis"] = redis
+
+    await process_prd(ctx, repo_full_name="owner/repo", issue_number=7, action="opened")
+
+    assert redis.enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_resume_round_job_resumes_the_round(make_ctx: CtxFactory) -> None:
+    """The deferred-resume task drives the pipeline's resume for its one round."""
+    pipeline = _RecordingPipeline()
+    ctx = make_ctx(pipeline)
+
+    await resume_round_job(ctx, repo_full_name="owner/repo", prd_number=7)
+
+    assert pipeline.resume_calls == [("owner/repo", 7)]
+
+
+@pytest.mark.asyncio
+async def test_resume_round_job_retries_while_still_deferred(
+    make_ctx: CtxFactory,
+) -> None:
+    """A resume whose re-gated build is still over budget retries via arq's Retry.
+
+    Re-enqueueing itself under the same ``_job_id`` would be silently dropped (the
+    running job's key still exists), so the still-deferred resume must raise
+    ``arq.worker.Retry`` and let arq re-schedule the same job.
+    """
+    from arq.worker import Retry
+
+    pipeline = _RecordingPipeline(resume_deferred=True)
+    ctx = make_ctx(pipeline)
+
+    with pytest.raises(Retry):
+        await resume_round_job(ctx, repo_full_name="owner/repo", prd_number=7)
+
+    assert pipeline.resume_calls == [("owner/repo", 7)]
+
+
+@pytest.mark.asyncio
+async def test_resume_round_job_skips_a_deopted_repo(make_ctx: CtxFactory) -> None:
+    """A deferred resume for a repo no longer opted in is a skip, not a crash."""
+    pipeline = _RecordingPipeline()
+    ctx = make_ctx(pipeline)
+
+    async def no_config(repo_full_name: str) -> str | None:
+        return None
+
+    ctx["fetch_config"] = no_config
+
+    await resume_round_job(ctx, repo_full_name="owner/repo", prd_number=7)
+
+    assert pipeline.resume_calls == []
+
+
 # --- review loopback ------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_process_review_job_parses_and_drives_loopback(tmp_path: Path) -> None:
+async def test_process_review_job_parses_and_drives_loopback(
+    make_ctx: CtxFactory,
+) -> None:
     """A review job resolves the PRD, parses findings, and drives the loopback."""
     pipeline = _RecordingPipeline(pr_round=(7, [100]))
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
 
     await process_review_job(
         ctx,
@@ -160,10 +380,10 @@ async def test_process_review_job_parses_and_drives_loopback(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_process_review_job_skips_unknown_pr(tmp_path: Path) -> None:
+async def test_process_review_job_skips_unknown_pr(make_ctx: CtxFactory) -> None:
     """A review on a PR not in run-state is skipped (not the retinue's PR)."""
     pipeline = _RecordingPipeline(pr_round=None)
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
 
     await process_review_job(
         ctx, repo_full_name="owner/repo", pr_number=5, review_state="approved"
@@ -172,14 +392,53 @@ async def test_process_review_job_skips_unknown_pr(tmp_path: Path) -> None:
     assert pipeline.reviews == []
 
 
+@pytest.mark.asyncio
+async def test_process_review_job_serializes_per_pr(make_ctx: CtxFactory) -> None:
+    """Two review jobs for the same PR run one at a time, never interleaved.
+
+    GitHub redelivers ``pull_request_review`` webhooks; without a per-PR lock two
+    deliveries both read a stale round count and double-consume the rebuild budget.
+    """
+
+    class _SlowPipeline(_RecordingPipeline):
+        def __init__(self) -> None:
+            super().__init__(pr_round=(7, [100]))
+            self.active = 0
+            self.max_active = 0
+
+        async def process_review(self, review: HeimdallReview) -> VerdictResult:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0)
+            self.active -= 1
+            return await super().process_review(review)
+
+    pipeline = _SlowPipeline()
+    ctx = make_ctx(pipeline)
+
+    def job() -> Any:
+        return process_review_job(
+            ctx,
+            repo_full_name="owner/repo",
+            pr_number=99,
+            review_state="changes_requested",
+            review_body="high: a blocking problem",
+        )
+
+    await asyncio.gather(job(), job())
+
+    assert len(pipeline.reviews) == 2
+    assert pipeline.max_active == 1
+
+
 # --- reap -----------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_reap_pr_job_resolves_slices_and_reaps(tmp_path: Path) -> None:
+async def test_reap_pr_job_resolves_slices_and_reaps(make_ctx: CtxFactory) -> None:
     """A merge job resolves the PRD + slice issues from run-state and reaps."""
     pipeline = _RecordingPipeline(pr_round=(7, [100, 101]))
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
 
     await reap_pr_job(ctx, repo_full_name="owner/repo", pr_number=99)
 
@@ -194,10 +453,10 @@ async def test_reap_pr_job_resolves_slices_and_reaps(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reap_pr_job_skips_unknown_pr(tmp_path: Path) -> None:
+async def test_reap_pr_job_skips_unknown_pr(make_ctx: CtxFactory) -> None:
     """A merge of a PR the retinue never opened is skipped, not reaped."""
     pipeline = _RecordingPipeline(pr_round=None)
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
 
     await reap_pr_job(ctx, repo_full_name="owner/repo", pr_number=5)
 
@@ -220,10 +479,13 @@ async def _seeded_run_state(tmp_path: Path) -> RunStateStore:
 
 
 @pytest.mark.asyncio
-async def test_resume_rounds_job_resumes_every_persisted_round(tmp_path: Path) -> None:
+async def test_resume_rounds_job_resumes_every_persisted_round(
+    tmp_path: Path,
+    make_ctx: CtxFactory,
+) -> None:
     """The sweep resumes each persisted round through the repo's pipeline."""
     pipeline = _RecordingPipeline()
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
     ctx["run_state"] = await _seeded_run_state(tmp_path)
 
     await resume_rounds_job(ctx)
@@ -234,10 +496,11 @@ async def test_resume_rounds_job_resumes_every_persisted_round(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_resume_rounds_job_skips_a_failing_round_and_continues(
     tmp_path: Path,
+    make_ctx: CtxFactory,
 ) -> None:
     """One round's resume crashing is logged and skipped; the sweep still finishes."""
     pipeline = _RecordingPipeline(resume_failures={7})
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
     ctx["run_state"] = await _seeded_run_state(tmp_path)
 
     await resume_rounds_job(ctx)  # must not raise
@@ -246,10 +509,12 @@ async def test_resume_rounds_job_skips_a_failing_round_and_continues(
 
 
 @pytest.mark.asyncio
-async def test_resume_rounds_job_without_run_state_is_a_noop(tmp_path: Path) -> None:
+async def test_resume_rounds_job_without_run_state_is_a_noop(
+    make_ctx: CtxFactory,
+) -> None:
     """A bare worker (no run-state/pipeline wired) logs and returns, never crashing."""
     pipeline = _RecordingPipeline()
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
     assert "run_state" not in ctx
 
     await resume_rounds_job(ctx)
@@ -258,10 +523,13 @@ async def test_resume_rounds_job_without_run_state_is_a_noop(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_resume_rounds_job_skips_a_deopted_repo(tmp_path: Path) -> None:
+async def test_resume_rounds_job_skips_a_deopted_repo(
+    tmp_path: Path,
+    make_ctx: CtxFactory,
+) -> None:
     """A persisted round of a repo no longer opted in is skipped, its row left alone."""
     pipeline = _RecordingPipeline()
-    ctx = _ctx(tmp_path, pipeline)
+    ctx = make_ctx(pipeline)
     store = await _seeded_run_state(tmp_path)
     ctx["run_state"] = store
 
@@ -276,25 +544,78 @@ async def test_resume_rounds_job_skips_a_deopted_repo(tmp_path: Path) -> None:
     assert len(await store.all_rounds()) == 2  # the rows survive for a later sweep
 
 
+def _registered_names() -> set[str]:
+    """The registered task names; ``arq.worker.func`` wrappers carry ``.name``."""
+    return {
+        getattr(fn, "name", None) or getattr(fn, "__name__")  # noqa: B009
+        for fn in WorkerSettings.functions
+    }
+
+
 def test_worker_registers_the_resume_task() -> None:
     """WorkerSettings registers ``resume_rounds_job`` under the enqueue-side task name."""
-    names = {fn.__name__ for fn in WorkerSettings.functions}
-    assert RESUME_ROUNDS_TASK in names
+    assert RESUME_ROUNDS_TASK in _registered_names()
     assert resume_rounds_job.__name__ == RESUME_ROUNDS_TASK
+
+
+def test_worker_registers_the_deferred_resume_task() -> None:
+    """WorkerSettings registers ``resume_round_job`` under the enqueue-side task name."""
+    assert RESUME_ROUND_TASK in _registered_names()
+    assert resume_round_job.__name__ == RESUME_ROUND_TASK
+
+
+def test_re_enqueued_tasks_keep_no_result() -> None:
+    """The self-re-enqueued tasks register with ``keep_result=0``.
+
+    arq's enqueue dedups on the completed job's *result* key too; a lingering result
+    (default 1h) would silently drop the next kick — a restart inside that window
+    would skip the resume sweep, and a deferred resume could never re-enqueue.
+    """
+    from arq.worker import Function
+
+    by_name = {
+        fn.name: fn for fn in WorkerSettings.functions if isinstance(fn, Function)
+    }
+    for task in (RESUME_ROUNDS_TASK, RESUME_ROUND_TASK, RUN_ADHOC_DRAIN_TASK):
+        assert task in by_name, f"{task} is not registered via arq func()"
+        assert by_name[task].keep_result_s == 0, f"{task} keeps its result"
+
+
+@pytest.mark.asyncio
+async def test_resume_rounds_job_re_enqueues_a_deferred_round(
+    tmp_path: Path,
+    make_ctx: CtxFactory,
+) -> None:
+    """The startup sweep re-enqueues a round whose resumed build was budget-deferred.
+
+    Without this the deferred round's row just sits until the *next* restart happens
+    to sweep it — the deferral would only ever resolve by accident.
+    """
+    pipeline = _RecordingPipeline(resume_deferred=True)
+    ctx = make_ctx(pipeline)
+    ctx["run_state"] = await _seeded_run_state(tmp_path)
+    redis = _RecordingRedis()
+    ctx["redis"] = redis
+
+    await resume_rounds_job(ctx)
+
+    assert [task for task, _ in redis.enqueued] == [RESUME_ROUND_TASK] * 2
+    assert redis.enqueued[0][1]["_job_id"] == "resume-round:owner/repo#7"
+    assert redis.enqueued[1][1]["_job_id"] == "resume-round:owner/repo#9"
 
 
 # --- ad-hoc drain kick ----------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_adhoc_drain_job_drives_the_bound_drain(tmp_path: Path) -> None:
+async def test_run_adhoc_drain_job_drives_the_bound_drain(make_ctx: CtxFactory) -> None:
     """A kicked drain job calls the bound drain from ctx with the repo (and its config)."""
     calls: list[dict[str, Any]] = []
 
     async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
         calls.append({"repo": repo_full_name, "config": config})
 
-    ctx = _ctx(tmp_path, _RecordingPipeline())
+    ctx = make_ctx(_RecordingPipeline())
     ctx["adhoc_drain"] = drain
 
     await run_adhoc_drain_job(ctx, repo_full_name="owner/repo")
@@ -305,23 +626,25 @@ async def test_run_adhoc_drain_job_drives_the_bound_drain(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_run_adhoc_drain_job_without_drain_is_a_noop(tmp_path: Path) -> None:
+async def test_run_adhoc_drain_job_without_drain_is_a_noop(
+    make_ctx: CtxFactory,
+) -> None:
     """With no drain wired (bare worker) the kick logs and returns, never crashing."""
-    ctx = _ctx(tmp_path, _RecordingPipeline())
+    ctx = make_ctx(_RecordingPipeline())
     assert "adhoc_drain" not in ctx
 
     await run_adhoc_drain_job(ctx, repo_full_name="owner/repo")  # must not raise
 
 
 @pytest.mark.asyncio
-async def test_run_adhoc_drain_job_skips_a_deopted_repo(tmp_path: Path) -> None:
+async def test_run_adhoc_drain_job_skips_a_deopted_repo(make_ctx: CtxFactory) -> None:
     """A repo no longer opted in (no config) is a skip — the drain is never fired."""
     calls: list[str] = []
 
     async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
         calls.append(repo_full_name)
 
-    ctx = _ctx(tmp_path, _RecordingPipeline())
+    ctx = make_ctx(_RecordingPipeline())
     ctx["adhoc_drain"] = drain
 
     async def no_config(repo_full_name: str) -> str | None:
@@ -341,8 +664,7 @@ def test_worker_registers_the_adhoc_drain_task() -> None:
     ``RUN_ADHOC_DRAIN_TASK`` and Arq dequeues by ``__name__``, so a function with that
     exact name must be in ``WorkerSettings.functions`` or the kick is dropped.
     """
-    names = {fn.__name__ for fn in WorkerSettings.functions}
-    assert RUN_ADHOC_DRAIN_TASK in names
+    assert RUN_ADHOC_DRAIN_TASK in _registered_names()
     assert run_adhoc_drain_job.__name__ == RUN_ADHOC_DRAIN_TASK
 
 
@@ -400,6 +722,34 @@ def test_parse_heimdall_review_unknown_state_is_commented() -> None:
     )
     assert review.state is ReviewState.COMMENTED
     assert review.findings == []
+
+
+def test_parse_heimdall_review_tolerates_markdown_finding_lines() -> None:
+    """Finding lines survive common markdown dressing: bullets, bold, numbering.
+
+    Heimdall writes prose reviews; a bullet like ``- **high**: broken auth`` must
+    parse as a HIGH finding rather than silently reading as zero findings (which
+    would previously converge a rejected PR).
+    """
+    body = (
+        "- **high**: broken auth check\n"
+        "* medium: slow query\n"
+        "1. low: rename this\n"
+        "2. **critical**: drops the table\n"
+    )
+    review = parse_heimdall_review(
+        repo_full_name="owner/repo",
+        pr_number=99,
+        prd_number=7,
+        review_state="changes_requested",
+        review_body=body,
+    )
+    assert [(f.severity, f.summary) for f in review.findings] == [
+        (Severity.HIGH, "broken auth check"),
+        (Severity.MEDIUM, "slow query"),
+        (Severity.LOW, "rename this"),
+        (Severity.CRITICAL, "drops the table"),
+    ]
 
 
 # --- on_startup: the production wiring path -------------------------------------
@@ -499,20 +849,40 @@ async def test_on_startup_kicks_the_resume_sweep(
         worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
     )
 
-    enqueued: list[str] = []
-
-    class _FakeRedis:
-        async def enqueue_job(self, task_name: str, *args: Any, **kwargs: Any) -> None:
-            enqueued.append(task_name)
-
-    ctx: dict[str, Any] = {"redis": _FakeRedis()}
+    redis = _RecordingRedis()
+    ctx: dict[str, Any] = {"redis": redis}
     try:
         await on_startup(ctx)
 
         assert isinstance(ctx["run_state"], RunStateStore)
-        assert enqueued == [RESUME_ROUNDS_TASK]
+        assert [task for task, _ in redis.enqueued] == [RESUME_ROUNDS_TASK]
+        # A pinned job id: with keep_result=0 a restart always re-kicks the sweep
+        # instead of racing a lingering result key from the previous boot.
+        assert redis.enqueued[0][1]["_job_id"] == "resume-rounds"
     finally:
         await on_shutdown(ctx)
+
+
+@pytest.mark.asyncio
+async def test_on_shutdown_closes_the_dedupe_store(tmp_path: Path) -> None:
+    """on_shutdown releases the dedupe store's SQLite connection.
+
+    The connection rides a non-daemon aiosqlite worker thread; a shutdown that skips
+    the close strands that thread and blocks clean process exit.
+    """
+    store = PrdDedupeStore(tmp_path / "dedupe.sqlite3")
+    await store.claim("owner/repo#1")
+    assert store._db is not None
+
+    await on_shutdown({"dedupe": store})
+
+    assert store._db is None
+
+
+@pytest.mark.asyncio
+async def test_on_shutdown_without_startup_is_a_noop() -> None:
+    """on_shutdown on a ctx on_startup never populated must not raise."""
+    await on_shutdown({})
 
 
 @pytest.mark.asyncio

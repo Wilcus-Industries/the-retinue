@@ -431,8 +431,14 @@ async def test_review_never_blocks_the_build_or_push() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reviewer_credentials_are_injected_at_start() -> None:
-    """The reviewer's auth env rides the build container at start, like the others."""
+async def test_reviewer_credential_is_not_injected_into_the_container() -> None:
+    """The reviewer runs over HTTP, so its credential must NOT ride the build container.
+
+    Unlike the planner and implementer (which exec *inside* the container), the reviewer's
+    model call goes out over HTTP from the generator, so placing its credential in the
+    container's start env is dead weight (and needless secret exposure). It must not appear
+    in the container env.
+    """
 
     class CredReviewer(_ReviewRecorder):
         def auth_env(self) -> dict[str, str]:
@@ -442,7 +448,7 @@ async def test_reviewer_credentials_are_injected_at_start() -> None:
     await _build(runtime=runtime, reviewer=CredReviewer())
 
     assert runtime.started_env is not None
-    assert runtime.started_env["REVIEWER_TOKEN"] == "r"
+    assert "REVIEWER_TOKEN" not in runtime.started_env
 
 
 @pytest.mark.asyncio

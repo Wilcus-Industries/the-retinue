@@ -11,18 +11,23 @@ or via the ``retinue-worker`` console script.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import enum
 import logging
+import re
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from arq import cron
 from arq.connections import RedisSettings
+from arq.worker import Retry
+from arq.worker import func as arq_func
 
 from retinue.budget import SystemClock
 from retinue.cron import CronTickResult
@@ -41,6 +46,7 @@ from retinue.loopback import (
     HeimdallReview,
     ReviewState,
     Severity,
+    round_key,
 )
 from retinue.pipeline import (
     ClaudeMdFetcher,
@@ -48,7 +54,7 @@ from retinue.pipeline import (
     build_pipeline_factory,
     run_state_store_path,
 )
-from retinue.queue import RESUME_ROUNDS_TASK, PrdJob
+from retinue.queue import RESUME_ROUND_TASK, RESUME_ROUNDS_TASK, PrdJob
 from retinue.reconcile import RunStateStore
 from retinue.repo_config import RepoConfig, load_repo_config
 
@@ -203,18 +209,42 @@ async def process_prd(
         return
 
     pipeline = await pipeline_factory(repo_full_name, result.config)
-    prd_result = await pipeline.process_prd_job(
-        repo_full_name=repo_full_name,
-        prd_number=issue_number,
-        prd_body=await _load_prd_body(ctx, repo_full_name, issue_number),
-    )
+    try:
+        prd_result = await pipeline.process_prd_job(
+            repo_full_name=repo_full_name,
+            prd_number=issue_number,
+            prd_body=await _load_prd_body(ctx, repo_full_name, issue_number),
+        )
+    except Exception:
+        # The dedupe claim landed at the gate, before any durable run state. A crash
+        # before the round persisted its slices would otherwise burn the PRD forever
+        # (every redelivery reads as a duplicate), so release the claim; once slices
+        # are durable the resume sweep owns the round and the claim must stand.
+        if not await pipeline.has_round(
+            repo_full_name=repo_full_name, prd_number=issue_number
+        ):
+            await dedupe.release(prd_dedupe_key(job))
+            logger.warning(
+                "PRD %s#%d crashed before any durable slice; dedupe claim released",
+                repo_full_name,
+                issue_number,
+            )
+        raise
     logger.info(
-        "Pipeline for %s#%d: sliced=%s pr_opened=%s",
+        "Pipeline for %s#%d: sliced=%s pr_opened=%s deferred=%s",
         repo_full_name,
         issue_number,
         prd_result.sliced,
         prd_result.pr_opened,
+        prd_result.deferred,
     )
+    if prd_result.deferred:
+        await _enqueue_resume_round(
+            ctx,
+            repo_full_name=repo_full_name,
+            prd_number=issue_number,
+            defer_until=prd_result.defer_until,
+        )
 
 
 async def process_review_job(
@@ -264,7 +294,13 @@ async def process_review_job(
         review_state=review_state,
         review_body=review_body,
     )
-    result = await pipeline.process_review(review)
+    # GitHub redelivers review webhooks; serializing per PR keeps the loopback's
+    # read-count-then-record-round window atomic so two deliveries cannot both see a
+    # stale round count and double-consume the rebuild budget.
+    locks: dict[str, asyncio.Lock] = ctx.setdefault("review_locks", {})
+    lock = locks.setdefault(round_key(repo_full_name, pr_number), asyncio.Lock())
+    async with lock:
+        result = await pipeline.process_review(review)
     logger.info(
         "Loopback for %s PR #%d: %s", repo_full_name, pr_number, result.outcome.value
     )
@@ -353,6 +389,120 @@ async def run_adhoc_drain_job(
     await drain(repo_full_name=repo_full_name, config=config)
 
 
+# A deferral with no reported window (the ledger couldn't say when it frees) retries on
+# this fallback cadence; a reported window schedules the resume for exactly then.
+_DEFERRED_RESUME_FALLBACK_SECONDS = 3600
+# A still-deferred resume retries via arq's Retry; this caps the retries (a day of
+# hourly fallbacks) so a wedged budget can't respin the job forever — the round's
+# run-state row survives for the next restart's sweep either way.
+_RESUME_ROUND_MAX_TRIES = 24
+
+
+def _resume_round_job_id(repo_full_name: str, prd_number: int) -> str:
+    """The per-round Arq job id coalescing concurrent deferred-resume enqueues."""
+    return f"resume-round:{repo_full_name}#{prd_number}"
+
+
+async def _enqueue_resume_round(
+    ctx: dict[str, Any],
+    *,
+    repo_full_name: str,
+    prd_number: int,
+    defer_until: datetime | None,
+) -> None:
+    """Enqueue the deferred round's resume for when the budget window frees.
+
+    Deliberately NOT a re-enqueue of ``PROCESS_PRD_TASK`` — that would re-slice the PRD
+    into duplicate issues. ``resume_round_job`` reconciles against GitHub truth and
+    re-drives only the unbuilt phase. The per-round ``_job_id`` coalesces a burst of
+    deferrals into one scheduled resume (the task registers with ``keep_result=0`` so a
+    finished run's result key never swallows the next enqueue).
+    """
+    redis = ctx.get("redis")
+    if redis is None:
+        logger.warning(
+            "No redis on the worker context; deferred PRD %s#%d was not re-enqueued",
+            repo_full_name,
+            prd_number,
+        )
+        return
+    schedule: dict[str, Any] = (
+        {"_defer_until": defer_until}
+        if defer_until is not None
+        else {"_defer_by": _DEFERRED_RESUME_FALLBACK_SECONDS}
+    )
+    await redis.enqueue_job(
+        RESUME_ROUND_TASK,
+        repo_full_name=repo_full_name,
+        prd_number=prd_number,
+        _job_id=_resume_round_job_id(repo_full_name, prd_number),
+        **schedule,
+    )
+
+
+async def resume_round_job(
+    ctx: dict[str, Any], *, repo_full_name: str, prd_number: int
+) -> None:
+    """Arq task: re-drive one budget-deferred PRD round once its window frees.
+
+    Enqueued by :func:`process_prd` / :func:`resume_rounds_job` when the budget gate
+    deferred a round's build. Re-gates through :meth:`retinue.pipeline.Pipeline.resume_round`
+    (reconcile against GitHub truth, then rebuild only the unfinished slices); a resume
+    that is *still* deferred raises :class:`arq.worker.Retry` so arq re-schedules this
+    same job — re-enqueueing under the running job's own ``_job_id`` would be silently
+    dropped (the live job key still exists). The usual skips apply: a de-opted repo or a
+    bare worker logs and returns.
+
+    Args:
+        ctx: Arq worker context carrying ``fetch_config`` and ``pipeline_factory``.
+        repo_full_name: e.g. "owner/repo".
+        prd_number: The deferred PRD's tracking issue number.
+    """
+    config = await _config_for(ctx, repo_full_name)
+    if config is None:
+        logger.info(
+            "Skipping deferred resume of %s PRD #%d: repo no longer opted in",
+            repo_full_name,
+            prd_number,
+        )
+        return
+    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
+    if pipeline_factory is None:
+        logger.info(
+            "No pipeline wired; dropping deferred resume of %s PRD #%d",
+            repo_full_name,
+            prd_number,
+        )
+        return
+
+    pipeline = await pipeline_factory(repo_full_name, config)
+    outcome = await pipeline.resume_round(
+        repo_full_name=repo_full_name, prd_number=prd_number
+    )
+    if outcome.deferred:
+        defer = _retry_defer_seconds(outcome.defer_until)
+        logger.info(
+            "Resume of %s PRD #%d still budget-deferred; retrying in %.0fs",
+            repo_full_name,
+            prd_number,
+            defer,
+        )
+        raise Retry(defer=defer)
+    logger.info(
+        "Deferred resume of %s PRD #%d completed at %s",
+        repo_full_name,
+        prd_number,
+        outcome.reconcile.phase.value,
+    )
+
+
+def _retry_defer_seconds(defer_until: datetime | None) -> float:
+    """Seconds until the budget window frees, floored at a minute; 1h with no window."""
+    if defer_until is None:
+        return float(_DEFERRED_RESUME_FALLBACK_SECONDS)
+    return max(60.0, (defer_until - datetime.now(UTC)).total_seconds())
+
+
 async def resume_rounds_job(ctx: dict[str, Any]) -> None:
     """Arq task: the crash-resume startup sweep over every persisted PRD round.
 
@@ -388,7 +538,7 @@ async def resume_rounds_job(ctx: dict[str, Any]) -> None:
             continue
         try:
             pipeline = await pipeline_factory(round_.repo_full_name, config)
-            result = await pipeline.resume_round(
+            outcome = await pipeline.resume_round(
                 repo_full_name=round_.repo_full_name, prd_number=round_.prd_number
             )
         except Exception:
@@ -399,11 +549,21 @@ async def resume_rounds_job(ctx: dict[str, Any]) -> None:
                 round_.prd_number,
             )
             continue
+        if outcome.deferred:
+            # A budget-deferred resume would otherwise sit until the *next* restart
+            # happens to sweep it; schedule its own resume for when the window frees.
+            await _enqueue_resume_round(
+                ctx,
+                repo_full_name=round_.repo_full_name,
+                prd_number=round_.prd_number,
+                defer_until=outcome.defer_until,
+            )
         logger.info(
-            "Resumed %s PRD #%d at %s",
+            "Resumed %s PRD #%d at %s%s",
             round_.repo_full_name,
             round_.prd_number,
-            result.phase.value,
+            outcome.reconcile.phase.value,
+            " (budget-deferred)" if outcome.deferred else "",
         )
 
 
@@ -490,18 +650,27 @@ def parse_heimdall_review(
     )
 
 
+# A finding line is ``<severity>: <summary>``, tolerating common markdown dressing —
+# a leading bullet (``-``/``*``/``+``) or ordinal (``1.``/``2)``), and ``**bold**``
+# around the severity — so a prose-formatted heimdall review still parses instead of
+# silently reading as zero findings.
+_FINDING_LINE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])?\s*\*{0,2}(low|medium|high|critical)\*{0,2}\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
 def _parse_findings(review_body: str) -> list[HeimdallFinding]:
     """Parse ``<severity>: <summary>`` lines from a review body into findings."""
     findings: list[HeimdallFinding] = []
     for line in review_body.splitlines():
-        prefix, sep, summary = line.partition(":")
-        if not sep or not summary.strip():
+        match = _FINDING_LINE.match(line)
+        if match is None:
             continue
-        try:
-            severity = Severity[prefix.strip().upper()]
-        except KeyError:
-            continue
-        findings.append(HeimdallFinding(summary=summary.strip(), severity=severity))
+        severity = Severity[match.group(1).upper()]
+        findings.append(
+            HeimdallFinding(summary=match.group(2).strip(), severity=severity)
+        )
     return findings
 
 
@@ -739,7 +908,10 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         ctx["run_state"] = RunStateStore(run_state_store_path(settings))
         redis = ctx.get("redis")
         if redis is not None:
-            await redis.enqueue_job(RESUME_ROUNDS_TASK)
+            # A pinned job id + the keep_result=0 registration make the kick reliable:
+            # without them a restart inside arq's default 1h result window is silently
+            # deduped against the previous boot's completed sweep and never runs.
+            await redis.enqueue_job(RESUME_ROUNDS_TASK, _job_id="resume-rounds")
         else:
             logger.warning(
                 "No redis on the worker context; the resume sweep was not enqueued"
@@ -945,10 +1117,17 @@ _ADHOC_DRAIN_ESTIMATED_AMOUNT = 1.0
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
-    """Close the shared GitHub HTTP client opened in :func:`on_startup`, if any."""
+    """Close what :func:`on_startup` opened: the GitHub HTTP client and dedupe store.
+
+    The dedupe store's SQLite connection rides an aiosqlite worker thread; skipping
+    its close would strand that thread past shutdown.
+    """
     client: httpx.AsyncClient | None = ctx.get("github_client")
     if client is not None:
         await client.aclose()
+    dedupe: PrdDedupeStore | None = ctx.get("dedupe")
+    if dedupe is not None:
+        await dedupe.close()
 
 
 async def _no_config_fetcher(repo_full_name: str) -> str | None:
@@ -1025,12 +1204,18 @@ class WorkerSettings:
         arq retinue.worker.WorkerSettings
     """
 
+    # The re-kicked tasks register with ``keep_result=0``: arq's enqueue dedups on the
+    # completed job's lingering *result* key too (default 1h), so keeping results would
+    # silently swallow a restart's sweep kick, a post-drain webhook kick, and a deferred
+    # round's re-enqueue. ``resume_round_job`` also self-retries via ``Retry`` while the
+    # budget stays deferred, so it carries a bounded ``max_tries``.
     functions = [
         process_prd,
         process_review_job,
         reap_pr_job,
-        run_adhoc_drain_job,
-        resume_rounds_job,
+        arq_func(run_adhoc_drain_job, keep_result=0),
+        arq_func(resume_rounds_job, keep_result=0),
+        arq_func(resume_round_job, keep_result=0, max_tries=_RESUME_ROUND_MAX_TRIES),
     ]
     # The worker-global cron heartbeat: fires every Nth minute as the safety-net sweep for
     # issues labeled while the webhook was missed (firing the ad-hoc drain for each due repo)

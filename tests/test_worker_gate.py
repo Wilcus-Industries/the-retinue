@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
+import pytest_asyncio
 
 from retinue.dedupe import PrdDedupeStore
 from retinue.github_app import InstallationToken
@@ -32,9 +34,12 @@ from retinue.worker import (
 VALID_CONFIG = "staging_branch: release\nretry_cap: 2\n"
 
 
-@pytest.fixture()
-def store(tmp_path: Path) -> PrdDedupeStore:
-    return PrdDedupeStore(tmp_path / "dedupe.sqlite3")
+@pytest_asyncio.fixture()
+async def store(tmp_path: Path) -> AsyncIterator[PrdDedupeStore]:
+    """A dedupe store closed at teardown so no worker thread outlives the test."""
+    dedupe = PrdDedupeStore(tmp_path / "dedupe.sqlite3")
+    yield dedupe
+    await dedupe.close()
 
 
 @pytest.fixture()

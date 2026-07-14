@@ -153,43 +153,83 @@ def _scripted_request(responses: dict[str, tuple[int, bytes]], calls: list[str])
 
 
 @pytest.mark.asyncio
-async def test_pull_falls_back_to_local_image_when_pull_denied() -> None:
-    """A registry-denied pull must NOT fail the build when the image is present locally.
+async def test_start_uses_local_image_without_pulling() -> None:
+    """Check-local-first: a locally-present image is used with no registry pull.
 
     Local single-host deploys build the runner image on the host daemon and never push
-    it to a registry, so ``/images/create`` is denied. The runtime must then inspect the
-    daemon, find the image, and proceed (``docker run --pull=missing`` semantics) instead
-    of raising. The orchestrator drives the host socket, so a local-only image is valid.
+    it to a registry, so a pull is pure latency (and would be denied). The runtime must
+    inspect the daemon first, find the image, and skip ``/images/create`` entirely.
     """
     runtime = DockerRuntime()
     calls: list[str] = []
     runtime._request = _scripted_request(  # type: ignore[method-assign]
         {
-            "/images/create": (500, b'{"message":"error from registry: denied"}'),
             "/json": (200, b'{"Id":"sha256:abc"}'),  # image-inspect: present locally
+            "/containers/create": (201, b'{"Id":"c1"}'),
+            "/containers/c1/start": (204, b""),
         },
         calls,
     )
 
-    # Must not raise: the image is present locally.
-    await runtime._pull_image("ghcr.io/the-retinue/done-check-runner:latest")
+    await runtime.start(image="local/runner:latest", env={})
 
-    assert any("/images/create" in c for c in calls)
-    assert any("/json" in c for c in calls), "must inspect the local daemon after a failed pull"
+    assert any("/images/local" in c and "/json" in c for c in calls), "must inspect first"
+    assert not any("/images/create" in c for c in calls), "present locally: must not pull"
 
 
 @pytest.mark.asyncio
-async def test_pull_raises_when_denied_and_image_absent() -> None:
-    """A denied pull with no local image is a real failure — surface it."""
+async def test_start_caches_image_presence_across_starts() -> None:
+    """Once an image is known present, later starts skip the inspect entirely."""
     runtime = DockerRuntime()
     calls: list[str] = []
     runtime._request = _scripted_request(  # type: ignore[method-assign]
         {
-            "/images/create": (500, b'{"message":"error from registry: denied"}'),
+            "/json": (200, b'{"Id":"sha256:abc"}'),
+            "/containers/create": (201, b'{"Id":"c1"}'),
+            "/containers/c1/start": (204, b""),
+        },
+        calls,
+    )
+
+    await runtime.start(image="local/runner:latest", env={})
+    calls.clear()
+    await runtime.start(image="local/runner:latest", env={})
+
+    assert not any("/images/" in c for c in calls), "cached presence: no re-check, no pull"
+
+
+@pytest.mark.asyncio
+async def test_start_pulls_when_image_absent_locally() -> None:
+    """On a local miss the runtime pulls from the registry before creating the container."""
+    runtime = DockerRuntime()
+    calls: list[str] = []
+    runtime._request = _scripted_request(  # type: ignore[method-assign]
+        {
+            "/json": (404, b'{"message":"no such image"}'),  # inspect: absent
+            "/images/create": (200, b""),  # pull ok
+            "/containers/create": (201, b'{"Id":"c1"}'),
+            "/containers/c1/start": (204, b""),
+        },
+        calls,
+    )
+
+    await runtime.start(image="ghcr.io/the-retinue/done-check-runner:latest", env={})
+
+    assert any("/images/create" in c for c in calls), "absent locally: must pull"
+
+
+@pytest.mark.asyncio
+async def test_start_raises_when_absent_and_pull_denied() -> None:
+    """A local miss plus a denied pull is a real failure — surface it."""
+    runtime = DockerRuntime()
+    calls: list[str] = []
+    runtime._request = _scripted_request(  # type: ignore[method-assign]
+        {
             "/json": (404, b'{"message":"no such image"}'),
+            "/images/create": (500, b'{"message":"error from registry: denied"}'),
         },
         calls,
     )
 
     with pytest.raises(DockerError, match="image pull failed"):
-        await runtime._pull_image("ghcr.io/the-retinue/done-check-runner:latest")
+        await runtime.start(image="ghcr.io/the-retinue/done-check-runner:latest", env={})

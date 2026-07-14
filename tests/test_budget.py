@@ -14,6 +14,7 @@ the faked gh seam from the reconcile tests — no real ``gh``, no network.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -31,6 +32,15 @@ from retinue.budget import (
 )
 from retinue.orchestrator import PrdSlice
 from tests.test_reconcile import FakeReconcileGh
+
+# The stores hold a long-lived connection for their (process-lifetime) lifespan and do
+# not require callers to close them. These tests construct many short-lived stores across
+# per-test event loops without closing, so a store GC'd after its loop shuts down lets
+# aiosqlite's worker thread touch the closed loop — a benign teardown-only warning that
+# does not occur for the single process-lifetime governor in the worker.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+)
 
 _T0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -214,7 +224,171 @@ async def test_ledger_is_shared_across_lanes(db_path: Path) -> None:
     assert await cron_lane.would_exceed(amount=2.0) is True
 
 
+# --- budget disabled: the 0.0 weekly-budget sentinel admits everything -----------
+
+
+def test_governor_warns_loudly_when_budget_is_disabled(
+    db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A weekly budget of 0.0 (the default) disables metering and logs one loud WARNING.
+
+    A deploy that forgets WEEKLY_BUDGET must not boot silently and do nothing; the
+    governor surfaces the disabled state at construction so it is visible in the logs.
+    """
+    ledger = BudgetLedger(
+        db_path, clock=FakeClock(), auth_mode=AuthMode.API_KEY, weekly_budget=0.0
+    )
+    with caplog.at_level(logging.WARNING, logger="retinue.budget"):
+        BudgetGovernor(ledger)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "WEEKLY_BUDGET" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_gate_admits_everything_when_budget_disabled(db_path: Path) -> None:
+    """With metering disabled, gate admits every run without charging the ledger.
+
+    The disabled sentinel must not decline work: an enormous estimate is admitted and
+    nothing is recorded, so a deploy without a budget still does work.
+    """
+    ledger = BudgetLedger(
+        db_path, clock=FakeClock(), auth_mode=AuthMode.API_KEY, weekly_budget=0.0
+    )
+    governor = BudgetGovernor(ledger)
+
+    decision = await governor.gate(estimated_amount=1_000_000.0)
+
+    assert decision == GateDecision(deferred=False, defer_until=None)
+    assert await ledger.trailing_24h_spend() == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_meter_adhoc_admits_everything_when_budget_disabled(
+    db_path: Path,
+) -> None:
+    """With metering disabled, meter_adhoc admits every build without charging."""
+    ledger = BudgetLedger(
+        db_path, clock=FakeClock(), auth_mode=AuthMode.API_KEY, weekly_budget=0.0
+    )
+    governor = BudgetGovernor(ledger)
+
+    assert await governor.meter_adhoc(amount=1_000_000.0) is True
+    assert await ledger.trailing_24h_spend() == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_positive_budget_with_zero_cap_still_denies(db_path: Path) -> None:
+    """Only the exact 0.0 sentinel bypasses; a positive budget whose cap rounds to 0 denies.
+
+    weekly_budget = 100 but daily_cap_fraction = 0 gives cap() == 0. This is *not* the
+    disabled sentinel, so meter_adhoc must still enforce it and decline the charge rather
+    than admit everything.
+    """
+    ledger = BudgetLedger(
+        db_path,
+        clock=FakeClock(),
+        auth_mode=AuthMode.API_KEY,
+        weekly_budget=100.0,
+        daily_cap_fraction=0.0,
+    )
+    governor = BudgetGovernor(ledger)
+
+    assert ledger.cap() == pytest.approx(0.0)
+    assert await governor.meter_adhoc(amount=1.0) is False
+
+
 # --- concurrent check-and-record: the cap must not be overshot -------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_try_record_on_one_instance_is_serialized(
+    db_path: Path,
+) -> None:
+    """Two concurrent try_record calls on the SAME ledger must not corrupt the cap check.
+
+    A single long-lived connection is shared across asyncio tasks, so without a per-store
+    lock the two calls interleave statements inside each other's ``BEGIN IMMEDIATE`` and
+    corrupt the transaction. The lock serializes them: exactly one records the last 1.0 of
+    room, the other re-reads it and declines, and the cap is never overshot.
+    """
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=11.0)  # cap 12.0, 1.0 of room
+
+    recorded = await asyncio.gather(
+        ledger.try_record_if_within_cap(amount=1.0),
+        ledger.try_record_if_within_cap(amount=1.0),
+    )
+
+    assert sorted(recorded) == [False, True]
+    trailing = await ledger.trailing_24h_spend()
+    assert trailing == pytest.approx(12.0)
+    assert trailing <= ledger.cap()
+
+
+@pytest.mark.asyncio
+async def test_ledger_connection_thread_is_a_daemon(db_path: Path) -> None:
+    """The connection's worker thread must not block interpreter exit.
+
+    aiosqlite runs each connection on a thread; a ledger leaked without close()
+    (crash paths, test teardown) would otherwise hang process shutdown forever on
+    the non-daemon thread join.
+    """
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=1.0)
+    assert ledger._db is not None
+    assert ledger._db._thread.daemon is True
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_ledger_close_is_reusable_and_persists(db_path: Path) -> None:
+    """close() releases the connection; data persists and a later call lazily reconnects."""
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    await ledger.record_spend(amount=5.0)
+    await ledger.close()
+
+    # A fresh store on the same file reads the persisted charge.
+    reopened = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    assert await reopened.trailing_24h_spend() == pytest.approx(5.0)
+    await reopened.close()
+
+    # The original store lazily reconnects after close rather than raising.
+    assert await ledger.trailing_24h_spend() == pytest.approx(5.0)
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_governor_close_releases_connections(db_path: Path) -> None:
+    """The governor's close() tears down its own and the ledger's connections cleanly."""
+    clock = FakeClock()
+    ledger = BudgetLedger(
+        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    governor = BudgetGovernor(ledger)
+    await governor.meter(
+        repo_full_name="owner/repo",
+        prd_number=1,
+        amount=1.0,
+        slices=[_prd_slice(2)],
+    )
+
+    await governor.close()
+
+    # After close the governor still works, reconnecting lazily.
+    assert await governor.meter_adhoc(amount=1.0) is True
+    await governor.close()
 
 
 @pytest.mark.asyncio

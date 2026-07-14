@@ -21,6 +21,7 @@ from retinue.orchestrator import PrdSlice
 from retinue.reconcile import (
     GhCliReconcile,
     PersistedRound,
+    PrState,
     ReconcileResult,
     ResumePhase,
     RunStateStore,
@@ -58,10 +59,12 @@ class FakeReconcileGh:
         closed_issues: set[int] | None = None,
         merged_branches: set[str] | None = None,
         pr: int | None = None,
+        pr_states: dict[int, PrState] | None = None,
     ) -> None:
         self._closed_issues = closed_issues or set()
         self._merged_branches = merged_branches or set()
         self._pr = pr
+        self._pr_states = pr_states or {}
         self.issue_queries: list[int] = []
         self.branch_queries: list[str] = []
         self.pr_queries: list[int] = []
@@ -70,13 +73,18 @@ class FakeReconcileGh:
         self.issue_queries.append(issue_number)
         return issue_number in self._closed_issues
 
-    async def branch_merged(self, *, repo_full_name: str, branch: str) -> bool:
+    async def branch_merged(
+        self, *, repo_full_name: str, branch: str, prd_number: int
+    ) -> bool:
         self.branch_queries.append(branch)
         return branch in self._merged_branches
 
     async def staging_pr(self, *, repo_full_name: str, prd_number: int) -> int | None:
         self.pr_queries.append(prd_number)
         return self._pr
+
+    async def pr_state(self, *, repo_full_name: str, pr_number: int) -> PrState:
+        return self._pr_states.get(pr_number, PrState.OPEN)
 
 
 async def _reconcile(
@@ -484,19 +492,26 @@ async def test_issue_closed_maps_open_state_to_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_branch_merged_compares_against_the_merge_base() -> None:
-    """branch_merged asks 'does the merge base contain this branch' via a compare."""
+async def test_branch_merged_compares_against_the_integration_branch() -> None:
+    """branch_merged asks whether the round's OWN integration branch has the slice.
+
+    The orchestrator merges slices into ``retinue/prd-<n>``, not staging — comparing
+    against staging would report a merged slice as unfinished during a mid-build
+    resume and rebuild it. Branch names carry a slash, so they are URL-encoded.
+    """
     runner = RecordingRunner('{"ahead_by": 0, "status": "identical"}')
     gh = GhCliReconcile(runner, merge_base="staging")
 
-    merged = await gh.branch_merged(repo_full_name="owner/repo", branch="issue-7")
+    merged = await gh.branch_merged(
+        repo_full_name="owner/repo", branch="issue-7", prd_number=5
+    )
 
-    # ahead_by 0 means every commit on issue-7 already landed on staging.
+    # ahead_by 0 means every commit on issue-7 already landed on retinue/prd-5.
     assert merged is True
     assert runner.calls == [
         [
             "api",
-            "repos/owner/repo/compare/staging...issue-7",
+            "repos/owner/repo/compare/retinue%2Fprd-5...issue-7",
             "--jq",
             "{ahead_by: .ahead_by, status: .status}",
         ]
@@ -505,22 +520,57 @@ async def test_branch_merged_compares_against_the_merge_base() -> None:
 
 @pytest.mark.asyncio
 async def test_branch_with_unique_commits_is_not_merged() -> None:
-    """A branch still ahead of the merge base has unlanded work — not merged."""
+    """A branch still ahead of the integration branch has unlanded work — not merged."""
     gh = GhCliReconcile(RecordingRunner('{"ahead_by": 3, "status": "ahead"}'))
     assert (
-        await gh.branch_merged(repo_full_name="owner/repo", branch="issue-7") is False
+        await gh.branch_merged(
+            repo_full_name="owner/repo", branch="issue-7", prd_number=5
+        )
+        is False
     )
 
 
 @pytest.mark.asyncio
-async def test_branch_merged_uses_the_configured_merge_base() -> None:
-    """A non-default merge base is the compare base."""
-    runner = RecordingRunner('{"ahead_by": 0}')
-    gh = GhCliReconcile(runner, merge_base="main")
+async def test_branch_merged_reads_a_missing_base_as_not_merged() -> None:
+    """A 404 compare (integration branch not created yet) means nothing merged.
 
-    await gh.branch_merged(repo_full_name="owner/repo", branch="issue-7")
+    Any other gh failure still surfaces — only a missing ref reads as truth.
+    """
 
-    assert runner.calls[0][1] == "repos/owner/repo/compare/main...issue-7"
+    class FailingRunner:
+        def __init__(self, message: str) -> None:
+            self._message = message
+
+        async def __call__(self, argv: list[str]) -> str:
+            raise RuntimeError(self._message)
+
+    gh_404 = GhCliReconcile(FailingRunner("gh api ... exited 1: HTTP 404: Not Found"))
+    assert (
+        await gh_404.branch_merged(
+            repo_full_name="owner/repo", branch="issue-7", prd_number=5
+        )
+        is False
+    )
+
+    gh_500 = GhCliReconcile(FailingRunner("gh api ... exited 1: HTTP 500"))
+    with pytest.raises(RuntimeError, match="500"):
+        await gh_500.branch_merged(
+            repo_full_name="owner/repo", branch="issue-7", prd_number=5
+        )
+
+
+@pytest.mark.asyncio
+async def test_pr_state_reads_the_pr_lifecycle_state() -> None:
+    """pr_state reads gh pr view --json state and maps it to the PrState enum."""
+    runner = RecordingRunner('{"state": "MERGED"}')
+    gh = GhCliReconcile(runner)
+
+    state = await gh.pr_state(repo_full_name="owner/repo", pr_number=101)
+
+    assert state is PrState.MERGED
+    assert runner.calls == [
+        ["pr", "view", "101", "--repo", "owner/repo", "--json", "state"]
+    ]
 
 
 @pytest.mark.asyncio

@@ -43,7 +43,10 @@ import json
 import logging
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
+
+import httpx
 
 from retinue.container import Container, ContainerRuntime, RunResult
 from retinue.done_check import (
@@ -57,7 +60,8 @@ from retinue.done_check import (
 )
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
-from retinue.roles import Role, oauth_system, resolve_effort, resolve_model
+from retinue.reviewer import ReviewGenerationError
+from retinue.roles import Role, oauth_system, resolve_model, structured_output_config
 
 logger = logging.getLogger(__name__)
 
@@ -242,11 +246,19 @@ def _claude_result_is_error(stdout: str) -> bool:
 
     The headless CLI emits a json object carrying an ``is_error`` boolean. A non-json or
     empty stdout is not treated as an error here — the exit code is the primary signal —
-    so this only catches a run that exited 0 yet reported an internal error.
+    so this only catches a run that exited 0 yet reported an internal error. An
+    unparseable or empty stdout is unexpected given ``--output-format json`` was
+    requested, so it is logged as a warning (the exit code still decides) rather than
+    silently passing.
     """
     try:
         result = json.loads(stdout)
     except (json.JSONDecodeError, ValueError):
+        logger.warning(
+            "Implementer CLI stdout was not parseable JSON despite --output-format "
+            "json (exit code stays authoritative): %r",
+            stdout,
+        )
         return False
     return bool(isinstance(result, dict) and result.get("is_error"))
 
@@ -541,15 +553,13 @@ class ContainerGitOps:
 
         Concatenates each merged ``issue-<N>`` branch's own contribution since it diverged
         from the integration ``base`` (the three-dot diff), giving the internal reviewer
-        the round's merged surface to review. The branch tips are fetched from origin first
-        so the diff reads the pushed work, not a stale local ref. An empty branch list
-        yields an empty diff (nothing merged, nothing to review).
+        the round's merged surface to review. Only already-merged branches are diffed, and
+        :meth:`merge` fetched each one's tip from origin moments earlier in this same
+        container, so ``origin/<branch>`` is already current — no re-fetch is issued here.
+        An empty branch list yields an empty diff (nothing merged, nothing to review).
         """
         sections: list[str] = []
         for branch in merged_branches:
-            await self._run_checked(
-                ["git", "fetch", "origin", branch], action=f"fetch {branch} for diff"
-            )
             result = await self._run_checked(
                 _branch_diff_command(branch, base), action=f"diff {branch}"
             )
@@ -762,9 +772,10 @@ def _resolve_payload(
 
     The frozen system brief leads; the user message carries the merge context plus each
     conflicted file's full marked-up body, fenced by path so the model can address each
-    one. The strict schema forces a per-file resolved body back. The request carries the
-    resolver's registry effort tier (``xhigh``) via ``output_config.effort`` (Opus 4.8
-    removed the extended-thinking ``budget_tokens`` mechanism, which now returns HTTP 400).
+    one. The shared :func:`~retinue.roles.structured_output_config` helper carries the
+    resolver's registry effort tier (``xhigh``) and the strict per-file schema on one
+    ``output_config`` dict — the canonical Messages API structured-output shape (the
+    OpenAI-style top-level ``response_format`` is not a Claude API parameter and 400s).
 
     ``is_oauth`` is required, not defaulted: a subscription OAuth token reaches the premium
     resolving model only when the leading ``system`` block is the Claude Code identity
@@ -782,10 +793,9 @@ def _resolve_payload(
     return {
         "model": model,
         "max_tokens": _RESOLVE_MAX_TOKENS,
-        "output_config": {"effort": resolve_effort(Role.RESOLVER)},
+        "output_config": structured_output_config(Role.RESOLVER, _RESOLVE_SCHEMA),
         "system": oauth_system(_RESOLVE_SYSTEM, is_oauth=is_oauth),
         "messages": [{"role": "user", "content": user}],
-        "response_format": {"type": "json_schema", "json_schema": _RESOLVE_SCHEMA},
     }
 
 
@@ -1012,7 +1022,7 @@ async def build_slice(
         )
         return BuildResult(outcome=BuildOutcome.BLOCKED, integration_branch=branch)
 
-    await _merge_green_slice(slice_, branch, config=config, git=git)
+    await _merge_green_slice(slice_, branch, git=git)
     return BuildResult(outcome=BuildOutcome.MERGED, integration_branch=branch)
 
 
@@ -1113,11 +1123,14 @@ async def _push_branch(container: Container, branch: str) -> None:
         )
 
 
-async def _merge_green_slice(
-    slice_: Slice, branch: str, *, config: RepoConfig, git: GitOps
-) -> None:
-    """Ensure the integration branch and merge a green slice onto it."""
-    await git.ensure_integration_branch(branch=branch, base=config.staging_branch)
+async def _merge_green_slice(slice_: Slice, branch: str, *, git: GitOps) -> None:
+    """Merge a green slice onto the integration branch.
+
+    The integration branch is ensured once up front (by :func:`build_slice` and
+    :func:`build_prd` before any slice is merged), so this merges straight onto it
+    rather than re-ensuring — a per-merge re-ensure is a redundant ``git ls-remote``
+    round-trip against origin on every merged slice.
+    """
     await git.merge(source=slice_.branch, into=branch)
     logger.info("Merged %s into %s after green done-check", slice_.branch, branch)
 
@@ -1185,6 +1198,9 @@ class PrdBuildResult:
         skipped_issues: Issue numbers that never became ready because an upstream
             slice they transitively depend on was blocked or escalated, pruning the
             subtree. Reported here rather than silently dropped.
+        deferred: True when the budget gate held the run back — nothing built, every
+            bucket empty. Carried so the caller can re-enqueue rather than lose the run.
+        defer_until: When the budget window frees on a deferred run; ``None`` otherwise.
     """
 
     integration_branch: str
@@ -1192,6 +1208,8 @@ class PrdBuildResult:
     blocked_issues: list[int]
     escalated_issues: list[int]
     skipped_issues: list[int]
+    deferred: bool = False
+    defer_until: datetime | None = None
 
 
 async def build_prd(
@@ -1278,7 +1296,6 @@ async def build_prd(
             merged_this_round = await _merge_round(
                 built,
                 branch,
-                config=config,
                 git=git,
                 resolve_conflict=resolve_conflict,
                 state=state,
@@ -1287,7 +1304,9 @@ async def build_prd(
             # diff and files review-fix follow-ups; each comes back as a slice that
             # enters a later round's ready set and builds in the same run.
             if review_round is not None and merged_this_round:
-                fixes = await review_round.review(merged_issues=merged_this_round)
+                fixes = await _review_round_advisory(
+                    review_round, merged_this_round, slices[0].prd_number
+                )
                 state.enqueue(fixes)
         # The ready set has drained; any still-pending slice was pruned by a failed
         # upstream slice. Surface it as skipped rather than dropping it silently.
@@ -1300,6 +1319,29 @@ async def build_prd(
         escalated_issues=state.escalated,
         skipped_issues=state.skipped,
     )
+
+
+async def _review_round_advisory(
+    review_round: RoundReviewer, merged_issues: list[int], prd_number: int
+) -> list[PrdSlice]:
+    """Run the per-round reviewer, swallowing its failure so it never aborts the build.
+
+    The reviewer is advisory — it only files review-fix follow-ups and never edits code —
+    but it runs *after* the round's slices are merged and pushed, so letting a reviewer
+    failure (an HTTP 400 from the Messages API, a leaked httpx transport error) propagate
+    would fail the whole arq job and discard an already-merged build. A failure is logged
+    against the PRD and treated as "no follow-ups this round" rather than raised. Only the
+    reviewer's own error types are caught; anything else still surfaces.
+    """
+    try:
+        return await review_round.review(merged_issues=merged_issues)
+    except (ReviewGenerationError, httpx.HTTPError):
+        logger.warning(
+            "Advisory round review for PRD #%d failed; continuing with no review-fixes",
+            prd_number,
+            exc_info=True,
+        )
+        return []
 
 
 class _PrdState:
@@ -1362,6 +1404,27 @@ class _PrdState:
             self.record(slice_, self.skipped)
 
 
+# Default cap on concurrent per-slice build containers when a repo sets no
+# ``max_parallel``. Without a bound a default-config repo runs *every* ready slice's
+# container at once, so a large ready set can exhaust the worker host's docker/CPU. An
+# explicit ``config.max_parallel`` still wins; this only backs the unset case.
+_DEFAULT_MAX_PARALLEL = 3
+
+
+class _SliceBuildOutcome(enum.Enum):
+    """How one slice's build ended, before the round's serial merge phase.
+
+    Distinguishes a red done-check (``BLOCKED``) from a build that raised
+    (``ERRORED``): the first is a clean-but-failing slice, the second a transient
+    build failure (clone/implement/Docker error) that must not cancel its siblings.
+    ``GREEN`` slices proceed to the merge.
+    """
+
+    GREEN = "green"
+    BLOCKED = "blocked"
+    ERRORED = "errored"
+
+
 async def _build_round(
     ready: list[PrdSlice],
     config: RepoConfig,
@@ -1374,19 +1437,24 @@ async def _build_round(
     resolve_secret: SecretResolver,
     report: ReportSink,
     image: str,
-) -> list[tuple[PrdSlice, bool]]:
-    """Fan out the ready slices, bounded by ``max_parallel``; return (slice, passed).
+) -> list[tuple[PrdSlice, _SliceBuildOutcome]]:
+    """Fan out the ready slices, bounded by ``max_parallel``; return per-slice outcomes.
 
     Each slice's build runs in its own disposable container (clone → branch off ``base``
     → implement → done-check → push-on-green), concurrently across the round but capped at
-    ``config.max_parallel`` live builds. ``base`` is the integration branch, so a later
-    round branches off the sibling work an earlier round already merged onto it. Only the
-    build phase runs here; merges are serialized afterwards in dependency order, against
-    the branches the green builds pushed.
-    """
-    semaphore = asyncio.Semaphore(config.max_parallel or len(ready) or 1)
+    ``config.max_parallel`` live builds (falling back to :data:`_DEFAULT_MAX_PARALLEL`
+    when unset, never more than the ready count). ``base`` is the integration branch, so a
+    later round branches off the sibling work an earlier round already merged onto it.
 
-    async def build_one(slice_: PrdSlice) -> tuple[PrdSlice, bool]:
+    One slice's build raising (a transient Docker/clone/implement error) must not cancel
+    its siblings, so the fan-out gathers with ``return_exceptions=True``: a raised build
+    is logged and mapped to ``ERRORED`` (escalated in the merge phase), while the green
+    siblings still merge. Only the build phase runs here; merges are serialized afterwards.
+    """
+    bound = config.max_parallel or min(len(ready), _DEFAULT_MAX_PARALLEL) or 1
+    semaphore = asyncio.Semaphore(bound)
+
+    async def build_one(slice_: PrdSlice) -> _SliceBuildOutcome:
         async with semaphore:
             passed = await _build_slice_in_container(
                 slice_,
@@ -1400,16 +1468,29 @@ async def _build_round(
                 report=report,
                 image=image,
             )
-            return slice_, passed
+            return _SliceBuildOutcome.GREEN if passed else _SliceBuildOutcome.BLOCKED
 
-    return await asyncio.gather(*(build_one(s) for s in ready))
+    results = await asyncio.gather(
+        *(build_one(s) for s in ready), return_exceptions=True
+    )
+    built: list[tuple[PrdSlice, _SliceBuildOutcome]] = []
+    for slice_, result in zip(ready, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Slice %s build raised; escalating (siblings unaffected)",
+                slice_.branch,
+                exc_info=result,
+            )
+            built.append((slice_, _SliceBuildOutcome.ERRORED))
+        else:
+            built.append((slice_, result))
+    return built
 
 
 async def _merge_round(
-    built: list[tuple[PrdSlice, bool]],
+    built: list[tuple[PrdSlice, _SliceBuildOutcome]],
     branch: str,
     *,
-    config: RepoConfig,
     git: GitOps,
     resolve_conflict: ConflictResolver | None,
     state: _PrdState,
@@ -1420,18 +1501,22 @@ async def _merge_round(
     topological sort over the round's ``blocked_by`` graph, so an in-round blocker
     always merges before its dependent; issue number only breaks ties between
     mutually independent slices, keeping the order deterministic. A red slice is
-    recorded blocked; a conflict is resolved under the done-check or escalated. The
-    returned list is *this* round's merged issue numbers in merge order — the surface
-    the per-round reviewer reviews.
+    recorded blocked, a build that raised is recorded escalated, and a merge conflict
+    is resolved under the done-check or escalated. The returned list is *this* round's
+    merged issue numbers in merge order — the surface the per-round reviewer reviews.
     """
-    passed_by_number = {slice_.issue_number: passed for slice_, passed in built}
+    outcome_by_number = {slice_.issue_number: outcome for slice_, outcome in built}
     merged_this_round: list[int] = []
     for slice_ in _topo_merge_order([slice_ for slice_, _ in built]):
-        if not passed_by_number[slice_.issue_number]:
+        outcome = outcome_by_number[slice_.issue_number]
+        if outcome is _SliceBuildOutcome.BLOCKED:
             state.record(slice_, state.blocked)
             continue
+        if outcome is _SliceBuildOutcome.ERRORED:
+            state.record(slice_, state.escalated)
+            continue
         merged = await _merge_or_escalate(
-            slice_, branch, config=config, git=git, resolve_conflict=resolve_conflict
+            slice_, branch, git=git, resolve_conflict=resolve_conflict
         )
         state.record(slice_, state.merged if merged else state.escalated)
         if merged:
@@ -1476,7 +1561,6 @@ async def _merge_or_escalate(
     slice_: PrdSlice,
     branch: str,
     *,
-    config: RepoConfig,
     git: GitOps,
     resolve_conflict: ConflictResolver | None,
 ) -> bool:
@@ -1486,7 +1570,7 @@ async def _merge_or_escalate(
     conflict, no resolver, or a retry that still conflicts).
     """
     try:
-        await _merge_green_slice(slice_, branch, config=config, git=git)
+        await _merge_green_slice(slice_, branch, git=git)
         return True
     except MergeConflict as conflict:
         if resolve_conflict is None:
@@ -1496,15 +1580,15 @@ async def _merge_or_escalate(
         if resolution is ConflictResolution.UNRESOLVED:
             logger.warning("Escalating %s: conflict unresolved", slice_.branch)
             return False
-        return await _retry_merge_after_resolution(slice_, branch, config=config, git=git)
+        return await _retry_merge_after_resolution(slice_, branch, git=git)
 
 
 async def _retry_merge_after_resolution(
-    slice_: PrdSlice, branch: str, *, config: RepoConfig, git: GitOps
+    slice_: PrdSlice, branch: str, *, git: GitOps
 ) -> bool:
     """Retry a merge after a claimed resolution; escalate if it still conflicts."""
     try:
-        await _merge_green_slice(slice_, branch, config=config, git=git)
+        await _merge_green_slice(slice_, branch, git=git)
         return True
     except MergeConflict:
         logger.warning("Escalating %s: still conflicts after resolution", slice_.branch)

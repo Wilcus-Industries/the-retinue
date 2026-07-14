@@ -68,6 +68,30 @@ class _RecordingGh:
         return self._children.get(prd_number, [])
 
 
+class _RaisingGh(_RecordingGh):
+    """A gh seam whose ``close_issue`` raises for a chosen set of issue numbers.
+
+    Models a transient per-issue ``gh`` failure so a test can assert one failed close does
+    not abort the others and is not credited to the reap gate.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_on: set[int],
+        children: dict[int, list[ChildIssue]] | None = None,
+    ) -> None:
+        super().__init__(children)
+        self._fail_on = set(fail_on)
+
+    async def close_issue(self, *, repo_full_name: str, issue_number: int) -> None:
+        if issue_number in self._fail_on:
+            raise RuntimeError(f"boom closing #{issue_number}")
+        await super().close_issue(
+            repo_full_name=repo_full_name, issue_number=issue_number
+        )
+
+
 # --- convergence handoff: fire "test & merge" (push + PR comment), never merge ----
 
 
@@ -240,6 +264,58 @@ async def test_reap_closes_slice_issues_before_checking_children() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_failed_slice_close_does_not_abort_the_other_closes() -> None:
+    """One slice close raising must not stop the others — closes run concurrently.
+
+    The serial-await form aborted the whole reap on the first failing close; closing the
+    slices with ``asyncio.gather`` means a transient failure on #10 still lets #11 close.
+    """
+    gh = _RaisingGh(
+        fail_on={10},
+        children={1: [ChildIssue(number=11, closed=True, hitl=False)]},
+    )
+    merged = MergedPullRequest(
+        repo_full_name="owner/repo",
+        pr_number=42,
+        prd_number=1,
+        slice_issues=[10, 11],
+    )
+
+    result = await reap_merged_pr(merged, gh=gh)
+
+    # #10 failed to close, but #11 was still closed despite #10 raising first-in-order.
+    assert ("owner/repo", 10) not in gh.closed
+    assert ("owner/repo", 11) in gh.closed
+    # The successfully-closed slice is the only one reported closed.
+    assert result.closed_slice_issues == [11]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_slice_close_is_not_credited_to_the_reap_gate() -> None:
+    """A slice whose close FAILED is not treated as closed by the reap gate.
+
+    The only non-hitl child is #10, still reported open by the children query, and its
+    close fails — so the gate must not credit it as just-closed and the PRD stays open.
+    """
+    gh = _RaisingGh(
+        fail_on={10},
+        children={1: [ChildIssue(number=10, closed=False, hitl=False)]},
+    )
+    merged = MergedPullRequest(
+        repo_full_name="owner/repo",
+        pr_number=42,
+        prd_number=1,
+        slice_issues=[10],
+    )
+
+    result = await reap_merged_pr(merged, gh=gh)
+
+    assert result.outcome is ReapOutcome.KEPT_OPEN
+    assert ("owner/repo", 1) not in gh.closed
+    assert result.prd_closed is False
+
+
+@pytest.mark.asyncio
 async def test_reap_with_no_children_closes_prd() -> None:
     """A PRD whose children are all merged-and-closed reaps with an empty gate."""
     gh = _RecordingGh(children={1: []})
@@ -302,6 +378,25 @@ def test_auth_env_without_token_omits_gh_token() -> None:
     """No token leaves GH_TOKEN unset so the host's own gh auth is used."""
     env = _auth_env(None)
     assert "GH_TOKEN" not in env
+
+
+def test_auth_env_does_not_leak_the_parent_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gh env carries only GH_TOKEN + what gh needs — never the worker's other secrets.
+
+    The old ``dict(os.environ)`` form handed the gh child the worker's ENTIRE environment
+    (Anthropic credentials and the like). The minimal env forwards only ``PATH`` (to locate
+    ``gh``) and ``HOME`` (its config / host auth), plus the injected ``GH_TOKEN``.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-leak")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/home/worker")
+
+    env = _auth_env("ghs_tok")
+
+    assert env == {"PATH": "/usr/bin", "HOME": "/home/worker", "GH_TOKEN": "ghs_tok"}
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_close_issue_argv_targets_repo_and_issue() -> None:

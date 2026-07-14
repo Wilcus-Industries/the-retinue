@@ -114,10 +114,16 @@ class TriageResult:
 
 @dataclass
 class _Signal:
-    """One implementer attempt's result: a hard failure or returned notes (or clean)."""
+    """One implementer attempt's result: a hard failure or returned notes (or clean).
+
+    ``budget_exhausted_before_run`` marks the pre-run escalation where a prior run had
+    already spent the whole retry budget: the implementer never ran this session, so the
+    escalation reason must not claim a fresh failure.
+    """
 
     failed: bool = False
     notes: ImplementerNotes | None = None
+    budget_exhausted_before_run: bool = False
 
     @property
     def clean(self) -> bool:
@@ -187,18 +193,19 @@ async def triage_implementer(
         A :class:`TriageResult` recording the terminal outcome.
     """
     key = impl_retry_key(slice_)
-    prior_attempts = await retry_store.count(key)
-    if prior_attempts > 0 and prior_attempts >= config.retry_cap:
+    attempts = await retry_store.count(key)
+    if attempts > 0 and attempts >= config.retry_cap:
         # A prior run already spent the whole retry budget on this slice; do not
         # burn another doomed attempt — escalate straight to a human.
-        return await _escalate(slice_, _Signal(failed=True), notifier)
+        return await _escalate(
+            slice_, _Signal(budget_exhausted_before_run=True), notifier
+        )
 
     while True:
         signal = await _run_implementer(slice_, implementer, container)
         if signal.clean:
             return TriageResult(outcome=TriageOutcome.BUILT)
 
-        attempts = await retry_store.count(key)
         decision = decide_triage(
             failed=signal.failed,
             notes=signal.notes,
@@ -206,11 +213,11 @@ async def triage_implementer(
             cap=config.retry_cap,
         )
         if decision is TriageDecision.RETRY:
-            await retry_store.record_attempt(key)
+            attempts = await retry_store.record_attempt(key)
             logger.info(
                 "Retrying implementer for %s (attempt %d/%d)",
                 key,
-                attempts + 1,
+                attempts,
                 config.retry_cap,
             )
             continue
@@ -272,6 +279,11 @@ async def _escalate(slice_: Slice, signal: _Signal, notifier: Notifier) -> Triag
 
 def _escalation_reason(signal: _Signal) -> str:
     """Build the human-readable escalation body from the triage signal."""
+    if signal.budget_exhausted_before_run:
+        return (
+            "Retry budget was already exhausted by prior runs; the implementer was not "
+            "re-run this session. A human needs to look at this slice."
+        )
     if signal.notes is not None:
         return (
             "The implementer could not finish this slice and the retry budget is spent. "
