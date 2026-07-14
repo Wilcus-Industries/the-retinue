@@ -359,6 +359,20 @@ def test_request_kwargs_carry_xhigh_effort() -> None:
     assert "thinking" not in kwargs
 
 
+def test_request_kwargs_carry_an_explicit_effort_override() -> None:
+    """An explicit ``effort=`` at construction overrides the registry default tier.
+
+    A repo's routing table can replace the slicer's effort tier at the wiring site
+    (:mod:`retinue.pipeline`); this proves the instance's resolved tier reaches the
+    request rather than always sending the registry's ``xhigh`` default.
+    """
+    gen = ClaudeSliceGenerator(token="sk-ant-123", effort="low")
+
+    kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
+
+    assert kwargs["output_config"]["effort"] == "low"
+
+
 def test_parse_plan_maps_payload_to_ordered_drafts() -> None:
     """A well-formed payload parses into ordered drafts preserving blocked_by + hitl."""
     payload = json.dumps(

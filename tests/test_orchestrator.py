@@ -50,8 +50,14 @@ from retinue.orchestrator import (
     build_slice,
     integration_branch,
 )
-from retinue.repo_config import RepoConfig, SecretsConfig
-from retinue.roles import CLAUDE_CODE_IDENTITY, ROLE_REGISTRY, Role
+from retinue.repo_config import (
+    ModelEffort,
+    RepoConfig,
+    RoutingConfig,
+    RoutingLevel,
+    SecretsConfig,
+)
+from retinue.roles import CLAUDE_CODE_IDENTITY, ROLE_REGISTRY, Role, resolve_effort, resolve_model
 from retinue.slicer import _EFFORT_XHIGH
 from tests.test_done_check import (
     CLAUDE_MD,
@@ -654,7 +660,12 @@ def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
         _ConflictedFile(path="b.py", content="conflict-b"),
     ]
     payload = _resolve_payload(
-        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+        files,
+        source="issue-7",
+        into="retinue/prd-1",
+        model="m",
+        effort=_EFFORT_XHIGH,
+        is_oauth=False,
     )
 
     assert payload["model"] == "m"
@@ -670,21 +681,42 @@ def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
 
 
 def test_resolve_payload_carries_xhigh_effort() -> None:
-    """The conflict resolver (the orchestrator's Opus 4.8 call) runs at the xhigh tier.
+    """The conflict resolver's default (registry) effort tier threads through unchanged.
 
     Opus 4.8 removed the ``thinking`` budget mechanism (400 on the live Messages API);
-    ``output_config.effort`` is the current effort control. The resolver reuses the
-    slicer's shared ``_EFFORT_XHIGH`` tier rather than keeping its own copy.
+    ``output_config.effort`` is the current effort control. Passing the registry's
+    ``xhigh`` tier explicitly proves the value round-trips onto the payload.
     """
     files = [_ConflictedFile(path="a.py", content="conflict-a")]
 
     payload = _resolve_payload(
-        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+        files,
+        source="issue-7",
+        into="retinue/prd-1",
+        model="m",
+        effort=_EFFORT_XHIGH,
+        is_oauth=False,
     )
 
     assert payload["output_config"]["effort"] == _EFFORT_XHIGH
     assert _EFFORT_XHIGH == "xhigh"
     assert "thinking" not in payload
+
+
+def test_resolve_payload_carries_the_given_effort_tier() -> None:
+    """The resolver's effort tier is not hardcoded — a caller-supplied tier threads through."""
+    files = [_ConflictedFile(path="a.py", content="conflict-a")]
+
+    payload = _resolve_payload(
+        files,
+        source="issue-7",
+        into="retinue/prd-1",
+        model="m",
+        effort="low",
+        is_oauth=False,
+    )
+
+    assert payload["output_config"]["effort"] == "low"
 
 
 def test_resolve_payload_oauth_leads_system_with_claude_code_identity() -> None:
@@ -697,7 +729,12 @@ def test_resolve_payload_oauth_leads_system_with_claude_code_identity() -> None:
     files = [_ConflictedFile(path="a.py", content="conflict-a")]
 
     payload = _resolve_payload(
-        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=True
+        files,
+        source="issue-7",
+        into="retinue/prd-1",
+        model="m",
+        effort=_EFFORT_XHIGH,
+        is_oauth=True,
     )
 
     assert payload["system"] == [
@@ -711,7 +748,12 @@ def test_resolve_payload_api_key_keeps_plain_string_system() -> None:
     files = [_ConflictedFile(path="a.py", content="conflict-a")]
 
     payload = _resolve_payload(
-        files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=False
+        files,
+        source="issue-7",
+        into="retinue/prd-1",
+        model="m",
+        effort=_EFFORT_XHIGH,
+        is_oauth=False,
     )
 
     assert payload["system"] == _RESOLVE_SYSTEM
@@ -838,6 +880,59 @@ async def test_resolver_escalates_on_non_200_status() -> None:
     # argv element here, so matching the token avoids the ``--no-commit`` recreate flag.
     assert not any("commit" in cmd for cmd in container.commands)
     assert not any("add" in cmd for cmd in container.commands)
+
+
+@pytest.mark.asyncio
+async def test_conflict_resolver_reads_model_and_effort_from_a_default_level_override() -> None:
+    """The resolver's model + effort resolve via the routing table's ``default:`` level.
+
+    ``AgentSdkConflictResolver`` has no production wiring site (``resolve_conflict`` is
+    always ``None`` in ``build_prd`` today), so this drives the mechanism directly: a
+    ``RoutingConfig`` whose ``default`` level overrides :data:`Role.RESOLVER` with a
+    custom model *and* effort, resolved via :func:`resolve_model`/:func:`resolve_effort`
+    (the same helpers a future wiring site would call), and asserts both land on the
+    request the resolver sends.
+    """
+    config = RepoConfig(
+        routing=RoutingConfig(
+            default="standard",
+            levels={
+                "standard": RoutingLevel(
+                    description="Ordinary work.",
+                    roles={
+                        Role.RESOLVER.value: ModelEffort(
+                            model="resolver-custom", effort="low"
+                        )
+                    },
+                )
+            },
+        )
+    )
+    container = ScriptedContainer(
+        {
+            "diff --name-only": RunResult(exit_code=1, stdout="a.py\n"),
+            "cat a.py": RunResult(exit_code=0, stdout="conflict"),
+        }
+    )
+    transport = FakeAnthropicTransport(
+        _text_response({"resolved": [{"path": "a.py", "content": "merged"}]})
+    )
+    resolver = AgentSdkConflictResolver(
+        container=container,
+        transport=transport,
+        credential="k",
+        model=resolve_model(Role.RESOLVER, config),
+        effort=resolve_effort(Role.RESOLVER, config),
+    )
+
+    result = await resolver(source="issue-7", into="retinue/prd-1")
+
+    assert result is ConflictResolution.RESOLVED
+    _, _, payload = transport.calls[0]
+    assert payload["model"] == "resolver-custom"
+    output_config = payload["output_config"]
+    assert isinstance(output_config, dict)
+    assert output_config["effort"] == "low"
 
 
 # --- real container-exec implementer ---------------------------------------------
