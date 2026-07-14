@@ -40,7 +40,15 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.wiring` — `bind_build_prd` (budget-gate + triage glue around the orchestrator
   build) and `bind_cron_tick` (the cron backlog lane over its real collaborators). Both
   take the implementer-spawn seam as their one injected dependency and share the
-  service-level `BudgetGovernor`.
+  service-level `BudgetGovernor`. `bind_build_prd` also accepts an optional
+  `resolve_implementer` (`retinue.routing`) that classifies each slice at its first build
+  and swaps in that level's implementer model; `None` keeps one model for every slice.
+- `retinue.routing` — per-issue implementer-model routing for the PRD build lane:
+  `PerIssueImplementerRouter` fetches an issue's facts (`GhCliIssueFacts`), resolves its
+  routing level via `retinue.level.resolve_level` (honoring a pre-existing `level:` label),
+  meters each classifier call on the shared ledger, and returns the base
+  `ContainerImplementer` with the level's model. Only wired when the repo declares a
+  `routing:` table, so a table-less repo makes zero classifier calls.
 - `retinue.app` — FastAPI factory; an Arq Redis pool is created in the lifespan and
   stored on `app.state.arq_pool`.
 - `retinue.repo_config` — the per-repo `.github/retinue.yml` schema (`RepoConfig`) and

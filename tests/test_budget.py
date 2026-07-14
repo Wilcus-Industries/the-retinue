@@ -278,6 +278,37 @@ async def test_meter_adhoc_admits_everything_when_budget_disabled(
 
 
 @pytest.mark.asyncio
+async def test_record_charge_appends_to_the_ledger(db_path: Path) -> None:
+    """A side charge is recorded post-hoc, adding to the trailing-24h spend.
+
+    Unlike gate/meter this is not gated — the classifier call has already run — so the
+    charge simply lands on the shared ledger and the rolling total climbs by it.
+    """
+    ledger = BudgetLedger(
+        db_path, clock=FakeClock(), auth_mode=AuthMode.API_KEY, weekly_budget=100.0
+    )
+    governor = BudgetGovernor(ledger)
+
+    await governor.record_charge(amount=0.01)
+    await governor.record_charge(amount=0.01)
+
+    assert await ledger.trailing_24h_spend() == pytest.approx(0.02)
+
+
+@pytest.mark.asyncio
+async def test_record_charge_is_a_noop_when_budget_disabled(db_path: Path) -> None:
+    """With metering disabled, record_charge writes nothing to the ledger."""
+    ledger = BudgetLedger(
+        db_path, clock=FakeClock(), auth_mode=AuthMode.API_KEY, weekly_budget=0.0
+    )
+    governor = BudgetGovernor(ledger)
+
+    await governor.record_charge(amount=1_000_000.0)
+
+    assert await ledger.trailing_24h_spend() == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
 async def test_positive_budget_with_zero_cap_still_denies(db_path: Path) -> None:
     """Only the exact 0.0 sentinel bypasses; a positive budget whose cap rounds to 0 denies.
 
