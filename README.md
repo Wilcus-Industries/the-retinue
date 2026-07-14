@@ -43,12 +43,18 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   service-level `BudgetGovernor`. `bind_build_prd` also accepts an optional
   `resolve_implementer` (`retinue.routing`) that classifies each slice at its first build
   and swaps in that level's implementer model; `None` keeps one model for every slice.
-- `retinue.routing` — per-issue implementer-model routing for the PRD build lane:
-  `PerIssueImplementerRouter` fetches an issue's facts (`GhCliIssueFacts`), resolves its
-  routing level via `retinue.level.resolve_level` (honoring a pre-existing `level:` label),
-  meters each classifier call on the shared ledger, and returns the base
-  `ContainerImplementer` with the level's model. Only wired when the repo declares a
-  `routing:` table, so a table-less repo makes zero classifier calls.
+- `retinue.routing` — per-issue routing shared by every build lane. `resolve_issue_level`
+  is the one hop that fetches an issue's facts (`GhCliIssueFacts`), resolves its routing
+  level via `retinue.level.resolve_level` (honoring a pre-existing `level:` label), meters
+  each classifier call on the shared ledger, and comments on a classification failure. The
+  PRD lane's `PerIssueImplementerRouter` routes through it and returns the base
+  `ContainerImplementer` at the level's model; the ad-hoc lane routes through it too
+  (`pipeline._resolve_adhoc_level`) to classify each issue once and launch its planner,
+  implementer, and ad-hoc reviewer at that level. Loopback fix-issues are orchestrator-lane
+  slices (`ready-for-agent` + `Part of #<prd>`), so they classify and route through the
+  exact same seam at their first build. Only wired when the repo declares a `routing:`
+  table, so a table-less repo makes zero classifier calls and builds at the registry
+  defaults.
 - `retinue.app` — FastAPI factory; an Arq Redis pool is created in the lifespan and
   stored on `app.state.arq_pool`.
 - `retinue.repo_config` — the per-repo `.github/retinue.yml` schema (`RepoConfig`) and

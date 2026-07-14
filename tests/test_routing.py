@@ -9,7 +9,14 @@ Two layers are exercised, all offline (no gh, no network, no Docker):
 * **Integration** — :func:`retinue.wiring.bind_build_prd` driven with a real router over
   the container-exec :class:`ContainerImplementer` and the in-memory runtime/git/auth
   fakes, so the recording container runtime records the actual ``claude --model <...>``
-  exec each slice launched with.
+  exec each slice launched with. This layer also proves a loopback fix-issue (a
+  ``ready-for-agent`` + ``Part of #<prd>`` slice) classifies and routes through the same
+  seam, and — over the ad-hoc :func:`retinue.adhoc_build.build_adhoc_issue` harness — that
+  the ad-hoc planner/implementer/reviewer all launch at the issue's resolved level.
+
+The shared :func:`retinue.routing.resolve_issue_level` hop and the ad-hoc
+:func:`retinue.pipeline._resolve_adhoc_level` best-effort resolver are unit-tested directly
+against the same recording fakes.
 
 Reuses ``FakeRuntime``/``FakeAuth``/``CLAUDE_MD``/``_resolver``/``_sink`` from
 ``tests/test_done_check.py``, ``FakeGitOps`` from ``tests/test_orchestrator.py``, and
@@ -24,20 +31,27 @@ from pathlib import Path
 
 import pytest
 
+from retinue.adhoc_build import (
+    AdhocIssue,
+    ContainerAdhocReviewer,
+    ContainerPlanner,
+    build_adhoc_issue,
+)
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
 from retinue.classifier import ClassifyInput, ClassifyResult, ClaudeIssueClassifier
 from retinue.notify import (
     CommentRequest,
     CommentSink,
     LabelRequest,
+    LabelSink,
     Notifier,
     PushRequest,
 )
 from retinue.orchestrator import ContainerImplementer, PrdSlice, Slice
-from retinue.pipeline import _CLASSIFIER_ESTIMATED_AMOUNT
+from retinue.pipeline import _CLASSIFIER_ESTIMATED_AMOUNT, _resolve_adhoc_level
 from retinue.repo_config import RepoConfig, RoutingConfig, RoutingLevel
-from retinue.reviewer import HttpResponse
-from retinue.roles import Role, resolve_model
+from retinue.reviewer import AgentSdkReviewGenerator, HttpResponse
+from retinue.roles import Role, resolve_effort, resolve_model
 from retinue.routing import (
     _FAILURE_COMMENT,
     GhCliIssueFacts,
@@ -45,6 +59,7 @@ from retinue.routing import (
     PerIssueImplementerRouter,
     _issue_facts_argv,
     _parse_issue_facts,
+    resolve_issue_level,
 )
 from retinue.wiring import BoundBuildResult, bind_build_prd
 from tests.test_budget import FakeClock
@@ -463,6 +478,7 @@ def _build_router(
     facts: _FactsFor,
     comments: CommentSink,
     governor: BudgetGovernor,
+    labels: LabelSink = _noop_label,
 ) -> PerIssueImplementerRouter:
     assert config.routing is not None
     return PerIssueImplementerRouter(
@@ -476,7 +492,7 @@ def _build_router(
             transport=transport,
             routing=config.routing,
         ),
-        label_sink=_noop_label,
+        label_sink=labels,
         comment_sink=comments,
         issue_facts=facts,
         governor=governor,
@@ -689,3 +705,427 @@ async def test_table_less_repo_uses_registry_default_and_no_classifier(
     # The classifier transport and issue-facts fetch were never touched.
     assert transport.calls == []
     assert facts.calls == []
+
+
+# --- resolve_issue_level: the shared classify-one-issue hop -----------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_issue_level_classify_success_labels_and_charges(
+    tmp_path: Path,
+) -> None:
+    """No pre-existing label -> classify -> the level name, a level label, one charge."""
+    labels, comments = _RecordingLabels(), _RecordingComments()
+    governor = _governor(tmp_path)
+    facts = _FactsFor({1: ClassifyInput(title="typo", body="b", labels=[])})
+
+    level = await resolve_issue_level(
+        "owner/repo",
+        1,
+        _config(),
+        classify=_RecordingClassifier(ClassifyResult(level="trivial")),
+        label_sink=labels,
+        comment_sink=comments,
+        issue_facts=facts,
+        governor=governor,
+        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+    )
+
+    assert level == "trivial"
+    assert [r.label for r in labels.calls] == ["level:trivial"]
+    assert comments.calls == []
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(
+        _CLASSIFIER_ESTIMATED_AMOUNT
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_issue_level_preexisting_label_short_circuits(
+    tmp_path: Path,
+) -> None:
+    """A known ``level:`` label skips the classifier: no call, no meter, no label write."""
+    labels, comments = _RecordingLabels(), _RecordingComments()
+    governor = _governor(tmp_path)
+    facts = _FactsFor(
+        {1: ClassifyInput(title="x", body="b", labels=["level:standard"])}
+    )
+
+    level = await resolve_issue_level(
+        "owner/repo",
+        1,
+        _config(),
+        classify=_UnusedClassifier(),
+        label_sink=labels,
+        comment_sink=comments,
+        issue_facts=facts,
+        governor=governor,
+        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+    )
+
+    assert level == "standard"
+    assert labels.calls == []
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_resolve_issue_level_failure_defaults_and_comments(
+    tmp_path: Path,
+) -> None:
+    """A classifier failure returns the default level, comments, and still meters once."""
+    labels, comments = _RecordingLabels(), _RecordingComments()
+    governor = _governor(tmp_path)
+    facts = _FactsFor({1: ClassifyInput(title="x", body="b", labels=[])})
+
+    level = await resolve_issue_level(
+        "owner/repo",
+        1,
+        _config(),
+        classify=_RecordingClassifier(ClassifyResult(level=None)),
+        label_sink=labels,
+        comment_sink=comments,
+        issue_facts=facts,
+        governor=governor,
+        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+    )
+
+    assert level == "standard"
+    assert labels.calls == []
+    assert len(comments.calls) == 1
+    assert comments.calls[0].body == _FAILURE_COMMENT.format(level="standard")
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(
+        _CLASSIFIER_ESTIMATED_AMOUNT
+    )
+
+
+# --- loopback fix-issues route through the identical seam -------------------------
+
+
+def _fix_issue_facts(issue_number: int, *, title: str) -> ClassifyInput:
+    """Facts shaped like a loopback fix-issue: ``ready-for-agent`` + ``Part of #<prd>``.
+
+    A loopback fix-issue (``retinue.loopback._file_fix_issue``) is an ordinary
+    orchestrator-lane slice — no ``level:`` label — so it must classify and route through
+    the same :class:`PerIssueImplementerRouter` seam as any PRD slice.
+    """
+    return ClassifyInput(
+        title=title,
+        body="A heimdall blocking finding to fix.\n\nPart of #7",
+        labels=["ready-for-agent"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_loopback_fix_issue_classifies_labels_and_routes(tmp_path: Path) -> None:
+    """A fix-issue-shaped slice classifies once, gets its label, meters, and routes."""
+    config = _config()
+    governor = _governor(tmp_path)
+    runtime = FakeRuntime()
+    transport = _TitleRoutingTransport()
+    labels = _RecordingLabels()
+    facts = _FactsFor(
+        {1: _fix_issue_facts(1, title="Heimdall fix: PICKTRIVIAL correct the typo")}
+    )
+    base = ContainerImplementer(
+        credential="sk-ant-api03-k", model=resolve_model(Role.IMPLEMENTER, config)
+    )
+    router = _build_router(
+        config=config,
+        transport=transport,
+        facts=facts,
+        comments=_RecordingComments(),
+        governor=governor,
+        labels=labels,
+    )
+    build_prd = _bind(
+        tmp_path=tmp_path,
+        governor=governor,
+        runtime=runtime,
+        resolve_implementer=router,
+        base=base,
+    )
+
+    result = await build_prd(
+        repo_full_name="owner/repo",
+        prd_number=7,
+        slices=[_prd_slice(1)],
+        config=config,
+        claude_md=CLAUDE_MD,
+    )
+
+    assert result.prd_build is not None
+    assert result.prd_build.merged_issues == [1]
+    # The classifier ran exactly once for the one fix-issue.
+    assert len(transport.calls) == 1
+    # Its resolved level label was applied.
+    assert [r.label for r in labels.calls] == ["level:trivial"]
+    # It launched on the resolved level's implementer model.
+    assert _launched_models(runtime) == ["implementer-trivial"]
+    # The classifier charge was metered on top of the build gate estimate.
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(
+        1.0 + _CLASSIFIER_ESTIMATED_AMOUNT
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_loopback_fix_issues_each_classified_individually(
+    tmp_path: Path,
+) -> None:
+    """Two fix-issues classifying to different levels each exec their own level's model."""
+    config = _config()
+    governor = _governor(tmp_path)
+    runtime = FakeRuntime()
+    transport = _TitleRoutingTransport()
+    labels = _RecordingLabels()
+    facts = _FactsFor(
+        {
+            1: _fix_issue_facts(1, title="Heimdall fix: PICKTRIVIAL a one-line typo"),
+            2: _fix_issue_facts(2, title="Heimdall fix: a substantive refactor"),
+        }
+    )
+    base = ContainerImplementer(
+        credential="sk-ant-api03-k", model=resolve_model(Role.IMPLEMENTER, config)
+    )
+    router = _build_router(
+        config=config,
+        transport=transport,
+        facts=facts,
+        comments=_RecordingComments(),
+        governor=governor,
+        labels=labels,
+    )
+    build_prd = _bind(
+        tmp_path=tmp_path,
+        governor=governor,
+        runtime=runtime,
+        resolve_implementer=router,
+        base=base,
+    )
+
+    result = await build_prd(
+        repo_full_name="owner/repo",
+        prd_number=7,
+        slices=[_prd_slice(1), _prd_slice(2)],
+        config=config,
+        claude_md=CLAUDE_MD,
+    )
+
+    assert result.prd_build is not None
+    assert result.prd_build.merged_issues == [1, 2]
+    # Each fix-issue was classified on its own facts.
+    assert len(transport.calls) == 2
+    models = _launched_models(runtime)
+    assert "implementer-trivial" in models
+    assert "implementer-standard" in models
+    assert sorted(r.label for r in labels.calls) == ["level:standard", "level:trivial"]
+
+
+# --- ad-hoc lane: _resolve_adhoc_level (unit) ------------------------------------
+
+
+def _adhoc_issue(issue_number: int = 1) -> AdhocIssue:
+    return AdhocIssue(repo_full_name="owner/repo", issue_number=issue_number)
+
+
+@pytest.mark.asyncio
+async def test_resolve_adhoc_level_table_less_returns_none_without_classifying(
+    tmp_path: Path,
+) -> None:
+    """A table-less repo resolves ``None`` and never fetches facts or classifies."""
+    governor = _governor(tmp_path)
+    facts = _FactsFor({1: ClassifyInput(title="x", body="b", labels=[])})
+
+    level = await _resolve_adhoc_level(
+        _adhoc_issue(),
+        RepoConfig(staging_branch="staging"),  # no routing table
+        classify=_UnusedClassifier(),  # type: ignore[arg-type]
+        label_sink=_RecordingLabels(),  # type: ignore[arg-type]
+        comment_sink=_RecordingComments(),  # type: ignore[arg-type]
+        issue_facts=facts,  # type: ignore[arg-type]
+        governor=governor,
+    )
+
+    assert level is None
+    assert facts.calls == []
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_resolve_adhoc_level_classify_success_labels_and_charges(
+    tmp_path: Path,
+) -> None:
+    """A routing repo classifies once, applies the label, and meters one charge."""
+    labels, comments = _RecordingLabels(), _RecordingComments()
+    governor = _governor(tmp_path)
+    facts = _FactsFor({1: ClassifyInput(title="typo", body="b", labels=[])})
+
+    level = await _resolve_adhoc_level(
+        _adhoc_issue(),
+        _config(),
+        classify=_RecordingClassifier(ClassifyResult(level="trivial")),  # type: ignore[arg-type]
+        label_sink=labels,  # type: ignore[arg-type]
+        comment_sink=comments,  # type: ignore[arg-type]
+        issue_facts=facts,  # type: ignore[arg-type]
+        governor=governor,
+    )
+
+    assert level == "trivial"
+    assert [r.label for r in labels.calls] == ["level:trivial"]
+    assert comments.calls == []
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(
+        _CLASSIFIER_ESTIMATED_AMOUNT
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_adhoc_level_preexisting_label_skips_classifier(
+    tmp_path: Path,
+) -> None:
+    """A known ``level:`` label routes by that label with no classifier call or charge."""
+    labels = _RecordingLabels()
+    governor = _governor(tmp_path)
+    facts = _FactsFor(
+        {1: ClassifyInput(title="x", body="b", labels=["level:standard"])}
+    )
+
+    level = await _resolve_adhoc_level(
+        _adhoc_issue(),
+        _config(),
+        classify=_UnusedClassifier(),  # type: ignore[arg-type]
+        label_sink=labels,  # type: ignore[arg-type]
+        comment_sink=_RecordingComments(),  # type: ignore[arg-type]
+        issue_facts=facts,  # type: ignore[arg-type]
+        governor=governor,
+    )
+
+    assert level == "standard"
+    assert labels.calls == []
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_resolve_adhoc_level_failure_defaults_and_comments(
+    tmp_path: Path,
+) -> None:
+    """A classifier failure builds at the default level and posts the failure comment."""
+    comments = _RecordingComments()
+    governor = _governor(tmp_path)
+    facts = _FactsFor({1: ClassifyInput(title="x", body="b", labels=[])})
+
+    level = await _resolve_adhoc_level(
+        _adhoc_issue(),
+        _config(),
+        classify=_RecordingClassifier(ClassifyResult(level=None)),  # type: ignore[arg-type]
+        label_sink=_RecordingLabels(),  # type: ignore[arg-type]
+        comment_sink=comments,  # type: ignore[arg-type]
+        issue_facts=facts,  # type: ignore[arg-type]
+        governor=governor,
+    )
+
+    assert level == "standard"
+    assert len(comments.calls) == 1
+    assert comments.calls[0].body == _FAILURE_COMMENT.format(level="standard")
+
+
+@pytest.mark.asyncio
+async def test_resolve_adhoc_level_facts_flake_falls_back_without_propagating(
+    tmp_path: Path,
+) -> None:
+    """A gh/facts flake falls back to the table default and never propagates out."""
+    governor = _governor(tmp_path)
+
+    level = await _resolve_adhoc_level(
+        _adhoc_issue(),
+        _config(),
+        classify=_UnusedClassifier(),  # type: ignore[arg-type]
+        label_sink=_RecordingLabels(),  # type: ignore[arg-type]
+        comment_sink=_RecordingComments(),  # type: ignore[arg-type]
+        issue_facts=_RaisingFacts(RuntimeError("gh view exited non-zero")),  # type: ignore[arg-type]
+        governor=governor,
+    )
+
+    assert level == "standard"  # config.routing.default
+
+
+# --- ad-hoc lane: all three roles launch at the resolved level (integration) ------
+
+
+def _adhoc_routing() -> RoutingConfig:
+    """A table whose ``trivial`` level overrides planner, implementer, and reviewer.
+
+    Each override names a model distinct from that role's registry default so an exec/model
+    assertion is meaningful; the reviewer also overrides its effort tier.
+    """
+    return RoutingConfig(
+        default="standard",
+        levels={
+            "trivial": RoutingLevel(
+                description="a tiny one-file fix",
+                roles={
+                    "planner": {"model": "planner-trivial"},  # type: ignore[dict-item]
+                    "implementer": {"model": "implementer-trivial"},  # type: ignore[dict-item]
+                    "reviewer": {"model": "reviewer-trivial", "effort": "low"},  # type: ignore[dict-item]
+                },
+            ),
+            "standard": RoutingLevel(
+                description="a normal feature",
+                roles={"implementer": {"model": "implementer-standard"}},  # type: ignore[dict-item]
+            ),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_adhoc_roles_all_launch_at_the_resolved_level(tmp_path: Path) -> None:
+    """AC-1: the ad-hoc planner + implementer exec the level's models; the reviewer too.
+
+    Mirrors the reworked ``bind_adhoc_build`` closure: construct the three per-issue roles
+    at the resolved level and drive ``build_adhoc_issue`` over a fake runtime. The planner
+    and implementer exec ``claude --model <level's model>`` in-container; the reviewer's
+    generator carries the level's model and effort (it reviews over HTTP, not in-container).
+    """
+    config = RepoConfig(staging_branch="staging", routing=_adhoc_routing())
+    level = "trivial"
+    runtime = FakeRuntime()
+
+    planner = ContainerPlanner(
+        credential="sk-ant-api03-k",
+        auth_mode="api_key",
+        model=resolve_model(Role.PLANNER, config, level=level),
+    )
+    implementer = ContainerImplementer(
+        credential="sk-ant-api03-k",
+        auth_mode="api_key",
+        model=resolve_model(Role.IMPLEMENTER, config, level=level),
+    )
+    review_generate = AgentSdkReviewGenerator(
+        credential="sk-ant-api03-k",
+        transport=_TitleRoutingTransport(),
+        model=resolve_model(Role.REVIEWER, config, level=level),
+        effort=resolve_effort(Role.REVIEWER, config, level=level),
+    )
+    reviewer = ContainerAdhocReviewer(
+        repo_full_name="owner/repo",
+        config=config,
+        generate=review_generate,
+        create_issue=_no_create,  # type: ignore[arg-type]
+    )
+
+    result = await build_adhoc_issue(
+        _adhoc_issue(29),
+        config,
+        CLAUDE_MD,
+        planner=planner,
+        implementer=implementer,
+        auth=FakeAuth(),
+        runtime=runtime,
+        resolve_secret=_resolver({}),
+        report=_sink([]),
+        reviewer=None,  # the reviewer's routing is asserted on the generator directly
+    )
+
+    assert result.passed is True
+    assert _launched_models(runtime) == ["planner-trivial", "implementer-trivial"]
+    assert review_generate.model == "reviewer-trivial"
+    assert reviewer.generate is review_generate
+    assert review_generate.effort == resolve_effort(Role.REVIEWER, config, level=level)
+    assert review_generate.effort == "low"

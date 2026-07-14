@@ -1053,6 +1053,9 @@ class _RecordingAdhocPipeline:
 
     pr_calls: list[tuple[object, object]] = field(default_factory=list)
     pr_result: object | None = None
+    # The shared budget governor the per-issue classify hop meters on; ``None`` is fine
+    # for the table-less chain tests (they never classify) and for tests that fake the hop.
+    governor: object | None = None
 
     async def process_adhoc_pr(self, issue: object, build: object) -> object | None:
         self.pr_calls.append((issue, build))
@@ -1169,18 +1172,25 @@ async def test_bind_adhoc_build_still_chains_process_adhoc_pr_on_a_red_build(
     assert pipeline.pr_calls == [(issue, red)]
 
 
-def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
+@pytest.mark.asyncio
+async def test_bind_adhoc_build_resolves_each_role_model_at_the_issue_level(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each role's model in the ad-hoc build resolves against the repo config override.
+    """Each ad-hoc role is constructed *per issue* at the issue's resolved routing level.
 
-    A routing table whose ``default:`` level names the planner/implementer/reviewer roles
-    must flow into the constructed adapters' models — proving the ad-hoc lane runs the
-    repo's chosen models, not the registry defaults. The adapter constructors are captured
-    so the ``model=`` each receives is asserted against the routing override.
+    Issue #65: the ad-hoc lane classifies each issue once at build start and constructs its
+    planner/implementer/reviewer at that resolved level (not at bind time, and not at the
+    table default). The classify hop is faked to resolve ``complex`` — a **non-default**
+    level whose ``roles:`` map overrides all three models with ids distinct from the
+    ``default`` level's overrides. Since ``resolve_model(..., level=None)`` would resolve
+    via the default level, asserting the captured ``model=`` each adapter receives matches
+    ``complex`` (not the default) pins the resolved level actually flowing into
+    construction — a closure that dropped the level (passing ``level=None``) would build
+    the default models and fail. The captured classify-hop kwargs also pin that the shared
+    ``pipeline.governor`` meters the classifier charge.
     """
     import retinue.pipeline as pipeline_mod
-    from retinue.adhoc_build import ContainerPlanner
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ContainerPlanner
     from retinue.orchestrator import ContainerImplementer
     from retinue.pipeline import bind_adhoc_build
     from retinue.reviewer import AgentSdkReviewGenerator
@@ -1208,7 +1218,28 @@ def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
     monkeypatch.setattr(
         pipeline_mod, "AgentSdkReviewGenerator", _record("reviewer", AgentSdkReviewGenerator)
     )
+    # Fake the classify hop (resolves to the non-default ``complex`` level) and the
+    # container build, so the closure runs offline — no gh, no classifier HTTP, no Docker.
+    # The kwargs the hop receives are captured to pin the governor threaded into it.
+    resolved: list[object] = []
+    resolve_kwargs: dict[str, object] = {}
 
+    async def _fake_level(issue: object, config: object, **kwargs: object) -> str:
+        resolved.append(issue)
+        resolve_kwargs.update(kwargs)
+        return "complex"
+
+    monkeypatch.setattr(pipeline_mod, "_resolve_adhoc_level", _fake_level)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "build_adhoc_issue",
+        _fake_build_adhoc_issue({}, AdhocBuildResult(branch="issue-31", passed=True)),
+    )
+
+    # Two levels with *distinct* role models: the ``default`` (``standard``) and the
+    # non-default ``complex`` the fake resolves to. If the closure dropped the level and
+    # resolved at ``level=None``, every model below would come out ``*-default``, so the
+    # ``*-complex`` asserts pin the resolved level flowing through the construction.
     config = RepoConfig(
         staging_branch="staging",
         retry_cap=2,
@@ -1218,29 +1249,52 @@ def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
                 "standard": RoutingLevel(
                     description="Ordinary work.",
                     roles={
-                        Role.PLANNER.value: ModelEffort(model="planner-custom"),
-                        Role.IMPLEMENTER.value: ModelEffort(model="implementer-custom"),
-                        Role.REVIEWER.value: ModelEffort(model="reviewer-custom"),
+                        Role.PLANNER.value: ModelEffort(model="planner-default"),
+                        Role.IMPLEMENTER.value: ModelEffort(model="implementer-default"),
+                        Role.REVIEWER.value: ModelEffort(model="reviewer-default"),
                     },
-                )
+                ),
+                "complex": RoutingLevel(
+                    description="Hard work.",
+                    roles={
+                        Role.PLANNER.value: ModelEffort(model="planner-complex"),
+                        Role.IMPLEMENTER.value: ModelEffort(model="implementer-complex"),
+                        Role.REVIEWER.value: ModelEffort(model="reviewer-complex"),
+                    },
+                ),
             },
         ),
     )
     settings = _settings(tmp_path, anthropic_credential="k")
-    bind_adhoc_build(
+    # A distinct governor sentinel so the captured classify-hop kwargs prove the pipeline's
+    # own governor (not some other object) meters the per-issue classifier charge.
+    governor_sentinel = object()
+    pipeline = _RecordingAdhocPipeline(governor=governor_sentinel)
+    build = bind_adhoc_build(
         settings,  # type: ignore[arg-type]
         _FakeAuth(),  # type: ignore[arg-type]
-        pipeline=_RecordingAdhocPipeline(),  # type: ignore[arg-type]
+        pipeline=pipeline,  # type: ignore[arg-type]
         repo_full_name="owner/repo",
         token="ghs_x",
         config=config,
         claude_md="## Definition of done\n```\nuv run pytest\n```\n",
     )
 
+    # No role is constructed at bind time — construction is deferred into the per-issue build.
+    assert captured == {}
+
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    await build(issue, repo_full_name="owner/repo")
+
+    # The issue was classified exactly once, metered on the pipeline's own governor.
+    assert resolved == [issue]
+    assert resolve_kwargs["governor"] is governor_sentinel
+    # Each role was built at the resolved (non-default ``complex``) level's model — a
+    # closure resolving at ``level=None`` would yield the ``*-default`` ids instead.
     assert captured == {
-        "planner": "planner-custom",
-        "implementer": "implementer-custom",
-        "reviewer": "reviewer-custom",
+        "planner": "planner-complex",
+        "implementer": "implementer-complex",
+        "reviewer": "reviewer-complex",
     }
     # The routing table's roles map named a model but no ``effort:`` for the reviewer, so
     # its effort falls through to the registry default (``max``) — a model-only override
