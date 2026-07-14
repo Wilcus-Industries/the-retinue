@@ -266,9 +266,11 @@ class ClaudeIssueClassifier:
         content = body.get("content")
         blocks = content if isinstance(content, list) else []
         text = "".join(
-            block.get("text", "")
+            block["text"]
             for block in blocks
-            if isinstance(block, dict) and block.get("type") == "text"
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
         )
         if not text.strip():
             raise ClassificationError("Messages API response carried no text content")

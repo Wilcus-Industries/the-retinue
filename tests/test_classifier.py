@@ -285,6 +285,23 @@ async def test_non_list_content_retries_once_then_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_non_string_text_block_retries_once_then_fails() -> None:
+    """A 200 body with a non-string ``text`` value fails without raising."""
+    transport = _FakeTransport(
+        [
+            HttpResponse(status_code=200, body={"content": [{"type": "text", "text": 42}]}),
+            HttpResponse(status_code=200, body={"content": [{"type": "text", "text": 42}]}),
+        ]
+    )
+    gen = _classifier(transport)
+
+    result = await gen(_issue())
+
+    assert result == ClassifyResult(level=None)
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_retry_succeeds_after_a_first_failure() -> None:
     """A first-attempt non-200 then a valid response yields the level in two calls."""
     transport = _FakeTransport(
