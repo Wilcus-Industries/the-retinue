@@ -384,6 +384,32 @@ async def test_router_facts_failure_falls_back_to_base_implementer(
 
 
 @pytest.mark.asyncio
+async def test_router_misuse_without_a_routing_table_fails_loudly(
+    tmp_path: Path,
+) -> None:
+    """Constructing the router for a table-less repo is misuse and must propagate.
+
+    The best-effort fallback exists for runtime flakes (gh, JSON, comment posts) — not
+    for programming errors. ``resolve_issue_level`` asserts the table exists; that
+    :class:`AssertionError` must escape ``__call__``'s guard rather than be silently
+    downgraded to a base-implementer fallback, or the misuse would never surface.
+    """
+    router = PerIssueImplementerRouter(
+        base_implementer=ContainerImplementer(credential="k", model="base-model"),
+        config=RepoConfig(staging_branch="staging"),  # no routing table
+        classify=_UnusedClassifier(),
+        label_sink=_RecordingLabels(),
+        comment_sink=_RecordingComments(),
+        issue_facts=_FactsFor({1: ClassifyInput(title="x", body="b", labels=[])}),
+        governor=_governor(tmp_path),
+        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+    )
+
+    with pytest.raises(AssertionError):
+        await router(_slice(1))
+
+
+@pytest.mark.asyncio
 async def test_router_failure_comment_post_failure_falls_back_to_base(
     tmp_path: Path,
 ) -> None:
@@ -1129,3 +1155,4 @@ async def test_adhoc_roles_all_launch_at_the_resolved_level(tmp_path: Path) -> N
     assert reviewer.generate is review_generate
     assert review_generate.effort == resolve_effort(Role.REVIEWER, config, level=level)
     assert review_generate.effort == "low"
+

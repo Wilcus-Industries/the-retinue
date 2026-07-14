@@ -184,13 +184,15 @@ class PerIssueImplementerRouter:
     classification failure, and returns the base implementer with the level's implementer
     model swapped in via :func:`dataclasses.replace` (same credential/auth_mode/max_turns).
 
-    Any failure along that path — a gh flake fetching facts, malformed JSON, a label
-    object missing ``name``, or a failed failure-comment post — is caught and swallowed:
-    the router logs a warning and returns the injected base implementer unchanged rather
-    than propagating. Propagating would surface out of the triage wrapper before its
-    retry logic, escalating the slice with zero retries; the base implementer (the
-    table's default level) is a sound fallback, mirroring the best-effort label contract
-    in :func:`retinue.level.resolve_level`.
+    Any runtime failure along that path — a gh flake fetching facts, malformed JSON, a
+    label object missing ``name``, or a failed failure-comment post — is caught and
+    swallowed: the router logs a warning and returns the injected base implementer
+    unchanged rather than propagating. Propagating would surface out of the triage
+    wrapper before its retry logic, escalating the slice with zero retries; the base
+    implementer (the table's default level) is a sound fallback, mirroring the
+    best-effort label contract in :func:`retinue.level.resolve_level`.
+    :class:`AssertionError` (router misuse: no routing table) is the exception — a
+    programming error propagates loudly instead of hiding behind the fallback.
 
     Attributes:
         base_implementer: The template implementer whose model is replaced per slice.
@@ -219,10 +221,11 @@ class PerIssueImplementerRouter:
         # logic, escalating the slice with zero retries and skipping its dependent
         # subtree. Instead fall back to the injected base implementer — the table's
         # default level is a good fallback — mirroring resolve_level's best-effort
-        # label contract.
+        # label contract. AssertionError is excluded: it marks router misuse (no
+        # routing table), a programming error that must fail loudly, not a flake.
         try:
             return await self._resolve(slice_)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, AssertionError):
             raise
         except Exception:
             logger.warning(
