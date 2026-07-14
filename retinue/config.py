@@ -34,8 +34,12 @@ class Settings(BaseSettings):
     )
     weekly_budget: float = Field(
         default=0.0,
+        ge=0.0,
         description="Service-level weekly budget — dollars in api_key mode, tokens in "
-        "subscription mode. The 24h cap is a fraction of this.",
+        "subscription mode. The 24h cap is a fraction of this. The default 0.0 is the "
+        "disabled sentinel: budget metering is off and every build is admitted "
+        "uncharged. Set a positive value to enforce spend caps; a negative value is "
+        "rejected at load.",
     )
     budget_db_path: str = Field(
         default="retinue-budget.sqlite3",
@@ -51,6 +55,7 @@ class Settings(BaseSettings):
     # drives WorkerSettings.job_timeout (applied in worker.main at process start).
     job_timeout_seconds: int = Field(
         default=1800,
+        gt=0,
         description="Arq worker-global job timeout in seconds; must outlast a full build",
     )
 
@@ -61,6 +66,7 @@ class Settings(BaseSettings):
     # agree. Tunable via env (no rebuild — worker recreate only).
     implement_max_turns: int = Field(
         default=80,
+        gt=0,
         description="Hard cap on the implementer's agent loop (claude --max-turns)",
     )
 

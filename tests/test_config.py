@@ -66,6 +66,27 @@ def test_budget_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.weekly_budget == 1_000_000.0
 
 
+@pytest.mark.parametrize("value", ["-1", "-0.5"])
+def test_negative_weekly_budget_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """A negative weekly budget is a config error; only 0.0 (disabled) or >0 are valid."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("WEEKLY_BUDGET", value)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_zero_weekly_budget_is_the_disabled_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WEEKLY_BUDGET=0 loads cleanly: it is the metering-disabled sentinel, not an error."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("WEEKLY_BUDGET", "0")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.weekly_budget == 0.0
+
+
 def test_job_timeout_default_exceeds_arq_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -87,6 +108,35 @@ def test_job_timeout_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JOB_TIMEOUT_SECONDS", "3600")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.job_timeout_seconds == 3600
+
+
+def test_implement_max_turns_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The implementer's agent-loop cap carries its default (mirrors the orchestrator)."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.implement_max_turns == 80
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_non_positive_job_timeout_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """A zero or negative job timeout is a config error, not a silent load."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("JOB_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_non_positive_implement_max_turns_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """A zero or negative implement cap is a config error, not a silent load."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("IMPLEMENT_MAX_TURNS", value)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
 
 
 def test_adapter_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:

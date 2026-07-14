@@ -12,7 +12,9 @@ Two enforcement points:
 * **gate at run start** (:meth:`BudgetGovernor.gate`) — if the run's estimated charge
   would push the trailing-24h spend over the cap, the run is *deferred* until the window
   frees enough room for that estimate (the charges expire oldest-first until the trailing
-  spend leaves room for the estimate under the cap).
+  spend leaves room for the estimate under the cap). An admitted run's estimate is
+  *charged* to the ledger atomically with the check, so the PRD and cron lanes' spend
+  counts against the shared window.
 * **meter mid-run** (:meth:`BudgetGovernor.meter`) — a charge that would cross the cap
   *pauses* the run and checkpoints it (the owned slice set is recorded in the reconcile
   :class:`~retinue.reconcile.RunStateStore`). :meth:`BudgetGovernor.try_resume` resumes
@@ -35,6 +37,7 @@ queries flow through the injected reconcile seam, so the whole flow runs with no
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
 from dataclasses import dataclass
@@ -44,6 +47,7 @@ from typing import Protocol
 
 import aiosqlite
 
+from retinue.db import connect_daemon
 from retinue.orchestrator import PrdSlice
 from retinue.reconcile import (
     ReconcileGh,
@@ -192,10 +196,51 @@ class BudgetLedger:
         self.auth_mode = auth_mode
         self._weekly_budget = weekly_budget
         self._daily_cap_fraction = daily_cap_fraction
+        # One long-lived connection per store instance, opened lazily and guarded by a
+        # per-store lock so the check-and-record transaction stays atomic under concurrent
+        # asyncio tasks (a shared connection would interleave statements mid-transaction).
+        self._db: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def metering_disabled(self) -> bool:
+        """Whether spend metering is off because the weekly budget is the 0.0 sentinel.
+
+        The default ``weekly_budget == 0.0`` means an operator never set a budget; rather
+        than cap every build at a zero ceiling (declining all work forever), metering is
+        disabled and callers admit everything uncharged. Only the *exact* 0.0 sentinel
+        disables — a positive budget whose fractional cap rounds to zero still enforces.
+        """
+        return self._weekly_budget == 0.0
 
     def cap(self) -> float:
         """Return the rolling-24h ceiling: ``daily_cap_fraction`` of the weekly budget."""
         return self._weekly_budget * self._daily_cap_fraction
+
+    async def _conn(self) -> aiosqlite.Connection:
+        """Return the store's long-lived connection, connecting + tuning it once.
+
+        Lazily opens the connection (creating the parent dir), enables WAL with
+        ``synchronous=NORMAL`` and the busy-timeout, and ensures the schema — all once per
+        instance. ``isolation_level=None`` puts the connection in autocommit so the
+        explicit ``BEGIN IMMEDIATE`` in :meth:`try_record_if_within_cap` is the only
+        transaction control, never colliding with sqlite3's implicit transactions. Callers
+        must hold :attr:`_lock` around this and the statements that follow.
+        """
+        if self._db is None:
+            self._db = await connect_daemon(self._db_path, isolation_level=None)
+            await self._db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA synchronous=NORMAL")
+            await self._db.execute(_SCHEMA)
+        return self._db
+
+    async def close(self) -> None:
+        """Close the store's long-lived connection if opened; a later call reconnects."""
+        async with self._lock:
+            if self._db is not None:
+                await self._db.close()
+                self._db = None
 
     async def record_spend(self, *, amount: float) -> None:
         """Append a timestamped charge to the ledger.
@@ -205,13 +250,12 @@ class BudgetLedger:
                 clock's current instant so it counts against the rolling window.
         """
         stamp = self._clock.now().isoformat()
-        async with self._connect() as db:
-            await db.execute(_SCHEMA)
+        async with self._lock:
+            db = await self._conn()
             await db.execute(
                 "INSERT INTO spend_entries (spent_at, amount) VALUES (?, ?)",
                 (stamp, amount),
             )
-            await db.commit()
 
     async def trailing_24h_spend(self) -> float:
         """Return the total charged in the trailing 24h from the clock's current instant.
@@ -219,8 +263,8 @@ class BudgetLedger:
         Charges older than 24h are excluded — the window rolls forward with the clock, so
         spend frees up as old charges age out.
         """
-        async with self._connect() as db:
-            await db.execute(_SCHEMA)
+        async with self._lock:
+            db = await self._conn()
             return await self._trailing_within(db)
 
     async def _trailing_within(self, db: aiosqlite.Connection) -> float:
@@ -257,12 +301,12 @@ class BudgetLedger:
             nothing is written.
         """
         stamp = self._clock.now().isoformat()
-        async with self._connect() as db:
-            await db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            await db.execute(_SCHEMA)
+        async with self._lock:
+            db = await self._conn()
             # BEGIN IMMEDIATE takes the write lock up front, so the re-read below reflects
-            # any concurrent writer that committed first; aiosqlite's autocommit must be
-            # off for the explicit transaction to span the read and the insert.
+            # any concurrent writer (a separate store on the same file) that committed
+            # first; the per-store lock above keeps this instance's own tasks from
+            # interleaving statements inside the transaction.
             await db.execute("BEGIN IMMEDIATE")
             try:
                 if (await self._trailing_within(db)) + amount > self.cap():
@@ -306,8 +350,8 @@ class BudgetLedger:
             is in the window (nothing to wait for).
         """
         cutoff = (self._clock.now() - _WINDOW).isoformat()
-        async with self._connect() as db:
-            await db.execute(_SCHEMA)
+        async with self._lock:
+            db = await self._conn()
             async with db.execute(
                 "SELECT spent_at, amount FROM spend_entries "
                 "WHERE spent_at > ? ORDER BY spent_at ASC",
@@ -327,11 +371,6 @@ class BudgetLedger:
         # Even with every in-window charge aged out, ``amount`` alone exceeds the cap; the
         # last charge to expire is the earliest the window is as empty as it can get.
         return datetime.fromisoformat(last_spent_at) + _WINDOW
-
-    def _connect(self) -> aiosqlite.Connection:
-        """Open a fresh DB connection, ensuring the parent dir exists first."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        return aiosqlite.connect(self._db_path)
 
 
 @dataclass(frozen=True)
@@ -368,7 +407,8 @@ class BudgetGovernor:
     """Gates a run at start and meters it mid-flight against the rolling-24h cap.
 
     Wraps a :class:`BudgetLedger`. :meth:`gate` defers a run that would start over the
-    cap. :meth:`meter` pauses and checkpoints a run whose next charge would cross the cap,
+    cap and charges an admitted run's estimate to the shared ledger. :meth:`meter`
+    pauses and checkpoints a run whose next charge would cross the cap,
     recording the owned slice set in the reconcile :class:`~retinue.reconcile.RunStateStore`
     so :meth:`try_resume` can rebuild only the unfinished work via
     :func:`~retinue.reconcile.reconcile_run` once the window frees.
@@ -391,28 +431,72 @@ class BudgetGovernor:
         # here for a same-process resume; a cross-restart resume falls back to an empty
         # graph (reconcile still resumes the unfinished slices correctly).
         self._blocked_by: dict[str, dict[int, list[int]]] = {}
+        # One long-lived connection for the pause table, opened lazily and guarded by a
+        # per-store lock (same rationale as BudgetLedger's connection).
+        self._db: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
+        if ledger.metering_disabled:
+            logger.warning(
+                "budget disabled — set WEEKLY_BUDGET to enforce spend caps"
+            )
+
+    async def _conn(self) -> aiosqlite.Connection:
+        """Return the governor's long-lived pause-table connection, tuning it once.
+
+        Lazily opens the connection (creating the parent dir), enables WAL with
+        ``synchronous=NORMAL`` and the busy-timeout, and runs the pause-schema migration —
+        all once per instance. Callers must hold :attr:`_lock` around this and the
+        statements that follow.
+        """
+        if self._db is None:
+            self._db = await connect_daemon(self._db_path, isolation_level=None)
+            await self._db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA synchronous=NORMAL")
+            await _ensure_pause_schema(self._db)
+        return self._db
+
+    async def close(self) -> None:
+        """Release the governor's pause connection and the wrapped ledger's connection."""
+        async with self._lock:
+            if self._db is not None:
+                await self._db.close()
+                self._db = None
+        await self._ledger.close()
 
     async def gate(self, *, estimated_amount: float) -> GateDecision:
-        """Admit or defer a run by its estimated charge against the rolling-24h cap.
+        """Admit-and-charge or defer a run by its estimated charge against the 24h cap.
+
+        An admitted run's estimate is *recorded* to the shared ledger inside the same
+        write-locked transaction that verified the room
+        (:meth:`BudgetLedger.try_record_if_within_cap`), so the PRD and cron lanes'
+        spend counts against the rolling window — and two lanes gating concurrently
+        serialize on the write lock and can never jointly overshoot the cap. A deferred
+        run records nothing.
 
         Args:
             estimated_amount: The run's estimated total charge in the ledger's unit.
+                Only call once the run will actually build on admission — the charge
+                lands at the gate.
 
         Returns:
             A :class:`GateDecision`: ``deferred`` with a ``defer_until`` when the charge
-            would start the run over the cap, else an admitted decision.
+            would start the run over the cap (nothing recorded), else an admitted
+            decision with the estimate charged.
         """
-        if await self._ledger.would_exceed(amount=estimated_amount):
-            defer_until = await self._ledger.window_frees_at(amount=estimated_amount)
-            logger.info(
-                "Budget gate deferring run: estimated %.4g would exceed the 24h cap "
-                "(%.4g); defer until %s",
-                estimated_amount,
-                self._ledger.cap(),
-                defer_until,
-            )
-            return GateDecision(deferred=True, defer_until=defer_until)
-        return GateDecision(deferred=False, defer_until=None)
+        if self._ledger.metering_disabled:
+            return GateDecision(deferred=False, defer_until=None)
+        if await self._ledger.try_record_if_within_cap(amount=estimated_amount):
+            return GateDecision(deferred=False, defer_until=None)
+        defer_until = await self._ledger.window_frees_at(amount=estimated_amount)
+        logger.info(
+            "Budget gate deferring run: estimated %.4g would exceed the 24h cap "
+            "(%.4g); defer until %s",
+            estimated_amount,
+            self._ledger.cap(),
+            defer_until,
+        )
+        return GateDecision(deferred=True, defer_until=defer_until)
 
     async def meter_adhoc(self, *, amount: float) -> bool:
         """Meter one ad-hoc build's flat charge against the shared rolling-24h cap.
@@ -433,6 +517,8 @@ class BudgetGovernor:
             True when the charge fit under the cap and was recorded (build admitted);
             False when the shared window leaves no room (build declined, nothing written).
         """
+        if self._ledger.metering_disabled:
+            return True
         return await self._ledger.try_record_if_within_cap(amount=amount)
 
     async def meter(
@@ -571,8 +657,8 @@ class BudgetGovernor:
         self._checkpoint_blocked_by(repo_full_name, prd_number, slices)
         key = run_state_key(repo_full_name, prd_number)
         stamp = (resume_at or self._ledger._clock.now()).isoformat()
-        async with self._connect() as db:
-            await _ensure_pause_schema(db)
+        async with self._lock:
+            db = await self._conn()
             await db.execute(
                 """
                 INSERT INTO budget_pauses (prd_key, resume_at, amount) VALUES (?, ?, ?)
@@ -581,7 +667,6 @@ class BudgetGovernor:
                 """,
                 (key, stamp, amount),
             )
-            await db.commit()
 
     def _checkpoint_blocked_by(
         self, repo_full_name: str, prd_number: int, slices: list[PrdSlice]
@@ -635,8 +720,8 @@ class BudgetGovernor:
     ) -> tuple[datetime, float] | None:
         """Return the paused PRD's (resume time, charge), or None when not paused."""
         key = run_state_key(repo_full_name, prd_number)
-        async with self._connect() as db:
-            await _ensure_pause_schema(db)
+        async with self._lock:
+            db = await self._conn()
             async with db.execute(
                 "SELECT resume_at, amount FROM budget_pauses WHERE prd_key = ?", (key,)
             ) as cursor:
@@ -648,12 +733,6 @@ class BudgetGovernor:
     async def _clear_pause(self, repo_full_name: str, prd_number: int) -> None:
         """Remove the pause record once a run resumes."""
         key = run_state_key(repo_full_name, prd_number)
-        async with self._connect() as db:
-            await _ensure_pause_schema(db)
+        async with self._lock:
+            db = await self._conn()
             await db.execute("DELETE FROM budget_pauses WHERE prd_key = ?", (key,))
-            await db.commit()
-
-    def _connect(self) -> aiosqlite.Connection:
-        """Open a fresh DB connection, ensuring the parent dir exists first."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        return aiosqlite.connect(self._db_path)

@@ -3,7 +3,9 @@
 A scheduled cron tick drains loose ``backlog`` issues one at a time:
 
 1. **gate** on the shared :class:`retinue.budget.BudgetGovernor` — defer when the budget
-   is spent (no issue is picked, no downstream runs),
+   is spent (no issue is picked, no downstream runs); an admitted tick's estimate is
+   charged to the shared ledger, and an empty backlog is checked first so an idle tick
+   never charges,
 2. **pick** the next backlog issue by a weighted score (priority + age), except on every
    Nth tick where a **quota floor** takes the oldest low-priority issue so low items
    provably drain,
@@ -212,7 +214,9 @@ async def test_low_priority_drains_over_many_ticks(tmp_path: Path) -> None:
     taken, so the low backlog drains rather than starving.
     """
     clock = FakeClock()
-    governor = _governor(tmp_path, clock)
+    # Every admitted tick charges its estimate to the ledger; a roomy budget keeps the
+    # 15 ticks under the cap so this test exercises the quota floor, not the gate.
+    governor = _governor(tmp_path, clock, weekly_budget=1000.0)
     # Two stubborn low-priority issues plus an always-present high-priority distractor.
     remaining = {
         1: _issue(1, priority="high", age_days=1),
@@ -277,36 +281,52 @@ async def test_tick_defers_when_budget_spent(tmp_path: Path) -> None:
     assert result.outcome is CronOutcome.DEFERRED
     assert result.defer_until is not None
     assert build.built == []
+    # A deferred tick charges nothing: only the 12.0 already spent is on the ledger.
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(12.0)
 
 
 @pytest.mark.asyncio
-async def test_gate_runs_before_the_backlog_query(tmp_path: Path) -> None:
-    """A deferred tick does not even query the backlog (gate precedes selection)."""
+async def test_ran_tick_charges_the_shared_ledger(tmp_path: Path) -> None:
+    """A tick that drains an issue records its estimate on the shared rolling-24h ledger.
+
+    The cron lane burns real spend when it builds; the gate must charge the estimate to
+    the service-level ledger (not just read it), or the 12%/24h cap never learns about
+    cron-lane spend and the shared budget is decorative.
+    """
     clock = FakeClock()
     governor = _governor(tmp_path, clock, weekly_budget=100.0)
-    await governor._ledger.record_spend(amount=12.0)
+    gh = FakeCronGh([_issue(1, priority="high", age_days=1)])
+    build = RecordingBuild()
 
-    queried = False
-
-    class TrackingGh:
-        async def list_backlog(self, *, repo_full_name: str) -> list[BacklogIssue]:
-            nonlocal queried
-            queried = True
-            return []
-
-    result = await run_cron_tick(
-        repo_full_name="owner/repo",
-        gh=TrackingGh(),
-        governor=governor,
-        clock=clock,
-        build=RecordingBuild(),
-        tick_number=1,
-        estimated_amount=5.0,
-        lock=OneAtATimeLock(),
+    result = await _tick(
+        gh=gh, governor=governor, clock=clock, build=build, estimated_amount=5.0
     )
 
-    assert result.outcome is CronOutcome.DEFERRED
-    assert queried is False
+    assert result.outcome is CronOutcome.RAN
+    assert build.built == [1]
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_idle_tick_charges_nothing(tmp_path: Path) -> None:
+    """An empty backlog is checked before the gate, so an idle tick burns no budget.
+
+    The gate now charges the admitted estimate to the shared ledger; if it ran before
+    the backlog query, a stream of idle ticks would fill the rolling-24h window with
+    phantom charges and defer real work. The backlog-empty check must precede the gate.
+    """
+    clock = FakeClock()
+    governor = _governor(tmp_path, clock, weekly_budget=100.0)
+    build = RecordingBuild()
+
+    result = await _tick(
+        gh=FakeCronGh([]), governor=governor, clock=clock, build=build,
+        estimated_amount=5.0,
+    )
+
+    assert result.outcome is CronOutcome.IDLE
+    assert build.built == []
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(0.0)
 
 
 # --- single cron run -------------------------------------------------------------

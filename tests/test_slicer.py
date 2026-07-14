@@ -246,31 +246,6 @@ def test_subscription_mode_uses_bearer_token_and_oauth_beta_header() -> None:
     }
 
 
-def test_request_kwargs_prepend_claude_code_identity_in_subscription_mode() -> None:
-    """OAuth (subscription) mode sends the identity as the first system block (issue #52).
-
-    Without it, Anthropic rejects a subscription-OAuth premium-model request as a
-    mislabeled 429 rate_limit_error.
-    """
-    gen = ClaudeSliceGenerator(token="oauth-tok", auth_mode="subscription")
-
-    kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
-
-    system = kwargs["system"]
-    assert isinstance(system, list)
-    assert system[0]["text"] == CLAUDE_CODE_IDENTITY
-    assert system[1]["text"] == _SLICE_SYSTEM
-
-
-def test_request_kwargs_keep_plain_system_string_in_api_key_mode() -> None:
-    """api_key mode is unaffected: the system value stays the plain role-brief string."""
-    gen = ClaudeSliceGenerator(token="sk-ant-123", auth_mode="api_key")
-
-    kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
-
-    assert kwargs["system"] == _SLICE_SYSTEM
-
-
 def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:
     """The assembled request pins the model, the PRD body, and a strict JSON schema."""
     gen = ClaudeSliceGenerator(token="sk-ant-123", model="claude-opus-4-8")
@@ -284,7 +259,35 @@ def test_request_kwargs_carry_model_prd_body_and_strict_schema() -> None:
     fmt = kwargs["output_config"]["format"]
     assert fmt["type"] == "json_schema"
     assert fmt["schema"]["properties"]["slices"]["type"] == "array"
+    assert "response_format" not in kwargs
     assert kwargs["max_tokens"] > 0
+
+
+def test_subscription_mode_request_system_leads_with_claude_code_identity() -> None:
+    """In subscription (OAuth) mode the system field leads with the identity block.
+
+    A subscription OAuth token reaches the premium slicing model over the raw Messages
+    API only when the first system block is the Claude Code identity string; the slicer's
+    own brief follows it as the second block.
+    """
+    gen = ClaudeSliceGenerator(token="oauth-tok", auth_mode="subscription")
+
+    system = gen._build_request_kwargs("body")["system"]
+
+    assert system == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": _SLICE_SYSTEM},
+    ]
+
+
+def test_api_key_mode_request_system_stays_the_plain_role_prompt() -> None:
+    """In api_key mode the system field stays the unchanged plain role brief."""
+    gen = ClaudeSliceGenerator(token="sk-ant-123", auth_mode="api_key")
+
+    system = gen._build_request_kwargs("body")["system"]
+
+    assert system == _SLICE_SYSTEM
+    assert isinstance(system, str)
 
 
 def test_request_injects_prd_testing_decisions_as_authoritative_seam() -> None:

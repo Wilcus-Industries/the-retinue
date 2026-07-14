@@ -42,7 +42,6 @@ from retinue.loopback import (
     _auth_env,
     _parse_review_requested,
     _re_review_args,
-    _refile_drafts,
     decide_verdict,
     priority_label,
     process_review,
@@ -167,26 +166,75 @@ def test_priority_label_maps_severity_one_to_one() -> None:
 # --- the pure verdict decision ---------------------------------------------------
 
 
-def test_decide_converged_with_no_blocking_findings() -> None:
-    """Zero blocking findings converges regardless of the round count."""
-    assert decide_verdict(blocking=0, rounds=0, cap=3) is VerdictDecision.CONVERGED
-    assert decide_verdict(blocking=0, rounds=3, cap=3) is VerdictDecision.CONVERGED
+def test_decide_approved_converges_regardless_of_findings_or_rounds() -> None:
+    """An APPROVED review converges — the authoritative state beats parsed findings."""
+    approved = ReviewState.APPROVED
+    assert (
+        decide_verdict(state=approved, blocking=0, rounds=0, cap=3)
+        is VerdictDecision.CONVERGED
+    )
+    # Even with blocking-looking parsed lines or the budget spent: approved is approved.
+    assert (
+        decide_verdict(state=approved, blocking=2, rounds=3, cap=3)
+        is VerdictDecision.CONVERGED
+    )
+
+
+def test_decide_commented_review_carries_no_verdict() -> None:
+    """A COMMENTED review is not a verdict: neither converge nor rebuild."""
+    commented = ReviewState.COMMENTED
+    assert (
+        decide_verdict(state=commented, blocking=0, rounds=0, cap=3)
+        is VerdictDecision.NO_VERDICT
+    )
+    assert (
+        decide_verdict(state=commented, blocking=2, rounds=0, cap=3)
+        is VerdictDecision.NO_VERDICT
+    )
 
 
 def test_decide_rebuild_while_under_cap() -> None:
     """Blocking findings under the round cap drive a REBUILD."""
-    assert decide_verdict(blocking=2, rounds=0, cap=3) is VerdictDecision.REBUILD
-    assert decide_verdict(blocking=1, rounds=2, cap=3) is VerdictDecision.REBUILD
+    changes = ReviewState.REQUEST_CHANGES
+    assert (
+        decide_verdict(state=changes, blocking=2, rounds=0, cap=3)
+        is VerdictDecision.REBUILD
+    )
+    assert (
+        decide_verdict(state=changes, blocking=1, rounds=2, cap=3)
+        is VerdictDecision.REBUILD
+    )
 
 
 def test_decide_escalate_at_cap_while_blocked() -> None:
     """Blocking findings with the round budget spent escalates."""
-    assert decide_verdict(blocking=1, rounds=3, cap=3) is VerdictDecision.ESCALATE
+    changes = ReviewState.REQUEST_CHANGES
+    assert (
+        decide_verdict(state=changes, blocking=1, rounds=3, cap=3)
+        is VerdictDecision.ESCALATE
+    )
 
 
 def test_decide_zero_cap_escalates_first_blocking_round() -> None:
     """retry_cap=0 means no rebuild rounds: the first blocking verdict escalates."""
-    assert decide_verdict(blocking=1, rounds=0, cap=0) is VerdictDecision.ESCALATE
+    changes = ReviewState.REQUEST_CHANGES
+    assert (
+        decide_verdict(state=changes, blocking=1, rounds=0, cap=0)
+        is VerdictDecision.ESCALATE
+    )
+
+
+def test_decide_request_changes_without_parseable_findings_escalates() -> None:
+    """REQUEST_CHANGES with zero parsed blocking findings escalates, never converges.
+
+    Heimdall explicitly rejected the PR; if its body didn't parse into actionable
+    findings the loopback must not silently hand the PR off as clean.
+    """
+    changes = ReviewState.REQUEST_CHANGES
+    assert (
+        decide_verdict(state=changes, blocking=0, rounds=0, cap=3)
+        is VerdictDecision.ESCALATE
+    )
 
 
 # --- REQUEST_CHANGES -> fix-issues that rebuild onto the same branch -------------
@@ -257,7 +305,7 @@ async def test_non_blocking_nits_become_backlog_priority_issues(tmp_path: Path) 
     store = HeimdallRoundStore(tmp_path / "rounds.sqlite3")
     sinks = _RecordingSinks()
     review = _review(
-        ReviewState.COMMENTED,
+        ReviewState.APPROVED,
         [_nit(Severity.LOW), _nit(Severity.MEDIUM)],
     )
 
@@ -265,7 +313,7 @@ async def test_non_blocking_nits_become_backlog_priority_issues(tmp_path: Path) 
         review, config=RepoConfig(), store=store, sinks=sinks
     )
 
-    # No blocking findings -> converged, and the nits are filed as backlog.
+    # Approved -> converged, and the nits are filed as backlog.
     assert result.outcome is VerdictOutcome.CONVERGED
     assert handoff.calls == [("owner/repo", 42)]
     assert len(creator.drafts) == 2
@@ -276,6 +324,49 @@ async def test_non_blocking_nits_become_backlog_priority_issues(tmp_path: Path) 
     # Backlog issues still link to the PRD but are not rebuilt.
     assert all("Part of #1" in draft.body for draft in creator.drafts)
     assert rebuilder.requests == []
+
+
+@pytest.mark.asyncio
+async def test_commented_review_is_ignored(tmp_path: Path) -> None:
+    """A COMMENTED heimdall review neither hands off nor rebuilds nor files issues.
+
+    Heimdall posts plain comments (progress notes) that carry no verdict; converging
+    on one would hand off a PR heimdall never approved.
+    """
+    store = HeimdallRoundStore(tmp_path / "rounds.sqlite3")
+    sinks = _RecordingSinks()
+    review = _review(ReviewState.COMMENTED, [_blocking(), _nit()])
+
+    creator, rebuilder, handoff, result = await _run(
+        review, config=RepoConfig(), store=store, sinks=sinks
+    )
+
+    assert result.outcome is VerdictOutcome.IGNORED
+    assert handoff.calls == []
+    assert creator.drafts == []
+    assert rebuilder.requests == []
+    assert sinks.comments == []
+    assert await store.count("owner/repo#42") == 0
+
+
+@pytest.mark.asyncio
+async def test_approved_with_blocking_lines_still_converges(tmp_path: Path) -> None:
+    """APPROVED beats parsed blocking-looking lines: converge, park them as backlog."""
+    store = HeimdallRoundStore(tmp_path / "rounds.sqlite3")
+    sinks = _RecordingSinks()
+    review = _review(ReviewState.APPROVED, [_blocking(Severity.HIGH)])
+
+    creator, rebuilder, handoff, result = await _run(
+        review, config=RepoConfig(retry_cap=3), store=store, sinks=sinks
+    )
+
+    assert result.outcome is VerdictOutcome.CONVERGED
+    assert handoff.calls == [("owner/repo", 42)]
+    assert rebuilder.requests == []
+    # The finding isn't lost: it's parked as backlog carrying its severity.
+    assert len(creator.drafts) == 1
+    assert BACKLOG_LABEL in creator.drafts[0].labels
+    assert "priority:high" in creator.drafts[0].labels
 
 
 @pytest.mark.asyncio
@@ -337,7 +428,7 @@ async def test_cap_exhaustion_escalates_and_leaves_pr_open(tmp_path: Path) -> No
         await HeimdallRoundStore(db).record_round("owner/repo#42")
 
     sinks = _RecordingSinks()
-    review = _review(ReviewState.REQUEST_CHANGES, [_blocking()])
+    review = _review(ReviewState.REQUEST_CHANGES, [_blocking(), _nit(Severity.LOW)])
 
     creator, rebuilder, handoff, result = await _run(
         review,
@@ -354,15 +445,23 @@ async def test_cap_exhaustion_escalates_and_leaves_pr_open(tmp_path: Path) -> No
     assert sinks.labels[0].label == "hitl"
     # No rebuild, no fix-issue, no handoff: the PR is left open for a human.
     assert rebuilder.requests == []
-    assert creator.drafts == []
     assert handoff.calls == []
+    # The nit is still parked as backlog even on the escalate path.
+    assert len(creator.drafts) == 1
+    assert BACKLOG_LABEL in creator.drafts[0].labels
+    assert result.filed_issues == [100]
     # result advertises the PR was left open.
     assert result.pr_left_open is True
 
 
 @pytest.mark.asyncio
-async def test_severity_below_threshold_is_a_nit_not_blocking(tmp_path: Path) -> None:
-    """A finding below the blocking threshold is a nit even on REQUEST_CHANGES."""
+async def test_severity_below_threshold_escalates_a_rejection(tmp_path: Path) -> None:
+    """REQUEST_CHANGES whose findings all parse below the threshold escalates.
+
+    Heimdall rejected the PR but nothing actionable parsed as blocking — silently
+    converging would hand off a rejected PR, so a human is pulled in instead. The
+    parsed nit is still parked as backlog.
+    """
     store = HeimdallRoundStore(tmp_path / "rounds.sqlite3")
     sinks = _RecordingSinks()
     # Threshold defaults to HIGH; a LOW finding is non-blocking.
@@ -372,11 +471,56 @@ async def test_severity_below_threshold_is_a_nit_not_blocking(tmp_path: Path) ->
         review, config=RepoConfig(), store=store, sinks=sinks
     )
 
-    assert result.outcome is VerdictOutcome.CONVERGED
+    assert result.outcome is VerdictOutcome.ESCALATED
     assert rebuilder.requests == []
+    assert handoff.calls == []
     assert len(creator.drafts) == 1
     assert BACKLOG_LABEL in creator.drafts[0].labels
-    assert handoff.calls == [("owner/repo", 42)]
+    assert sinks.labels[0].label == "hitl"
+    assert result.pr_left_open is True
+
+
+@pytest.mark.asyncio
+async def test_rebuild_trigger_failure_escalates_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A failed rebuild trigger (gh error) escalates with the round already counted.
+
+    The round is recorded before the trigger so a doomed PR cannot loop unbounded;
+    when the re-review request then fails, raising would just retry the whole job
+    and double-file the fix-issues — instead a human is notified and the PR is left
+    open with the fix-issues already filed.
+    """
+
+    class _FailingRebuilder:
+        async def __call__(self, request: RebuildRequest) -> None:
+            raise GhCommandError(
+                ["pr", "edit"], GhResult(exit_code=1, stderr="boom")
+            )
+
+    store = HeimdallRoundStore(tmp_path / "rounds.sqlite3")
+    sinks = _RecordingSinks()
+    review = _review(ReviewState.REQUEST_CHANGES, [_blocking()])
+    creator = _RecordingCreator()
+
+    result = await process_review(
+        review,
+        RepoConfig(retry_cap=3),
+        round_store=store,
+        create_issue=creator,
+        rebuild=_FailingRebuilder(),
+        handoff=_RecordingHandoff(),
+        notifier=_notifier(sinks),
+    )
+
+    assert result.outcome is VerdictOutcome.ESCALATED
+    assert result.pr_left_open is True
+    # The fix-issue was filed and the round consumed before the trigger failed.
+    assert len(creator.drafts) == 1
+    assert await store.count("owner/repo#42") == 1
+    # A human was pulled in.
+    assert sinks.labels[0].label == "hitl"
+    assert "re-review" in sinks.comments[0].body
 
 
 # --- the production GhCliRebuilder: pure/parseable parts (no live gh/network) ------
@@ -439,35 +583,22 @@ def test_parse_review_requested_raises_on_a_numberless_payload() -> None:
         _parse_review_requested("not-a-url")
 
 
-def test_refile_drafts_reconstruct_ready_for_agent_prd_linked_slices() -> None:
-    """The rebuild plan re-files one ready-for-agent, PRD-linked slice per fix-issue."""
-    drafts = _refile_drafts(_rebuild_request())
-    assert len(drafts) == 2
-    for draft, number in zip(drafts, (100, 101), strict=True):
-        assert draft.labels == [READY_LABEL]
-        assert BACKLOG_LABEL not in draft.labels
-        assert "Part of #1" in draft.body
-        # The slice rebuilds onto the SAME integration branch, named in the body.
-        assert "retinue/prd-1" in draft.body
-        assert f"#{number}" in draft.body
-
-
 @pytest.mark.asyncio
-async def test_gh_cli_rebuilder_refiles_via_creator_then_re_requests_review() -> None:
-    """The real rebuilder (re)files the fix-issues via the creator, then re-reviews."""
+async def test_gh_cli_rebuilder_re_requests_review_without_refiling() -> None:
+    """The real rebuilder only re-requests the heimdall review — no duplicate issues.
+
+    The fix-issues were already filed by the loopback before the rebuild trigger;
+    re-filing them here would double every finding as a second ready-for-agent issue.
+    """
     runner = _RecordingRunner(
         GhResult(exit_code=0, stdout="https://github.com/owner/repo/pull/42")
     )
-    creator = _RecordingCreator()
     rebuilder = GhCliRebuilder(
-        runner, create_issue=creator, token="ghs_tok", reviewer_login="watcher[bot]"
+        runner, token="ghs_tok", reviewer_login="watcher[bot]"
     )
 
     await rebuilder(_rebuild_request())
 
-    # Each fix-issue was re-filed through the injected IssueCreator (Layer 2 seam).
-    assert len(creator.drafts) == 2
-    assert all(READY_LABEL in d.labels for d in creator.drafts)
     # Exactly one gh call: the heimdall re-review, GH_TOKEN-authenticated, re-requesting
     # the *configured* reviewer login (not a hardcoded one).
     assert len(runner.calls) == 1
@@ -482,7 +613,6 @@ async def test_gh_cli_rebuilder_raises_on_a_failed_re_review() -> None:
     runner = _RecordingRunner(GhResult(exit_code=1, stderr="no such PR"))
     rebuilder = GhCliRebuilder(
         runner,
-        create_issue=_RecordingCreator(),
         token="ghs_tok",
         reviewer_login="heimdall[bot]",
     )

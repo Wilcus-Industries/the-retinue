@@ -31,8 +31,8 @@ from retinue.roles import (
     EFFORT_XHIGH,
     Role,
     oauth_system,
-    resolve_effort,
     resolve_model,
+    structured_output_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -251,28 +251,23 @@ class ClaudeSliceGenerator:
     def _build_request_kwargs(self, prd_body: str) -> dict[str, Any]:
         """Assemble the streaming-request kwargs for one PRD slice run.
 
-        The slicer is the PRD-decision Opus role, so the request carries the "xhigh"
-        reasoning-effort tier via ``output_config.effort`` (Opus 4.8 removed the thinking
-        ``budget_tokens`` mechanism). The effort rides the same ``output_config`` dict as
-        the JSON-schema ``format`` — one output_config carries both.
+        The slicer is the PRD-decision Opus role; the shared
+        :func:`~retinue.roles.structured_output_config` helper carries its "xhigh"
+        reasoning-effort tier and the JSON-schema ``format`` on one ``output_config``
+        dict (Opus 4.8 removed the thinking ``budget_tokens`` mechanism).
 
         The PRD's ``## Testing Decisions`` section is the authoritative testing seam, so
         it is extracted and prepended as an explicit, labeled block instructing the model
         to honor it; the full PRD body follows. A PRD without that section keeps the body
         verbatim (and the caller escalates a thin/malformed PRD before reaching here).
-
-        In ``subscription`` (OAuth) mode the Claude Code identity is prepended as the
-        first system block (see :func:`retinue.roles.oauth_system`); ``api_key`` mode is
-        unaffected.
         """
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
-            "system": oauth_system(_SLICE_SYSTEM, is_oauth=self.auth_mode == "subscription"),
-            "output_config": {
-                "effort": resolve_effort(Role.SLICER),
-                "format": {"type": "json_schema", "schema": _SLICE_SCHEMA},
-            },
+            "system": oauth_system(
+                _SLICE_SYSTEM, is_oauth=self.auth_mode == "subscription"
+            ),
+            "output_config": structured_output_config(Role.SLICER, _SLICE_SCHEMA),
             "messages": [{"role": "user", "content": _build_user_content(prd_body)}],
         }
 

@@ -262,6 +262,65 @@ async def test_persisted_count_bounds_retries_across_runs(tmp_path: Path) -> Non
     assert result.outcome is TriageOutcome.ESCALATED
 
 
+@pytest.mark.asyncio
+async def test_prior_exhausted_budget_escalates_with_honest_reason(tmp_path: Path) -> None:
+    """A budget spent by prior runs escalates with a reason that does not claim a fresh failure."""
+    db = tmp_path / "retry.sqlite3"
+    await ImplRetryStore(db).record_attempt("owner/repo#7")
+    await ImplRetryStore(db).record_attempt("owner/repo#7")
+    implementer = FailingImplementer()
+    sinks = _RecordingSinks()
+
+    result = await triage_implementer(
+        _slice(),
+        RepoConfig(retry_cap=2),
+        implementer=implementer,
+        notifier=_notifier(sinks),
+        create_issue=_RecordingCreator(),
+        retry_store=ImplRetryStore(db),
+        container=_CONTAINER,
+    )
+
+    assert implementer.calls == 0
+    assert result.outcome is TriageOutcome.ESCALATED
+    body = sinks.comments[0].body.lower()
+    # Honest: the implementer never ran this session, so it did not "fail repeatedly".
+    assert "already exhausted" in body or "already spent" in body
+    assert "failed repeatedly" not in body
+
+
+class _CountingRetryStore(ImplRetryStore):
+    """An ImplRetryStore that records how many times ``count`` is called."""
+
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(db_path)
+        self.count_calls = 0
+
+    async def count(self, key: str) -> int:
+        self.count_calls += 1
+        return await super().count(key)
+
+
+@pytest.mark.asyncio
+async def test_retry_count_is_read_once_per_triage(tmp_path: Path) -> None:
+    """The persisted retry count is read once, not re-read on every loop iteration."""
+    store = _CountingRetryStore(tmp_path / "retry.sqlite3")
+    implementer = FailingImplementer()
+    sinks = _RecordingSinks()
+
+    await triage_implementer(
+        _slice(),
+        RepoConfig(retry_cap=2),
+        implementer=implementer,
+        notifier=_notifier(sinks),
+        create_issue=_RecordingCreator(),
+        retry_store=store,
+        container=_CONTAINER,
+    )
+
+    assert store.count_calls == 1
+
+
 # --- the orchestrated triage: a retry that then succeeds -------------------------
 
 

@@ -35,12 +35,14 @@ SQLite file — no real ``gh``, no network.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import quote
 
 import aiosqlite
 
@@ -55,6 +57,23 @@ CREATE TABLE IF NOT EXISTS run_state (
     pr_number INTEGER
 )
 """
+
+
+@dataclass(frozen=True)
+class PersistedRound:
+    """One persisted PRD round as the startup sweep reads it from the run-state store.
+
+    Attributes:
+        repo_full_name: The round's repo, e.g. "owner/repo".
+        prd_number: The PRD's tracking issue number.
+        slice_numbers: The slice issue numbers the round owns (order preserved).
+        pr_number: The staging PR recorded for the round, or ``None`` before one opened.
+    """
+
+    repo_full_name: str
+    prd_number: int
+    slice_numbers: list[int]
+    pr_number: int | None
 
 
 def run_state_key(repo_full_name: str, prd_number: int) -> str:
@@ -208,10 +227,53 @@ class RunStateStore:
         prd_number = int(str(row[0]).rsplit("#", 1)[-1])
         return prd_number, _decode_slices(row[1])
 
+    async def all_rounds(self) -> list[PersistedRound]:
+        """Enumerate every persisted round — the startup sweep's read.
+
+        Returns:
+            Every recorded round as a :class:`PersistedRound`, ordered by key
+            (repo, then PRD) so the sweep's resume order is deterministic.
+        """
+        async with self._connect() as db:
+            await db.execute(_SCHEMA)
+            async with db.execute(
+                "SELECT prd_key, slices, pr_number FROM run_state ORDER BY prd_key"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [_persisted_round(row) for row in rows]
+
+    async def delete_round(
+        self, *, repo_full_name: str, prd_number: int
+    ) -> None:
+        """Delete a round's row — its terminal event, so no sweep re-reconciles it.
+
+        Deleting a round never recorded is a no-op, so the cleanup is safe to repeat.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            prd_number: The PRD's tracking issue number.
+        """
+        key = run_state_key(repo_full_name, prd_number)
+        async with self._connect() as db:
+            await db.execute(_SCHEMA)
+            await db.execute("DELETE FROM run_state WHERE prd_key = ?", (key,))
+            await db.commit()
+
     def _connect(self) -> aiosqlite.Connection:
         """Open a fresh DB connection, ensuring the parent dir exists first."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         return aiosqlite.connect(self._db_path)
+
+
+def _persisted_round(row: aiosqlite.Row) -> PersistedRound:
+    """Decode one run-state row into a :class:`PersistedRound`."""
+    repo_full_name, _, prd = str(row[0]).rpartition("#")
+    return PersistedRound(
+        repo_full_name=repo_full_name,
+        prd_number=int(prd),
+        slice_numbers=_decode_slices(row[1]),
+        pr_number=None if row[2] is None else int(row[2]),
+    )
 
 
 def _encode_slices(issue_numbers: list[int]) -> str:
@@ -224,26 +286,41 @@ def _decode_slices(encoded: str) -> list[int]:
     return [int(part) for part in encoded.split(",") if part]
 
 
+class PrState(enum.Enum):
+    """The lifecycle state GitHub reports for a pull request."""
+
+    OPEN = "open"
+    CLOSED = "closed"
+    MERGED = "merged"
+
+
 class ReconcileGh(Protocol):
     """The gh queries reconciliation reads GitHub truth through. The reconcile gh seam.
 
     A production implementation runs ``gh`` against the target repo (an issue-state
-    lookup, a "is this branch merged into staging" query, and a PR-existence query for
-    ``retinue/prd-<n>`` -> staging); tests inject a fake that scripts the truth. Modeled
-    as one protocol so the whole reconciliation injects through a single collaborator,
-    mirroring the gh-seam style of :mod:`retinue.pr_opener` / :mod:`retinue.handoff`.
+    lookup, a "is this branch merged into the round's integration branch" query, a
+    PR-existence query for ``retinue/prd-<n>`` -> staging, and a PR-state lookup for a
+    recorded PR); tests inject a fake that scripts the truth. Modeled as one protocol so
+    the whole reconciliation injects through a single collaborator, mirroring the
+    gh-seam style of :mod:`retinue.pr_opener` / :mod:`retinue.handoff`.
     """
 
     async def issue_closed(self, *, repo_full_name: str, issue_number: int) -> bool:
         """Return True when ``issue_number`` is closed on the repo."""
         ...
 
-    async def branch_merged(self, *, repo_full_name: str, branch: str) -> bool:
-        """Return True when ``branch`` (an ``issue-<N>`` branch) is merged."""
+    async def branch_merged(
+        self, *, repo_full_name: str, branch: str, prd_number: int
+    ) -> bool:
+        """Return True when ``branch`` is merged into PRD ``prd_number``'s round."""
         ...
 
     async def staging_pr(self, *, repo_full_name: str, prd_number: int) -> int | None:
         """Return the open ``retinue/prd-<n>`` -> staging PR number, or None."""
+        ...
+
+    async def pr_state(self, *, repo_full_name: str, pr_number: int) -> PrState:
+        """Return the lifecycle state of ``pr_number`` (open / closed / merged)."""
         ...
 
 
@@ -323,6 +400,19 @@ def _staging_pr_argv(repo_full_name: str, head: str, base: str) -> list[str]:
     ]
 
 
+def _pr_state_argv(repo_full_name: str, pr_number: int) -> list[str]:
+    """Assemble the ``gh`` argv reading one PR's lifecycle state as JSON."""
+    return [
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        repo_full_name,
+        "--json",
+        "state",
+    ]
+
+
 def _parse_issue_closed(stdout: str) -> bool:
     """Parse an issue-state payload: True when GitHub reports the issue ``closed``."""
     payload = json.loads(stdout)
@@ -348,6 +438,12 @@ def _parse_staging_pr(stdout: str) -> int | None:
     return int(payload[0]["number"])
 
 
+def _parse_pr_state(stdout: str) -> PrState:
+    """Parse a ``pr view --json state`` payload into a :class:`PrState`."""
+    payload = json.loads(stdout)
+    return PrState(str(payload["state"]).lower())
+
+
 class GhCliReconcile:
     """Production :class:`ReconcileGh`: reads GitHub truth by shelling out to ``gh``.
 
@@ -359,18 +455,18 @@ class GhCliReconcile:
     installation-token env live in the runner (see :func:`gh_env`), so this class is pure
     command-assembly plus payload-parsing.
 
-    The ``branch_merged`` query asks whether a *merge target* already contains the
-    ``issue-<N>`` branch. The orchestrator merges slice branches into the integration
-    branch, but the protocol signature carries only the branch name (no PRD number), so
-    the comparison base is fixed at construction: ``merge_base`` is the branch a landed
-    slice's commits are guaranteed to reach (the staging branch the integration flow
-    lands into). A slice whose commits are all already on that base reports ``ahead_by 0``.
+    The ``branch_merged`` query asks whether the round's own *integration branch*
+    (``retinue/prd-<n>``) already contains the ``issue-<N>`` branch — that is the base
+    the orchestrator merges slices into. Comparing against the staging branch instead
+    would report a merged-but-not-yet-landed slice as unfinished during a mid-build
+    resume and rebuild it, duplicating work. A compare that 404s (the integration
+    branch or the slice branch doesn't exist yet/anymore) reads as *not merged* — with
+    no integration branch there is nothing the slice could have merged into.
 
     Args:
         runner: The injected gh-subprocess seam that runs an argv and returns stdout.
-        merge_base: The branch ``branch_merged`` compares a slice branch against (the
-            staging branch landed work reaches). Also the base a staging PR opens into.
-            Defaults to ``"staging"``.
+        merge_base: The base branch a round's staging PR opens into (the staging
+            branch). Defaults to ``"staging"``.
     """
 
     def __init__(self, runner: GhRunner, *, merge_base: str = "staging") -> None:
@@ -382,11 +478,18 @@ class GhCliReconcile:
         stdout = await self._runner(_issue_state_argv(repo_full_name, issue_number))
         return _parse_issue_closed(stdout)
 
-    async def branch_merged(self, *, repo_full_name: str, branch: str) -> bool:
-        """Return True when the merge base already contains ``branch`` (ahead_by 0)."""
-        stdout = await self._runner(
-            _compare_argv(repo_full_name, self._merge_base, branch)
-        )
+    async def branch_merged(
+        self, *, repo_full_name: str, branch: str, prd_number: int
+    ) -> bool:
+        """Return True when the round's integration branch contains ``branch``."""
+        base = quote(integration_branch(prd_number), safe="")
+        head = quote(branch, safe="")
+        try:
+            stdout = await self._runner(_compare_argv(repo_full_name, base, head))
+        except RuntimeError as exc:
+            if "404" in str(exc):
+                return False
+            raise
         return _parse_branch_merged(stdout)
 
     async def staging_pr(self, *, repo_full_name: str, prd_number: int) -> int | None:
@@ -396,6 +499,11 @@ class GhCliReconcile:
             _staging_pr_argv(repo_full_name, head, self._merge_base)
         )
         return _parse_staging_pr(stdout)
+
+    async def pr_state(self, *, repo_full_name: str, pr_number: int) -> PrState:
+        """Return the lifecycle state GitHub reports for ``pr_number``."""
+        stdout = await self._runner(_pr_state_argv(repo_full_name, pr_number))
+        return _parse_pr_state(stdout)
 
 
 class ResumePhase(enum.Enum):
@@ -483,7 +591,9 @@ async def reconcile_run(
             pr_number=pr_number,
         )
 
-    finished, unfinished = await _partition_slices(repo_full_name, slices, gh)
+    finished, unfinished = await _partition_slices(
+        repo_full_name, prd_number, slices, gh
+    )
     phase = _phase_without_pr(slices, unfinished)
     logger.info(
         "Resuming PRD #%d (%s) at %s: %d finished, %d unfinished",
@@ -514,18 +624,23 @@ def _phase_without_pr(
 
 
 async def _partition_slices(
-    repo_full_name: str, slices: list[PrdSlice], gh: ReconcileGh
+    repo_full_name: str, prd_number: int, slices: list[PrdSlice], gh: ReconcileGh
 ) -> tuple[list[int], list[PrdSlice]]:
     """Split slices into (finished issue numbers, unfinished slices) by GitHub truth.
 
     A slice is finished when GitHub shows EITHER its issue closed OR its branch merged;
     either proves the work landed, so a crash between the two still resumes correctly.
-    Input order is preserved in both buckets so the result is deterministic.
+    The per-slice checks run concurrently (each is one or two gh round-trips, and an
+    N-slice round would otherwise pay them serially on the boot-critical resume path);
+    input order is preserved in both buckets so the result is deterministic.
     """
+    outcomes = await asyncio.gather(
+        *(_slice_finished(repo_full_name, prd_number, slice_, gh) for slice_ in slices)
+    )
     finished: list[int] = []
     unfinished: list[PrdSlice] = []
-    for slice_ in slices:
-        if await _slice_finished(repo_full_name, slice_, gh):
+    for slice_, done in zip(slices, outcomes, strict=True):
+        if done:
             finished.append(slice_.issue_number)
         else:
             unfinished.append(slice_)
@@ -533,11 +648,13 @@ async def _partition_slices(
 
 
 async def _slice_finished(
-    repo_full_name: str, slice_: PrdSlice, gh: ReconcileGh
+    repo_full_name: str, prd_number: int, slice_: PrdSlice, gh: ReconcileGh
 ) -> bool:
     """Whether GitHub shows a slice's work landed (issue closed or branch merged)."""
     if await gh.issue_closed(
         repo_full_name=repo_full_name, issue_number=slice_.issue_number
     ):
         return True
-    return await gh.branch_merged(repo_full_name=repo_full_name, branch=slice_.branch)
+    return await gh.branch_merged(
+        repo_full_name=repo_full_name, branch=slice_.branch, prd_number=prd_number
+    )

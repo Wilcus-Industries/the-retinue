@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections.abc import Mapping
 
 import pytest
@@ -554,11 +555,13 @@ async def test_merge_hard_error_is_gitops_error_not_conflict() -> None:
 
 
 @pytest.mark.asyncio
-async def test_round_diff_fetches_then_diffs_each_branch_over_base() -> None:
-    """The round diff fetches each merged branch then diffs it (3-dot) over the base.
+async def test_round_diff_diffs_each_branch_without_refetching() -> None:
+    """The round diff diffs each merged branch (3-dot) over the base, fetching nothing.
 
     Feeds the internal reviewer the round's merged surface: each ``issue-<N>`` branch's
-    contribution since it diverged from the integration branch, concatenated.
+    contribution since it diverged from the integration branch, concatenated. Only merged
+    branches are diffed and :meth:`merge` already fetched each one's tip into this same
+    container, so ``round_diff`` must not re-fetch — a redundant ``git fetch`` per branch.
     """
     container = ScriptedContainer(
         {"diff retinue/prd-1...origin/issue-7": RunResult(exit_code=0, stdout="DIFF-7")}
@@ -570,10 +573,10 @@ async def test_round_diff_fetches_then_diffs_each_branch_over_base() -> None:
     )
 
     cmds = _joined(container)
-    assert "git fetch origin issue-7" in cmds
     assert "git diff retinue/prd-1...origin/issue-7" in cmds
-    assert "git fetch origin issue-8" in cmds
     assert "git diff retinue/prd-1...origin/issue-8" in cmds
+    # The merge already fetched each branch tip; round_diff issues no fetch of its own.
+    assert not any(c.startswith("git fetch") for c in cmds)
     # The matched branch's diff body is carried through into the concatenated result.
     assert "DIFF-7" in diff
 
@@ -640,7 +643,12 @@ def test_resolve_headers_routes_api_key_to_x_api_key() -> None:
 
 
 def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
-    """The request payload fences each conflicted file and forces the strict schema."""
+    """The request payload fences each conflicted file and forces the strict schema.
+
+    The schema must ride ``output_config.format`` (the canonical Messages API shape);
+    the OpenAI-style top-level ``response_format`` is not a Claude API parameter and
+    400s on the live wire.
+    """
     files = [
         _ConflictedFile(path="a.py", content="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"),
         _ConflictedFile(path="b.py", content="conflict-b"),
@@ -650,7 +658,10 @@ def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
     )
 
     assert payload["model"] == "m"
-    assert payload["response_format"]["type"] == "json_schema"
+    fmt = payload["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"]["required"] == ["resolved"]
+    assert "response_format" not in payload
     user = payload["messages"][0]["content"]
     # Both paths and both blobs ride in the user message, fenced by path.
     assert "### a.py" in user and "### b.py" in user
@@ -676,11 +687,12 @@ def test_resolve_payload_carries_xhigh_effort() -> None:
     assert "thinking" not in payload
 
 
-def test_resolve_payload_prepends_claude_code_identity_when_oauth() -> None:
-    """``is_oauth=True`` sends the identity as the first system block (issue #52).
+def test_resolve_payload_oauth_leads_system_with_claude_code_identity() -> None:
+    """With an OAuth credential the system field leads with the identity block.
 
-    Without it, Anthropic rejects a subscription-OAuth premium-model request as a
-    mislabeled 429 rate_limit_error.
+    A subscription OAuth token reaches the premium resolving model over the raw Messages
+    API only when the first system block is the Claude Code identity string; the
+    resolver's own brief follows it as the second block.
     """
     files = [_ConflictedFile(path="a.py", content="conflict-a")]
 
@@ -688,14 +700,14 @@ def test_resolve_payload_prepends_claude_code_identity_when_oauth() -> None:
         files, source="issue-7", into="retinue/prd-1", model="m", is_oauth=True
     )
 
-    system = payload["system"]
-    assert isinstance(system, list)
-    assert system[0]["text"] == CLAUDE_CODE_IDENTITY
-    assert system[1]["text"] == _RESOLVE_SYSTEM
+    assert payload["system"] == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": _RESOLVE_SYSTEM},
+    ]
 
 
-def test_resolve_payload_keeps_plain_system_string_when_not_oauth() -> None:
-    """``is_oauth=False`` is unaffected: the system value stays a plain string."""
+def test_resolve_payload_api_key_keeps_plain_string_system() -> None:
+    """With an API-key credential the system field stays the unchanged plain brief."""
     files = [_ConflictedFile(path="a.py", content="conflict-a")]
 
     payload = _resolve_payload(
@@ -703,6 +715,7 @@ def test_resolve_payload_keeps_plain_system_string_when_not_oauth() -> None:
     )
 
     assert payload["system"] == _RESOLVE_SYSTEM
+    assert isinstance(payload["system"], str)
 
 
 def test_parse_resolution_maps_paths_to_resolved_bodies() -> None:
@@ -787,37 +800,6 @@ async def test_resolver_recreates_merge_resolves_and_commits() -> None:
     # The resolved body was written byte-exact via the base64 round-trip.
     write = next(cmd for cmd in container.commands if cmd[0] == "sh")
     assert base64.b64decode(write[-2]).decode() == "merged"
-
-
-@pytest.mark.asyncio
-async def test_resolver_sends_claude_code_identity_for_oauth_credential() -> None:
-    """A ``sk-ant-oat...`` credential sends the two-block identity system on the wire.
-
-    Subscription OAuth tokens only unlock premium models over the raw Messages API when
-    the first system block is the Claude Code identity string (issue #52).
-    """
-    container = ScriptedContainer(
-        {
-            "diff --name-only": RunResult(exit_code=1, stdout="a.py\n"),
-            "cat a.py": RunResult(
-                exit_code=0, stdout="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"
-            ),
-        }
-    )
-    transport = FakeAnthropicTransport(
-        _text_response({"resolved": [{"path": "a.py", "content": "merged"}]})
-    )
-    resolver = AgentSdkConflictResolver(
-        container=container, transport=transport, credential="sk-ant-oat-abc"
-    )
-
-    await resolver(source="issue-7", into="retinue/prd-1")
-
-    _, _, sent_json = transport.calls[0]
-    system = sent_json["system"]
-    assert isinstance(system, list)
-    assert system[0]["text"] == CLAUDE_CODE_IDENTITY
-    assert system[1]["text"] == _RESOLVE_SYSTEM
 
 
 @pytest.mark.asyncio
@@ -952,6 +934,24 @@ def test_claude_result_is_error_reads_json_flag() -> None:
     assert _claude_result_is_error('{"is_error": false}') is False
     assert _claude_result_is_error("not json") is False
     assert _claude_result_is_error("") is False
+
+
+def test_claude_result_is_error_warns_on_unparseable_stdout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unparseable/empty CLI stdout is not an error but is logged, not swallowed silently.
+
+    ``--output-format json`` was requested, so a non-json or empty result is unexpected:
+    the exit code stays authoritative (returns not-an-error), but the anomaly is surfaced
+    as a warning rather than passing silently.
+    """
+    with caplog.at_level(logging.WARNING, logger="retinue.orchestrator"):
+        assert _claude_result_is_error("not json") is False
+        assert _claude_result_is_error("") is False
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert all("not parseable JSON" in r.getMessage() for r in warnings)
 
 
 @pytest.mark.asyncio

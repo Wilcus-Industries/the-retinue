@@ -108,8 +108,10 @@ def bind_build_prd(
 
     Returns an async ``(repo_full_name, prd_number, slices, config, claude_md) ->
     BoundBuildResult``. It first asks the shared ``governor`` to gate the run by its
-    ``estimated_amount``; a deferred gate returns immediately without building. Otherwise
-    it runs :func:`retinue.orchestrator.build_prd`, wrapping each implementer attempt in
+    ``estimated_amount``; a deferred gate returns immediately without building (and
+    charges nothing), while an admitted run's estimate is recorded on the shared
+    rolling-24h ledger at the gate. Otherwise it runs
+    :func:`retinue.orchestrator.build_prd`, wrapping each implementer attempt in
     :func:`retinue.triage.triage_implementer` so a failure/mis-scope is reasoned about
     against the persisted retry cap (retry / reslice / escalate) instead of a blind loop.
 
@@ -119,7 +121,8 @@ def bind_build_prd(
         notifier: The escalation fan-out used by triage's escalate path.
         create_issue: The gh issue creator used by triage's reslice path.
         retry_store_path: SQLite file backing the persisted per-slice retry counter.
-        estimated_amount: The run's estimated charge, gated against the rolling-24h cap.
+        estimated_amount: The run's estimated charge, gated against — and recorded on —
+            the rolling-24h ledger when the run is admitted.
         git: Integration-branch git operations (the merge seam).
         auth: Mints the installation token used to clone.
         runtime: Spawns the disposable done-check container.

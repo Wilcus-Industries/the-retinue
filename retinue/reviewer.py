@@ -26,7 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from retinue.roles import Role, oauth_system, resolve_effort, resolve_model
+from retinue.roles import Role, oauth_system, resolve_model, structured_output_config
 from retinue.slicer import (
     READY_LABEL,
     CreatedIssue,
@@ -131,15 +131,20 @@ BlockedByEditor = Callable[[EditBlockedByRequest], Awaitable[None]]
 # default); a subscription OAuth token goes on ``Authorization: Bearer`` with the
 # ``oauth-2025-04-20`` beta header, while a raw API key goes on ``x-api-key``;
 # ``anthropic-version`` is always sent. The model must return only the JSON object
-# matching the schema. In OAuth mode the Claude Code identity is also prepended as the
-# first system block (:func:`retinue.roles.oauth_system`), or Anthropic rejects the
-# premium-model request as a mislabeled 429 (issue #52).
+# matching the schema.
 # ---------------------------------------------------------------------------
 
 _ANTHROPIC_VERSION = "2023-06-01"
 _OAUTH_BETA = "oauth-2025-04-20"
 _MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 _MAX_TOKENS = 16_000
+
+# Cap on the round diff interpolated into the reviewer's user message, mirroring the
+# done-check's failure-detail clamp. An unbounded merged diff would blow the request
+# body (and the reviewer's context) on a big round; the head is kept — a diff's file
+# headers and hunks read front-to-back — with an explicit note so the model knows the
+# review surface is partial.
+_DIFF_MAX_CHARS = 8_000
 
 # Strict JSON schema the headless reviewer must emit: an ordered list of findings,
 # each with the dependent issue numbers (from the round) whose work is layered on
@@ -178,6 +183,21 @@ _REVIEW_SYSTEM = (
     "standalone fix nothing depends on. Return only the JSON object matching the "
     "schema; no prose."
 )
+
+
+def _clip_diff(diff: str) -> str:
+    """Clamp ``diff`` to :data:`_DIFF_MAX_CHARS`, noting the truncation explicitly.
+
+    Keeps the head — a diff's file headers and hunks read front-to-back — and appends
+    a note carrying the original size so the model knows the review surface is
+    partial rather than silently reviewing a diff that just stops.
+    """
+    if len(diff) <= _DIFF_MAX_CHARS:
+        return diff
+    return (
+        f"{diff[:_DIFF_MAX_CHARS]}\n"
+        f"[diff truncated: first {_DIFF_MAX_CHARS} of {len(diff)} characters shown]"
+    )
 
 
 @dataclass(frozen=True)
@@ -256,11 +276,13 @@ class AgentSdkReviewGenerator:
     def _payload(self, review_input: ReviewInput) -> dict[str, Any]:
         """Assemble the Messages API request body for one round's review.
 
-        The internal reviewer is the highest-rigor Opus role, so the request carries the
-        role's registry effort tier (``max``) via ``output_config.effort`` (Opus 4.8
-        removed the extended-thinking ``budget_tokens`` mechanism, which now returns
-        HTTP 400). A subscription OAuth credential prepends the Claude Code identity as
-        the first system block (see :func:`retinue.roles.oauth_system`).
+        The internal reviewer is the highest-rigor Opus role; the shared
+        :func:`~retinue.roles.structured_output_config` helper carries its registry
+        effort tier (``max``) and the findings JSON schema on one ``output_config``
+        dict — the canonical Messages API structured-output shape (the OpenAI-style
+        top-level ``response_format`` is not a Claude API parameter and 400s). The
+        round diff is clamped to :data:`_DIFF_MAX_CHARS` before interpolation so a
+        big round cannot blow the request body.
         """
         merged = ", ".join(f"#{n}" for n in review_input.merged_issues) or "(none)"
         user = (
@@ -269,17 +291,16 @@ class AgentSdkReviewGenerator:
             f"Merged issues, in merge order: {merged}.\n"
             "Review the following merged diff and emit findings as JSON matching "
             "the schema:\n\n"
-            f"{review_input.diff}"
+            f"{_clip_diff(review_input.diff)}"
         )
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
-            "output_config": {"effort": resolve_effort(Role.REVIEWER)},
+            "output_config": structured_output_config(Role.REVIEWER, _REVIEW_SCHEMA),
             "system": oauth_system(
                 _REVIEW_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")
             ),
             "messages": [{"role": "user", "content": user}],
-            "response_format": {"type": "json_schema", "json_schema": _REVIEW_SCHEMA},
         }
 
     def _parse(self, body: dict[str, Any]) -> ReviewPlan:

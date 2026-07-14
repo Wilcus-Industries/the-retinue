@@ -115,7 +115,7 @@ def _governor(tmp_path: Path, clock: _Clock, *, weekly: float = 1000.0) -> Budge
 async def test_build_prd_defers_when_budget_spent(tmp_path: Path) -> None:
     """An estimate over the rolling-24h cap defers the run; nothing is implemented."""
     clock = _Clock()
-    governor = _governor(tmp_path, clock, weekly=0.0)  # cap is 0 -> any estimate defers
+    governor = _governor(tmp_path, clock, weekly=1.0)  # cap 0.12 < the 1.0 estimate -> defers
     implementer = _Implementer()
     build_prd = bind_build_prd(
         implementer=cast(Implementer, implementer),
@@ -175,6 +175,71 @@ async def test_build_prd_runs_and_triages_a_failure(tmp_path: Path) -> None:
     assert sinks.comments  # the escalation comment landed
     assert result.prd_build is not None
     assert result.prd_build.merged_issues == []
+
+
+@pytest.mark.asyncio
+async def test_build_prd_charges_the_shared_ledger(tmp_path: Path) -> None:
+    """An admitted PRD build records its estimate on the shared rolling-24h ledger.
+
+    The PRD lane burns real spend when it builds; the gate must charge the estimate to
+    the service-level ledger (not just read it), or the 12%/24h cap never learns about
+    PRD-lane spend and the shared budget is decorative.
+    """
+    clock = _Clock()
+    governor = _governor(tmp_path, clock)
+    implementer = _Implementer(outcomes={100: RuntimeError("boom")})
+    build_prd = bind_build_prd(
+        implementer=cast(Implementer, implementer),
+        governor=governor,
+        notifier=_notifier(_RecordingSinks()),
+        create_issue=cast(IssueCreator, _created),
+        retry_store_path=tmp_path / "retries.sqlite3",
+        estimated_amount=3.0,
+        git=cast(GitOps, _NoGit()),
+        auth=cast(InstallationAuth, _NoAuth()),
+        runtime=cast(ContainerRuntime, _NoRuntime()),
+        resolve_secret=_no_secret,
+        report=_no_report,
+    )
+    result = await build_prd(
+        repo_full_name="owner/repo",
+        prd_number=7,
+        slices=[PrdSlice(repo_full_name="owner/repo", issue_number=100, prd_number=7)],
+        config=RepoConfig(staging_branch="staging", retry_cap=0, max_parallel=1),
+        claude_md=_CLAUDE_MD,
+    )
+    assert result.deferred is False
+    # The admitted run's estimate landed on the shared ledger inside the gate.
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(3.0)
+
+
+@pytest.mark.asyncio
+async def test_deferred_build_prd_charges_nothing(tmp_path: Path) -> None:
+    """A deferred PRD run leaves the ledger untouched: no phantom charge without a build."""
+    clock = _Clock()
+    governor = _governor(tmp_path, clock, weekly=1.0)  # cap 0.12 < the 1.0 estimate -> defers
+    build_prd = bind_build_prd(
+        implementer=cast(Implementer, _Implementer()),
+        governor=governor,
+        notifier=_notifier(_RecordingSinks()),
+        create_issue=cast(IssueCreator, _created),
+        retry_store_path=tmp_path / "retries.sqlite3",
+        estimated_amount=1.0,
+        git=cast(GitOps, _NoGit()),
+        auth=cast(InstallationAuth, _NoAuth()),
+        runtime=cast(ContainerRuntime, _NoRuntime()),
+        resolve_secret=_no_secret,
+        report=_no_report,
+    )
+    result = await build_prd(
+        repo_full_name="owner/repo",
+        prd_number=7,
+        slices=[PrdSlice(repo_full_name="owner/repo", issue_number=100, prd_number=7)],
+        config=_config(),
+        claude_md="cm",
+    )
+    assert result.deferred is True
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(0.0)
 
 
 # --- bind_round_reviewer: the per-round internal reviewer seam --------------------
@@ -348,7 +413,7 @@ async def test_adhoc_drain_skips_the_build_when_the_shared_budget_is_spent(
     from retinue.adhoc_drain import ReadyIssue
 
     clock = _Clock()
-    governor = _governor(tmp_path, clock, weekly=0.0)  # cap is 0 -> every build is declined
+    governor = _governor(tmp_path, clock, weekly=1.0)  # cap 0.12 < the 1.0 estimate -> declined
     gh = _FakeAdhocGh([ReadyIssue(number=7, labels=["ready-for-agent"], body="")])
     built: list[AdhocIssue] = []
 

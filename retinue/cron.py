@@ -11,7 +11,9 @@ Each :func:`run_cron_tick`:
    mirroring the orchestrator's :class:`retinue.orchestrator.OrchestratorBusyError` guard;
 2. **gates** on the shared :class:`retinue.budget.BudgetGovernor` — the *same*
    service-level governor the orchestrator shares — and **defers** when the budget is
-   spent, picking nothing and running no downstream;
+   spent, picking nothing and running no downstream; an admitted tick's estimate is
+   charged to the shared ledger at the gate (an empty backlog is checked first, so an
+   idle tick never charges);
 3. **picks** the next backlog issue by a weighted score (priority + age), except on every
    ``quota_every``-th tick where a **quota floor** takes the oldest low-priority issue so
    the low items provably drain rather than starving behind a steady high-priority stream;
@@ -498,22 +500,26 @@ async def run_cron_tick(
 ) -> CronTickResult:
     """Drain one backlog issue: gate on budget, pick by score/quota, run the downstream.
 
-    Runs under ``lock`` so at most one cron tick executes at a time. Gates on the shared
-    ``governor`` first and **defers** (picking nothing, running nothing) when the budget
-    is spent. Otherwise picks the next backlog issue — the highest weighted score
+    Runs under ``lock`` so at most one cron tick executes at a time. An empty backlog is
+    ``IDLE`` and never touches the budget; otherwise the tick gates on the shared
+    ``governor`` — which *charges* an admitted estimate to the shared rolling-24h ledger —
+    and **defers** (picking nothing, running and charging nothing) when the budget is
+    spent. An admitted tick picks the next backlog issue — the highest weighted score
     (priority + age), except on every ``quota_every``-th tick where the oldest low-priority
     issue is taken so low items provably drain — and runs its downstream ``build``.
 
     Args:
         repo_full_name: The target repo, e.g. "owner/repo".
         gh: The backlog gh seam (lists ``backlog`` issues with labels + ages).
-        governor: The shared service-level budget governor; its ``gate`` defers the tick.
+        governor: The shared service-level budget governor; its ``gate`` defers the tick
+            or charges the admitted estimate to the shared ledger.
         clock: The injected time source for age-weighting (no wall-clock).
         build: The downstream chain run for the picked issue (build -> PR -> loopback ->
             notify), injected so the tick runs with no Docker, gh, or network.
         tick_number: This tick's sequence number; ``tick_number % quota_every == 0`` is a
             quota tick that forces the oldest low-priority issue through.
-        estimated_amount: The tick's estimated charge, gated against the rolling-24h cap.
+        estimated_amount: The tick's estimated charge, gated against — and recorded on —
+            the rolling-24h ledger when the tick is admitted.
         lock: The single-run lock; entering it raises :class:`CronBusyError` when a tick
             is already in flight.
         quota_every: Take the oldest low-priority issue on every Nth tick (default 5).
@@ -526,6 +532,14 @@ async def run_cron_tick(
         CronBusyError: A tick is already in flight (from the injected lock).
     """
     async with lock:
+        # The empty-backlog check must precede the gate: the gate *charges* an admitted
+        # estimate to the shared ledger, so gating an idle tick would fill the rolling
+        # window with phantom spend and defer real work.
+        issues = await gh.list_backlog(repo_full_name=repo_full_name)
+        if not issues:
+            logger.info("Cron tick %d idle: no backlog issues", tick_number)
+            return CronTickResult(outcome=CronOutcome.IDLE)
+
         gate = await governor.gate(estimated_amount=estimated_amount)
         if gate.deferred:
             logger.info(
@@ -536,11 +550,6 @@ async def run_cron_tick(
             return CronTickResult(
                 outcome=CronOutcome.DEFERRED, defer_until=gate.defer_until
             )
-
-        issues = await gh.list_backlog(repo_full_name=repo_full_name)
-        if not issues:
-            logger.info("Cron tick %d idle: no backlog issues", tick_number)
-            return CronTickResult(outcome=CronOutcome.IDLE)
 
         picked = _pick_issue(
             issues, now=clock.now(), tick_number=tick_number, quota_every=quota_every

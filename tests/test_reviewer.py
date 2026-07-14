@@ -266,18 +266,59 @@ def test_headers_api_key_uses_x_api_key() -> None:
 
 
 def test_payload_carries_model_schema_diff_and_merged_issues() -> None:
-    """The request body assembles model, schema, and the diff + merged issues."""
+    """The request body assembles model, schema, and the diff + merged issues.
+
+    The schema must ride ``output_config.format`` (the canonical Messages API shape);
+    the OpenAI-style top-level ``response_format`` is not a Claude API parameter and
+    400s on the live wire — the reviewer-in-subscription-mode bug.
+    """
     gen = AgentSdkReviewGenerator(
         credential="k", transport=_FakeTransport(_text_response({"findings": []}))
     )
     payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
 
     assert payload["model"] == "claude-opus-4-8"
-    assert payload["response_format"]["type"] == "json_schema"
+    fmt = payload["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"]["required"] == ["findings"]
+    assert "response_format" not in payload
     user = payload["messages"][0]["content"]
     assert "#2, #3" in user
     assert "off-by-one planted defect" in user
     assert f"PRD #{PRD_NUMBER}" in user
+
+
+def test_payload_keeps_a_small_diff_whole() -> None:
+    """A diff under the cap rides the user message verbatim, no truncation note."""
+    gen = AgentSdkReviewGenerator(
+        credential="k", transport=_FakeTransport(_text_response({"findings": []}))
+    )
+
+    user = gen._payload(_input(PLANTED_DEFECT_DIFF))["messages"][0]["content"]
+
+    assert PLANTED_DEFECT_DIFF.strip() in user
+    assert "truncated" not in user
+
+
+def test_payload_caps_an_oversized_diff_with_a_note() -> None:
+    """A huge round diff is clamped before interpolation so the request stays bounded.
+
+    An unbounded merged diff would blow the request body (and the reviewer's context)
+    on a big round; the payload keeps the head of the diff up to the cap and appends
+    an explicit truncation note so the model knows the diff is partial.
+    """
+    gen = AgentSdkReviewGenerator(
+        credential="k", transport=_FakeTransport(_text_response({"findings": []}))
+    )
+    big_diff = "\n".join(f"+line {n}: {'x' * 60}" for n in range(1000))
+    assert len(big_diff) > 8_000
+
+    user = gen._payload(_input(big_diff))["messages"][0]["content"]
+
+    assert "+line 0:" in user  # head kept
+    assert big_diff not in user  # tail dropped
+    assert "truncated" in user
+    assert len(user) < 10_000
 
 
 def test_payload_carries_max_effort() -> None:
@@ -298,11 +339,12 @@ def test_payload_carries_max_effort() -> None:
     assert "thinking" not in payload
 
 
-def test_payload_prepends_claude_code_identity_for_oauth_credential() -> None:
-    """A ``sk-ant-oat...`` credential sends the identity as the first system block.
+def test_payload_oauth_credential_leads_system_with_claude_code_identity() -> None:
+    """An OAuth credential makes the system field lead with the identity block.
 
-    Without it, Anthropic rejects a subscription-OAuth premium-model request as a
-    mislabeled 429 rate_limit_error (issue #52).
+    A subscription OAuth token reaches the premium reviewing model over the raw Messages
+    API only when the first system block is the Claude Code identity string; the
+    reviewer's own brief follows it as the second block.
     """
     gen = AgentSdkReviewGenerator(
         credential="sk-ant-oat-abc",
@@ -311,21 +353,23 @@ def test_payload_prepends_claude_code_identity_for_oauth_credential() -> None:
 
     payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
 
-    system = payload["system"]
-    assert isinstance(system, list)
-    assert system[0]["text"] == CLAUDE_CODE_IDENTITY
-    assert system[1]["text"] == _REVIEW_SYSTEM
+    assert payload["system"] == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": _REVIEW_SYSTEM},
+    ]
 
 
-def test_payload_keeps_plain_system_string_for_api_key_credential() -> None:
-    """A raw API key credential is unaffected: the system value stays a plain string."""
+def test_payload_api_key_credential_keeps_plain_string_system() -> None:
+    """A raw API-key credential keeps the system field as the unchanged plain brief."""
     gen = AgentSdkReviewGenerator(
-        credential="k", transport=_FakeTransport(_text_response({"findings": []}))
+        credential="sk-ant-api-xyz",
+        transport=_FakeTransport(_text_response({"findings": []})),
     )
 
     payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
 
     assert payload["system"] == _REVIEW_SYSTEM
+    assert isinstance(payload["system"], str)
 
 
 @pytest.mark.asyncio

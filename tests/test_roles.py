@@ -26,6 +26,7 @@ from retinue.roles import (
     planner_cli_argv,
     resolve_effort,
     resolve_model,
+    structured_output_config,
 )
 
 
@@ -145,25 +146,6 @@ def test_planner_instruction_requires_an_explore_subagent_before_a_plan() -> Non
     assert "before" in lowered and "plan" in lowered
 
 
-def test_oauth_system_prepends_claude_code_identity_in_oauth_mode() -> None:
-    """OAuth mode demotes the role prompt to a second system block behind the identity.
-
-    Subscription OAuth tokens only unlock premium models over the raw Messages API when
-    the first system block is the Claude Code identity string (issue #52).
-    """
-    system = oauth_system("role brief", is_oauth=True)
-
-    assert system == [
-        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
-        {"type": "text", "text": "role brief"},
-    ]
-
-
-def test_oauth_system_passes_role_prompt_through_in_api_key_mode() -> None:
-    """api_key mode is unaffected: the role prompt rides as a plain string, unchanged."""
-    assert oauth_system("role brief", is_oauth=False) == "role brief"
-
-
 def test_planner_argv_writes_nothing_to_the_workspace() -> None:
     """The plan is the captured stdout — the argv asks for no file output of its own.
 
@@ -176,3 +158,69 @@ def test_planner_argv_writes_nothing_to_the_workspace() -> None:
     assert "--output-format" not in argv
     disallowed = argv[argv.index("--disallowedTools") + 1]
     assert "Write" in disallowed
+
+
+def test_oauth_system_prepends_identity_block_in_oauth_mode() -> None:
+    """OAuth mode turns the system field into a two-block list, identity block first.
+
+    A subscription OAuth token may only reach a premium model over the raw Messages API
+    when the request's leading ``system`` block is the Claude Code identity string; the
+    role's own brief follows it as the second block.
+    """
+    assert oauth_system("role prompt", is_oauth=True) == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": "role prompt"},
+    ]
+
+
+def test_oauth_system_passes_plain_string_through_in_api_key_mode() -> None:
+    """api_key mode leaves the role prompt as the unchanged plain string (never a list)."""
+    result = oauth_system("role prompt", is_oauth=False)
+    assert result == "role prompt"
+    assert not isinstance(result, list)
+
+
+def test_structured_output_config_carries_effort_and_json_schema_format() -> None:
+    """The shared helper emits the canonical ``output_config`` wire shape.
+
+    The Messages API accepts structured output only as
+    ``output_config.format = {type: json_schema, schema: ...}`` — the OpenAI-style
+    top-level ``response_format`` is not a Claude API parameter and 400s. The helper
+    is the single place that shape lives, with the role's registry effort riding the
+    same dict so a role sends exactly one output_config.
+    """
+    schema = {"type": "object", "required": [], "additionalProperties": False}
+
+    config = structured_output_config(Role.REVIEWER, schema)
+
+    assert config == {
+        "effort": EFFORT_MAX,
+        "format": {"type": "json_schema", "schema": schema},
+    }
+
+
+@pytest.mark.parametrize(
+    ("role", "effort"),
+    [
+        (Role.SLICER, EFFORT_XHIGH),
+        (Role.RESOLVER, EFFORT_XHIGH),
+        (Role.REVIEWER, EFFORT_MAX),
+    ],
+)
+def test_structured_output_config_resolves_effort_per_role(
+    role: Role, effort: str
+) -> None:
+    """Each Messages-API role's effort tier comes from the registry, not the caller."""
+    assert structured_output_config(role, {"type": "object"})["effort"] == effort
+
+
+def test_claude_code_identity_is_the_exact_cli_string() -> None:
+    """The identity block is the exact Claude Code CLI system string.
+
+    The entitlement match is exact-string, so this pins the literal the CLI sends —
+    any drift would silently lose premium-model access for the OAuth roles.
+    """
+    assert (
+        CLAUDE_CODE_IDENTITY
+        == "You are Claude Code, Anthropic's official CLI for Claude."
+    )

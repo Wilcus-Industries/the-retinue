@@ -166,6 +166,7 @@ class VerdictDecision(enum.Enum):
     REBUILD = "rebuild"
     CONVERGED = "converged"
     ESCALATE = "escalate"
+    NO_VERDICT = "no_verdict"
 
 
 class VerdictOutcome(enum.Enum):
@@ -174,6 +175,7 @@ class VerdictOutcome(enum.Enum):
     REBUILT = "rebuilt"
     CONVERGED = "converged"
     ESCALATED = "escalated"
+    IGNORED = "ignored"
 
 
 @dataclass(frozen=True)
@@ -287,18 +289,26 @@ class HeimdallRoundStore:
         return int(row[0]) if row is not None else 0
 
 
-def decide_verdict(*, blocking: int, rounds: int, cap: int) -> VerdictDecision:
-    """Decide rebuild / converge / escalate from the verdict and the round count.
+def decide_verdict(
+    *, state: ReviewState, blocking: int, rounds: int, cap: int
+) -> VerdictDecision:
+    """Decide rebuild / converge / escalate from the review state and the round count.
 
-    The reasoning, in order:
+    The review ``state`` is the authoritative verdict — the parsed finding count only
+    refines a rejection. The reasoning, in order:
 
-    1. No blocking findings means the PR is good — converge (proceed to handoff),
-       whatever the round count.
-    2. Otherwise, while the persisted round count is below ``cap`` there is budget for
-       another rebuild round.
-    3. With the round budget exhausted while still blocked, the flow escalates.
+    1. ``APPROVED`` converges (proceed to handoff), whatever the parsed findings or
+       round count — an approval is never rebuilt.
+    2. ``COMMENTED`` carries no verdict (heimdall's progress notes): the loopback
+       neither converges nor rebuilds on it.
+    3. ``REQUEST_CHANGES`` with **no** parseable blocking findings escalates — the PR
+       was explicitly rejected, so converging on an unparseable body would hand off
+       rejected work.
+    4. Otherwise, while the persisted round count is below ``cap`` there is budget for
+       another rebuild round; with the budget exhausted the flow escalates.
 
     Args:
+        state: Heimdall's review state — the authoritative verdict.
         blocking: The number of blocking findings (severity at/above the threshold).
         rounds: Rebuild rounds already persisted for this PR (the spent budget).
         cap: The round cap (``RepoConfig.retry_cap``); ``0`` means no rebuild rounds.
@@ -306,8 +316,12 @@ def decide_verdict(*, blocking: int, rounds: int, cap: int) -> VerdictDecision:
     Returns:
         The :class:`VerdictDecision` to carry out.
     """
-    if blocking == 0:
+    if state is ReviewState.APPROVED:
         return VerdictDecision.CONVERGED
+    if state is ReviewState.COMMENTED:
+        return VerdictDecision.NO_VERDICT
+    if blocking == 0:
+        return VerdictDecision.ESCALATE
     if rounds < cap:
         return VerdictDecision.REBUILD
     return VerdictDecision.ESCALATE
@@ -325,14 +339,15 @@ async def process_review(
 ) -> VerdictResult:
     """Process one heimdall review: rebuild on blocking findings, else converge/escalate.
 
-    Splits the review's findings into blocking (severity at/above the threshold) and
-    non-blocking nits, then feeds the blocking count plus the *persisted* round count to
-    :func:`decide_verdict`. ``REBUILD`` files each blocking finding as a fix-issue
-    (``ready-for-agent`` + ``Part of #<prd>``), records a round, and triggers a rebuild
-    onto the SAME integration branch (re-triggering heimdall review). ``CONVERGED``
-    files the nits as ``backlog`` + ``priority:<severity>`` issues and proceeds to
-    handoff. ``ESCALATE`` comments the PRD, applies ``hitl``, notifies, and leaves the
-    PR open. Nits are always filed as backlog regardless of decision.
+    Feeds the review state (the authoritative verdict), the blocking-finding count,
+    and the *persisted* round count to :func:`decide_verdict`. ``REBUILD`` files each
+    blocking finding as a fix-issue (``ready-for-agent`` + ``Part of #<prd>``),
+    records a round, and triggers a rebuild onto the SAME integration branch
+    (re-triggering heimdall review). ``CONVERGED`` files the remaining findings as
+    ``backlog`` + ``priority:<severity>`` issues and proceeds to handoff.
+    ``ESCALATE`` comments the PRD, applies ``hitl``, notifies, and leaves the PR
+    open. ``NO_VERDICT`` (a plain comment) is ignored. On every verdict path the
+    non-blocking nits are filed as backlog.
 
     Args:
         review: The parsed heimdall bot review.
@@ -349,14 +364,29 @@ async def process_review(
     key = round_key(review.repo_full_name, review.pr_number)
     rounds = await round_store.count(key)
     decision = decide_verdict(
-        blocking=len(review.blocking), rounds=rounds, cap=config.retry_cap
+        state=review.state,
+        blocking=len(review.blocking),
+        rounds=rounds,
+        cap=config.retry_cap,
     )
 
+    if decision is VerdictDecision.NO_VERDICT:
+        logger.info(
+            "Heimdall comment on PR #%d (%s) carries no verdict; ignoring",
+            review.pr_number,
+            review.repo_full_name,
+        )
+        return VerdictResult(outcome=VerdictOutcome.IGNORED)
     if decision is VerdictDecision.CONVERGED:
         return await _converge(review, create_issue, handoff)
     if decision is VerdictDecision.REBUILD:
-        return await _rebuild(review, round_store, key, create_issue, rebuild)
-    return await _escalate(review, notifier)
+        return await _rebuild(review, round_store, key, create_issue, rebuild, notifier)
+    reason = (
+        _CAP_EXHAUSTED_REASON
+        if review.blocking
+        else _UNPARSEABLE_REJECTION_REASON
+    )
+    return await _escalate(review, create_issue, notifier, reason=reason)
 
 
 async def _converge(
@@ -364,8 +394,13 @@ async def _converge(
     create_issue: IssueCreator,
     handoff: Handoff,
 ) -> VerdictResult:
-    """Converge: file any nits as backlog, then hand off the clean PR."""
-    filed = await _file_backlog_nits(review, create_issue)
+    """Converge: park every finding as backlog, then hand off the approved PR.
+
+    An approval converges whatever the parsed findings say, so any blocking-severity
+    lines in an approved body are parked as backlog (carrying their priority label)
+    rather than dropped or rebuilt.
+    """
+    filed = await _file_backlog(review, review.findings, create_issue)
     logger.info(
         "Heimdall converged on PR #%d (%s); proceeding to handoff",
         review.pr_number,
@@ -381,14 +416,21 @@ async def _rebuild(
     key: str,
     create_issue: IssueCreator,
     rebuild: Rebuilder,
+    notifier: Notifier,
 ) -> VerdictResult:
-    """File fix-issues for the blocking findings, then rebuild onto the same branch."""
+    """File fix-issues for the blocking findings, then rebuild onto the same branch.
+
+    The round is recorded *before* the rebuild trigger so a doomed PR cannot loop
+    unbounded across retries. A failed trigger therefore escalates (the round is
+    already spent and the fix-issues already filed — retrying the whole job would
+    double-file them) instead of raising.
+    """
     fix_issues: list[int] = []
     for finding in review.blocking:
         created = await _file_fix_issue(finding, review, create_issue)
         fix_issues.append(created.issue_number)
 
-    backlog = await _file_backlog_nits(review, create_issue)
+    backlog = await _file_backlog(review, review.nits, create_issue)
 
     round_number = await round_store.record_round(key)
     logger.info(
@@ -399,40 +441,88 @@ async def _rebuild(
         len(fix_issues),
         review.integration_branch,
     )
-    await rebuild(
-        RebuildRequest(
-            repo_full_name=review.repo_full_name,
-            integration_branch=review.integration_branch,
-            prd_number=review.prd_number,
-            pr_number=review.pr_number,
-            fix_issues=fix_issues,
+    try:
+        await rebuild(
+            RebuildRequest(
+                repo_full_name=review.repo_full_name,
+                integration_branch=review.integration_branch,
+                prd_number=review.prd_number,
+                pr_number=review.pr_number,
+                fix_issues=fix_issues,
+            )
         )
-    )
+    except (GhCommandError, ValueError) as exc:
+        logger.error(
+            "Heimdall rebuild trigger failed on PR #%d (%s): %s",
+            review.pr_number,
+            review.repo_full_name,
+            exc,
+        )
+        await _notify_escalation(
+            review,
+            notifier,
+            reason=(
+                f"The fix-issues for round {round_number} were filed "
+                f"({', '.join(f'#{n}' for n in fix_issues)}) but the heimdall "
+                f"re-review request failed ({exc}). The loop is stalled until a "
+                f"human re-requests the review or resolves the PR."
+            ),
+        )
+        return VerdictResult(
+            outcome=VerdictOutcome.ESCALATED,
+            filed_issues=fix_issues + backlog,
+            pr_left_open=True,
+        )
     return VerdictResult(outcome=VerdictOutcome.REBUILT, filed_issues=fix_issues + backlog)
 
 
-async def _escalate(review: HeimdallReview, notifier: Notifier) -> VerdictResult:
-    """Escalate a still-blocked PR with the round budget spent; leave the PR open."""
-    body = (
-        f"Heimdall still raised blocking findings on PR #{review.pr_number} after the "
-        f"rebuild budget (retry_cap) was spent. The retinue is stopping the loopback; "
-        f"the PR is left open for a human to resolve."
+_CAP_EXHAUSTED_REASON = (
+    "Heimdall still raised blocking findings after the rebuild budget (retry_cap) "
+    "was spent. The retinue is stopping the loopback; the PR is left open for a "
+    "human to resolve."
+)
+
+_UNPARSEABLE_REJECTION_REASON = (
+    "Heimdall requested changes but no blocking findings could be parsed from the "
+    "review body, so the retinue cannot file fix-issues. The PR is left open for a "
+    "human to read the review and resolve it."
+)
+
+
+async def _escalate(
+    review: HeimdallReview,
+    create_issue: IssueCreator,
+    notifier: Notifier,
+    *,
+    reason: str,
+) -> VerdictResult:
+    """Escalate a blocked PR to a human; park any parsed nits as backlog first."""
+    filed = await _file_backlog(review, review.nits, create_issue)
+    await _notify_escalation(review, notifier, reason=reason)
+    return VerdictResult(
+        outcome=VerdictOutcome.ESCALATED, filed_issues=filed, pr_left_open=True
     )
+
+
+async def _notify_escalation(
+    review: HeimdallReview, notifier: Notifier, *, reason: str
+) -> None:
+    """Comment the PRD, apply ``hitl``, and push-notify that a human is needed."""
     await notifier.notify(
         Notification(
             repo_full_name=review.repo_full_name,
             issue_number=review.prd_issue_number,
             title=f"Retinue needs a human on PR #{review.pr_number}",
-            body=body,
+            body=f"{reason} (PR #{review.pr_number})",
             label=HITL_LABEL,
         )
     )
     logger.warning(
-        "Heimdall loopback escalated PR #%d (%s): budget spent, PR left open",
+        "Heimdall loopback escalated PR #%d (%s): %s",
         review.pr_number,
         review.repo_full_name,
+        reason,
     )
-    return VerdictResult(outcome=VerdictOutcome.ESCALATED, pr_left_open=True)
 
 
 async def _file_fix_issue(
@@ -445,27 +535,30 @@ async def _file_fix_issue(
         title=f"Heimdall fix: {finding.summary}",
         body=(
             f"Heimdall raised a blocking finding ({finding.severity.name.lower()}) on "
-            f"PR #{review.pr_number}:\n\n{finding.summary}\n\nPart of #{review.prd_number}"
+            f"PR #{review.pr_number}:\n\n{finding.summary}\n\n"
+            f"The fix targets the round's integration branch "
+            f"`{review.integration_branch}`.\n\nPart of #{review.prd_number}"
         ),
         labels=[READY_LABEL],
     )
     return await create_issue(draft)
 
 
-async def _file_backlog_nits(
+async def _file_backlog(
     review: HeimdallReview,
+    findings: list[HeimdallFinding],
     create_issue: IssueCreator,
 ) -> list[int]:
-    """File each non-blocking nit as a backlog issue carrying its priority label."""
+    """File each finding as a backlog issue carrying its priority label."""
     filed: list[int] = []
-    for nit in review.nits:
+    for finding in findings:
         draft = IssueDraft(
-            title=f"Heimdall nit: {nit.summary}",
+            title=f"Heimdall nit: {finding.summary}",
             body=(
-                f"Heimdall raised a non-blocking nit on PR #{review.pr_number}:\n\n"
-                f"{nit.summary}\n\nPart of #{review.prd_number}"
+                f"Heimdall raised a non-blocking finding on PR #{review.pr_number}:\n\n"
+                f"{finding.summary}\n\nPart of #{review.prd_number}"
             ),
-            labels=[BACKLOG_LABEL, priority_label(nit.severity)],
+            labels=[BACKLOG_LABEL, priority_label(finding.severity)],
         )
         created = await create_issue(draft)
         filed.append(created.issue_number)
@@ -476,15 +569,12 @@ async def _file_backlog_nits(
 #
 # :func:`process_review` depends only on the :data:`Rebuilder` protocol. Production wires
 # the concrete :class:`GhCliRebuilder` below; tests inject a fake that records the
-# :class:`RebuildRequest`. On a review loopback the rebuild has two side effects, both
-# behind already-injected seams so this adapter carries ``external_dep none``:
-#
-# 1. it reconstructs the round's rebuild plan from the request and *(re)files* each
-#    fix-issue as a ``ready-for-agent`` slice linked to the PRD onto the SAME integration
-#    branch, reusing the injected :data:`IssueCreator` (the slicer's gh create seam), and
-# 2. it re-triggers heimdall's bot review on the same PR by re-requesting review through
-#    an injected :class:`GhRunner` (the only process-spawn seam), authenticated with a
-#    ``GH_TOKEN`` bearer.
+# :class:`RebuildRequest`. The fix-issues were already filed by the loopback before the
+# trigger fires, so the rebuild's single side effect is re-triggering heimdall's bot
+# review on the same PR — re-requesting review through an injected :class:`GhRunner`
+# (the only process-spawn seam), authenticated with a ``GH_TOKEN`` bearer. The filed
+# ``ready-for-agent`` fix-issues re-enter the build lane through the ordinary issue
+# routing.
 #
 # The adapter never shells out itself: every pure/parseable part — the auth-env build, the
 # ``gh pr edit --add-reviewer`` command assembly, and parsing the re-review payload — is a
@@ -586,49 +676,25 @@ def _parse_review_requested(stdout: str) -> int:
         raise ValueError(f"gh pr edit returned no PR number: {stdout!r}") from exc
 
 
-def _refile_drafts(request: RebuildRequest) -> list[IssueDraft]:
-    """Reconstruct the round's rebuild plan as one ``ready-for-agent`` draft per fix-issue.
-
-    The request carries the fix-issue numbers filed for this round; each is re-materialized
-    as a PRD-linked, ``ready-for-agent`` slice that builds onto the SAME integration branch
-    (named in the body so the build targets it, not a fresh one). Pure assembly — no gh,
-    Docker, or network — so the rebuild plan is unit-testable in isolation.
-    """
-    return [
-        IssueDraft(
-            title=f"Heimdall rebuild: fix-issue #{number}",
-            body=(
-                f"Rebuilding fix-issue #{number} onto {request.integration_branch} "
-                f"(PR #{request.pr_number}).\n\nPart of #{request.prd_number}"
-            ),
-            labels=[READY_LABEL],
-        )
-        for number in request.fix_issues
-    ]
-
-
 class GhCliRebuilder:
-    """Production :data:`Rebuilder`: (re)files the fix-issues and re-triggers heimdall.
+    """Production :data:`Rebuilder`: re-triggers heimdall's review on the rebuilt PR.
 
     An instance is callable as ``await rebuilder(request)`` — it satisfies the
     :data:`Rebuilder` protocol via :meth:`__call__`, so it drops straight in where the fake
-    rebuilder sits in tests and at the wiring site (``process_review``). On a rebuild it:
+    rebuilder sits in tests and at the wiring site (``process_review``). The loopback has
+    already filed the round's fix-issues before this trigger fires (re-filing them here
+    would double every finding), so the trigger's single job is re-requesting the heimdall
+    bot review on the same PR: it dispatches the assembled ``gh pr edit`` argv
+    (:func:`_re_review_args`) through the injected :class:`GhRunner`, authenticated with a
+    ``GH_TOKEN`` bearer (:func:`_auth_env`), and confirms the PR number echoed back
+    (:func:`_parse_review_requested`).
 
-    1. reconstructs the round's rebuild plan (:func:`_refile_drafts`) and *(re)files* each
-       fix-issue as a ``ready-for-agent`` slice onto the same integration branch through
-       the injected :data:`IssueCreator` (the slicer's gh create seam), then
-    2. re-requests the heimdall bot review on the same PR by dispatching the assembled
-       ``gh pr edit`` argv (:func:`_re_review_args`) through the injected
-       :class:`GhRunner`, authenticated with a ``GH_TOKEN`` bearer (:func:`_auth_env`), and
-       confirms the PR number echoed back (:func:`_parse_review_requested`).
-
-    The runner and the issue creator are the only side-effecting seams, which keeps the
-    rebuild-plan assembly, command assembly, and payload parsing unit-testable with no live
-    ``gh``/heimdall/network (``external_dep none``).
+    The runner is the only side-effecting seam, which keeps the command assembly and
+    payload parsing unit-testable with no live ``gh``/heimdall/network
+    (``external_dep none``).
 
     Args:
         runner: The process-spawn seam that runs each ``gh`` command.
-        create_issue: The slicer's gh create seam used to (re)file the fix-issue slices.
         token: The installation/access token ``gh`` authenticates with.
         reviewer_login: The bot login re-requested as a reviewer to re-trigger heimdall's
             review — the centralized ``Settings.heimdall_bot_login`` the webhook also
@@ -639,20 +705,15 @@ class GhCliRebuilder:
         self,
         runner: GhRunner,
         *,
-        create_issue: IssueCreator,
         token: str,
         reviewer_login: str,
     ) -> None:
         self._runner = runner
-        self._create_issue = create_issue
         self._token = token
         self._reviewer_login = reviewer_login
 
     async def __call__(self, request: RebuildRequest) -> None:
-        """(Re)file the fix-issue slices, then re-request the heimdall review on the PR."""
-        for draft in _refile_drafts(request):
-            await self._create_issue(draft)
-
+        """Re-request the heimdall review on the rebuilt PR."""
         args = _re_review_args(request, self._reviewer_login)
         result = await self._runner.run(args, env=_auth_env(self._token))
         if not result.ok:

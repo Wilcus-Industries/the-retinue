@@ -289,7 +289,12 @@ class AdhocReviewer(Protocol):
         ...
 
     def auth_env(self) -> dict[str, str]:
-        """The credential env merged into the build container at start, for symmetry."""
+        """The reviewer's credential env.
+
+        Retained for wiring symmetry with the planner and implementer seams, but the ad-hoc
+        build no longer injects it into the container — the reviewer's model call goes out
+        over HTTP with the generator's own credential, so an in-container credential is unused.
+        """
         ...
 
 
@@ -350,8 +355,9 @@ class ContainerAdhocReviewer:
         generate: The headless Agent-SDK reviewer (the :class:`ReviewGenerator` seam).
         create_issue: The gh issue creator filing each flat review-fix issue (slicer's
             seam, reused from the internal reviewer).
-        credential: The reviewing model's credential; for seam symmetry with the planner
-            and implementer (the generator holds its own credential over HTTP).
+        credential: The reviewing model's credential; retained for wiring symmetry with the
+            planner and implementer, but NOT injected into the build container — the reviewer
+            runs over HTTP with the generator's own credential.
         auth_mode: ``"api_key"`` or ``"subscription"``; routes :meth:`auth_env`.
     """
 
@@ -423,7 +429,12 @@ class ContainerAdhocReviewer:
         return result.stdout
 
     def auth_env(self) -> dict[str, str]:
-        """The credential env the orchestration merges into the build container at start."""
+        """The reviewer's credential env (empty when no credential is set).
+
+        Retained for wiring symmetry with the planner and implementer seams; the ad-hoc
+        build no longer injects it in-container, since the reviewer's model call goes out
+        over HTTP with the generator's own credential.
+        """
         if not self.credential:
             return {}
         return _implement_env(self.credential, self.auth_mode)
@@ -463,8 +474,9 @@ async def build_adhoc_issue(
 
     1. parse the done-check and resolve the config's secrets (a missing one escalates on
        the report sink and propagates *before* any container starts),
-    2. start the container with the secrets, the git committer identity, and the planner's,
-       the implementer's, and the reviewer's credential env (the env is fixed at ``start``),
+    2. start the container with the secrets, the git committer identity, and the planner's
+       and the implementer's credential env — the two roles that exec in-container (the env
+       is fixed at ``start``); the reviewer runs over HTTP, so its credential is not injected,
     3. clone the repo and check out a fresh ``issue-<N>`` branch off ``config.staging_branch``,
     4. run the read-only planner to produce a plan, captured from its output,
     5. materialize the plan into :data:`PLAN_FILE` for the implementer to read,
@@ -506,16 +518,19 @@ async def build_adhoc_issue(
     env = await resolve_secrets_or_escalate(
         issue.repo_full_name, issue.issue_number, config, resolve_secret, report
     )
+    # Only the in-container roles' credentials are injected: the planner and implementer
+    # exec inside the container, but the reviewer's model call goes out over HTTP from the
+    # generator, so its credential has no in-container use — injecting it would be dead
+    # weight and needless secret exposure.
     auth_envs = [
         planner.auth_env(),
         implementer.auth_env(),
-        *([reviewer.auth_env()] if reviewer is not None else []),
     ]
     start_env = {**env, **_GIT_COMMITTER_ENV}
     for auth_env in auth_envs:
         start_env.update(auth_env)
-    # The exact secret values injected into the container, so a failing done-check has
-    # them scrubbed from its report — repo-declared secrets plus the auth credential.
+    # The exact secret values injected into the container, so a failing done-check has them
+    # scrubbed from its report — repo-declared secrets plus the in-container credentials.
     secret_values = [*env.values(), *(v for a in auth_envs for v in a.values())]
     token = await auth.installation_token(issue.repo_full_name)
     container = await runtime.start(image=image, env=start_env)
