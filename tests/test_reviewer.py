@@ -335,6 +335,8 @@ def test_payload_carries_max_effort() -> None:
     payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
 
     assert payload["output_config"]["effort"] == _EFFORT_MAX
+    assert _EFFORT_MAX == "max"
+    assert "thinking" not in payload
 
 
 def test_payload_carries_an_explicit_effort_override() -> None:
@@ -353,7 +355,6 @@ def test_payload_carries_an_explicit_effort_override() -> None:
     payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
 
     assert payload["output_config"]["effort"] == "low"
-    assert _EFFORT_MAX == "max"
     assert "thinking" not in payload
 
 
