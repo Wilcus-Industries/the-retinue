@@ -1,11 +1,13 @@
 """The agent-role registry: one table owning every agent role's model and effort.
 
-The retinue runs five agent roles — the PRD :class:`~retinue.slicer.ClaudeSliceGenerator`,
+The retinue runs six agent roles — the PRD :class:`~retinue.slicer.ClaudeSliceGenerator`,
 the :class:`~retinue.orchestrator.ContainerImplementer`, the
 :class:`~retinue.orchestrator.AgentSdkConflictResolver`, the internal
-:class:`~retinue.reviewer.AgentSdkReviewGenerator`, and the read-only ``planner`` (Opus
+:class:`~retinue.reviewer.AgentSdkReviewGenerator`, the read-only ``planner`` (Opus
 on the in-container CLI, run with no write/edit/commit capability — it maps the code via
-an Explore subagent and emits a plan as its captured output). Each one needs a model id,
+an Explore subagent and emits a plan as its captured output), and the
+:class:`~retinue.classifier.ClaudeIssueClassifier` (a Haiku-class Messages-API role that
+routes one issue to a level of a repo's routing table). Each one needs a model id,
 a reasoning-effort tier, and an invocation transport. This module is the single place
 those facts live: :data:`ROLE_REGISTRY` maps each :class:`Role` to its :class:`RoleSpec`,
 and the adapters resolve their model and effort from it instead of hand-rolling private
@@ -45,8 +47,10 @@ if TYPE_CHECKING:
 # API call carries. Opus 4.8 (the model every Opus role pins) removed the extended-
 # thinking ``budget_tokens`` mechanism — it returns HTTP 400 — so effort is the current
 # control. The literal tier strings are self-documenting, so no numeric budget bookkeeping
-# is needed. ``high`` is the implementer's Sonnet tier; ``xhigh`` the slicer/resolver
-# Opus tier; ``max`` the highest tier, reserved for the internal reviewer.
+# is needed. ``low`` is the classifier's cheap Haiku tier; ``high`` the implementer's
+# Sonnet tier; ``xhigh`` the slicer/resolver Opus tier; ``max`` the highest tier,
+# reserved for the internal reviewer.
+EFFORT_LOW = "low"
 EFFORT_HIGH = "high"
 EFFORT_XHIGH = "xhigh"
 EFFORT_MAX = "max"
@@ -78,6 +82,7 @@ class Role(enum.Enum):
     RESOLVER = "resolver"
     REVIEWER = "reviewer"
     PLANNER = "planner"
+    CLASSIFIER = "classifier"
 
 
 @dataclass(frozen=True)
@@ -87,8 +92,8 @@ class RoleSpec:
     Attributes:
         model: The default model id for the role; a repo's ``models`` override replaces
             it per :func:`resolve_model`.
-        effort: The reasoning-effort tier (one of :data:`EFFORT_HIGH` / :data:`EFFORT_XHIGH`
-            / :data:`EFFORT_MAX`); registry-owned, never overridden.
+        effort: The reasoning-effort tier (one of :data:`EFFORT_LOW` / :data:`EFFORT_HIGH`
+            / :data:`EFFORT_XHIGH` / :data:`EFFORT_MAX`); registry-owned, never overridden.
         transport: How the role's model is invoked (:class:`Transport`).
     """
 
@@ -128,6 +133,11 @@ ROLE_REGISTRY: dict[Role, RoleSpec] = {
         model="claude-opus-4-8",
         effort=EFFORT_HIGH,
         transport=Transport.CLAUDE_CLI,
+    ),
+    Role.CLASSIFIER: RoleSpec(
+        model="claude-haiku-4-5",
+        effort=EFFORT_LOW,
+        transport=Transport.MESSAGES_API,
     ),
 }
 
@@ -206,27 +216,33 @@ def oauth_system(role_system: str, *, is_oauth: bool) -> str | list[dict[str, st
     return role_system
 
 
-def structured_output_config(role: Role, schema: dict[str, Any]) -> dict[str, Any]:
+def structured_output_config(
+    role: Role, schema: dict[str, Any], *, effort: str | None = None
+) -> dict[str, Any]:
     """Build a Messages-API ``output_config`` carrying a role's effort + JSON schema.
 
     The Messages API accepts structured output only as ``output_config.format =
     {"type": "json_schema", "schema": ...}``; the OpenAI-style top-level
     ``response_format`` parameter does not exist on the Claude wire and is rejected
-    with HTTP 400. This helper is the single place that shape lives, so the three
-    Messages-API roles (slicer, reviewer, resolver) cannot drift onto incompatible
-    encodings again. The role's registry effort tier rides the same dict — one
-    ``output_config`` per request, never two.
+    with HTTP 400. This helper is the single place that shape lives, so the
+    Messages-API roles (slicer, reviewer, resolver, classifier) cannot drift onto
+    incompatible encodings again. The role's registry effort tier rides the same dict
+    — one ``output_config`` per request, never two.
 
     Args:
         role: The Messages-API role whose registry effort tier the request carries.
         schema: The strict JSON schema the model must emit (callers keep
             ``required`` + ``additionalProperties: false`` on every object).
+        effort: Optional effort-tier override; when a repo's routing table supplies a
+            per-role tier (e.g. a ``classifier:`` override), it replaces the
+            registry-resolved tier. ``None`` (the default) keeps the registry tier, so
+            existing callers are unchanged.
 
     Returns:
         The ``output_config`` dict for the Messages API request body.
     """
     return {
-        "effort": resolve_effort(role),
+        "effort": effort if effort is not None else resolve_effort(role),
         "format": {"type": "json_schema", "schema": schema},
     }
 

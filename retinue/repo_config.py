@@ -213,9 +213,10 @@ class RepoConfig(BaseModel):
         max_parallel: Optional cap on concurrent work; unset means no explicit cap.
         cron: Optional five-field cron cadence for scheduled runs.
         models: Role -> model-id overrides, keyed by the :class:`retinue.roles.Role`
-            value (``slicer`` / ``implementer`` / ``resolver`` / ``reviewer``), e.g.
-            ``{"implementer": "claude-opus-4-8"}``. Applied over the role registry's
-            default model by :func:`retinue.roles.resolve_model`.
+            value (``slicer`` / ``implementer`` / ``resolver`` / ``reviewer`` /
+            ``planner`` / ``classifier``), e.g. ``{"implementer": "claude-opus-4-8"}``.
+            Applied over the role registry's default model by
+            :func:`retinue.roles.resolve_model`.
         secrets: Secrets and secret-references block.
         routing: Optional per-issue model/effort routing table (the ``routing:``
             block); absent means routing is off and every role resolves the plain

@@ -1,12 +1,12 @@
 """Tests for the agent-role registry.
 
-The registry owns the five agent roles (slicer, implementer, conflict resolver,
-internal reviewer, and read-only planner) and resolves each one's model id and
-reasoning-effort tier from a single table. A ``repo_config.models`` entry overrides a
-role's model; the effort tier is the registry's alone. The planner additionally owns a
-read-only CLI invocation builder, asserted here for its no-write/explore-first contract.
-No network, Agent SDK, or gh is touched — this is a pure lookup over the table plus
-argv string assembly.
+The registry owns the six agent roles (slicer, implementer, conflict resolver,
+internal reviewer, read-only planner, and the issue classifier) and resolves each one's
+model id and reasoning-effort tier from a single table. A ``repo_config.models`` entry
+overrides a role's model; the effort tier is the registry's alone. The planner
+additionally owns a read-only CLI invocation builder, asserted here for its
+no-write/explore-first contract. No network, Agent SDK, or gh is touched — this is a
+pure lookup over the table plus argv string assembly.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from retinue.repo_config import RepoConfig
 from retinue.roles import (
     CLAUDE_CODE_IDENTITY,
     EFFORT_HIGH,
+    EFFORT_LOW,
     EFFORT_MAX,
     EFFORT_XHIGH,
     ROLE_REGISTRY,
@@ -43,6 +44,7 @@ def test_every_role_has_a_registry_entry() -> None:
         (Role.RESOLVER, "claude-opus-4-8", EFFORT_XHIGH, Transport.MESSAGES_API),
         (Role.REVIEWER, "claude-opus-4-8", EFFORT_MAX, Transport.MESSAGES_API),
         (Role.PLANNER, "claude-opus-4-8", EFFORT_HIGH, Transport.CLAUDE_CLI),
+        (Role.CLASSIFIER, "claude-haiku-4-5", EFFORT_LOW, Transport.MESSAGES_API),
     ],
 )
 def test_default_tiers_match_the_prd(
@@ -212,6 +214,25 @@ def test_structured_output_config_resolves_effort_per_role(
 ) -> None:
     """Each Messages-API role's effort tier comes from the registry, not the caller."""
     assert structured_output_config(role, {"type": "object"})["effort"] == effort
+
+
+def test_structured_output_config_honors_an_effort_override() -> None:
+    """An explicit ``effort=`` replaces the registry tier; omitting it keeps the tier.
+
+    A repo's routing table can supply a per-role tier (e.g. a ``classifier:`` override);
+    the helper carries that when given and otherwise resolves the registry default, so
+    existing two-arg callers are unchanged.
+    """
+    schema = {"type": "object"}
+    assert (
+        structured_output_config(Role.CLASSIFIER, schema, effort="max")["effort"]
+        == "max"
+    )
+    assert (
+        structured_output_config(Role.CLASSIFIER, schema)["effort"]
+        == ROLE_REGISTRY[Role.CLASSIFIER].effort
+        == EFFORT_LOW
+    )
 
 
 def test_claude_code_identity_is_the_exact_cli_string() -> None:
