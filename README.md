@@ -40,7 +40,21 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
 - `retinue.wiring` — `bind_build_prd` (budget-gate + triage glue around the orchestrator
   build) and `bind_cron_tick` (the cron backlog lane over its real collaborators). Both
   take the implementer-spawn seam as their one injected dependency and share the
-  service-level `BudgetGovernor`.
+  service-level `BudgetGovernor`. `bind_build_prd` also accepts an optional
+  `resolve_implementer` (`retinue.routing`) that classifies each slice at its first build
+  and swaps in that level's implementer model; `None` keeps one model for every slice.
+- `retinue.routing` — per-issue routing shared by every build lane. `resolve_issue_level`
+  is the one hop that fetches an issue's facts (`GhCliIssueFacts`), resolves its routing
+  level via `retinue.level.resolve_level` (honoring a pre-existing `level:` label), meters
+  each classifier call on the shared ledger, and comments on a classification failure. The
+  PRD lane's `PerIssueImplementerRouter` routes through it and returns the base
+  `ContainerImplementer` at the level's model; the ad-hoc lane routes through it too
+  (`pipeline._resolve_adhoc_level`) to classify each issue once and launch its planner,
+  implementer, and ad-hoc reviewer at that level. Loopback fix-issues are orchestrator-lane
+  slices (`ready-for-agent` + `Part of #<prd>`), so they classify and route through the
+  exact same seam at their first build. Only wired when the repo declares a `routing:`
+  table, so a table-less repo makes zero classifier calls and builds at the registry
+  defaults.
 - `retinue.app` — FastAPI factory; an Arq Redis pool is created in the lifespan and
   stored on `app.state.arq_pool`.
 - `retinue.repo_config` — the per-repo `.github/retinue.yml` schema (`RepoConfig`) and
@@ -49,7 +63,9 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   `Role` (slicer / implementer / resolver / reviewer / planner) to its model id,
   reasoning-effort tier, and invocation transport. The role adapters resolve their model
   and effort here via `resolve_model` / `resolve_effort` instead of hand-rolled constants;
-  `resolve_model` applies a repo's `models` override, effort stays registry-owned. The
+  `resolve_model` / `resolve_effort` are level-aware over the repo's routing table: a
+  level's `roles:` map overrides the model (and effort for Messages-API roles), registry
+  defaults otherwise. The
   read-only `planner` (Opus on the CLI) also owns `planner_cli_argv`, which builds its
   explore-first, no-write invocation and captures the plan as the run's output.
 - `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
@@ -166,8 +182,6 @@ staging_branch: staging        # branch the retinue integrates onto
 retry_cap: 3                   # max retries per unit of work (>= 0)
 max_parallel: 4                # optional concurrency cap (> 0)
 cron: "0 */6 * * *"            # optional five-field cron cadence
-models:                        # optional role -> model-id overrides; keys are the
-  implementer: claude-opus-4-8  # roles: slicer/implementer/resolver/reviewer/planner
 secrets:                       # optional inline secrets + external refs
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   refs:

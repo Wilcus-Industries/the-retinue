@@ -339,6 +339,25 @@ def test_payload_carries_max_effort() -> None:
     assert "thinking" not in payload
 
 
+def test_payload_carries_an_explicit_effort_override() -> None:
+    """An explicit ``effort=`` at construction overrides the registry default tier.
+
+    A repo's routing table can replace the reviewer's effort tier at the wiring site
+    (:mod:`retinue.pipeline`); this proves the instance's resolved tier reaches the
+    request rather than always sending the registry's ``max`` default.
+    """
+    gen = AgentSdkReviewGenerator(
+        credential="k",
+        transport=_FakeTransport(_text_response({"findings": []})),
+        effort="low",
+    )
+
+    payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
+
+    assert payload["output_config"]["effort"] == "low"
+    assert "thinking" not in payload
+
+
 def test_payload_oauth_credential_leads_system_with_claude_code_identity() -> None:
     """An OAuth credential makes the system field lead with the identity block.
 

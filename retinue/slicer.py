@@ -31,6 +31,7 @@ from retinue.roles import (
     EFFORT_XHIGH,
     Role,
     oauth_system,
+    resolve_effort,
     resolve_model,
     structured_output_config,
 )
@@ -199,12 +200,16 @@ class ClaudeSliceGenerator:
         auth_mode: ``"api_key"`` or ``"subscription"``.
         model: The model the headless slicer runs on; defaults to the
             :data:`~retinue.roles.Role.SLICER` registry entry, which a repo's
-            ``models`` override can replace at the wiring site.
+            routing level can replace at the wiring site.
+        effort: The slicing request's reasoning-effort tier; defaults to the
+            registry entry's tier, which a repo's routing level can replace at
+            the wiring site.
     """
 
     token: str
     auth_mode: str = "api_key"
     model: str = field(default_factory=lambda: resolve_model(Role.SLICER))
+    effort: str = field(default_factory=lambda: resolve_effort(Role.SLICER))
 
     async def generate(self, prd_body: str) -> SlicePlan:
         """Run the headless slicer over ``prd_body`` and return its :class:`SlicePlan`.
@@ -252,9 +257,10 @@ class ClaudeSliceGenerator:
         """Assemble the streaming-request kwargs for one PRD slice run.
 
         The slicer is the PRD-decision Opus role; the shared
-        :func:`~retinue.roles.structured_output_config` helper carries its "xhigh"
-        reasoning-effort tier and the JSON-schema ``format`` on one ``output_config``
-        dict (Opus 4.8 removed the thinking ``budget_tokens`` mechanism).
+        :func:`~retinue.roles.structured_output_config` helper carries the
+        instance's resolved effort tier and the JSON-schema ``format`` on one
+        ``output_config`` dict (Opus 4.8 removed the thinking ``budget_tokens``
+        mechanism).
 
         The PRD's ``## Testing Decisions`` section is the authoritative testing seam, so
         it is extracted and prepended as an explicit, labeled block instructing the model
@@ -267,7 +273,9 @@ class ClaudeSliceGenerator:
             "system": oauth_system(
                 _SLICE_SYSTEM, is_oauth=self.auth_mode == "subscription"
             ),
-            "output_config": structured_output_config(Role.SLICER, _SLICE_SCHEMA),
+            "output_config": structured_output_config(
+                Role.SLICER, _SLICE_SCHEMA, effort=self.effort
+            ),
             "messages": [{"role": "user", "content": _build_user_content(prd_body)}],
         }
 

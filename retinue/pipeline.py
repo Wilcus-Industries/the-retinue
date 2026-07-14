@@ -58,6 +58,7 @@ from retinue.budget import (
     BudgetLedger,
     SystemClock,
 )
+from retinue.classifier import ClaudeIssueClassifier
 from retinue.container import Container, ContainerRuntime, DockerRuntime
 from retinue.cron import CronBuild
 from retinue.done_check import (
@@ -119,7 +120,13 @@ from retinue.reviewer import (
     GhCliBlockedByEditor,
     ReviewGenerator,
 )
-from retinue.roles import Role, resolve_model
+from retinue.roles import Role, resolve_effort, resolve_model
+from retinue.routing import (
+    GhCliIssueFacts,
+    PerIssueImplementer,
+    PerIssueImplementerRouter,
+    resolve_issue_level,
+)
 from retinue.slicer import (
     HITL_LABEL,
     ClaudeSliceGenerator,
@@ -791,6 +798,10 @@ def _build_push_sink(settings: Settings) -> PushSink:
 # public config schema is unchanged.
 _BUILD_ESTIMATED_AMOUNT = 1.0
 
+# The estimated charge one classifier call meters against the shared ledger. Kept small
+# (a Haiku-class call) and separate from the build gate estimate, which is unchanged.
+_CLASSIFIER_ESTIMATED_AMOUNT = 0.01
+
 
 class _MergeContainerGitOps:
     """A :class:`GitOps` that lazily starts its own merge container, then delegates.
@@ -943,6 +954,7 @@ def build_pipeline_factory(
             token=settings.anthropic_credential,
             auth_mode=settings.auth_mode,
             model=resolve_model(Role.SLICER, config),
+            effort=resolve_effort(Role.SLICER, config),
         ).generate
         pr_ops = GhCliPrOps(pr_runner, token=token)
         reap_gh = HandoffGh(token=token)
@@ -1063,7 +1075,7 @@ def _bind_build_prd_for_repo(
         notifier: The escalation fan-out used by triage's escalate path.
         create_issue: The gh issue creator used by triage's reslice path.
         retry_store_path: SQLite file backing the persisted per-slice retry counter.
-        config: The repo's validated config; its ``models`` block overrides the
+        config: The repo's validated config; its ``routing:`` table overrides the
             implementer's and reviewer's model per the role registry.
 
     Returns:
@@ -1089,6 +1101,26 @@ def _bind_build_prd_for_repo(
         diff_source=git,
         config=config,
     )
+    # The classifier (and its HTTP transport) is constructed only when the repo declares a
+    # routing table, so a table-less repo makes zero classifier calls and no issue-facts
+    # fetch — invocations identical to pre-routing. This is load-bearing; do not hoist it.
+    resolve_implementer: PerIssueImplementer | None = None
+    if config.routing is not None:
+        classifier = ClaudeIssueClassifier(
+            credential=settings.anthropic_credential,
+            transport=HttpxTransport(),
+            routing=config.routing,
+        )
+        resolve_implementer = PerIssueImplementerRouter(
+            base_implementer=implementer,
+            config=config,
+            classify=classifier,
+            label_sink=GhLabelSink(token=token),
+            comment_sink=GhCommentSink(token=token),
+            issue_facts=GhCliIssueFacts(_ReconcileGhRunner(token)),
+            governor=governor,
+            classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        )
     bound = bind_build_prd(
         implementer=implementer,
         governor=governor,
@@ -1102,6 +1134,7 @@ def _bind_build_prd_for_repo(
         resolve_secret=resolve_secret,
         report=report,
         review_reviewer=review_reviewer,
+        resolve_implementer=resolve_implementer,
     )
 
     async def run(**kwargs: object) -> PrdBuildResult:
@@ -1131,7 +1164,7 @@ async def build_cron_slice_builder(
     resolver, and the gh report sink. The merge container the lazy git ops starts is
     destroyed after each drained issue in a ``finally`` (mirroring
     :func:`_bind_build_prd_for_repo`), so a long-lived worker never leaks a container across
-    cron ticks. The repo config (its ``models`` block, ``staging_branch``, and ``secrets``)
+    cron ticks. The repo config (its ``routing:`` table, ``staging_branch``, and ``secrets``)
     is read from the all-defaults config a loose backlog nit carries no per-issue override
     for; the heartbeat already passed the opted-in config, so the cron tick reuses it.
 
@@ -1179,6 +1212,65 @@ async def build_cron_slice_builder(
     return build
 
 
+async def _resolve_adhoc_level(
+    issue: AdhocIssue,
+    config: RepoConfig,
+    *,
+    classify: ClaudeIssueClassifier,
+    label_sink: GhLabelSink,
+    comment_sink: GhCommentSink,
+    issue_facts: GhCliIssueFacts,
+    governor: BudgetGovernor,
+) -> str | None:
+    """Resolve one ad-hoc issue's routing level once, best-effort.
+
+    Returns ``None`` for a table-less repo (every ad-hoc role falls through to the
+    registry default — today's behavior, and zero classifier calls). Otherwise classifies
+    the issue via :func:`retinue.routing.resolve_issue_level` (honoring a pre-existing
+    ``level:`` label, metering, applying the label, commenting on a classification failure)
+    and returns the level name. Any error along the classify path is logged and falls back
+    to the table's ``default`` level — mirroring
+    :class:`~retinue.routing.PerIssueImplementerRouter`'s best-effort contract, so a gh
+    flake never crashes the ad-hoc build.
+
+    Args:
+        issue: The ad-hoc issue being routed (its repo/number identify the GitHub issue).
+        config: The repo config; its ``routing:`` table supplies the level set.
+        classify: The classifier seam.
+        label_sink: Applies the resolved ``level:`` label.
+        comment_sink: Posts the classification-failure explanation.
+        issue_facts: Fetches the issue's classification facts.
+        governor: The shared budget governor each classifier charge is metered on.
+
+    Returns:
+        The resolved level name, or ``None`` for a table-less repo.
+    """
+    if config.routing is None:
+        return None
+    try:
+        return await resolve_issue_level(
+            issue.repo_full_name,
+            issue.issue_number,
+            config,
+            classify=classify,
+            label_sink=label_sink,
+            comment_sink=comment_sink,
+            issue_facts=issue_facts,
+            governor=governor,
+            classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "Ad-hoc routing resolution failed for %s#%d; building at the default level",
+            issue.repo_full_name,
+            issue.issue_number,
+            exc_info=True,
+        )
+        return config.routing.default
+
+
 def bind_adhoc_build(
     settings: Settings,
     auth: InstallationAuth,
@@ -1199,9 +1291,17 @@ def bind_adhoc_build(
     ``issue-<N>`` -> staging PR on a green build (reusing the pipeline's PR ops, gh issue
     creator, and run-state store rather than standing up parallel ones). The build's
     container/planner/implementer/reviewer adapters are the *same* real ones the PRD lane
-    uses (:func:`_bind_build_prd_for_repo`), each with its model resolved against the repo's
-    ``models`` override, so an ad-hoc build runs the production lane — not a bare no-op. A red
-    build pushes nothing and opens no PR (``process_adhoc_pr`` skips it).
+    uses (:func:`_bind_build_prd_for_repo`), so an ad-hoc build runs the production lane —
+    not a bare no-op. A red build pushes nothing and opens no PR (``process_adhoc_pr``
+    skips it).
+
+    Each ad-hoc issue is **classified once** at build start — mirroring the PRD lane's
+    per-slice routing — via :func:`_resolve_adhoc_level`, and its planner, implementer, and
+    ad-hoc reviewer are then constructed at that resolved level
+    (``resolve_model(Role.X, config, level=...)``). The classifier and its collaborators
+    are constructed only when the repo declares a ``routing:`` table; a table-less repo
+    makes zero classifier calls and builds all three roles at the registry defaults, exactly
+    as before. A pre-labeled issue skips the classifier and routes by its ``level:`` label.
 
     Args:
         settings: Carries the Anthropic credential/auth mode (planner, implementer, reviewer).
@@ -1219,34 +1319,65 @@ def bind_adhoc_build(
         The bound :data:`retinue.adhoc_drain.AdhocBuild` callable the drain runs per issue.
     """
     runtime = DockerRuntime()
-    planner = ContainerPlanner(
-        credential=settings.anthropic_credential,
-        auth_mode=settings.auth_mode,
-        model=resolve_model(Role.PLANNER, config),
-    )
-    implementer = ContainerImplementer(
-        credential=settings.anthropic_credential,
-        auth_mode=settings.auth_mode,
-        model=resolve_model(Role.IMPLEMENTER, config),
-        max_turns=settings.implement_max_turns,
-    )
-    review_generate = AgentSdkReviewGenerator(
-        credential=settings.anthropic_credential,
-        transport=HttpxTransport(),
-        model=resolve_model(Role.REVIEWER, config),
-    )
-    reviewer = ContainerAdhocReviewer(
-        repo_full_name=repo_full_name,
-        config=config,
-        generate=review_generate,
-        create_issue=pipeline.create_issue,
-        credential=settings.anthropic_credential,
-        auth_mode=settings.auth_mode,
-    )
     resolve_secret: SecretResolver = EnvSecretResolver()
     report: ReportSink = GhReportSink(token=token)
+    # The classifier (and its collaborators) is constructed only when the repo declares a
+    # routing table, so a table-less repo makes zero classifier calls and no issue-facts
+    # fetch — invocations identical to pre-routing. This mirrors _bind_build_prd_for_repo.
+    classifier: ClaudeIssueClassifier | None = None
+    label_sink: GhLabelSink | None = None
+    comment_sink: GhCommentSink | None = None
+    issue_facts: GhCliIssueFacts | None = None
+    if config.routing is not None:
+        classifier = ClaudeIssueClassifier(
+            credential=settings.anthropic_credential,
+            transport=HttpxTransport(),
+            routing=config.routing,
+        )
+        label_sink = GhLabelSink(token=token)
+        comment_sink = GhCommentSink(token=token)
+        issue_facts = GhCliIssueFacts(_ReconcileGhRunner(token))
 
     async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
+        level: str | None = None
+        if classifier is not None:
+            assert label_sink is not None
+            assert comment_sink is not None
+            assert issue_facts is not None
+            level = await _resolve_adhoc_level(
+                issue,
+                config,
+                classify=classifier,
+                label_sink=label_sink,
+                comment_sink=comment_sink,
+                issue_facts=issue_facts,
+                governor=pipeline.governor,
+            )
+        planner = ContainerPlanner(
+            credential=settings.anthropic_credential,
+            auth_mode=settings.auth_mode,
+            model=resolve_model(Role.PLANNER, config, level=level),
+        )
+        implementer = ContainerImplementer(
+            credential=settings.anthropic_credential,
+            auth_mode=settings.auth_mode,
+            model=resolve_model(Role.IMPLEMENTER, config, level=level),
+            max_turns=settings.implement_max_turns,
+        )
+        review_generate = AgentSdkReviewGenerator(
+            credential=settings.anthropic_credential,
+            transport=HttpxTransport(),
+            model=resolve_model(Role.REVIEWER, config, level=level),
+            effort=resolve_effort(Role.REVIEWER, config, level=level),
+        )
+        reviewer = ContainerAdhocReviewer(
+            repo_full_name=repo_full_name,
+            config=config,
+            generate=review_generate,
+            create_issue=pipeline.create_issue,
+            credential=settings.anthropic_credential,
+            auth_mode=settings.auth_mode,
+        )
         result = await build_adhoc_issue(
             issue,
             config,
@@ -1310,8 +1441,8 @@ def _build_review_reviewer_factory(
     PRD), but the build lane is bound per repo, so this returns a
     ``(repo_full_name, prd_number) -> RoundReviewer`` factory the build calls at run time.
     Each reviewer wires the real Agent-SDK review generator (over the httpx transport,
-    with its model resolved from the role registry against the repo's ``models``
-    override), the gh issue creator reused from the slicer, and the gh Blocked-by editor —
+    with its model resolved from the role registry against the repo's routing
+    table), the gh issue creator reused from the slicer, and the gh Blocked-by editor —
     so a live build reviews every merged round and the review-fix follow-ups it files build
     later. ``generate`` defaults to the real Agent-SDK reviewer; tests inject a fake to
     keep the review flow off the network.
@@ -1320,6 +1451,7 @@ def _build_review_reviewer_factory(
         credential=settings.anthropic_credential,
         transport=HttpxTransport(),
         model=resolve_model(Role.REVIEWER, config),
+        effort=resolve_effort(Role.REVIEWER, config),
     )
     edit_blocked_by = GhCliBlockedByEditor(
         runner=SubprocessGhRunner(_reviewer_gh.GhResult), token=token

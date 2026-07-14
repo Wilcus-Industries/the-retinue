@@ -498,6 +498,20 @@ class BudgetGovernor:
         )
         return GateDecision(deferred=True, defer_until=defer_until)
 
+    async def record_charge(self, *, amount: float) -> None:
+        """Record a side charge (e.g. one classifier call) on the shared ledger.
+
+        Unlike :meth:`gate`/:meth:`meter` this only records — the agent call has already
+        happened and is cheap, so it is metered after the fact, not gated. A disabled
+        budget records nothing.
+
+        Args:
+            amount: The charge in the ledger's unit (dollars or tokens).
+        """
+        if self._ledger.metering_disabled:
+            return
+        await self._ledger.record_spend(amount=amount)
+
     async def meter_adhoc(self, *, amount: float) -> bool:
         """Meter one ad-hoc build's flat charge against the shared rolling-24h cap.
 

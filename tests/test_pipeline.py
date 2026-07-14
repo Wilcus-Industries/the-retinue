@@ -31,7 +31,12 @@ from retinue.pr_opener import (
     PullRequest,
 )
 from retinue.reconcile import PrState, ResumePhase, RunStateStore
-from retinue.repo_config import RepoConfig
+from retinue.repo_config import (
+    ModelEffort,
+    RepoConfig,
+    RoutingConfig,
+    RoutingLevel,
+)
 from retinue.slicer import (
     CreatedIssue,
     IssueDraft,
@@ -819,6 +824,64 @@ async def test_build_pipeline_factory_sources_claude_md(tmp_path: Path) -> None:
     assert "uv run pytest" in pipeline.claude_md
 
 
+@pytest.mark.asyncio
+async def test_build_pipeline_factory_applies_routing_default_to_slicer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routing-default slicer override sets the constructed slicer's model + effort.
+
+    Drives the real production slicer construction (:class:`ClaudeSliceGenerator`), so a
+    routing table's ``default:`` level override for :data:`Role.SLICER` flows end-to-end
+    from the repo config through the role registry into the wired generator — proving
+    both model *and* effort thread through, not just the model (the bug #63 fixes).
+    """
+    import retinue.pipeline as pipeline_mod
+    from retinue.pipeline import build_pipeline_factory
+    from retinue.roles import ROLE_REGISTRY, Role
+    from retinue.slicer import ClaudeSliceGenerator
+
+    captured: dict[str, object] = {}
+
+    def _record(*args: object, **kwargs: object) -> ClaudeSliceGenerator:
+        captured["model"] = kwargs.get("model")
+        captured["effort"] = kwargs.get("effort")
+        return ClaudeSliceGenerator(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline_mod, "ClaudeSliceGenerator", _record)
+
+    config = RepoConfig(
+        staging_branch="staging",
+        retry_cap=2,
+        routing=RoutingConfig(
+            default="standard",
+            levels={
+                "standard": RoutingLevel(
+                    description="Ordinary work.",
+                    roles={
+                        Role.SLICER.value: ModelEffort(
+                            model="slicer-custom", effort="low"
+                        )
+                    },
+                )
+            },
+        ),
+    )
+    settings = _settings(tmp_path, ntfy_topic="alerts")
+    factory = build_pipeline_factory(settings, _FakeAuth())  # type: ignore[arg-type]
+    await factory("owner/repo", config)
+
+    assert captured["model"] == "slicer-custom"
+    assert captured["effort"] == "low"
+
+    # A table-less repo config (no ``routing:`` block at all) resolves both model and
+    # effort to the plain registry defaults, unaffected by the routed override above.
+    captured.clear()
+    await factory("owner/repo", _config())
+
+    assert captured["model"] == ROLE_REGISTRY[Role.SLICER].model
+    assert captured["effort"] == ROLE_REGISTRY[Role.SLICER].effort
+
+
 def test_build_push_sink_picks_pushover_when_no_ntfy(tmp_path: Path) -> None:
     """With only Pushover configured, the push sink is the Pushover backend."""
     from retinue.notify import PushoverPushSink
@@ -875,11 +938,11 @@ async def test_review_reviewer_factory_diffs_round_over_integration_branch(
 
 
 def test_review_factory_applies_repo_config_model_override(tmp_path: Path) -> None:
-    """A ``repo_config.models`` reviewer entry overrides the review generator's model.
+    """A routing-default reviewer override sets the review generator's model.
 
     Drives the real production review-generator construction (no ``generate`` override),
-    so the override flows end-to-end from the repo config through the role registry into
-    the live :class:`~retinue.reviewer.AgentSdkReviewGenerator`.
+    so the override flows end-to-end from the repo config's routing default level through
+    the role registry into the live :class:`~retinue.reviewer.AgentSdkReviewGenerator`.
     """
     from retinue.pipeline import _build_review_reviewer_factory
     from retinue.reviewer import AgentSdkReviewGenerator
@@ -891,7 +954,19 @@ def test_review_factory_applies_repo_config_model_override(tmp_path: Path) -> No
             return "diff-body"
 
     settings = _settings(tmp_path, anthropic_credential="k")
-    config = RepoConfig(models={Role.REVIEWER.value: "claude-opus-4-8-custom"})
+    config = RepoConfig(
+        routing=RoutingConfig(
+            default="standard",
+            levels={
+                "standard": RoutingLevel(
+                    description="Ordinary work.",
+                    roles={
+                        Role.REVIEWER.value: ModelEffort(model="claude-opus-4-8-custom")
+                    },
+                )
+            },
+        )
+    )
     factory = _build_review_reviewer_factory(
         settings,  # type: ignore[arg-type]
         repo_full_name="owner/repo",
@@ -905,6 +980,55 @@ def test_review_factory_applies_repo_config_model_override(tmp_path: Path) -> No
     assert isinstance(reviewer, _BoundRoundReviewer)
     assert isinstance(reviewer.generate, AgentSdkReviewGenerator)
     assert reviewer.generate.model == "claude-opus-4-8-custom"
+
+
+def test_review_factory_applies_repo_config_effort_override(tmp_path: Path) -> None:
+    """A routing-default reviewer override sets the review generator's effort tier.
+
+    Mirrors ``test_review_factory_applies_repo_config_model_override``: drives the real
+    production review-generator construction so a routing-table ``effort:`` override
+    flows end-to-end into the live :class:`~retinue.reviewer.AgentSdkReviewGenerator`
+    (the bug #63 fixes — previously only the model threaded through).
+    """
+    from retinue.pipeline import _build_review_reviewer_factory
+    from retinue.reviewer import AgentSdkReviewGenerator
+    from retinue.roles import Role
+    from retinue.wiring import _BoundRoundReviewer
+
+    class _DiffSource:
+        async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+            return "diff-body"
+
+    settings = _settings(tmp_path, anthropic_credential="k")
+    config = RepoConfig(
+        routing=RoutingConfig(
+            default="standard",
+            levels={
+                "standard": RoutingLevel(
+                    description="Ordinary work.",
+                    roles={
+                        Role.REVIEWER.value: ModelEffort(
+                            model="claude-opus-4-8-custom", effort="low"
+                        )
+                    },
+                )
+            },
+        )
+    )
+    factory = _build_review_reviewer_factory(
+        settings,  # type: ignore[arg-type]
+        repo_full_name="owner/repo",
+        token="ghs_x",
+        create_issue=_created,
+        diff_source=_DiffSource(),
+        config=config,
+    )
+    reviewer = factory("owner/repo", 7)
+
+    assert isinstance(reviewer, _BoundRoundReviewer)
+    assert isinstance(reviewer.generate, AgentSdkReviewGenerator)
+    assert reviewer.generate.model == "claude-opus-4-8-custom"
+    assert reviewer.generate.effort == "low"
 
 
 def test_httpx_transport_is_the_default_review_transport() -> None:
@@ -929,6 +1053,9 @@ class _RecordingAdhocPipeline:
 
     pr_calls: list[tuple[object, object]] = field(default_factory=list)
     pr_result: object | None = None
+    # The shared budget governor the per-issue classify hop meters on; ``None`` is fine
+    # for the table-less chain tests (they never classify) and for tests that fake the hop.
+    governor: object | None = None
 
     async def process_adhoc_pr(self, issue: object, build: object) -> object | None:
         self.pr_calls.append((issue, build))
@@ -1045,29 +1172,39 @@ async def test_bind_adhoc_build_still_chains_process_adhoc_pr_on_a_red_build(
     assert pipeline.pr_calls == [(issue, red)]
 
 
-def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
+@pytest.mark.asyncio
+async def test_bind_adhoc_build_resolves_each_role_model_at_the_issue_level(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each role's model in the ad-hoc build resolves against the repo config override.
+    """Each ad-hoc role is constructed *per issue* at the issue's resolved routing level.
 
-    A ``repo_config.models`` block keyed by the planner/implementer/reviewer roles must
-    flow into the constructed adapters' models — proving the ad-hoc lane runs the repo's
-    chosen models, not the registry defaults. The adapter constructors are captured so the
-    ``model=`` each receives is asserted against the config override.
+    Issue #65: the ad-hoc lane classifies each issue once at build start and constructs its
+    planner/implementer/reviewer at that resolved level (not at bind time, and not at the
+    table default). The classify hop is faked to resolve ``complex`` — a **non-default**
+    level whose ``roles:`` map overrides all three models with ids distinct from the
+    ``default`` level's overrides. Since ``resolve_model(..., level=None)`` would resolve
+    via the default level, asserting the captured ``model=`` each adapter receives matches
+    ``complex`` (not the default) pins the resolved level actually flowing into
+    construction — a closure that dropped the level (passing ``level=None``) would build
+    the default models and fail. The captured classify-hop kwargs also pin that the shared
+    ``pipeline.governor`` meters the classifier charge.
     """
     import retinue.pipeline as pipeline_mod
-    from retinue.adhoc_build import ContainerPlanner
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ContainerPlanner
     from retinue.orchestrator import ContainerImplementer
     from retinue.pipeline import bind_adhoc_build
     from retinue.reviewer import AgentSdkReviewGenerator
-    from retinue.roles import Role
+    from retinue.roles import EFFORT_MAX, Role
 
     captured: dict[str, str] = {}
+    captured_effort: dict[str, str] = {}
 
     def _record(name: str, real: object) -> object:
         def ctor(*args: object, **kwargs: object) -> object:
             if "model" in kwargs:
                 captured[name] = kwargs["model"]  # type: ignore[assignment]
+            if "effort" in kwargs:
+                captured_effort[name] = kwargs["effort"]  # type: ignore[assignment]
             return real(*args, **kwargs)  # type: ignore[operator]
 
         return ctor
@@ -1081,29 +1218,85 @@ def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
     monkeypatch.setattr(
         pipeline_mod, "AgentSdkReviewGenerator", _record("reviewer", AgentSdkReviewGenerator)
     )
+    # Fake the classify hop (resolves to the non-default ``complex`` level) and the
+    # container build, so the closure runs offline — no gh, no classifier HTTP, no Docker.
+    # The kwargs the hop receives are captured to pin the governor threaded into it.
+    resolved: list[object] = []
+    resolve_kwargs: dict[str, object] = {}
 
+    async def _fake_level(issue: object, config: object, **kwargs: object) -> str:
+        resolved.append(issue)
+        resolve_kwargs.update(kwargs)
+        return "complex"
+
+    monkeypatch.setattr(pipeline_mod, "_resolve_adhoc_level", _fake_level)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "build_adhoc_issue",
+        _fake_build_adhoc_issue({}, AdhocBuildResult(branch="issue-31", passed=True)),
+    )
+
+    # Two levels with *distinct* role models: the ``default`` (``standard``) and the
+    # non-default ``complex`` the fake resolves to. If the closure dropped the level and
+    # resolved at ``level=None``, every model below would come out ``*-default``, so the
+    # ``*-complex`` asserts pin the resolved level flowing through the construction.
     config = RepoConfig(
         staging_branch="staging",
         retry_cap=2,
-        models={
-            Role.PLANNER.value: "planner-custom",
-            Role.IMPLEMENTER.value: "implementer-custom",
-            Role.REVIEWER.value: "reviewer-custom",
-        },
+        routing=RoutingConfig(
+            default="standard",
+            levels={
+                "standard": RoutingLevel(
+                    description="Ordinary work.",
+                    roles={
+                        Role.PLANNER.value: ModelEffort(model="planner-default"),
+                        Role.IMPLEMENTER.value: ModelEffort(model="implementer-default"),
+                        Role.REVIEWER.value: ModelEffort(model="reviewer-default"),
+                    },
+                ),
+                "complex": RoutingLevel(
+                    description="Hard work.",
+                    roles={
+                        Role.PLANNER.value: ModelEffort(model="planner-complex"),
+                        Role.IMPLEMENTER.value: ModelEffort(model="implementer-complex"),
+                        Role.REVIEWER.value: ModelEffort(model="reviewer-complex"),
+                    },
+                ),
+            },
+        ),
     )
     settings = _settings(tmp_path, anthropic_credential="k")
-    bind_adhoc_build(
+    # A distinct governor sentinel so the captured classify-hop kwargs prove the pipeline's
+    # own governor (not some other object) meters the per-issue classifier charge.
+    governor_sentinel = object()
+    pipeline = _RecordingAdhocPipeline(governor=governor_sentinel)
+    build = bind_adhoc_build(
         settings,  # type: ignore[arg-type]
         _FakeAuth(),  # type: ignore[arg-type]
-        pipeline=_RecordingAdhocPipeline(),  # type: ignore[arg-type]
+        pipeline=pipeline,  # type: ignore[arg-type]
         repo_full_name="owner/repo",
         token="ghs_x",
         config=config,
         claude_md="## Definition of done\n```\nuv run pytest\n```\n",
     )
 
+    # No role is constructed at bind time — construction is deferred into the per-issue build.
+    assert captured == {}
+
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    await build(issue, repo_full_name="owner/repo")
+
+    # The issue was classified exactly once, metered on the pipeline's own governor.
+    assert resolved == [issue]
+    assert resolve_kwargs["governor"] is governor_sentinel
+    # Each role was built at the resolved (non-default ``complex``) level's model — a
+    # closure resolving at ``level=None`` would yield the ``*-default`` ids instead.
     assert captured == {
-        "planner": "planner-custom",
-        "implementer": "implementer-custom",
-        "reviewer": "reviewer-custom",
+        "planner": "planner-complex",
+        "implementer": "implementer-complex",
+        "reviewer": "reviewer-complex",
     }
+    # The routing table's roles map named a model but no ``effort:`` for the reviewer, so
+    # its effort falls through to the registry default (``max``) — a model-only override
+    # does not implicitly change effort.
+    assert captured_effort == {"reviewer": EFFORT_MAX}

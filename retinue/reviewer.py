@@ -26,7 +26,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from retinue.roles import Role, oauth_system, resolve_model, structured_output_config
+from retinue.roles import (
+    Role,
+    oauth_system,
+    resolve_effort,
+    resolve_model,
+    structured_output_config,
+)
 from retinue.slicer import (
     READY_LABEL,
     CreatedIssue,
@@ -240,12 +246,16 @@ class AgentSdkReviewGenerator:
         transport: The injected HTTP POST seam.
         model: The reviewing model id; defaults to the
             :data:`~retinue.roles.Role.REVIEWER` registry entry (Opus 4.8), which a
-            repo's ``models`` override can replace at the wiring site.
+            repo's routing level can replace at the wiring site.
+        effort: The review request's reasoning-effort tier; defaults to the
+            registry entry's tier, which a repo's routing level can replace at
+            the wiring site.
     """
 
     credential: str
     transport: HttpTransport
     model: str = field(default_factory=lambda: resolve_model(Role.REVIEWER))
+    effort: str = field(default_factory=lambda: resolve_effort(Role.REVIEWER))
 
     async def __call__(self, review_input: ReviewInput) -> ReviewPlan:
         """Review ``review_input``'s diff and return the parsed :class:`ReviewPlan`."""
@@ -277,12 +287,12 @@ class AgentSdkReviewGenerator:
         """Assemble the Messages API request body for one round's review.
 
         The internal reviewer is the highest-rigor Opus role; the shared
-        :func:`~retinue.roles.structured_output_config` helper carries its registry
-        effort tier (``max``) and the findings JSON schema on one ``output_config``
-        dict — the canonical Messages API structured-output shape (the OpenAI-style
-        top-level ``response_format`` is not a Claude API parameter and 400s). The
-        round diff is clamped to :data:`_DIFF_MAX_CHARS` before interpolation so a
-        big round cannot blow the request body.
+        :func:`~retinue.roles.structured_output_config` helper carries the instance's
+        resolved effort tier (``max`` by default) and the findings JSON schema on one
+        ``output_config`` dict — the canonical Messages API structured-output shape
+        (the OpenAI-style top-level ``response_format`` is not a Claude API parameter
+        and 400s). The round diff is clamped to :data:`_DIFF_MAX_CHARS` before
+        interpolation so a big round cannot blow the request body.
         """
         merged = ", ".join(f"#{n}" for n in review_input.merged_issues) or "(none)"
         user = (
@@ -296,7 +306,9 @@ class AgentSdkReviewGenerator:
         return {
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
-            "output_config": structured_output_config(Role.REVIEWER, _REVIEW_SCHEMA),
+            "output_config": structured_output_config(
+                Role.REVIEWER, _REVIEW_SCHEMA, effort=self.effort
+            ),
             "system": oauth_system(
                 _REVIEW_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")
             ),
