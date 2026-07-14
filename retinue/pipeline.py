@@ -119,7 +119,7 @@ from retinue.reviewer import (
     GhCliBlockedByEditor,
     ReviewGenerator,
 )
-from retinue.roles import Role, resolve_model
+from retinue.roles import Role, resolve_effort, resolve_model
 from retinue.slicer import (
     HITL_LABEL,
     ClaudeSliceGenerator,
@@ -943,6 +943,7 @@ def build_pipeline_factory(
             token=settings.anthropic_credential,
             auth_mode=settings.auth_mode,
             model=resolve_model(Role.SLICER, config),
+            effort=resolve_effort(Role.SLICER, config),
         ).generate
         pr_ops = GhCliPrOps(pr_runner, token=token)
         reap_gh = HandoffGh(token=token)
@@ -1234,6 +1235,7 @@ def bind_adhoc_build(
         credential=settings.anthropic_credential,
         transport=HttpxTransport(),
         model=resolve_model(Role.REVIEWER, config),
+        effort=resolve_effort(Role.REVIEWER, config),
     )
     reviewer = ContainerAdhocReviewer(
         repo_full_name=repo_full_name,
@@ -1320,6 +1322,7 @@ def _build_review_reviewer_factory(
         credential=settings.anthropic_credential,
         transport=HttpxTransport(),
         model=resolve_model(Role.REVIEWER, config),
+        effort=resolve_effort(Role.REVIEWER, config),
     )
     edit_blocked_by = GhCliBlockedByEditor(
         runner=SubprocessGhRunner(_reviewer_gh.GhResult), token=token

@@ -61,7 +61,13 @@ from retinue.done_check import (
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import ReviewGenerationError
-from retinue.roles import Role, oauth_system, resolve_model, structured_output_config
+from retinue.roles import (
+    Role,
+    oauth_system,
+    resolve_effort,
+    resolve_model,
+    structured_output_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -766,16 +772,23 @@ def _resolve_headers(credential: str) -> dict[str, str]:
 
 
 def _resolve_payload(
-    files: list[_ConflictedFile], *, source: str, into: str, model: str, is_oauth: bool
+    files: list[_ConflictedFile],
+    *,
+    source: str,
+    into: str,
+    model: str,
+    effort: str,
+    is_oauth: bool,
 ) -> dict[str, Any]:
     """Assemble the Messages API request body for one conflict resolution.
 
     The frozen system brief leads; the user message carries the merge context plus each
     conflicted file's full marked-up body, fenced by path so the model can address each
-    one. The shared :func:`~retinue.roles.structured_output_config` helper carries the
-    resolver's registry effort tier (``xhigh``) and the strict per-file schema on one
-    ``output_config`` dict — the canonical Messages API structured-output shape (the
-    OpenAI-style top-level ``response_format`` is not a Claude API parameter and 400s).
+    one. The shared :func:`~retinue.roles.structured_output_config` helper carries
+    ``effort`` (the caller's resolved reasoning-effort tier) and the strict per-file
+    schema on one ``output_config`` dict — the canonical Messages API structured-output
+    shape (the OpenAI-style top-level ``response_format`` is not a Claude API parameter
+    and 400s).
 
     ``is_oauth`` is required, not defaulted: a subscription OAuth token reaches the premium
     resolving model only when the leading ``system`` block is the Claude Code identity
@@ -793,7 +806,9 @@ def _resolve_payload(
     return {
         "model": model,
         "max_tokens": _RESOLVE_MAX_TOKENS,
-        "output_config": structured_output_config(Role.RESOLVER, _RESOLVE_SCHEMA),
+        "output_config": structured_output_config(
+            Role.RESOLVER, _RESOLVE_SCHEMA, effort=effort
+        ),
         "system": oauth_system(_RESOLVE_SYSTEM, is_oauth=is_oauth),
         "messages": [{"role": "user", "content": user}],
     }
@@ -845,12 +860,16 @@ class AgentSdkConflictResolver:
         model: The resolving model id; defaults to the
             :data:`~retinue.roles.Role.RESOLVER` registry entry (Opus 4.8), which a
             repo's routing level can replace at the wiring site.
+        effort: The resolving request's reasoning-effort tier; defaults to the
+            registry entry's tier, which a repo's routing level can replace at
+            the wiring site.
     """
 
     container: Container
     transport: AnthropicTransport
     credential: str
     model: str = field(default_factory=lambda: resolve_model(Role.RESOLVER))
+    effort: str = field(default_factory=lambda: resolve_effort(Role.RESOLVER))
 
     async def __call__(self, *, source: str, into: str) -> ConflictResolution:
         """Resolve the conflict merging ``source`` into ``into``; stage and commit it."""
@@ -890,6 +909,7 @@ class AgentSdkConflictResolver:
                 source=source,
                 into=into,
                 model=self.model,
+                effort=self.effort,
                 is_oauth=self.credential.startswith("sk-ant-oat"),
             ),
         )
