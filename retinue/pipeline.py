@@ -58,6 +58,7 @@ from retinue.budget import (
     BudgetLedger,
     SystemClock,
 )
+from retinue.classifier import ClaudeIssueClassifier
 from retinue.container import Container, ContainerRuntime, DockerRuntime
 from retinue.cron import CronBuild
 from retinue.done_check import (
@@ -120,6 +121,11 @@ from retinue.reviewer import (
     ReviewGenerator,
 )
 from retinue.roles import Role, resolve_effort, resolve_model
+from retinue.routing import (
+    GhCliIssueFacts,
+    PerIssueImplementer,
+    PerIssueImplementerRouter,
+)
 from retinue.slicer import (
     HITL_LABEL,
     ClaudeSliceGenerator,
@@ -791,6 +797,10 @@ def _build_push_sink(settings: Settings) -> PushSink:
 # public config schema is unchanged.
 _BUILD_ESTIMATED_AMOUNT = 1.0
 
+# The estimated charge one classifier call meters against the shared ledger. Kept small
+# (a Haiku-class call) and separate from the build gate estimate, which is unchanged.
+_CLASSIFIER_ESTIMATED_AMOUNT = 0.01
+
 
 class _MergeContainerGitOps:
     """A :class:`GitOps` that lazily starts its own merge container, then delegates.
@@ -1090,6 +1100,26 @@ def _bind_build_prd_for_repo(
         diff_source=git,
         config=config,
     )
+    # The classifier (and its HTTP transport) is constructed only when the repo declares a
+    # routing table, so a table-less repo makes zero classifier calls and no issue-facts
+    # fetch — invocations identical to pre-routing. This is load-bearing; do not hoist it.
+    resolve_implementer: PerIssueImplementer | None = None
+    if config.routing is not None:
+        classifier = ClaudeIssueClassifier(
+            credential=settings.anthropic_credential,
+            transport=HttpxTransport(),
+            routing=config.routing,
+        )
+        resolve_implementer = PerIssueImplementerRouter(
+            base_implementer=implementer,
+            config=config,
+            classify=classifier,
+            label_sink=GhLabelSink(token=token),
+            comment_sink=GhCommentSink(token=token),
+            issue_facts=GhCliIssueFacts(_ReconcileGhRunner(token)),
+            governor=governor,
+            classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        )
     bound = bind_build_prd(
         implementer=implementer,
         governor=governor,
@@ -1103,6 +1133,7 @@ def _bind_build_prd_for_repo(
         resolve_secret=resolve_secret,
         report=report,
         review_reviewer=review_reviewer,
+        resolve_implementer=resolve_implementer,
     )
 
     async def run(**kwargs: object) -> PrdBuildResult:

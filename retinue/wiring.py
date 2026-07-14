@@ -53,6 +53,7 @@ from retinue.reviewer import (
     ReviewInput,
     review_round,
 )
+from retinue.routing import PerIssueImplementer
 from retinue.slicer import IssueCreator
 from retinue.triage import TriageImplementer, triage_implementer
 
@@ -103,6 +104,7 @@ def bind_build_prd(
     resolve_secret: SecretResolver,
     report: ReportSink,
     review_reviewer: ReviewerFactory | None = None,
+    resolve_implementer: PerIssueImplementer | None = None,
 ) -> Callable[..., Awaitable[BoundBuildResult]]:
     """Bind the budget-gated, triage-wrapped orchestrator build.
 
@@ -131,6 +133,9 @@ def bind_build_prd(
         review_reviewer: A factory ``(repo_full_name, prd_number) -> RoundReviewer`` built
             per build (the reviewer is per-PRD), run after each round's merge; absent means
             no per-round review (and no review-fix follow-up slices).
+        resolve_implementer: Per-slice implementer resolver (classify + route the model per
+            issue); ``None`` keeps the single injected implementer for every slice — today's
+            behavior and the table-less path.
 
     Returns:
         An async build callable returning a :class:`BoundBuildResult`.
@@ -161,6 +166,7 @@ def bind_build_prd(
             notifier=notifier,
             create_issue=create_issue,
             retry_store=retry_store,
+            resolve_implementer=resolve_implementer,
         )
         reviewer = (
             review_reviewer(repo_full_name, prd_number)
@@ -305,6 +311,11 @@ class _TriagingImplementer:
     This is the PRD lane's implementer, where there is no materialized plan file, so
     ``plan_path`` is accepted for protocol conformance and ignored — the ad-hoc lane's
     plan threading is a :mod:`retinue.adhoc_build` concern, not a triaged-build one.
+
+    When ``resolve_implementer`` is wired, the implementer's model is resolved per slice
+    (classify + route) once at that slice's first build, so triage retries within the same
+    slice reuse the resolved model rather than re-classifying; ``None`` keeps the single
+    injected implementer for every slice (the table-less path).
     """
 
     implementer: Implementer | TriageImplementer
@@ -312,14 +323,20 @@ class _TriagingImplementer:
     notifier: Notifier
     create_issue: IssueCreator
     retry_store: ImplRetryStore
+    resolve_implementer: PerIssueImplementer | None = None
 
     async def implement(
         self, slice_: Slice, *, container: Container, plan_path: str | None = None
     ) -> None:
+        implementer = (
+            await self.resolve_implementer(slice_)
+            if self.resolve_implementer is not None
+            else self.implementer
+        )
         await triage_implementer(
             slice_,
             self.config,
-            implementer=self.implementer,
+            implementer=implementer,
             notifier=self.notifier,
             create_issue=self.create_issue,
             retry_store=self.retry_store,
