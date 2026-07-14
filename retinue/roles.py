@@ -36,9 +36,10 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from retinue.repo_config import RepoConfig
+if TYPE_CHECKING:
+    from retinue.repo_config import RepoConfig
 
 # Reasoning-effort tiers, expressed as the ``output_config.effort`` string the Messages
 # API call carries. Opus 4.8 (the model every Opus role pins) removed the extended-

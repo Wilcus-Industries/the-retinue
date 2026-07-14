@@ -118,3 +118,137 @@ def test_repo_config_is_constructible_directly() -> None:
     config = RepoConfig()
     assert config.staging_branch == "staging"
     assert config.retry_cap == 3
+
+
+ROUTING_CONFIG = """
+routing:
+  default: standard
+  classifier:
+    model: claude-haiku-4
+    effort: low
+  levels:
+    trivial:
+      description: Typo fixes, docs-only changes, and other one-line diffs.
+      roles:
+        implementer:
+          model: claude-haiku-4
+    standard:
+      description: Ordinary feature work and bug fixes of moderate scope.
+      roles:
+        implementer:
+          model: claude-sonnet-4-6
+        reviewer:
+          model: claude-opus-4-8
+          effort: high
+    high-risk:
+      description: Cross-module migrations, concurrency refactors, schema changes.
+      roles:
+        implementer:
+          model: claude-opus-4-8
+          effort: xhigh
+        reviewer:
+          model: claude-opus-4-8
+          effort: max
+"""
+
+
+def test_routing_block_parses_full_shape() -> None:
+    """Three levels, partial role maps, default, and a classifier override all parse."""
+    config = load_repo_config(ROUTING_CONFIG)
+    assert config is not None
+    assert config.routing is not None
+    routing = config.routing
+    assert routing.default == "standard"
+    assert routing.classifier is not None
+    assert routing.classifier.model == "claude-haiku-4"
+    assert routing.classifier.effort == "low"
+    assert set(routing.levels) == {"trivial", "standard", "high-risk"}
+    trivial = routing.levels["trivial"]
+    assert trivial.description == "Typo fixes, docs-only changes, and other one-line diffs."
+    assert set(trivial.roles) == {"implementer"}
+    assert trivial.roles["implementer"].model == "claude-haiku-4"
+    assert trivial.roles["implementer"].effort is None
+    assert routing.levels["standard"].roles["reviewer"].effort == "high"
+    high_risk = routing.levels["high-risk"]
+    assert high_risk.roles["implementer"].effort == "xhigh"
+    assert high_risk.roles["reviewer"].effort == "max"
+
+
+def test_routing_absent_is_valid_and_reports_none() -> None:
+    """A config with no routing: block validates, with routing simply off."""
+    config = load_repo_config("staging_branch: staging\n")
+    assert config is not None
+    assert config.routing is None
+
+
+def test_routing_rejects_bad_level_slug() -> None:
+    """An uppercase or otherwise non-slug level name is rejected."""
+    bad = "routing:\n  default: Trivial\n  levels:\n    Trivial:\n      description: bad name\n"
+    assert load_repo_config(bad) is None
+
+
+def test_routing_rejects_bad_effort_value() -> None:
+    """An effort tier outside the known five-tier set is rejected."""
+    bad = """
+routing:
+  default: standard
+  levels:
+    standard:
+      description: ok
+      roles:
+        implementer:
+          model: claude-sonnet-4-6
+          effort: extreme
+"""
+    assert load_repo_config(bad) is None
+
+
+def test_routing_rejects_unknown_role_key() -> None:
+    """A role key not in the role registry is rejected."""
+    bad = """
+routing:
+  default: standard
+  levels:
+    standard:
+      description: ok
+      roles:
+        wizard:
+          model: claude-sonnet-4-6
+"""
+    assert load_repo_config(bad) is None
+
+
+def test_routing_rejects_default_naming_missing_level() -> None:
+    """default: naming a level that isn't declared is rejected."""
+    bad = "routing:\n  default: nonexistent\n  levels:\n    standard:\n      description: ok\n"
+    assert load_repo_config(bad) is None
+
+
+def test_routing_rejects_zero_levels() -> None:
+    """A routing: block with an empty levels map is invalid."""
+    bad = "routing:\n  default: standard\n  levels: {}\n"
+    assert load_repo_config(bad) is None
+
+
+def test_routing_rejects_unknown_key_in_block() -> None:
+    """A typo'd or unknown key in the routing: block is rejected."""
+    bad = """
+routing:
+  default: standard
+  levels:
+    standard:
+      description: ok
+  extra_key: true
+"""
+    assert load_repo_config(bad) is None
+
+
+def test_routing_violation_logs_warning_not_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A routing violation degrades to a logged warning, never an exception."""
+    bad = "routing:\n  default: standard\n  levels: {}\n"
+    with caplog.at_level(logging.WARNING, logger="retinue.repo_config"):
+        config = load_repo_config(bad)
+    assert config is None
+    assert "retinue.yml" in caplog.text.lower()
