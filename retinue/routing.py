@@ -23,7 +23,9 @@ production ``gh`` adapter fakes out in tests. No import of :mod:`retinue.wiring`
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
@@ -35,6 +37,8 @@ from retinue.orchestrator import ContainerImplementer, Implementer, Slice
 from retinue.reconcile import GhRunner
 from retinue.repo_config import RepoConfig
 from retinue.roles import Role, resolve_model
+
+logger = logging.getLogger(__name__)
 
 # Fetch one issue's classification facts (title/body/labels) — the router's read seam.
 IssueFactsSource = Callable[[str, int], Awaitable[ClassifyInput]]
@@ -110,6 +114,14 @@ class PerIssueImplementerRouter:
     classification failure, and returns the base implementer with the level's implementer
     model swapped in via :func:`dataclasses.replace` (same credential/auth_mode/max_turns).
 
+    Any failure along that path — a gh flake fetching facts, malformed JSON, a label
+    object missing ``name``, or a failed failure-comment post — is caught and swallowed:
+    the router logs a warning and returns the injected base implementer unchanged rather
+    than propagating. Propagating would surface out of the triage wrapper before its
+    retry logic, escalating the slice with zero retries; the base implementer (the
+    table's default level) is a sound fallback, mirroring the best-effort label contract
+    in :func:`retinue.level.resolve_level`.
+
     Attributes:
         base_implementer: The template implementer whose model is replaced per slice.
         config: The repo config; its ``routing:`` table supplies the level's model.
@@ -131,6 +143,29 @@ class PerIssueImplementerRouter:
     classifier_charge: float
 
     async def __call__(self, slice_: Slice) -> Implementer:
+        # A per-slice resolution failure (a gh flake fetching facts, malformed JSON, a
+        # label object missing 'name', or a failed failure-comment post) must never
+        # propagate: it would surface out of the triage wrapper *before* its retry
+        # logic, escalating the slice with zero retries and skipping its dependent
+        # subtree. Instead fall back to the injected base implementer — the table's
+        # default level is a good fallback — mirroring resolve_level's best-effort
+        # label contract.
+        try:
+            return await self._resolve(slice_)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Routing resolution failed for %s#%d; falling back to the base "
+                "implementer",
+                slice_.repo_full_name,
+                slice_.issue_number,
+                exc_info=True,
+            )
+            return self.base_implementer
+
+    async def _resolve(self, slice_: Slice) -> Implementer:
+        """Classify one slice and route its implementer model; may raise on any hop."""
         routing = self.config.routing
         # The router is only constructed for routing repos; assert narrows for mypy and
         # fails loudly on misuse.

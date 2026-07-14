@@ -133,6 +133,25 @@ class _FactsFor:
         return self._facts[issue_number]
 
 
+class _RaisingFacts:
+    """A fake :data:`IssueFactsSource` that raises — models a gh flake / bad JSON."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __call__(
+        self, repo_full_name: str, issue_number: int
+    ) -> ClassifyInput:
+        raise self._exc
+
+
+class _RaisingComments:
+    """A comment sink that raises — models a failed failure-comment post."""
+
+    async def __call__(self, request: CommentRequest) -> None:
+        raise RuntimeError("comment post failed")
+
+
 def _governor(tmp_path: Path, *, weekly: float = 1000.0) -> BudgetGovernor:
     return BudgetGovernor(
         BudgetLedger(
@@ -315,6 +334,63 @@ async def test_router_classification_failure_defaults_and_comments(
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
         _CLASSIFIER_ESTIMATED_AMOUNT
     )
+
+
+@pytest.mark.asyncio
+async def test_router_facts_failure_falls_back_to_base_implementer(
+    tmp_path: Path,
+) -> None:
+    """A resolution failure (gh flake / bad JSON) falls back to the base implementer.
+
+    The facts fetch raising must not propagate — that would escalate the slice with
+    zero triage retries. Instead the router logs and returns the injected base
+    implementer unchanged, mirroring resolve_level's best-effort label contract.
+    """
+    labels, comments = _RecordingLabels(), _RecordingComments()
+    governor = _governor(tmp_path)
+    base = ContainerImplementer(credential="k", model="base-model")
+    router = PerIssueImplementerRouter(
+        base_implementer=base,
+        config=_config(),
+        classify=_UnusedClassifier(),
+        label_sink=labels,
+        comment_sink=comments,
+        issue_facts=_RaisingFacts(RuntimeError("gh view exited non-zero")),
+        governor=governor,
+        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+    )
+
+    implementer = await router(_slice(1))
+
+    # The exact injected base implementer is returned — no model swap, no charge.
+    assert implementer is base
+    assert comments.calls == []
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_router_failure_comment_post_failure_falls_back_to_base(
+    tmp_path: Path,
+) -> None:
+    """A failed failure-comment post falls back to the base implementer, not an escalation."""
+    labels = _RecordingLabels()
+    governor = _governor(tmp_path)
+    facts = _FactsFor({1: ClassifyInput(title="x", body="b", labels=[])})
+    base = ContainerImplementer(credential="k", model="base-model")
+    router = PerIssueImplementerRouter(
+        base_implementer=base,
+        config=_config(),
+        classify=_RecordingClassifier(ClassifyResult(level=None)),
+        label_sink=labels,
+        comment_sink=_RaisingComments(),
+        issue_facts=facts,
+        governor=governor,
+        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+    )
+
+    implementer = await router(_slice(1))
+
+    assert implementer is base
 
 
 # --- integration: bind_build_prd driving a real router --------------------------
