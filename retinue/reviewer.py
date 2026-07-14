@@ -240,7 +240,7 @@ class AgentSdkReviewGenerator:
         transport: The injected HTTP POST seam.
         model: The reviewing model id; defaults to the
             :data:`~retinue.roles.Role.REVIEWER` registry entry (Opus 4.8), which a
-            repo's ``models`` override can replace at the wiring site.
+            repo's routing level can replace at the wiring site.
     """
 
     credential: str

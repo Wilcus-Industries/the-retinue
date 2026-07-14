@@ -31,7 +31,12 @@ from retinue.pr_opener import (
     PullRequest,
 )
 from retinue.reconcile import PrState, ResumePhase, RunStateStore
-from retinue.repo_config import RepoConfig
+from retinue.repo_config import (
+    ModelEffort,
+    RepoConfig,
+    RoutingConfig,
+    RoutingLevel,
+)
 from retinue.slicer import (
     CreatedIssue,
     IssueDraft,
@@ -875,11 +880,11 @@ async def test_review_reviewer_factory_diffs_round_over_integration_branch(
 
 
 def test_review_factory_applies_repo_config_model_override(tmp_path: Path) -> None:
-    """A ``repo_config.models`` reviewer entry overrides the review generator's model.
+    """A routing-default reviewer override sets the review generator's model.
 
     Drives the real production review-generator construction (no ``generate`` override),
-    so the override flows end-to-end from the repo config through the role registry into
-    the live :class:`~retinue.reviewer.AgentSdkReviewGenerator`.
+    so the override flows end-to-end from the repo config's routing default level through
+    the role registry into the live :class:`~retinue.reviewer.AgentSdkReviewGenerator`.
     """
     from retinue.pipeline import _build_review_reviewer_factory
     from retinue.reviewer import AgentSdkReviewGenerator
@@ -891,7 +896,19 @@ def test_review_factory_applies_repo_config_model_override(tmp_path: Path) -> No
             return "diff-body"
 
     settings = _settings(tmp_path, anthropic_credential="k")
-    config = RepoConfig(models={Role.REVIEWER.value: "claude-opus-4-8-custom"})
+    config = RepoConfig(
+        routing=RoutingConfig(
+            default="standard",
+            levels={
+                "standard": RoutingLevel(
+                    description="Ordinary work.",
+                    roles={
+                        Role.REVIEWER.value: ModelEffort(model="claude-opus-4-8-custom")
+                    },
+                )
+            },
+        )
+    )
     factory = _build_review_reviewer_factory(
         settings,  # type: ignore[arg-type]
         repo_full_name="owner/repo",
@@ -1050,10 +1067,10 @@ def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
 ) -> None:
     """Each role's model in the ad-hoc build resolves against the repo config override.
 
-    A ``repo_config.models`` block keyed by the planner/implementer/reviewer roles must
-    flow into the constructed adapters' models — proving the ad-hoc lane runs the repo's
-    chosen models, not the registry defaults. The adapter constructors are captured so the
-    ``model=`` each receives is asserted against the config override.
+    A routing table whose ``default:`` level names the planner/implementer/reviewer roles
+    must flow into the constructed adapters' models — proving the ad-hoc lane runs the
+    repo's chosen models, not the registry defaults. The adapter constructors are captured
+    so the ``model=`` each receives is asserted against the routing override.
     """
     import retinue.pipeline as pipeline_mod
     from retinue.adhoc_build import ContainerPlanner
@@ -1085,11 +1102,19 @@ def test_bind_adhoc_build_resolves_each_role_model_from_repo_config(
     config = RepoConfig(
         staging_branch="staging",
         retry_cap=2,
-        models={
-            Role.PLANNER.value: "planner-custom",
-            Role.IMPLEMENTER.value: "implementer-custom",
-            Role.REVIEWER.value: "reviewer-custom",
-        },
+        routing=RoutingConfig(
+            default="standard",
+            levels={
+                "standard": RoutingLevel(
+                    description="Ordinary work.",
+                    roles={
+                        Role.PLANNER.value: ModelEffort(model="planner-custom"),
+                        Role.IMPLEMENTER.value: ModelEffort(model="implementer-custom"),
+                        Role.REVIEWER.value: ModelEffort(model="reviewer-custom"),
+                    },
+                )
+            },
+        ),
     )
     settings = _settings(tmp_path, anthropic_credential="k")
     bind_adhoc_build(

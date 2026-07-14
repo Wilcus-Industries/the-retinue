@@ -2,18 +2,19 @@
 
 The registry owns the five agent roles (slicer, implementer, conflict resolver,
 internal reviewer, and read-only planner) and resolves each one's model id and
-reasoning-effort tier from a single table. A ``repo_config.models`` entry overrides a
-role's model; the effort tier is the registry's alone. The planner additionally owns a
-read-only CLI invocation builder, asserted here for its no-write/explore-first contract.
-No network, Agent SDK, or gh is touched — this is a pure lookup over the table plus
-argv string assembly.
+reasoning-effort tier from a single table. Resolution is level-aware over the repo's
+routing table: a routing level's ``roles:`` map overrides a role's model, and its effort
+tier too when the entry sets ``effort:``; a role the level does not name falls back to the
+registry default. The planner additionally owns a read-only CLI invocation builder,
+asserted here for its no-write/explore-first contract. No network, Agent SDK, or gh is
+touched — this is a pure lookup over the table plus argv string assembly.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from retinue.repo_config import RepoConfig
+from retinue.repo_config import ModelEffort, RepoConfig, RoutingConfig, RoutingLevel
 from retinue.roles import (
     CLAUDE_CODE_IDENTITY,
     EFFORT_HIGH,
@@ -60,32 +61,112 @@ def test_default_tiers_match_the_prd(
 
 
 def test_resolve_model_returns_the_registry_default_without_override() -> None:
-    """With no ``models`` override, the resolved model is the registry default."""
+    """With no routing table, the resolved model is the registry default."""
     config = RepoConfig()
     for role in Role:
         assert resolve_model(role, config) == ROLE_REGISTRY[role].model
 
 
-def test_resolve_model_applies_a_repo_config_override() -> None:
-    """A ``repo_config.models`` entry keyed by the role overrides that role's model."""
-    config = RepoConfig(models={Role.IMPLEMENTER.value: "claude-opus-4-8"})
-    assert resolve_model(Role.IMPLEMENTER, config) == "claude-opus-4-8"
-    # An unrelated role is untouched by another role's override.
-    assert resolve_model(Role.SLICER, config) == ROLE_REGISTRY[Role.SLICER].model
+def _routing_config() -> RepoConfig:
+    """A repo config whose routing table overrides a couple of roles per level.
+
+    ``standard`` (the default level) sets the implementer's model + effort; ``high-risk``
+    sets the reviewer's model + effort and the implementer's model but *no* effort.
+    """
+    return RepoConfig(
+        routing=RoutingConfig(
+            default="standard",
+            levels={
+                "standard": RoutingLevel(
+                    description="Ordinary feature work.",
+                    roles={
+                        Role.IMPLEMENTER.value: ModelEffort(
+                            model="implementer-standard", effort="medium"
+                        ),
+                    },
+                ),
+                "high-risk": RoutingLevel(
+                    description="Cross-module migrations.",
+                    roles={
+                        Role.IMPLEMENTER.value: ModelEffort(model="implementer-risk"),
+                        Role.REVIEWER.value: ModelEffort(
+                            model="reviewer-risk", effort="max"
+                        ),
+                    },
+                ),
+            },
+        )
+    )
 
 
-def test_resolve_model_ignores_an_unrelated_override_key() -> None:
-    """A ``models`` key that names no known role leaves every role on its default."""
-    config = RepoConfig(models={"nonexistent-role": "claude-opus-4"})
+def test_resolve_at_level_applies_the_levels_model_and_effort() -> None:
+    """A level naming a role with an ``effort:`` overrides both model and effort tier."""
+    config = _routing_config()
+    assert resolve_model(Role.REVIEWER, config, level="high-risk") == "reviewer-risk"
+    assert resolve_effort(Role.REVIEWER, config, level="high-risk") == "max"
+
+
+def test_resolve_at_level_falls_back_for_a_role_the_level_omits() -> None:
+    """A role the level does not name resolves to the registry default, both functions."""
+    config = _routing_config()
+    # ``standard`` names only the implementer, so the reviewer falls through.
+    assert (
+        resolve_model(Role.REVIEWER, config, level="standard")
+        == ROLE_REGISTRY[Role.REVIEWER].model
+    )
+    assert resolve_effort(Role.REVIEWER, config, level="standard") == EFFORT_MAX
+
+
+def test_resolve_at_level_overrides_model_but_keeps_registry_effort_without_effort() -> (
+    None
+):
+    """A level entry with a model but no ``effort:`` keeps the registry effort tier."""
+    config = _routing_config()
+    # ``high-risk`` sets the implementer's model but no effort.
+    assert (
+        resolve_model(Role.IMPLEMENTER, config, level="high-risk") == "implementer-risk"
+    )
+    assert (
+        resolve_effort(Role.IMPLEMENTER, config, level="high-risk")
+        == ROLE_REGISTRY[Role.IMPLEMENTER].effort
+    )
+
+
+def test_resolve_with_level_none_uses_the_default_level_map() -> None:
+    """``level=None`` with a routing table resolves via the ``default:`` level's map."""
+    config = _routing_config()
+    # ``default`` is ``standard``, which overrides the implementer's model + effort.
+    assert resolve_model(Role.IMPLEMENTER, config) == "implementer-standard"
+    assert resolve_effort(Role.IMPLEMENTER, config) == "medium"
+
+
+def test_resolve_with_no_routing_returns_registry_defaults() -> None:
+    """No routing block yields the registry default for every role, both functions."""
+    config = RepoConfig()
     for role in Role:
         assert resolve_model(role, config) == ROLE_REGISTRY[role].model
+        assert resolve_effort(role, config) == ROLE_REGISTRY[role].effort
 
 
-def test_resolve_effort_is_registry_only_and_ignores_overrides() -> None:
-    """Effort is the registry's alone — ``models`` overrides the model, never the tier."""
-    config = RepoConfig(models={Role.REVIEWER.value: "claude-opus-4-8"})
-    assert resolve_effort(Role.REVIEWER) == EFFORT_MAX
-    assert resolve_effort(Role.REVIEWER, config) == EFFORT_MAX
+def test_resolve_config_none_returns_registry_defaults() -> None:
+    """With ``config=None`` every role resolves to the registry default, both functions."""
+    for role in Role:
+        assert resolve_model(role) == ROLE_REGISTRY[role].model
+        assert resolve_effort(role) == ROLE_REGISTRY[role].effort
+
+
+def test_resolve_at_unknown_level_falls_back_to_registry_defaults() -> None:
+    """A ``level`` naming no declared level defensively resolves to the registry default."""
+    config = _routing_config()
+    for role in Role:
+        assert (
+            resolve_model(role, config, level="nonexistent")
+            == ROLE_REGISTRY[role].model
+        )
+        assert (
+            resolve_effort(role, config, level="nonexistent")
+            == ROLE_REGISTRY[role].effort
+        )
 
 
 def test_planner_role_resolves_opus_high_on_the_cli_transport() -> None:

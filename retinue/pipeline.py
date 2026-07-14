@@ -1063,7 +1063,7 @@ def _bind_build_prd_for_repo(
         notifier: The escalation fan-out used by triage's escalate path.
         create_issue: The gh issue creator used by triage's reslice path.
         retry_store_path: SQLite file backing the persisted per-slice retry counter.
-        config: The repo's validated config; its ``models`` block overrides the
+        config: The repo's validated config; its ``routing:`` table overrides the
             implementer's and reviewer's model per the role registry.
 
     Returns:
@@ -1131,7 +1131,7 @@ async def build_cron_slice_builder(
     resolver, and the gh report sink. The merge container the lazy git ops starts is
     destroyed after each drained issue in a ``finally`` (mirroring
     :func:`_bind_build_prd_for_repo`), so a long-lived worker never leaks a container across
-    cron ticks. The repo config (its ``models`` block, ``staging_branch``, and ``secrets``)
+    cron ticks. The repo config (its ``routing:`` table, ``staging_branch``, and ``secrets``)
     is read from the all-defaults config a loose backlog nit carries no per-issue override
     for; the heartbeat already passed the opted-in config, so the cron tick reuses it.
 
@@ -1200,7 +1200,7 @@ def bind_adhoc_build(
     creator, and run-state store rather than standing up parallel ones). The build's
     container/planner/implementer/reviewer adapters are the *same* real ones the PRD lane
     uses (:func:`_bind_build_prd_for_repo`), each with its model resolved against the repo's
-    ``models`` override, so an ad-hoc build runs the production lane — not a bare no-op. A red
+    routing table, so an ad-hoc build runs the production lane — not a bare no-op. A red
     build pushes nothing and opens no PR (``process_adhoc_pr`` skips it).
 
     Args:
@@ -1310,8 +1310,8 @@ def _build_review_reviewer_factory(
     PRD), but the build lane is bound per repo, so this returns a
     ``(repo_full_name, prd_number) -> RoundReviewer`` factory the build calls at run time.
     Each reviewer wires the real Agent-SDK review generator (over the httpx transport,
-    with its model resolved from the role registry against the repo's ``models``
-    override), the gh issue creator reused from the slicer, and the gh Blocked-by editor —
+    with its model resolved from the role registry against the repo's routing
+    table), the gh issue creator reused from the slicer, and the gh Blocked-by editor —
     so a live build reviews every merged round and the review-fix follow-ups it files build
     later. ``generate`` defaults to the real Agent-SDK reviewer; tests inject a fake to
     keep the review flow off the network.

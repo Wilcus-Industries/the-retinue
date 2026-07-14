@@ -49,7 +49,9 @@ FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
   `Role` (slicer / implementer / resolver / reviewer / planner) to its model id,
   reasoning-effort tier, and invocation transport. The role adapters resolve their model
   and effort here via `resolve_model` / `resolve_effort` instead of hand-rolled constants;
-  `resolve_model` applies a repo's `models` override, effort stays registry-owned. The
+  `resolve_model` / `resolve_effort` are level-aware over the repo's routing table: a
+  level's `roles:` map overrides the model (and effort for Messages-API roles), registry
+  defaults otherwise. The
   read-only `planner` (Opus on the CLI) also owns `planner_cli_argv`, which builds its
   explore-first, no-write invocation and captures the plan as the run's output.
 - `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
@@ -166,8 +168,6 @@ staging_branch: staging        # branch the retinue integrates onto
 retry_cap: 3                   # max retries per unit of work (>= 0)
 max_parallel: 4                # optional concurrency cap (> 0)
 cron: "0 */6 * * *"            # optional five-field cron cadence
-models:                        # optional role -> model-id overrides; keys are the
-  implementer: claude-opus-4-8  # roles: slicer/implementer/resolver/reviewer/planner
 secrets:                       # optional inline secrets + external refs
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   refs:

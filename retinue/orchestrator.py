@@ -151,7 +151,7 @@ class Implementer(Protocol):
 #
 # The implementing model and effort tier come from the :data:`~retinue.roles.Role.IMPLEMENTER`
 # registry entry (Sonnet 4.6 at the ``high`` tier by default), resolved at construction time
-# so a repo's ``models`` override can swap the model at the wiring site. The in-container
+# so a repo's routing level can swap the model at the wiring site. The in-container
 # ``claude`` CLI carries no effort flag today, so the ``high`` tier is registry metadata that
 # records the PRD's intent without changing the wire.
 
@@ -291,7 +291,7 @@ class ContainerImplementer:
             ``"subscription"`` (credential rides ``CLAUDE_CODE_OAUTH_TOKEN``).
         model: The implementing model id; defaults to the
             :data:`~retinue.roles.Role.IMPLEMENTER` registry entry (Sonnet 4.6), which a
-            repo's ``models`` override can replace at the wiring site.
+            repo's routing level can replace at the wiring site.
         max_turns: Hard cap on the agent loop, threaded to ``claude --max-turns`` so a
             runaway implement stops itself rather than being killed (with its done-check)
             by the arq job_timeout. The wiring site passes ``settings.implement_max_turns``.
@@ -638,8 +638,8 @@ _RESOLVE_MAX_TOKENS = 32_000
 # The conflict resolver's model and effort tier come from the
 # :data:`~retinue.roles.Role.RESOLVER` registry entry (Opus 4.8 at the ``xhigh`` tier by
 # default — the same tier the slicer uses). Drawing both from the registry keeps the tier
-# from silently drifting between the two Opus call sites and lets a repo's ``models``
-# override swap the model at the wiring site.
+# from silently drifting between the two Opus call sites and lets a repo's routing level
+# swap the model at the wiring site.
 
 # Re-runs the merge (no auto-commit) so the working tree carries the conflict markers
 # the resolver reads; ``--no-commit`` keeps it stopped at the conflict even when git
@@ -844,7 +844,7 @@ class AgentSdkConflictResolver:
         credential: The Anthropic credential (OAuth subscription token or API key).
         model: The resolving model id; defaults to the
             :data:`~retinue.roles.Role.RESOLVER` registry entry (Opus 4.8), which a
-            repo's ``models`` override can replace at the wiring site.
+            repo's routing level can replace at the wiring site.
     """
 
     container: Container

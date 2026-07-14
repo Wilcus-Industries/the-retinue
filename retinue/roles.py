@@ -18,11 +18,14 @@ subagent, and a deny-list of every write-capable tool. The brief mandates at lea
 Explore subagent before a plan is produced, and the plan is captured from the run's
 output rather than written to the workspace.
 
-:func:`resolve_model` applies a repo's ``models`` override (the optional ``role ->
-model-id`` block in ``.github/retinue.yml``, carried on :class:`~retinue.repo_config.RepoConfig`)
-on top of the registry default, keyed by the role's :attr:`Role.value`. Effort is the
-registry's alone — :func:`resolve_effort` never reads the override, so a repo can swap a
-role's model without disturbing the rigor tier the PRD pinned.
+:func:`resolve_model` and :func:`resolve_effort` are level-aware over the repo's routing
+table (the optional ``routing:`` block in ``.github/retinue.yml``, carried on
+:class:`~retinue.repo_config.RepoConfig`). At a given ``level``, a level's ``roles:`` map
+keyed by the role's :attr:`Role.value` overrides the model (and, when the entry sets
+``effort:``, the effort tier); a role the level does not name — or a call with no
+``level``, no ``routing:`` block, or no config at all — falls through to the registry
+default. A ``level`` of ``None`` with a routing table present resolves via the table's
+``default:`` level.
 
 The two transports are kept distinct because the roles use genuinely different wires: the
 implementer execs the in-container ``claude`` CLI, while the other three POST the Anthropic
@@ -39,7 +42,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from retinue.repo_config import RepoConfig
+    from retinue.repo_config import ModelEffort, RepoConfig
 
 # Reasoning-effort tiers, expressed as the ``output_config.effort`` string the Messages
 # API call carries. Opus 4.8 (the model every Opus role pins) removed the extended-
@@ -68,9 +71,9 @@ class Transport(enum.Enum):
 class Role(enum.Enum):
     """The agent roles the retinue runs.
 
-    The ``value`` is the key a repo's ``models`` override block uses to target a role
-    (e.g. ``models: {implementer: claude-opus-4-8}``), so it is the stable public name
-    of the role, not an implementation detail.
+    The ``value`` is the key a routing level's ``roles:`` map uses to target a role
+    (e.g. ``roles: {implementer: {model: claude-opus-4-8}}``), so it is the stable public
+    name of the role, not an implementation detail.
     """
 
     SLICER = "slicer"
@@ -85,10 +88,11 @@ class RoleSpec:
     """The model, effort tier, and transport one agent role runs with.
 
     Attributes:
-        model: The default model id for the role; a repo's ``models`` override replaces
-            it per :func:`resolve_model`.
-        effort: The reasoning-effort tier (one of :data:`EFFORT_HIGH` / :data:`EFFORT_XHIGH`
-            / :data:`EFFORT_MAX`); registry-owned, never overridden.
+        model: The default model id for the role; a routing level replaces it per role
+            via :func:`resolve_model`.
+        effort: The default reasoning-effort tier (one of :data:`EFFORT_HIGH` /
+            :data:`EFFORT_XHIGH` / :data:`EFFORT_MAX`); a routing level whose entry sets
+            ``effort:`` replaces it per role via :func:`resolve_effort`.
         transport: How the role's model is invoked (:class:`Transport`).
     """
 
@@ -132,42 +136,78 @@ ROLE_REGISTRY: dict[Role, RoleSpec] = {
 }
 
 
-def resolve_model(role: Role, config: RepoConfig | None = None) -> str:
-    """Return the model id for ``role``, applying a repo's ``models`` override if present.
+def _routed_override(
+    role: Role, config: RepoConfig | None, level: str | None
+) -> ModelEffort | None:
+    """Return the routing-table entry for ``role`` at the effective level, or None.
 
-    The registry default is used unless ``config.models`` carries an entry keyed by the
-    role's :attr:`Role.value`, in which case that model id wins. ``config`` is optional so
-    a call site with no repo config (or a fake) still resolves the default.
+    With no config or no ``routing:`` block, routing is off and there is no override.
+    A ``level`` of None is the wider-scope callers, which resolve via the table's
+    ``default:`` level. A level (or default) that names no declared level, or a level
+    whose ``roles:`` map does not name ``role``, yields None so the caller falls back
+    to the registry default.
+    """
+    if config is None or config.routing is None:
+        return None
+    level_name = level if level is not None else config.routing.default
+    routing_level = config.routing.levels.get(level_name)
+    if routing_level is None:
+        return None
+    return routing_level.roles.get(role.value)
+
+
+def resolve_model(
+    role: Role, config: RepoConfig | None = None, *, level: str | None = None
+) -> str:
+    """Return the model id for ``role``, applying the routing table's override if present.
+
+    The registry default is used unless the effective routing level's ``roles:`` map names
+    the role, in which case that entry's model id wins. ``level`` selects the level; a
+    ``level`` of ``None`` resolves via the table's ``default:`` level. With no config, no
+    ``routing:`` block, or a level naming no declared level, the registry default is used.
 
     Args:
         role: The agent role whose model to resolve.
-        config: The repo's validated config; its ``models`` block overrides the default.
+        config: The repo's validated config; its ``routing:`` table supplies overrides.
+        level: The routing level to resolve at, or ``None`` for the ``default:`` level.
 
     Returns:
         The resolved model id.
     """
-    default = ROLE_REGISTRY[role].model
-    if config is None:
-        return default
-    return config.models.get(role.value, default)
+    override = _routed_override(role, config, level)
+    if override is None:
+        return ROLE_REGISTRY[role].model
+    return override.model
 
 
-def resolve_effort(role: Role, config: RepoConfig | None = None) -> str:
-    """Return the reasoning-effort tier for ``role`` from the registry.
+def resolve_effort(
+    role: Role, config: RepoConfig | None = None, *, level: str | None = None
+) -> str:
+    """Return the reasoning-effort tier for ``role``, applying a routing override if set.
 
-    Effort is registry-owned: a repo's ``models`` block overrides only the model, never
-    the rigor tier the PRD pinned, so ``config`` is accepted for call-site symmetry with
-    :func:`resolve_model` but does not change the result.
+    The registry tier is used unless the effective routing level's ``roles:`` map names
+    the role *and* that entry sets ``effort:``, in which case the level's effort wins. A
+    level that names the role's model but no ``effort`` leaves the tier on the registry
+    default (only the model is overridden). ``level`` of ``None`` resolves via the
+    ``default:`` level; no config or no ``routing:`` block yields the registry tier.
+
+    Effort surfaces on the wire only for Messages-API roles (via
+    :func:`structured_output_config`); CLI-transport roles (implementer, planner) carry
+    it as recorded metadata with no wire effect.
 
     Args:
         role: The agent role whose effort tier to resolve.
-        config: Accepted for symmetry; the effort tier ignores it.
+        config: The repo's validated config; its ``routing:`` table supplies overrides.
+        level: The routing level to resolve at, or ``None`` for the ``default:`` level.
 
     Returns:
-        The role's effort tier (one of :data:`EFFORT_HIGH` / :data:`EFFORT_XHIGH` /
-        :data:`EFFORT_MAX`).
+        The resolved effort tier (one of :data:`EFFORT_HIGH` / :data:`EFFORT_XHIGH` /
+        :data:`EFFORT_MAX`, or a level's lighter ``low`` / ``medium`` tier).
     """
-    return ROLE_REGISTRY[role].effort
+    override = _routed_override(role, config, level)
+    if override is None or override.effort is None:
+        return ROLE_REGISTRY[role].effort
+    return override.effort
 
 
 # --- Claude Code identity block for OAuth premium-model access --------------------

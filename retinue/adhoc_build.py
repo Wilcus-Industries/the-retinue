@@ -247,7 +247,7 @@ class ContainerPlanner:
             ``"subscription"`` (credential rides ``CLAUDE_CODE_OAUTH_TOKEN``).
         model: The planning model id; defaults to the
             :data:`~retinue.roles.Role.PLANNER` registry entry (Opus 4.8), which a repo's
-            ``models`` override can replace at the wiring site.
+            routing level can replace at the wiring site.
     """
 
     credential: str

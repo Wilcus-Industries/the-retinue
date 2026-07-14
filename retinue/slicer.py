@@ -199,7 +199,7 @@ class ClaudeSliceGenerator:
         auth_mode: ``"api_key"`` or ``"subscription"``.
         model: The model the headless slicer runs on; defaults to the
             :data:`~retinue.roles.Role.SLICER` registry entry, which a repo's
-            ``models`` override can replace at the wiring site.
+            routing level can replace at the wiring site.
     """
 
     token: str

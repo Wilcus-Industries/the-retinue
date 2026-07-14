@@ -17,9 +17,6 @@ staging_branch: integration
 retry_cap: 5
 max_parallel: 4
 cron: "0 */6 * * *"
-models:
-  planner: claude-opus-4
-  coder: claude-sonnet-4
 secrets:
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   refs:
@@ -35,7 +32,6 @@ def test_full_config_parses_every_field() -> None:
     assert config.retry_cap == 5
     assert config.max_parallel == 4
     assert config.cron == "0 */6 * * *"
-    assert config.models == {"planner": "claude-opus-4", "coder": "claude-sonnet-4"}
     assert config.secrets.values == {"OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}"}
     assert config.secrets.refs == ["vault://team/retinue/github-token"]
 
@@ -48,7 +44,6 @@ def test_minimal_config_applies_defaults() -> None:
     assert config.retry_cap == 3
     assert config.max_parallel is None
     assert config.cron is None
-    assert config.models == {}
     assert config.secrets.values == {}
     assert config.secrets.refs == []
 
@@ -82,9 +77,9 @@ def test_validates_cron_cadence() -> None:
     assert load_repo_config('cron: "* * * *"\n') is None
 
 
-def test_validates_model_overrides_are_strings() -> None:
-    """Model overrides must map role names to string model ids."""
-    assert load_repo_config("models:\n  planner: 42\n") is None
+def test_rejects_the_removed_models_block() -> None:
+    """The flat ``models:`` override was removed; strict validation now rejects it."""
+    assert load_repo_config("models:\n  implementer: claude-opus-4-8\n") is None
 
 
 def test_validates_secrets_block_shape() -> None:
