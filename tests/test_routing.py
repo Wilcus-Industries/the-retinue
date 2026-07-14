@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from retinue.adhoc_build import (
+    AdhocBuildResult,
     AdhocIssue,
     ContainerAdhocReviewer,
     ContainerPlanner,
@@ -1156,3 +1157,88 @@ async def test_adhoc_roles_all_launch_at_the_resolved_level(tmp_path: Path) -> N
     assert review_generate.effort == resolve_effort(Role.REVIEWER, config, level=level)
     assert review_generate.effort == "low"
 
+@pytest.mark.asyncio
+async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mock-debt #70: the ad-hoc closure's routing runs the real classify chain.
+
+    :func:`bind_adhoc_build`'s per-issue closure is driven through the **real**
+    ``_resolve_adhoc_level`` -> :func:`resolve_issue_level` ->
+    :class:`ClaudeIssueClassifier` chain — nothing on the classify path is mocked. Only
+    the boundary seams are faked: the Messages-API transport (:class:`_TitleRoutingTransport`
+    routes on the issue title), the gh subprocess runner (returns the ``issue view`` JSON
+    :class:`GhCliIssueFacts` parses for real), and the gh label/comment sinks.
+
+    The issue classifies to ``trivial`` — a **non-default** level whose planner/
+    implementer/reviewer models are distinct from both the registry defaults and the
+    ``standard`` default level's map — so a closure that dropped the resolved level
+    (passing ``level=None``, which resolves via the default level) would construct
+    ``implementer-standard`` and the registry planner/reviewer models and fail the
+    asserts below. The classifier's charge is asserted on the **pipeline's own**
+    governor's ledger, pinning the ``governor=pipeline.governor`` kwarg the closure
+    passes.
+    """
+    import retinue.pipeline as pipeline_mod
+    from retinue.pipeline import bind_adhoc_build
+    from tests.test_pipeline import (
+        _fake_build_adhoc_issue,
+        _RecordingAdhocPipeline,
+        _settings,
+    )
+
+    transport = _TitleRoutingTransport()
+    labels, comments = _RecordingLabels(), _RecordingComments()
+
+    async def gh_runner(argv: list[str]) -> str:
+        # The ``gh issue view --json title,body,labels`` stdout GhCliIssueFacts parses;
+        # PICKTRIVIAL routes the transport to the non-default ``trivial`` level.
+        assert argv[:2] == ["issue", "view"]
+        return json.dumps({"title": "PICKTRIVIAL doc fix", "body": "b", "labels": []})
+
+    monkeypatch.setattr(pipeline_mod, "HttpxTransport", lambda: transport)
+    monkeypatch.setattr(pipeline_mod, "GhLabelSink", lambda token: labels)
+    monkeypatch.setattr(pipeline_mod, "GhCommentSink", lambda token: comments)
+    monkeypatch.setattr(pipeline_mod, "_ReconcileGhRunner", lambda token: gh_runner)
+    captured: dict[str, object] = {}
+    green = AdhocBuildResult(branch="issue-31", passed=True)
+    monkeypatch.setattr(
+        pipeline_mod, "build_adhoc_issue", _fake_build_adhoc_issue(captured, green)
+    )
+
+    config = RepoConfig(staging_branch="staging", routing=_adhoc_routing())
+    governor = _governor(tmp_path)
+    pipeline = _RecordingAdhocPipeline(governor=governor)
+    settings = _settings(tmp_path, anthropic_credential="sk-ant-api03-k")
+    build = bind_adhoc_build(
+        settings,  # type: ignore[arg-type]
+        FakeAuth(),
+        pipeline=pipeline,  # type: ignore[arg-type]
+        repo_full_name="owner/repo",
+        token="ghs_x",
+        config=config,
+        claude_md=CLAUDE_MD,
+    )
+
+    issue = _adhoc_issue(31)
+    await build(issue, repo_full_name="owner/repo")
+
+    # The classifier really ran: exactly one Messages-API POST over the fake transport,
+    # and its verdict was persisted as the additive ``level:trivial`` label.
+    assert len(transport.calls) == 1
+    assert [request.label for request in labels.calls] == ["level:trivial"]
+    assert comments.calls == []  # classification succeeded — no failure comment
+    # Every role was constructed at the resolved non-default level's model — the
+    # ``level=None`` default-level resolution would yield none of these three ids.
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["planner"].model == "planner-trivial"
+    assert kwargs["implementer"].model == "implementer-trivial"
+    assert kwargs["reviewer"].generate.model == "reviewer-trivial"
+    assert kwargs["reviewer"].generate.effort == "low"
+    # The classifier charge landed on the pipeline's own governor's ledger.
+    assert await governor._ledger.trailing_24h_spend() == pytest.approx(
+        _CLASSIFIER_ESTIMATED_AMOUNT
+    )
+    # The green result still chained into process_adhoc_pr.
+    assert pipeline.pr_calls == [(issue, green)]
