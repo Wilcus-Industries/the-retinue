@@ -307,7 +307,7 @@ class AgentSdkReviewGenerator:
             "model": self.model,
             "max_tokens": _MAX_TOKENS,
             "output_config": structured_output_config(
-                Role.REVIEWER, _REVIEW_SCHEMA, effort=self.effort
+                Role.REVIEWER, _REVIEW_SCHEMA, model=self.model, effort=self.effort
             ),
             "system": oauth_system(
                 _REVIEW_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")

@@ -351,6 +351,48 @@ def test_structured_output_config_honors_an_effort_override() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250929",
+    ],
+)
+def test_structured_output_config_omits_effort_for_models_that_reject_it(
+    model: str,
+) -> None:
+    """Haiku 4.5 / Sonnet 4.5 family models get no ``effort`` key at all.
+
+    The Messages API returns HTTP 400 ("This model does not support the effort
+    parameter.") for these families, so the helper must drop the key — even when an
+    explicit ``effort=`` override is supplied — rather than send a request the API
+    rejects. Dated ids match their family by prefix.
+    """
+    schema = {"type": "object"}
+
+    config = structured_output_config(Role.CLASSIFIER, schema, model=model)
+    assert "effort" not in config
+    assert config["format"] == {"type": "json_schema", "schema": schema}
+
+    overridden = structured_output_config(
+        Role.CLASSIFIER, schema, model=model, effort="max"
+    )
+    assert "effort" not in overridden
+
+
+@pytest.mark.parametrize(
+    "model", ["claude-opus-4-8", "claude-sonnet-4-6", "claude-opus-4-5"]
+)
+def test_structured_output_config_keeps_effort_for_models_that_support_it(
+    model: str,
+) -> None:
+    """Effort-capable models keep the resolved effort tier when ``model=`` is given."""
+    config = structured_output_config(Role.REVIEWER, {"type": "object"}, model=model)
+    assert config["effort"] == EFFORT_MAX
+
+
 def test_claude_code_identity_is_the_exact_cli_string() -> None:
     """The identity block is the exact Claude Code CLI system string.
 

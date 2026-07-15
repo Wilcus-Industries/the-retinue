@@ -807,7 +807,7 @@ def _resolve_payload(
         "model": model,
         "max_tokens": _RESOLVE_MAX_TOKENS,
         "output_config": structured_output_config(
-            Role.RESOLVER, _RESOLVE_SCHEMA, effort=effort
+            Role.RESOLVER, _RESOLVE_SCHEMA, model=model, effort=effort
         ),
         "system": oauth_system(_RESOLVE_SYSTEM, is_oauth=is_oauth),
         "messages": [{"role": "user", "content": user}],

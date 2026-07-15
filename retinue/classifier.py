@@ -179,7 +179,8 @@ class ClaudeIssueClassifier:
         )
         if response.status_code != 200:
             raise ClassificationError(
-                f"Anthropic Messages API returned {response.status_code}"
+                f"Anthropic Messages API returned {response.status_code}: "
+                f"{json.dumps(response.body)[:500]}"
             )
         return self._parse(response.body)
 
@@ -210,7 +211,7 @@ class ClaudeIssueClassifier:
             "model": model,
             "max_tokens": _MAX_TOKENS,
             "output_config": structured_output_config(
-                Role.CLASSIFIER, self._schema(), effort=effort
+                Role.CLASSIFIER, self._schema(), model=model, effort=effort
             ),
             "system": oauth_system(
                 _CLASSIFY_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")

@@ -274,7 +274,7 @@ class ClaudeSliceGenerator:
                 _SLICE_SYSTEM, is_oauth=self.auth_mode == "subscription"
             ),
             "output_config": structured_output_config(
-                Role.SLICER, _SLICE_SCHEMA, effort=self.effort
+                Role.SLICER, _SLICE_SCHEMA, model=self.model, effort=self.effort
             ),
             "messages": [{"role": "user", "content": _build_user_content(prd_body)}],
         }

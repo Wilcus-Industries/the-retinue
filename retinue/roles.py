@@ -270,8 +270,24 @@ def oauth_system(role_system: str, *, is_oauth: bool) -> str | list[dict[str, st
     return role_system
 
 
+# Model families that reject the Messages-API ``output_config.effort`` parameter with
+# HTTP 400 ("This model does not support the effort parameter."): Haiku 4.5 and
+# Sonnet 4.5. Later families (Sonnet 4.6+, Opus 4.5+) accept it. Prefix-matched so a
+# dated id (``claude-haiku-4-5-20251001``) matches its family.
+_EFFORT_UNSUPPORTED_MODEL_PREFIXES = ("claude-haiku-4-5", "claude-sonnet-4-5")
+
+
+def supports_effort(model: str) -> bool:
+    """True when ``model`` accepts the Messages-API ``output_config.effort`` parameter."""
+    return not model.startswith(_EFFORT_UNSUPPORTED_MODEL_PREFIXES)
+
+
 def structured_output_config(
-    role: Role, schema: dict[str, Any], *, effort: str | None = None
+    role: Role,
+    schema: dict[str, Any],
+    *,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """Build a Messages-API ``output_config`` carrying a role's effort + JSON schema.
 
@@ -281,12 +297,18 @@ def structured_output_config(
     with HTTP 400. This helper is the single place that shape lives, so the
     Messages-API roles (slicer, reviewer, resolver, classifier) cannot drift onto
     incompatible encodings again. The role's registry effort tier rides the same dict
-    — one ``output_config`` per request, never two.
+    — one ``output_config`` per request, never two — except for models that reject
+    the parameter outright (see :func:`supports_effort`), where the key is omitted
+    entirely so the request survives.
 
     Args:
         role: The Messages-API role whose registry effort tier the request carries.
         schema: The strict JSON schema the model must emit (callers keep
             ``required`` + ``additionalProperties: false`` on every object).
+        model: The model id the request will name. When it is one that rejects the
+            ``effort`` parameter (Haiku 4.5 / Sonnet 4.5 families), the key is dropped
+            regardless of ``effort``. ``None`` keeps the effort key — callers should
+            pass their resolved model so a routed-to-Haiku request cannot 400.
         effort: Optional effort-tier override; when a repo's routing table supplies a
             per-role tier (e.g. a ``classifier:`` override), it replaces the
             registry-resolved tier. ``None`` (the default) keeps the registry tier, so
@@ -295,10 +317,12 @@ def structured_output_config(
     Returns:
         The ``output_config`` dict for the Messages API request body.
     """
-    return {
-        "effort": effort if effort is not None else resolve_effort(role),
+    config: dict[str, Any] = {
         "format": {"type": "json_schema", "schema": schema},
     }
+    if model is None or supports_effort(model):
+        config["effort"] = effort if effort is not None else resolve_effort(role)
+    return config
 
 
 # --- planner invocation construction (read-only, explore-first) -------------------

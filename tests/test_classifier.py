@@ -20,7 +20,7 @@ from retinue.classifier import (
 )
 from retinue.repo_config import ModelEffort, RoutingConfig, RoutingLevel
 from retinue.reviewer import HttpResponse
-from retinue.roles import CLAUDE_CODE_IDENTITY, EFFORT_LOW, ROLE_REGISTRY, Role
+from retinue.roles import CLAUDE_CODE_IDENTITY, ROLE_REGISTRY, Role
 
 
 class _FakeTransport:
@@ -175,27 +175,45 @@ def test_headers_api_key_uses_x_api_key() -> None:
     assert "anthropic-beta" not in headers
 
 
-def test_default_model_and_effort_come_from_the_registry() -> None:
-    """With no ``classifier:`` override, model and effort are the registry defaults."""
+def test_default_model_comes_from_the_registry_and_carries_no_effort() -> None:
+    """With no ``classifier:`` override, the model is the registry default Haiku.
+
+    Haiku 4.5 rejects the ``output_config.effort`` parameter with HTTP 400, so the
+    payload must omit the key entirely — the live classifier 400'd on exactly this.
+    """
     gen = _classifier(_FakeTransport(_text_response({"level": "trivial"})))
     payload = gen._payload(_issue())
 
     assert payload["model"] == ROLE_REGISTRY[Role.CLASSIFIER].model == "claude-haiku-4-5"
-    assert payload["output_config"]["effort"] == EFFORT_LOW
+    assert "effort" not in payload["output_config"]
 
 
 def test_classifier_override_steers_model_and_effort() -> None:
     """A routing ``classifier:`` override replaces both model and output effort."""
     routing = _routing(
-        classifier=ModelEffort(model="claude-haiku-4-5-override", effort="max")
+        classifier=ModelEffort(model="claude-opus-4-8", effort="max")
     )
     gen = _classifier(
         _FakeTransport(_text_response({"level": "trivial"})), routing=routing
     )
     payload = gen._payload(_issue())
 
-    assert payload["model"] == "claude-haiku-4-5-override"
+    assert payload["model"] == "claude-opus-4-8"
     assert payload["output_config"]["effort"] == "max"
+
+
+def test_classifier_override_to_an_effortless_model_still_omits_effort() -> None:
+    """An override naming a Haiku 4.5 model drops ``effort`` even when the entry sets one."""
+    routing = _routing(
+        classifier=ModelEffort(model="claude-haiku-4-5-20251001", effort="low")
+    )
+    gen = _classifier(
+        _FakeTransport(_text_response({"level": "trivial"})), routing=routing
+    )
+    payload = gen._payload(_issue())
+
+    assert payload["model"] == "claude-haiku-4-5-20251001"
+    assert "effort" not in payload["output_config"]
 
 
 @pytest.mark.asyncio
@@ -209,6 +227,37 @@ async def test_success_returns_the_chosen_level_in_one_call() -> None:
     assert result == ClassifyResult(level="trivial")
     assert result.failed is False
     assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_200_failure_logs_the_response_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-200 failure's warning carries the API error body, not just the status.
+
+    The live classifier 400 was undiagnosable from logs because only the status code
+    was logged; the API's error message must survive into the retry warning.
+    """
+    error_body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "This model does not support the effort parameter.",
+        },
+    }
+    transport = _FakeTransport(
+        [
+            HttpResponse(status_code=400, body=error_body),
+            HttpResponse(status_code=400, body=error_body),
+        ]
+    )
+    gen = _classifier(transport)
+
+    with caplog.at_level("WARNING"):
+        result = await gen(_issue())
+
+    assert result.failed is True
+    assert "does not support the effort parameter" in caplog.text
 
 
 @pytest.mark.asyncio
