@@ -3,3 +3,27 @@
 # file is a valid opt-in (all defaults).
 staging_branch: staging  # the retinue integrates slice PRs onto this branch
 retry_cap: 3             # max implementer retries per slice before escalating
+
+routing:
+  default: standard
+  levels:
+    trivial:
+      description: >-
+        A tiny mechanical change: a one-file typo, docstring, comment, or config
+        tweak with no design decisions and no new test surface.
+      roles:
+        implementer: {model: claude-haiku-4-5}
+        reviewer: {model: claude-sonnet-4-6, effort: high}
+    standard:
+      description: >-
+        Ordinary slice work: a feature or fix across a few files with tests,
+        following existing patterns.
+      roles:
+        reviewer: {model: claude-opus-4-8, effort: xhigh}
+    complex:
+      description: >-
+        Cross-module or concurrency-sensitive work, schema or wire-format
+        changes, or anything touching budget, reconcile, or worker lifecycle.
+      roles:
+        implementer: {model: claude-opus-4-8}
+        reviewer: {model: claude-opus-4-8, effort: max}
