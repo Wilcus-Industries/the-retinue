@@ -67,6 +67,39 @@ def request_headers(credential: str) -> dict[str, str]:
     return headers
 
 
+# The internal reviewer's single Anthropic Messages API call runs at the "max" effort
+# tier on Opus 4.8; a high-effort Opus turn can take minutes, so the transport's timeout
+# matches the SDK's 10-minute default rather than a short connect-style cap.
+_REVIEW_HTTP_TIMEOUT_SECONDS = 600.0
+
+
+@dataclass(frozen=True)
+class HttpxTransport:
+    """Production :class:`HttpTransport`: POST one request via httpx.
+
+    The reviewer assembles the full request body and headers (model, effort tier, the
+    json-schema response format, and the credential's auth header); this transport only
+    POSTs them and reads the status code + JSON body back into the reviewer's
+    :class:`HttpResponse`. The single POST is the only network edge, so it sits behind
+    the reviewer's injected seam and the rest of the review flow is exercised in tests
+    with a fake transport — no httpx, no network.
+    """
+
+    timeout: float = _REVIEW_HTTP_TIMEOUT_SECONDS
+
+    async def post(
+        self, url: str, *, headers: dict[str, str], json: dict[str, object]
+    ) -> HttpResponse:
+        """POST ``json`` to ``url`` with ``headers``; return status + parsed JSON body."""
+        import httpx
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(url, headers=headers, json=json)
+        return HttpResponse(
+            status_code=response.status_code, body=response.json()
+        )
+
+
 def extract_json_object(
     body: dict[str, Any], *, who: str, error: type[Exception]
 ) -> dict[str, Any]:

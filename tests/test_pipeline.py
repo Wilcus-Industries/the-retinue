@@ -884,11 +884,10 @@ async def test_build_pipeline_factory_applies_routing_default_to_slicer(
 
 def test_build_push_sink_picks_pushover_when_no_ntfy(tmp_path: Path) -> None:
     """With only Pushover configured, the push sink is the Pushover backend."""
-    from retinue.notify import PushoverPushSink
-    from retinue.pipeline import _build_push_sink
+    from retinue.notify import PushoverPushSink, build_push_sink
 
     settings = _settings(tmp_path, pushover_token="pk", pushover_user="uk")
-    sink = _build_push_sink(settings)  # type: ignore[arg-type]
+    sink = build_push_sink(settings)  # type: ignore[arg-type]
     assert isinstance(sink, PushoverPushSink)
 
 
@@ -1033,7 +1032,7 @@ def test_review_factory_applies_repo_config_effort_override(tmp_path: Path) -> N
 
 def test_httpx_transport_is_the_default_review_transport() -> None:
     """The factory's default review transport is the real httpx-backed adapter."""
-    from retinue.pipeline import HttpxTransport
+    from retinue.messages_api import HttpxTransport
 
     assert HttpxTransport().timeout > 0
 

@@ -23,9 +23,13 @@ import urllib.error
 import urllib.request
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 from retinue.gh import GhCliError, auth_env, run_gh_subprocess
+
+if TYPE_CHECKING:
+    from retinue.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +310,25 @@ def _post_sync(post: _HttpPost, timeout: float) -> bytes:
         raise PushDeliveryError(f"push HTTP {exc.code} from {post.url}") from exc
     except urllib.error.URLError as exc:
         raise PushDeliveryError(f"push transport error to {post.url}: {exc}") from exc
+
+
+def build_push_sink(settings: Settings) -> PushSink:
+    """Pick the push sink from settings: ntfy (topic) or Pushover (token+user).
+
+    Exactly one backend is expected; with neither configured the push is a logged no-op
+    so the comment + label (the durable record) still land. ntfy wins when both are set.
+    """
+    if settings.ntfy_topic:
+        return NtfyPushSink(
+            topic=settings.ntfy_topic, token=settings.ntfy_token or None
+        )
+    if settings.pushover_token and settings.pushover_user:
+        return PushoverPushSink(token=settings.pushover_token, user=settings.pushover_user)
+
+    async def _noop(request: PushRequest) -> None:
+        logger.warning("No push channel configured; skipping push %r", request.title)
+
+    return _noop
 
 
 # --- Real comment sink: gh issue comment ------------------------------------

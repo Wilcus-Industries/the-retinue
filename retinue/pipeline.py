@@ -54,10 +54,9 @@ from retinue.budget import (
     SystemClock,
 )
 from retinue.classifier import ClaudeIssueClassifier
-from retinue.container import Container, ContainerRuntime, DockerRuntime
+from retinue.container import DockerRuntime
 from retinue.cron import CronBuild
 from retinue.done_check import (
-    DEFAULT_IMAGE,
     DoneCheckError,
     EnvSecretResolver,
     GhReportSink,
@@ -82,20 +81,17 @@ from retinue.loopback import (
     VerdictResult,
     process_review,
 )
-from retinue.messages_api import HttpResponse
+from retinue.messages_api import HttpxTransport
 from retinue.notify import (
     GhCommentSink,
     GhLabelSink,
     Notification,
     Notifier,
-    NtfyPushSink,
-    PushoverPushSink,
-    PushRequest,
-    PushSink,
+    build_push_sink,
 )
 from retinue.orchestrator import (
-    ContainerGitOps,
     ContainerImplementer,
+    MergeContainerGitOps,
     PrdBuildResult,
     PrdSlice,
     RoundReviewer,
@@ -703,23 +699,28 @@ def _slices_from_numbers(
 # --- production wiring: build the real pipeline from Settings ----------------------
 
 
-def _build_push_sink(settings: Settings) -> PushSink:
-    """Pick the push sink from settings: ntfy (topic) or Pushover (token+user).
+def _state_dir(settings: Settings) -> Path:
+    """The directory the pipeline's durable SQLite stores live in.
 
-    Exactly one backend is expected; with neither configured the push is a logged no-op
-    so the comment + label (the durable record) still land. ntfy wins when both are set.
+    Co-locates the run-state/round/retry stores next to the dedupe DB so a single mounted
+    volume holds all of the worker's durable state.
     """
-    if settings.ntfy_topic:
-        return NtfyPushSink(
-            topic=settings.ntfy_topic, token=settings.ntfy_token or None
-        )
-    if settings.pushover_token and settings.pushover_user:
-        return PushoverPushSink(token=settings.pushover_token, user=settings.pushover_user)
+    return Path(settings.dedupe_db_path).resolve().parent
 
-    async def _noop(request: PushRequest) -> None:
-        logger.warning("No push channel configured; skipping push %r", request.title)
 
-    return _noop
+def run_state_store_path(settings: Settings) -> Path:
+    """The run-state SQLite file the factory's pipelines and the startup sweep share.
+
+    The sweep (:func:`retinue.worker.resume_rounds_job`) enumerates the same store every
+    factory-built :class:`Pipeline` records into, so the path is derived in one place.
+
+    Args:
+        settings: The runtime settings locating the worker's durable state directory.
+
+    Returns:
+        The run-state database path.
+    """
+    return _state_dir(settings) / "run-state.sqlite3"
 
 
 # The orchestrator build's estimated charge, gated against the rolling-24h budget cap.
@@ -732,93 +733,6 @@ _BUILD_ESTIMATED_AMOUNT = 1.0
 # The estimated charge one classifier call meters against the shared ledger. Kept small
 # (a Haiku-class call) and separate from the build gate estimate, which is unchanged.
 _CLASSIFIER_ESTIMATED_AMOUNT = 0.01
-
-
-class _MergeContainerGitOps:
-    """A :class:`GitOps` that lazily starts its own merge container, then delegates.
-
-    The orchestrator's merge phase runs ``git`` inside a container holding a clone of the
-    repo, but ``build_prd`` starts no such container — the done-check's per-slice
-    containers are created and destroyed inside the build round, before any merge. This
-    adapter closes that gap: on the first branch/merge call it starts a fresh container
-    via the injected :class:`ContainerRuntime`, clones the repo over the installation
-    token, and wraps it in :class:`ContainerGitOps`; every later call within the same
-    build reuses that one container (so the integration branch persists across the
-    round's merges). :meth:`aclose` destroys it, and the build seam wrapper calls it in a
-    ``finally`` so the container is never leaked.
-
-    Args:
-        repo_full_name: The repo to clone for the merges, e.g. "owner/repo".
-        auth: Mints the installation token whose URL the clone authenticates with.
-        runtime: Spawns the disposable merge container (the Docker seam).
-        image: The container image the merges run in; defaults to the done-check image.
-    """
-
-    def __init__(
-        self,
-        *,
-        repo_full_name: str,
-        auth: InstallationAuth,
-        runtime: ContainerRuntime,
-        image: str = DEFAULT_IMAGE,
-    ) -> None:
-        self._repo_full_name = repo_full_name
-        self._auth = auth
-        self._runtime = runtime
-        self._image = image
-        self._container: Container | None = None
-        self._delegate: ContainerGitOps | None = None
-
-    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
-        """Ensure ``branch`` exists in the (lazily started) merge container."""
-        delegate = await self._ensure_delegate()
-        await delegate.ensure_integration_branch(branch=branch, base=base)
-
-    async def merge(self, *, source: str, into: str) -> None:
-        """Merge ``source`` into ``into`` in the (lazily started) merge container."""
-        delegate = await self._ensure_delegate()
-        await delegate.merge(source=source, into=into)
-
-    async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
-        """Diff a round's ``merged_branches`` over ``base`` in the merge container.
-
-        The merge container is already started (the round merged into ``base`` through it),
-        so the internal reviewer reads the round's merged surface from the same clone the
-        merges advanced — no second container or clone.
-        """
-        delegate = await self._ensure_delegate()
-        return await delegate.round_diff(merged_branches=merged_branches, base=base)
-
-    async def _ensure_delegate(self) -> ContainerGitOps:
-        """Start + clone the merge container on first use; reuse it thereafter."""
-        if self._delegate is not None:
-            return self._delegate
-        token = await self._auth.installation_token(self._repo_full_name)
-        container = await self._runtime.start(image=self._image, env={})
-        result = await container.run_command(["git", "clone", token.clone_url, "."])
-        if not result.ok:
-            await container.destroy()
-            raise GitOpsCloneError(
-                f"clone of {self._repo_full_name} for merge failed "
-                f"(exit {result.exit_code}): {result.stderr}"
-            )
-        self._container = container
-        self._delegate = ContainerGitOps(container)
-        return self._delegate
-
-    async def aclose(self) -> None:
-        """Destroy the merge container if one was started. Idempotent."""
-        container, self._container, self._delegate = self._container, None, None
-        if container is not None:
-            await container.destroy()
-
-
-class GitOpsCloneError(RuntimeError):
-    """The merge container could not clone the repo, so no merge can run.
-
-    Raised rather than returning a sentinel so a doomed merge round fails loudly instead
-    of silently reporting an empty integration branch.
-    """
 
 
 def build_pipeline_factory(
@@ -862,7 +776,7 @@ def build_pipeline_factory(
             daily_cap_fraction=settings.budget_daily_cap_fraction,
         )
     )
-    push = _build_push_sink(settings)
+    push = build_push_sink(settings)
     state_dir = _state_dir(settings)
     retry_store_path = state_dir / "impl-retries.sqlite3"
     # One stateless subprocess runner satisfies every ``run(args, *, env)`` gh seam
@@ -941,39 +855,6 @@ async def _fetch_claude_md(
     return await fetch_claude_md(repo_full_name)
 
 
-# The internal reviewer's single Anthropic Messages API call runs at the "max" effort
-# tier on Opus 4.8; a high-effort Opus turn can take minutes, so the transport's timeout
-# matches the SDK's 10-minute default rather than a short connect-style cap.
-_REVIEW_HTTP_TIMEOUT_SECONDS = 600.0
-
-
-@dataclass(frozen=True)
-class HttpxTransport:
-    """Production :class:`~retinue.messages_api.HttpTransport`: POST one request via httpx.
-
-    The reviewer assembles the full request body and headers (model, effort tier, the
-    json-schema response format, and the credential's auth header); this transport only
-    POSTs them and reads the status code + JSON body back into the reviewer's
-    :class:`~retinue.messages_api.HttpResponse`. The single POST is the only network edge,
-    so it sits behind the reviewer's injected seam and the rest of the review flow is
-    exercised in tests with a fake transport — no httpx, no network.
-    """
-
-    timeout: float = _REVIEW_HTTP_TIMEOUT_SECONDS
-
-    async def post(
-        self, url: str, *, headers: dict[str, str], json: dict[str, object]
-    ) -> HttpResponse:
-        """POST ``json`` to ``url`` with ``headers``; return status + parsed JSON body."""
-        import httpx
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(url, headers=headers, json=json)
-        return HttpResponse(
-            status_code=response.status_code, body=response.json()
-        )
-
-
 def _bind_build_prd_for_repo(
     settings: Settings,
     auth: InstallationAuth,
@@ -1011,7 +892,7 @@ def _bind_build_prd_for_repo(
         The bound ``build_prd`` seam the pipeline drives.
     """
     runtime = DockerRuntime()
-    git = _MergeContainerGitOps(
+    git = MergeContainerGitOps(
         repo_full_name=repo_full_name, auth=auth, runtime=runtime
     )
     issue_facts = GhCliIssueFacts(ReconcileGhRunner(token))
@@ -1114,7 +995,7 @@ async def build_cron_slice_builder(
     config = RepoConfig()
     claude_md = await _fetch_claude_md(fetch_claude_md, repo_full_name)
     runtime = DockerRuntime()
-    git = _MergeContainerGitOps(
+    git = MergeContainerGitOps(
         repo_full_name=repo_full_name, auth=auth, runtime=runtime
     )
     implementer = ContainerImplementer(
@@ -1427,27 +1308,3 @@ def _prd_build_from_bound(
         deferred=result.deferred,
         defer_until=result.defer_until,
     )
-
-
-def _state_dir(settings: Settings) -> Path:
-    """The directory the pipeline's durable SQLite stores live in.
-
-    Co-locates the run-state/round/retry stores next to the dedupe DB so a single mounted
-    volume holds all of the worker's durable state.
-    """
-    return Path(settings.dedupe_db_path).resolve().parent
-
-
-def run_state_store_path(settings: Settings) -> Path:
-    """The run-state SQLite file the factory's pipelines and the startup sweep share.
-
-    The sweep (:func:`retinue.worker.resume_rounds_job`) enumerates the same store every
-    factory-built :class:`Pipeline` records into, so the path is derived in one place.
-
-    Args:
-        settings: The runtime settings locating the worker's durable state directory.
-
-    Returns:
-        The run-state database path.
-    """
-    return _state_dir(settings) / "run-state.sqlite3"

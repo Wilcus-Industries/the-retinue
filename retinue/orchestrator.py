@@ -545,6 +545,93 @@ class ContainerGitOps:
         return result
 
 
+class MergeContainerGitOps:
+    """A :class:`GitOps` that lazily starts its own merge container, then delegates.
+
+    The orchestrator's merge phase runs ``git`` inside a container holding a clone of the
+    repo, but ``build_prd`` starts no such container — the done-check's per-slice
+    containers are created and destroyed inside the build round, before any merge. This
+    adapter closes that gap: on the first branch/merge call it starts a fresh container
+    via the injected :class:`ContainerRuntime`, clones the repo over the installation
+    token, and wraps it in :class:`ContainerGitOps`; every later call within the same
+    build reuses that one container (so the integration branch persists across the
+    round's merges). :meth:`aclose` destroys it, and the build seam wrapper calls it in a
+    ``finally`` so the container is never leaked.
+
+    Args:
+        repo_full_name: The repo to clone for the merges, e.g. "owner/repo".
+        auth: Mints the installation token whose URL the clone authenticates with.
+        runtime: Spawns the disposable merge container (the Docker seam).
+        image: The container image the merges run in; defaults to the done-check image.
+    """
+
+    def __init__(
+        self,
+        *,
+        repo_full_name: str,
+        auth: InstallationAuth,
+        runtime: ContainerRuntime,
+        image: str = DEFAULT_IMAGE,
+    ) -> None:
+        self._repo_full_name = repo_full_name
+        self._auth = auth
+        self._runtime = runtime
+        self._image = image
+        self._container: Container | None = None
+        self._delegate: ContainerGitOps | None = None
+
+    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
+        """Ensure ``branch`` exists in the (lazily started) merge container."""
+        delegate = await self._ensure_delegate()
+        await delegate.ensure_integration_branch(branch=branch, base=base)
+
+    async def merge(self, *, source: str, into: str) -> None:
+        """Merge ``source`` into ``into`` in the (lazily started) merge container."""
+        delegate = await self._ensure_delegate()
+        await delegate.merge(source=source, into=into)
+
+    async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+        """Diff a round's ``merged_branches`` over ``base`` in the merge container.
+
+        The merge container is already started (the round merged into ``base`` through it),
+        so the internal reviewer reads the round's merged surface from the same clone the
+        merges advanced — no second container or clone.
+        """
+        delegate = await self._ensure_delegate()
+        return await delegate.round_diff(merged_branches=merged_branches, base=base)
+
+    async def _ensure_delegate(self) -> ContainerGitOps:
+        """Start + clone the merge container on first use; reuse it thereafter."""
+        if self._delegate is not None:
+            return self._delegate
+        token = await self._auth.installation_token(self._repo_full_name)
+        container = await self._runtime.start(image=self._image, env={})
+        result = await container.run_command(["git", "clone", token.clone_url, "."])
+        if not result.ok:
+            await container.destroy()
+            raise GitOpsCloneError(
+                f"clone of {self._repo_full_name} for merge failed "
+                f"(exit {result.exit_code}): {result.stderr}"
+            )
+        self._container = container
+        self._delegate = ContainerGitOps(container)
+        return self._delegate
+
+    async def aclose(self) -> None:
+        """Destroy the merge container if one was started. Idempotent."""
+        container, self._container, self._delegate = self._container, None, None
+        if container is not None:
+            await container.destroy()
+
+
+class GitOpsCloneError(RuntimeError):
+    """The merge container could not clone the repo, so no merge can run.
+
+    Raised rather than returning a sentinel so a doomed merge round fails loudly instead
+    of silently reporting an empty integration branch.
+    """
+
+
 class ConflictResolution(enum.Enum):
     """Whether a conflict resolver believes it fixed the merge."""
 
