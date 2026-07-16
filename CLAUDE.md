@@ -22,8 +22,10 @@ uv run mypy .
 Every `retinue/prd-<n>` → staging PR is reviewed by heimdall; the retinue **awaits and
 acts on** that verdict (`retinue/loopback.py`):
 
-- **Approved** (no blocking findings): nits are filed as `backlog` + `priority:<severity>`
-  issues, then the PR proceeds to reap/handoff.
+- **Passed** (APPROVED, or a verdict-carrying COMMENT — heimdall never approves: its
+  clean pass is the "no concerns" COMMENT, nits-only reviews are COMMENTED too): findings
+  are filed as `backlog` + `priority:<severity>` issues, then the PR proceeds to
+  reap/handoff. A verdict-less COMMENT (heimdall's "review failed" note) is ignored.
 - **Changes requested**: each blocking finding becomes a fix-issue (`ready-for-agent`,
   `Part of #<prd>`) rebuilt onto the **same** PR branch, re-triggering heimdall review —
   looped up to `retry_cap` rounds (count persisted, survives a worker restart).

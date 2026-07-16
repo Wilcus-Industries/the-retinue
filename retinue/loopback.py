@@ -11,9 +11,11 @@ round count, then carries out one of three things:
   reusing :mod:`retinue.slicer`'s create-issue seam) that rebuilds onto the **same**
   integration branch and re-triggers heimdall review. The round count is recorded so
   the loop survives a worker restart and is bounded at the cap,
-* **converge** — heimdall raised **no** blocking findings. The PR is good; the flow
-  proceeds to handoff. Any non-blocking nits are still filed as ``backlog`` issues
-  carrying heimdall severity mapped 1:1 to a ``priority:<severity>`` label,
+* **converge** — heimdall passed the PR: an APPROVED review, or a verdict-carrying
+  COMMENT (heimdall never submits APPROVED — its clean pass is the "no concerns"
+  COMMENT and a nits-only review is COMMENTED too). The PR is good; the flow proceeds
+  to handoff. Any findings are still filed as ``backlog`` issues carrying heimdall
+  severity mapped 1:1 to a ``priority:<severity>`` label,
 * **escalate** — the round budget is spent while still blocked. The flow stops: it
   comments the PRD, applies the ``hitl`` label, and notifies through the shared
   :class:`retinue.notify.Notifier`, leaving the PR open for a human.
@@ -119,6 +121,10 @@ class HeimdallReview:
         integration_branch: The branch the fix-issues rebuild onto (the SAME branch).
         state: Heimdall's review state.
         findings: The findings heimdall raised; split into blocking vs nits here.
+        clean_pass: True when the review body is heimdall's explicit clean pass (the
+            "no concerns" body). Heimdall never submits APPROVED — its clean verdict
+            is a COMMENTED review — so this flag is what lets a findings-free COMMENT
+            converge instead of being ignored as verdict-less.
     """
 
     repo_full_name: str
@@ -128,6 +134,7 @@ class HeimdallReview:
     integration_branch: str
     state: ReviewState
     findings: list[HeimdallFinding]
+    clean_pass: bool = False
 
     @property
     def blocking(self) -> list[HeimdallFinding]:
@@ -138,6 +145,17 @@ class HeimdallReview:
     def nits(self) -> list[HeimdallFinding]:
         """Findings below the blocking threshold — non-blocking backlog nits."""
         return [f for f in self.findings if f.severity < _BLOCKING_THRESHOLD]
+
+    @property
+    def carries_verdict(self) -> bool:
+        """Whether a COMMENTED review is a verdict rather than a verdict-less note.
+
+        Heimdall's clean pass and nits-only reviews are both COMMENTED (it never
+        submits APPROVED), but so are its verdict-less notes (the "review failed"
+        note). A COMMENT is a verdict when it parsed findings or carries the explicit
+        clean-pass body.
+        """
+        return bool(self.findings) or self.clean_pass
 
 
 @dataclass(frozen=True)
@@ -290,17 +308,22 @@ class HeimdallRoundStore:
 
 
 def decide_verdict(
-    *, state: ReviewState, blocking: int, rounds: int, cap: int
+    *, state: ReviewState, blocking: int, carries_verdict: bool, rounds: int, cap: int
 ) -> VerdictDecision:
     """Decide rebuild / converge / escalate from the review state and the round count.
 
     The review ``state`` is the authoritative verdict — the parsed finding count only
-    refines a rejection. The reasoning, in order:
+    refines a rejection. Heimdall never submits an APPROVED review: its only blocking
+    verdict is ``REQUEST_CHANGES``, and everything else it posts is a COMMENT — the
+    clean pass ("no concerns"), a nits-only review, or a verdict-less note (the
+    "review failed" note). The reasoning, in order:
 
     1. ``APPROVED`` converges (proceed to handoff), whatever the parsed findings or
        round count — an approval is never rebuilt.
-    2. ``COMMENTED`` carries no verdict (heimdall's progress notes): the loopback
-       neither converges nor rebuilds on it.
+    2. ``COMMENTED`` converges when it carries a verdict (heimdall explicitly chose
+       not to block, so even blocking-severity parsed lines are parked as backlog,
+       matching the APPROVED path); a verdict-less COMMENT is ignored — converging on
+       one would hand off a PR heimdall never actually reviewed.
     3. ``REQUEST_CHANGES`` with **no** parseable blocking findings escalates — the PR
        was explicitly rejected, so converging on an unparseable body would hand off
        rejected work.
@@ -310,6 +333,8 @@ def decide_verdict(
     Args:
         state: Heimdall's review state — the authoritative verdict.
         blocking: The number of blocking findings (severity at/above the threshold).
+        carries_verdict: Whether a COMMENTED review is a verdict (parsed findings or
+            the explicit clean-pass body) rather than a verdict-less note.
         rounds: Rebuild rounds already persisted for this PR (the spent budget).
         cap: The round cap (``RepoConfig.retry_cap``); ``0`` means no rebuild rounds.
 
@@ -319,7 +344,7 @@ def decide_verdict(
     if state is ReviewState.APPROVED:
         return VerdictDecision.CONVERGED
     if state is ReviewState.COMMENTED:
-        return VerdictDecision.NO_VERDICT
+        return VerdictDecision.CONVERGED if carries_verdict else VerdictDecision.NO_VERDICT
     if blocking == 0:
         return VerdictDecision.ESCALATE
     if rounds < cap:
@@ -346,8 +371,9 @@ async def process_review(
     (re-triggering heimdall review). ``CONVERGED`` files the remaining findings as
     ``backlog`` + ``priority:<severity>`` issues and proceeds to handoff.
     ``ESCALATE`` comments the PRD, applies ``hitl``, notifies, and leaves the PR
-    open. ``NO_VERDICT`` (a plain comment) is ignored. On every verdict path the
-    non-blocking nits are filed as backlog.
+    open. ``NO_VERDICT`` (a verdict-less comment, e.g. heimdall's "review failed"
+    note) is ignored. On every verdict path the non-blocking nits are filed as
+    backlog.
 
     Args:
         review: The parsed heimdall bot review.
@@ -366,6 +392,7 @@ async def process_review(
     decision = decide_verdict(
         state=review.state,
         blocking=len(review.blocking),
+        carries_verdict=review.carries_verdict,
         rounds=rounds,
         cap=config.retry_cap,
     )
@@ -394,11 +421,11 @@ async def _converge(
     create_issue: IssueCreator,
     handoff: Handoff,
 ) -> VerdictResult:
-    """Converge: park every finding as backlog, then hand off the approved PR.
+    """Converge: park every finding as backlog, then hand off the passed PR.
 
-    An approval converges whatever the parsed findings say, so any blocking-severity
-    lines in an approved body are parked as backlog (carrying their priority label)
-    rather than dropped or rebuilt.
+    A pass (APPROVED, or a verdict-carrying COMMENT) converges whatever the parsed
+    findings say, so any blocking-severity lines in its body are parked as backlog
+    (carrying their priority label) rather than dropped or rebuilt.
     """
     filed = await _file_backlog(review, review.findings, create_issue)
     logger.info(

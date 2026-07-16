@@ -607,6 +607,13 @@ _REVIEW_STATE_MAP = {
     "commented": ReviewState.COMMENTED,
 }
 
+# Heimdall never submits an APPROVED review: its clean pass is a COMMENTED review whose
+# body is "Heimdall review: no concerns found across any lens." — this marker (matched
+# case-insensitively) is what flags that COMMENT as a verdict so the loopback converges
+# on it. Heimdall's verdict-less "review failed" COMMENT note carries neither this
+# marker nor finding lines, so it stays a no-verdict.
+_CLEAN_PASS_MARKER = "no concerns found"
+
 
 def parse_heimdall_review(
     *,
@@ -621,9 +628,11 @@ def parse_heimdall_review(
     Maps the gh review ``state`` onto the loopback's three-valued state and reads
     heimdall's findings out of the review body — one finding per
     ``<severity>: <summary>`` line (severity is one of low/medium/high/critical,
-    case-insensitive); a line without that shape is ignored as prose. The integration
-    branch is derived from the PRD number (``retinue/prd-<n>``). Pure and value-free, so
-    it is unit-tested without a live gh.
+    case-insensitive); a line without that shape is ignored as prose. A body carrying
+    heimdall's clean-pass marker (:data:`_CLEAN_PASS_MARKER`) sets ``clean_pass`` so
+    the findings-free clean COMMENT still reads as a verdict. The integration branch
+    is derived from the PRD number (``retinue/prd-<n>``). Pure and value-free, so it
+    is unit-tested without a live gh.
 
     Args:
         repo_full_name: e.g. "owner/repo".
@@ -647,6 +656,7 @@ def parse_heimdall_review(
         integration_branch=integration_branch(prd_number),
         state=state,
         findings=_parse_findings(review_body),
+        clean_pass=_CLEAN_PASS_MARKER in review_body.lower(),
     )
 
 

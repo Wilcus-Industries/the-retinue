@@ -107,7 +107,12 @@ def _notifier(sinks: _RecordingSinks) -> Notifier:
     return Notifier(push=sinks.push, comment=sinks.comment, label=sinks.label)
 
 
-def _review(state: ReviewState, findings: list[HeimdallFinding]) -> HeimdallReview:
+def _review(
+    state: ReviewState,
+    findings: list[HeimdallFinding],
+    *,
+    clean_pass: bool = False,
+) -> HeimdallReview:
     return HeimdallReview(
         repo_full_name="owner/repo",
         pr_number=42,
@@ -116,6 +121,7 @@ def _review(state: ReviewState, findings: list[HeimdallFinding]) -> HeimdallRevi
         integration_branch="retinue/prd-1",
         state=state,
         findings=findings,
+        clean_pass=clean_pass,
     )
 
 
@@ -170,26 +176,39 @@ def test_decide_approved_converges_regardless_of_findings_or_rounds() -> None:
     """An APPROVED review converges — the authoritative state beats parsed findings."""
     approved = ReviewState.APPROVED
     assert (
-        decide_verdict(state=approved, blocking=0, rounds=0, cap=3)
+        decide_verdict(state=approved, blocking=0, carries_verdict=True, rounds=0, cap=3)
         is VerdictDecision.CONVERGED
     )
     # Even with blocking-looking parsed lines or the budget spent: approved is approved.
     assert (
-        decide_verdict(state=approved, blocking=2, rounds=3, cap=3)
+        decide_verdict(state=approved, blocking=2, carries_verdict=True, rounds=3, cap=3)
         is VerdictDecision.CONVERGED
     )
 
 
-def test_decide_commented_review_carries_no_verdict() -> None:
-    """A COMMENTED review is not a verdict: neither converge nor rebuild."""
+def test_decide_verdictless_comment_is_ignored() -> None:
+    """A COMMENTED review with no verdict (heimdall's "review failed" note, progress
+    prose) neither converges nor rebuilds."""
     commented = ReviewState.COMMENTED
     assert (
-        decide_verdict(state=commented, blocking=0, rounds=0, cap=3)
+        decide_verdict(state=commented, blocking=0, carries_verdict=False, rounds=0, cap=3)
         is VerdictDecision.NO_VERDICT
     )
+
+
+def test_decide_verdict_carrying_comment_converges() -> None:
+    """Heimdall never submits APPROVED: its clean pass is a COMMENTED review (the
+    "no concerns" body or nits-only findings), so a verdict-carrying COMMENT converges
+    — even with blocking-severity parsed lines, the state (not blocking) is
+    authoritative, matching the APPROVED path."""
+    commented = ReviewState.COMMENTED
     assert (
-        decide_verdict(state=commented, blocking=2, rounds=0, cap=3)
-        is VerdictDecision.NO_VERDICT
+        decide_verdict(state=commented, blocking=0, carries_verdict=True, rounds=0, cap=3)
+        is VerdictDecision.CONVERGED
+    )
+    assert (
+        decide_verdict(state=commented, blocking=2, carries_verdict=True, rounds=0, cap=3)
+        is VerdictDecision.CONVERGED
     )
 
 
@@ -197,11 +216,11 @@ def test_decide_rebuild_while_under_cap() -> None:
     """Blocking findings under the round cap drive a REBUILD."""
     changes = ReviewState.REQUEST_CHANGES
     assert (
-        decide_verdict(state=changes, blocking=2, rounds=0, cap=3)
+        decide_verdict(state=changes, blocking=2, carries_verdict=True, rounds=0, cap=3)
         is VerdictDecision.REBUILD
     )
     assert (
-        decide_verdict(state=changes, blocking=1, rounds=2, cap=3)
+        decide_verdict(state=changes, blocking=1, carries_verdict=True, rounds=2, cap=3)
         is VerdictDecision.REBUILD
     )
 
@@ -210,7 +229,7 @@ def test_decide_escalate_at_cap_while_blocked() -> None:
     """Blocking findings with the round budget spent escalates."""
     changes = ReviewState.REQUEST_CHANGES
     assert (
-        decide_verdict(state=changes, blocking=1, rounds=3, cap=3)
+        decide_verdict(state=changes, blocking=1, carries_verdict=True, rounds=3, cap=3)
         is VerdictDecision.ESCALATE
     )
 
@@ -219,7 +238,7 @@ def test_decide_zero_cap_escalates_first_blocking_round() -> None:
     """retry_cap=0 means no rebuild rounds: the first blocking verdict escalates."""
     changes = ReviewState.REQUEST_CHANGES
     assert (
-        decide_verdict(state=changes, blocking=1, rounds=0, cap=0)
+        decide_verdict(state=changes, blocking=1, carries_verdict=True, rounds=0, cap=0)
         is VerdictDecision.ESCALATE
     )
 
@@ -232,7 +251,7 @@ def test_decide_request_changes_without_parseable_findings_escalates() -> None:
     """
     changes = ReviewState.REQUEST_CHANGES
     assert (
-        decide_verdict(state=changes, blocking=0, rounds=0, cap=3)
+        decide_verdict(state=changes, blocking=0, carries_verdict=True, rounds=0, cap=3)
         is VerdictDecision.ESCALATE
     )
 
@@ -327,15 +346,16 @@ async def test_non_blocking_nits_become_backlog_priority_issues(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_commented_review_is_ignored(tmp_path: Path) -> None:
-    """A COMMENTED heimdall review neither hands off nor rebuilds nor files issues.
+async def test_verdictless_comment_is_ignored(tmp_path: Path) -> None:
+    """A verdict-less COMMENTED review neither hands off nor rebuilds nor files issues.
 
-    Heimdall posts plain comments (progress notes) that carry no verdict; converging
-    on one would hand off a PR heimdall never approved.
+    Heimdall posts verdict-less COMMENT notes (the "review failed" note, progress
+    prose) that parse zero findings and carry no clean-pass marker; converging on one
+    would hand off a PR heimdall never actually reviewed.
     """
     store = HeimdallRoundStore(tmp_path / "rounds.sqlite3")
     sinks = _RecordingSinks()
-    review = _review(ReviewState.COMMENTED, [_blocking(), _nit()])
+    review = _review(ReviewState.COMMENTED, [])
 
     creator, rebuilder, handoff, result = await _run(
         review, config=RepoConfig(), store=store, sinks=sinks
@@ -347,6 +367,50 @@ async def test_commented_review_is_ignored(tmp_path: Path) -> None:
     assert rebuilder.requests == []
     assert sinks.comments == []
     assert await store.count("owner/repo#42") == 0
+
+
+@pytest.mark.asyncio
+async def test_clean_pass_comment_converges_with_no_issues(tmp_path: Path) -> None:
+    """Heimdall's clean pass — a COMMENTED "no concerns" review — converges to handoff.
+
+    Heimdall never submits APPROVED; its clean verdict is a COMMENT with the
+    no-concerns body, so that review must hand off rather than be ignored.
+    """
+    store = HeimdallRoundStore(tmp_path / "rounds.sqlite3")
+    sinks = _RecordingSinks()
+    review = _review(ReviewState.COMMENTED, [], clean_pass=True)
+
+    creator, rebuilder, handoff, result = await _run(
+        review, config=RepoConfig(), store=store, sinks=sinks
+    )
+
+    assert result.outcome is VerdictOutcome.CONVERGED
+    assert handoff.calls == [("owner/repo", 42)]
+    assert creator.drafts == []
+    assert rebuilder.requests == []
+
+
+@pytest.mark.asyncio
+async def test_nits_only_comment_converges_and_files_backlog(tmp_path: Path) -> None:
+    """A COMMENTED review with parsed findings converges and parks them as backlog.
+
+    Heimdall COMMENTs (rather than REQUEST_CHANGES) when no finding crosses its
+    blocking threshold, so the findings are nits: file them as backlog and hand off.
+    """
+    store = HeimdallRoundStore(tmp_path / "rounds.sqlite3")
+    sinks = _RecordingSinks()
+    review = _review(ReviewState.COMMENTED, [_nit(), _nit(Severity.MEDIUM)])
+
+    creator, rebuilder, handoff, result = await _run(
+        review, config=RepoConfig(), store=store, sinks=sinks
+    )
+
+    assert result.outcome is VerdictOutcome.CONVERGED
+    assert handoff.calls == [("owner/repo", 42)]
+    assert len(creator.drafts) == 2
+    labels = {label for draft in creator.drafts for label in draft.labels}
+    assert BACKLOG_LABEL in labels
+    assert rebuilder.requests == []
 
 
 @pytest.mark.asyncio

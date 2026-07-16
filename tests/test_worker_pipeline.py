@@ -722,6 +722,60 @@ def test_parse_heimdall_review_unknown_state_is_commented() -> None:
     )
     assert review.state is ReviewState.COMMENTED
     assert review.findings == []
+    assert not review.carries_verdict
+
+
+def test_parse_heimdall_review_clean_pass_body_carries_verdict() -> None:
+    """Heimdall's clean pass — the COMMENTED "no concerns" body — reads as a verdict.
+
+    Heimdall never submits APPROVED; its clean verdict is a COMMENT with the
+    no-concerns body, so the parser must flag it verdict-carrying or the loopback
+    would never converge a clean PR.
+    """
+    review = parse_heimdall_review(
+        repo_full_name="owner/repo",
+        pr_number=75,
+        prd_number=51,
+        review_state="commented",
+        review_body="Heimdall review: no concerns found across any lens.",
+    )
+    assert review.state is ReviewState.COMMENTED
+    assert review.findings == []
+    assert review.clean_pass
+    assert review.carries_verdict
+
+
+def test_parse_heimdall_review_failed_note_carries_no_verdict() -> None:
+    """Heimdall's "review failed" COMMENT note must not read as a verdict.
+
+    Converging on it would hand off a PR heimdall never actually reviewed.
+    """
+    review = parse_heimdall_review(
+        repo_full_name="owner/repo",
+        pr_number=75,
+        prd_number=51,
+        review_state="commented",
+        review_body=(
+            "Heimdall review failed: the automated review could not complete after "
+            "a retry. No verdict was produced for this commit."
+        ),
+    )
+    assert review.state is ReviewState.COMMENTED
+    assert not review.clean_pass
+    assert not review.carries_verdict
+
+
+def test_parse_heimdall_review_findings_carry_verdict() -> None:
+    """A COMMENTED review with parsed finding lines is a (nits-only) verdict."""
+    review = parse_heimdall_review(
+        repo_full_name="owner/repo",
+        pr_number=75,
+        prd_number=51,
+        review_state="commented",
+        review_body="- low: rename this",
+    )
+    assert not review.clean_pass
+    assert review.carries_verdict
 
 
 def test_parse_heimdall_review_tolerates_markdown_finding_lines() -> None:
