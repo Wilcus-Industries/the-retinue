@@ -446,10 +446,28 @@ class GhCliPrOps:
         test the heimdall context across each ruleset's rules, short-circuiting on the first
         hit. (Querying ``.rules`` on the list response always yields nothing — the prior bug
         that left ``heimdall_installed`` permanently False, so no PR ever opened.)
+
+        A 403 from the list endpoint ("Upgrade to GitHub Pro or make this repository
+        public to enable this feature.") means the repo has no rulesets feature at all —
+        a private repo on a free plan — so no ruleset can require the heimdall check:
+        that is a False answer (the HEIMDALL_MISSING escalation path), not a gh failure
+        to raise on. Any other non-zero exit (auth, network) still raises.
         """
-        listed = await self._gh(
-            ["api", f"repos/{repo_full_name}/rulesets", "--jq", "[.[].id]"]
+        listed = await self._runner.run(
+            ["api", f"repos/{repo_full_name}/rulesets", "--jq", "[.[].id]"],
+            env=_auth_env(self._token),
         )
+        if not listed.ok:
+            if "HTTP 403" in listed.stderr:
+                logger.info(
+                    "Rulesets feature unavailable on %s (HTTP 403); reading "
+                    "heimdall as not installed",
+                    repo_full_name,
+                )
+                return False
+            raise GhCommandError(
+                ["api", f"repos/{repo_full_name}/rulesets", "--jq", "[.[].id]"], listed
+            )
         for ruleset_id in json.loads(listed.stdout or "[]"):
             detail = await self._gh(
                 [

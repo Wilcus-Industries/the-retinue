@@ -465,6 +465,44 @@ async def test_heimdall_installed_false_and_no_detail_call_when_no_rulesets() ->
 
 
 @pytest.mark.asyncio
+async def test_heimdall_installed_false_when_rulesets_feature_unavailable() -> None:
+    """A 403 from the rulesets list reads as not installed, not a crash.
+
+    GitHub returns HTTP 403 ("Upgrade to GitHub Pro or make this repository public
+    to enable this feature.") for a private repo on a free plan — the rulesets
+    feature does not exist there, so no ruleset can require the heimdall check.
+    That is the HEIMDALL_MISSING escalation path, not a gh failure to raise on;
+    raising here crashed the PRD resume sweep after a green merged round.
+    """
+    runner = _FakeGhRunner(
+        [
+            GhResult(
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    "gh: Upgrade to GitHub Pro or make this repository public to "
+                    "enable this feature. (HTTP 403)"
+                ),
+            )
+        ]
+    )
+
+    assert await _ops(runner).heimdall_installed("owner/repo") is False
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_heimdall_installed_still_raises_on_other_gh_failures() -> None:
+    """A non-403 gh failure (auth, network) still raises rather than reading False."""
+    runner = _FakeGhRunner(
+        [GhResult(exit_code=1, stdout="", stderr="gh: Bad credentials (HTTP 401)")]
+    )
+
+    with pytest.raises(GhCommandError):
+        await _ops(runner).heimdall_installed("owner/repo")
+
+
+@pytest.mark.asyncio
 async def test_staging_exists_maps_404_to_false() -> None:
     """A non-zero gh exit (the 404 for a missing branch) reads as not existing."""
     runner = _FakeGhRunner([GhResult(exit_code=1, stderr="HTTP 404")])
