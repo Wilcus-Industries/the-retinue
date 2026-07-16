@@ -49,15 +49,19 @@ from retinue.repo_config import RepoConfig
 from retinue.reviewer import AgentSdkReviewGenerator
 from retinue.slicer import SlicePlan
 from retinue.worker import run_adhoc_drain_job
-from tests.test_adhoc_drain import FakeAdhocGh
-from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
-from tests.test_pipeline import (
+from tests.fakes import (
+    CLAUDE_MD,
+    FakeAdhocGh,
+    FakeAuth,
+    FakeRuntime,
     _created,
     _FakePrOps,
     _FakeReapGh,
     _governor,
     _noop_rebuild,
     _RecordingNotifier,
+    _resolver,
+    _sink,
 )
 
 

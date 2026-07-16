@@ -65,9 +65,15 @@ from retinue.routing import (
     resolve_issue_level,
 )
 from retinue.wiring import BoundBuildResult, bind_build_prd
-from tests.test_budget import FakeClock
-from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
-from tests.test_orchestrator import FakeGitOps
+from tests.fakes import (
+    CLAUDE_MD,
+    FakeAuth,
+    FakeClock,
+    FakeGitOps,
+    FakeRuntime,
+    _resolver,
+    _sink,
+)
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore::pytest.PytestUnhandledThreadExceptionWarning"
@@ -1210,7 +1216,7 @@ async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
     """
     import retinue.pipeline as pipeline_mod
     from retinue.pipeline import bind_adhoc_build
-    from tests.test_pipeline import (
+    from tests.fakes import (
         _fake_build_adhoc_issue,
         _RecordingAdhocPipeline,
         _settings,

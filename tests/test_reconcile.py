@@ -28,12 +28,7 @@ from retinue.reconcile import (
     gh_env,
     reconcile_run,
 )
-
-
-@pytest.fixture()
-def db_path(tmp_path: Path) -> Path:
-    """An on-disk SQLite path inside the test's tmp dir."""
-    return tmp_path / "run-state.sqlite3"
+from tests.fakes import FakeReconcileGh
 
 
 def _prd_slice(issue_number: int, blocked_by: list[int] | None = None) -> PrdSlice:
@@ -43,48 +38,6 @@ def _prd_slice(issue_number: int, blocked_by: list[int] | None = None) -> PrdSli
         prd_number=1,
         blocked_by=blocked_by or [],
     )
-
-
-class FakeReconcileGh:
-    """In-memory gh truth: which slice issues are closed, which branches merged, PR.
-
-    ``closed_issues`` and ``merged_branches`` script the GitHub truth a restart reads;
-    ``pr`` is the staging PR number once one exists (``None`` when no PR is open). Every
-    query records its argument so a test can assert exactly which questions were asked.
-    """
-
-    def __init__(
-        self,
-        *,
-        closed_issues: set[int] | None = None,
-        merged_branches: set[str] | None = None,
-        pr: int | None = None,
-        pr_states: dict[int, PrState] | None = None,
-    ) -> None:
-        self._closed_issues = closed_issues or set()
-        self._merged_branches = merged_branches or set()
-        self._pr = pr
-        self._pr_states = pr_states or {}
-        self.issue_queries: list[int] = []
-        self.branch_queries: list[str] = []
-        self.pr_queries: list[int] = []
-
-    async def issue_closed(self, *, repo_full_name: str, issue_number: int) -> bool:
-        self.issue_queries.append(issue_number)
-        return issue_number in self._closed_issues
-
-    async def branch_merged(
-        self, *, repo_full_name: str, branch: str, prd_number: int
-    ) -> bool:
-        self.branch_queries.append(branch)
-        return branch in self._merged_branches
-
-    async def staging_pr(self, *, repo_full_name: str, prd_number: int) -> int | None:
-        self.pr_queries.append(prd_number)
-        return self._pr
-
-    async def pr_state(self, *, repo_full_name: str, pr_number: int) -> PrState:
-        return self._pr_states.get(pr_number, PrState.OPEN)
 
 
 async def _reconcile(

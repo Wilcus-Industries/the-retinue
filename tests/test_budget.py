@@ -26,6 +26,7 @@ from retinue.budget import (
     GateDecision,
     SystemClock,
 )
+from tests.fakes import FakeClock
 
 # The stores hold a long-lived connection for their (process-lifetime) lifespan and do
 # not require callers to close them. These tests construct many short-lived stores across
@@ -37,25 +38,6 @@ pytestmark = pytest.mark.filterwarnings(
 )
 
 _T0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
-
-
-class FakeClock:
-    """A deterministic, advanceable time source the ledger reads ``now()`` from."""
-
-    def __init__(self, start: datetime = _T0) -> None:
-        self._now = start
-
-    def now(self) -> datetime:
-        return self._now
-
-    def advance(self, delta: timedelta) -> None:
-        self._now += delta
-
-
-@pytest.fixture()
-def db_path(tmp_path: Path) -> Path:
-    """An on-disk SQLite path inside the test's tmp dir."""
-    return tmp_path / "budget.sqlite3"
 
 
 # --- real SystemClock: the production adapter behind the Clock seam --------------

@@ -17,7 +17,7 @@ from collections.abc import Mapping
 import pytest
 
 from retinue.classifier import ClassifyInput
-from retinue.container import Container, RunResult
+from retinue.container import RunResult
 from retinue.container_build import (
     GitOpsError,
     Implementer,
@@ -44,77 +44,16 @@ from retinue.repo_config import (
     SecretsConfig,
 )
 from retinue.roles import ROLE_REGISTRY, Role
-from tests.test_done_check import (
+from tests.fakes import (
     CLAUDE_MD,
     FakeAuth,
+    FakeGitOps,
+    FakeImplementer,
     FakeRuntime,
+    MergeConflictError,
     _resolver,
     _sink,
 )
-
-
-class FakeImplementer:
-    """Records the slice it was asked to build and marks the build container.
-
-    Appends an ``implement`` marker to the container log so the per-slice lifecycle
-    order (clone -> checkout -> implement -> done-check -> push) is assertable, and
-    returns an empty ``auth_env`` (a fake needs no real Anthropic credential).
-    """
-
-    def __init__(self) -> None:
-        self.built: list[Slice] = []
-
-    async def implement(
-        self, slice_: Slice, *, container: Container, plan_path: str | None = None
-    ) -> None:
-        self.built.append(slice_)
-        await container.run_command(["implement", slice_.branch])
-
-    def auth_env(self) -> dict[str, str]:
-        return {}
-
-
-class FakeGitOps:
-    """In-memory git: records branch creation and merges, scripts existence/conflicts.
-
-    ``existing`` is the set of branches that already exist on the remote. ``conflicts``
-    is the set of source branches whose merge should raise (a conflict the orchestrator
-    surfaces). ``log`` records each ensure/merge event in order.
-    """
-
-    def __init__(
-        self,
-        existing: set[str] | None = None,
-        conflicts: set[str] | None = None,
-        timeline: list[str] | None = None,
-    ) -> None:
-        self.existing = set(existing or set())
-        self._conflicts = set(conflicts or set())
-        self.log: list[str] = []
-        self.merges: list[tuple[str, str]] = []
-        # Optional shared event list, written to by both this seam and the runtime, so a
-        # test can assert ordering *across* the git and container seams.
-        self._timeline = timeline
-
-    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
-        if branch in self.existing:
-            self.log.append(f"exists:{branch}")
-            return
-        event = f"create:{branch}<-{base}"
-        self.log.append(event)
-        if self._timeline is not None:
-            self._timeline.append(event)
-        self.existing.add(branch)
-
-    async def merge(self, *, source: str, into: str) -> None:
-        self.log.append(f"merge:{source}->{into}")
-        if source in self._conflicts:
-            raise MergeConflictError(source, into)
-        self.merges.append((source, into))
-
-
-class MergeConflictError(MergeConflict):
-    """A merge could not complete because of a conflict (a typed ``MergeConflict``)."""
 
 
 def _slice(issue_number: int = 7, prd_number: int = 1) -> Slice:

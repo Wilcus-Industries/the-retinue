@@ -32,6 +32,7 @@ from retinue.heartbeat import (
 )
 from retinue.repo_config import RepoConfig
 from retinue.worker import WorkerSettings
+from tests.fakes import FakeClock
 
 # --- cron_due: the per-repo "is this repo due?" filter ----------------------------
 
@@ -106,16 +107,6 @@ def test_cron_due_sunday_accepts_both_0_and_7() -> None:
 
 
 # --- the fakes the heartbeat injects through --------------------------------------
-
-
-class FakeClock:
-    """A fixed clock: the heartbeat's wall-clock seam (the global tick's instant)."""
-
-    def __init__(self, now: datetime) -> None:
-        self._now = now
-
-    def now(self) -> datetime:
-        return self._now
 
 
 class RecordingDrain:

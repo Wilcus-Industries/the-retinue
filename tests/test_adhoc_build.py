@@ -53,7 +53,7 @@ from retinue.reviewer import (
 )
 from retinue.roles import Role, planner_cli_argv, resolve_model
 from retinue.vocab import READY_LABEL
-from tests.test_done_check import (
+from tests.fakes import (
     CLAUDE_MD,
     FakeAuth,
     FakeRuntime,

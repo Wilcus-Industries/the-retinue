@@ -19,12 +19,6 @@ from retinue.container_build import Slice
 from retinue.impl_retry import ImplRetryStore, impl_retry_key
 
 
-@pytest.fixture()
-def db_path(tmp_path: Path) -> Path:
-    """An on-disk SQLite path inside the test's tmp dir."""
-    return tmp_path / "impl-retry.sqlite3"
-
-
 def _slice(issue_number: int = 7) -> Slice:
     return Slice(repo_full_name="owner/repo", issue_number=issue_number, prd_number=1)
 

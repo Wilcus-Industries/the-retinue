@@ -9,23 +9,20 @@ Docker, no network.
 
 The in-memory ``FakeAuth`` / ``FakeContainer`` / ``FakeRuntime`` fakes and the
 ``_resolver`` / ``_sink`` / ``CLAUDE_MD`` helpers are reused by the orchestrator and
-reviewer tests, so they live here.
+reviewer tests, so they live in ``tests/fakes.py``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import pytest
 
-from retinue.container import Container, RunResult
+from retinue.container import RunResult
 from retinue.done_check import (
     DoneCheckError,
     DoneCheckReport,
     EnvSecretResolver,
     GhReportSink,
     MissingSecretError,
-    ReportSink,
     SecretResolver,
     parse_done_check,
     parse_secret_ref,
@@ -35,109 +32,8 @@ from retinue.done_check import (
     run_done_check_commands,
 )
 from retinue.gh import GhCliError
-from retinue.github_app import InstallationToken
 from retinue.repo_config import RepoConfig, SecretsConfig
-
-CLAUDE_MD = """# CLAUDE.md
-
-## Definition of done
-
-```
-uv run pytest
-uv run ruff check .
-```
-"""
-
-
-class FakeAuth:
-    """Mints a canned installation token and records that auth was called."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    async def installation_token(self, repo_full_name: str) -> InstallationToken:
-        self.calls.append(repo_full_name)
-        return InstallationToken(
-            token="ghs_faketoken",
-            clone_url=f"https://x-access-token:ghs_faketoken@github.com/{repo_full_name}.git",
-        )
-
-
-class FakeContainer:
-    """In-memory container that scripts per-command results and records teardown.
-
-    ``results`` maps the first argv token (e.g. "git", "uv") — or the first two, for a
-    subcommand-precise script (e.g. "git rev-list") that must not also hit clone/push —
-    to the :class:`RunResult` to return; the two-token key wins. An unscripted command
-    returns success, except ``git rev-list`` which returns a count of ``1`` (the
-    orchestrator's landed-no-commits guard; the fake models an implementer that
-    committed, so green-path tests stay green by default). ``log`` appends each event
-    so a test can assert command order and that destroy ran.
-    """
-
-    def __init__(self, log: list[str], results: dict[str, RunResult]) -> None:
-        self._log = log
-        self._results = results
-        self.destroyed = False
-        # Per-command exec env overrides, keyed by the first argv token, so a test can
-        # assert the done-check blanks the Anthropic credential before running pytest.
-        self.command_env: dict[str, Mapping[str, str]] = {}
-
-    async def run_command(
-        self, command: list[str], *, env: Mapping[str, str] | None = None
-    ) -> RunResult:
-        self._log.append("run:" + " ".join(command))
-        if env is not None:
-            self.command_env[command[0]] = env
-        for key in (" ".join(command[:2]), command[0]):
-            if key in self._results:
-                return self._results[key]
-        if command[:2] == ["git", "rev-list"]:
-            return RunResult(exit_code=0, stdout="1\n")
-        return RunResult(exit_code=0)
-
-    async def destroy(self) -> None:
-        self.destroyed = True
-        self._log.append("destroy")
-
-
-class FakeRuntime:
-    """Spawns one :class:`FakeContainer`, recording the start event and injected env."""
-
-    def __init__(
-        self,
-        results: dict[str, RunResult] | None = None,
-        timeline: list[str] | None = None,
-    ) -> None:
-        self.log: list[str] = []
-        self.started_env: dict[str, str] | None = None
-        self.container: FakeContainer | None = None
-        self._results = results or {}
-        # Optional shared event list, written to by both this runtime and the git seam,
-        # so a test can assert ordering *across* the container and git seams.
-        self._timeline = timeline
-
-    async def start(self, *, image: str, env: dict[str, str]) -> Container:
-        self.log.append(f"start:{image}")
-        if self._timeline is not None:
-            self._timeline.append(f"start:{image}")
-        self.started_env = env
-        self.container = FakeContainer(self.log, self._results)
-        return self.container
-
-
-def _resolver(known: dict[str, str]) -> SecretResolver:
-    async def resolve(name: str) -> str | None:
-        return known.get(name)
-
-    return resolve
-
-
-def _sink(captured: list[DoneCheckReport]) -> ReportSink:
-    async def report(result: DoneCheckReport) -> None:
-        captured.append(result)
-
-    return report
+from tests.fakes import CLAUDE_MD, FakeContainer, _resolver, _sink
 
 
 def _config(secrets: SecretsConfig | None = None) -> RepoConfig:

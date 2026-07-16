@@ -43,19 +43,7 @@ from retinue.cron import (
 from retinue.orchestrator import BuildOutcome, BuildResult, integration_branch
 from retinue.repo_config import RepoConfig
 from retinue.vocab import Severity
-
-
-class FakeClock:
-    """A deterministic, advanceable clock (the budget/cron time source)."""
-
-    def __init__(self, start: datetime | None = None) -> None:
-        self._now = start or datetime(2026, 6, 1, tzinfo=UTC)
-
-    def now(self) -> datetime:
-        return self._now
-
-    def advance(self, delta: timedelta) -> None:
-        self._now += delta
+from tests.fakes import FakeClock
 
 
 class FakeCronGh:

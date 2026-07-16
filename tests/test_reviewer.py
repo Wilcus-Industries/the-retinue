@@ -36,9 +36,16 @@ from retinue.reviewer import (
 )
 from retinue.roles import CLAUDE_CODE_IDENTITY, EFFORT_MAX
 from retinue.slicer import CreatedIssue, IssueDraft
-from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
-from tests.test_orchestrator import FakeGitOps, FakeImplementer
-from tests.test_prd_build import OneAtATimeLock
+from tests.fakes import (
+    CLAUDE_MD,
+    FakeAuth,
+    FakeGitOps,
+    FakeImplementer,
+    FakeRuntime,
+    OneAtATimeLock,
+    _resolver,
+    _sink,
+)
 
 PRD_NUMBER = 1
 REPO = "owner/repo"

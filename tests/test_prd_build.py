@@ -34,8 +34,17 @@ from retinue.orchestrator import (
 )
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import ReviewGenerationError
-from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
-from tests.test_orchestrator import FakeGitOps, FakeImplementer
+from tests.fakes import (
+    CLAUDE_MD,
+    FakeAuth,
+    FakeGitOps,
+    FakeImplementer,
+    FakeRuntime,
+    OneAtATimeLock,
+    OrchestratorBusyError,
+    _resolver,
+    _sink,
+)
 
 
 class RecordingImplementer:
@@ -61,33 +70,6 @@ class RecordingImplementer:
 
     def auth_env(self) -> dict[str, str]:
         return {}
-
-
-class OrchestratorBusyError(Exception):
-    """Raised by the test lock when a second concurrent run is attempted."""
-
-
-class OneAtATimeLock:
-    """An async lock that records contention; refuses a second concurrent holder.
-
-    Models the single-orchestrator-run guarantee: ``__aenter__`` raises
-    :class:`OrchestratorBusyError` if the lock is already held rather than blocking,
-    so a second run is rejected, not silently serialized.
-    """
-
-    def __init__(self) -> None:
-        self.held = False
-        self.acquisitions = 0
-
-    async def __aenter__(self) -> OneAtATimeLock:
-        if self.held:
-            raise OrchestratorBusyError()
-        self.held = True
-        self.acquisitions += 1
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        self.held = False
 
 
 def _prd_slice(issue_number: int, blocked_by: list[int] | None = None) -> PrdSlice:
