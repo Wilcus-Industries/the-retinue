@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,7 @@ import aiosqlite
 
 from retinue.gh import GhCommandError, GhRunner, auth_env
 from retinue.notify import Notification, Notifier
+from retinue.orchestrator import integration_branch
 from retinue.repo_config import RepoConfig
 from retinue.slicer import CreatedIssue, IssueCreator, IssueDraft
 from retinue.vocab import (
@@ -129,6 +131,91 @@ class HeimdallReview:
         clean-pass body.
         """
         return bool(self.findings) or self.clean_pass
+
+
+# gh review states map onto the loopback's three-valued review state. ``dismissed`` and
+# any unrecognised state are read as a plain comment (no verdict), so an odd state never
+# blocks or converges on its own.
+_REVIEW_STATE_MAP = {
+    "approved": ReviewState.APPROVED,
+    "changes_requested": ReviewState.REQUEST_CHANGES,
+    "request_changes": ReviewState.REQUEST_CHANGES,
+    "commented": ReviewState.COMMENTED,
+}
+
+# Heimdall never submits an APPROVED review: its clean pass is a COMMENTED review whose
+# body is "Heimdall review: no concerns found across any lens." — this marker (matched
+# case-insensitively) is what flags that COMMENT as a verdict so the loopback converges
+# on it. Heimdall's verdict-less "review failed" COMMENT note carries neither this
+# marker nor finding lines, so it stays a no-verdict.
+_CLEAN_PASS_MARKER = "no concerns found"
+
+
+def parse_heimdall_review(
+    *,
+    repo_full_name: str,
+    pr_number: int,
+    prd_number: int,
+    review_state: str,
+    review_body: str,
+) -> HeimdallReview:
+    """Parse a ``pull_request_review`` into a :class:`HeimdallReview`.
+
+    Maps the gh review ``state`` onto the loopback's three-valued state and reads
+    heimdall's findings out of the review body — one finding per
+    ``<severity>: <summary>`` line (severity is one of low/medium/high/critical,
+    case-insensitive); a line without that shape is ignored as prose. A body carrying
+    heimdall's clean-pass marker (:data:`_CLEAN_PASS_MARKER`) sets ``clean_pass`` so
+    the findings-free clean COMMENT still reads as a verdict. The integration branch
+    is derived from the PRD number (``retinue/prd-<n>``). Pure and value-free, so it
+    is unit-tested without a live gh.
+
+    Args:
+        repo_full_name: e.g. "owner/repo".
+        pr_number: The reviewed PR number.
+        prd_number: The parent PRD (resolved from run-state); also the issue an
+            escalation comments/labels and the integration branch's number.
+        review_state: The gh review state string.
+        review_body: The review body to parse findings from.
+
+    Returns:
+        The parsed :class:`HeimdallReview`.
+    """
+    state = _REVIEW_STATE_MAP.get(review_state.lower(), ReviewState.COMMENTED)
+    return HeimdallReview(
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        prd_number=prd_number,
+        prd_issue_number=prd_number,
+        integration_branch=integration_branch(prd_number),
+        state=state,
+        findings=_parse_findings(review_body),
+        clean_pass=_CLEAN_PASS_MARKER in review_body.lower(),
+    )
+
+
+# A finding line is ``<severity>: <summary>``, tolerating common markdown dressing —
+# a leading bullet (``-``/``*``/``+``) or ordinal (``1.``/``2)``), and ``**bold**``
+# around the severity — so a prose-formatted heimdall review still parses instead of
+# silently reading as zero findings.
+_FINDING_LINE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])?\s*\*{0,2}(low|medium|high|critical)\*{0,2}\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_findings(review_body: str) -> list[HeimdallFinding]:
+    """Parse ``<severity>: <summary>`` lines from a review body into findings."""
+    findings: list[HeimdallFinding] = []
+    for line in review_body.splitlines():
+        match = _FINDING_LINE.match(line)
+        if match is None:
+            continue
+        severity = Severity[match.group(1).upper()]
+        findings.append(
+            HeimdallFinding(summary=match.group(2).strip(), severity=severity)
+        )
+    return findings
 
 
 @dataclass(frozen=True)

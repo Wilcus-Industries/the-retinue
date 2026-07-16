@@ -18,18 +18,17 @@ import pytest
 import pytest_asyncio
 
 from retinue.dedupe import PrdDedupeStore
-from retinue.github_app import InstallationToken
-from retinue.queue import PrdJob
-from retinue.worker import (
+from retinue.github_app import (
     GITHUB_API_BASE_URL,
     RETINUE_CONFIG_PATH,
-    GateOutcome,
+    InstallationToken,
     _auth_headers,
-    _contents_url,
     _decode_contents_payload,
-    gate_prd,
+    _repo_contents_url,
     github_config_fetcher,
 )
+from retinue.queue import PrdJob
+from retinue.worker import GateOutcome, gate_prd
 
 VALID_CONFIG = "staging_branch: release\nretry_cap: 2\n"
 
@@ -151,7 +150,7 @@ def _contents_payload(text: str) -> dict[str, object]:
 
 
 def test_contents_url_targets_the_opt_in_file() -> None:
-    url = _contents_url("owner/repo")
+    url = _repo_contents_url("owner/repo", RETINUE_CONFIG_PATH)
     assert url == f"{GITHUB_API_BASE_URL}/repos/owner/repo/contents/{RETINUE_CONFIG_PATH}"
 
 
@@ -193,7 +192,7 @@ async def test_github_fetcher_returns_raw_config_text() -> None:
     assert raw == VALID_CONFIG
     assert auth.asked_for == "owner/repo"
     assert captured["auth"] == "Bearer ghs_live"
-    assert captured["url"] == _contents_url("owner/repo")
+    assert captured["url"] == _repo_contents_url("owner/repo", RETINUE_CONFIG_PATH)
 
 
 @pytest.mark.asyncio

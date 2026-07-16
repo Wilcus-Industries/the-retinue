@@ -27,6 +27,7 @@ from retinue.loopback import (
     ReviewState,
     VerdictOutcome,
     VerdictResult,
+    parse_heimdall_review,
 )
 from retinue.pipeline import PrdJobResult, ResumeRoundOutcome
 from retinue.queue import RESUME_ROUND_TASK, RESUME_ROUNDS_TASK, RUN_ADHOC_DRAIN_TASK
@@ -37,7 +38,6 @@ from retinue.worker import (
     WorkerSettings,
     on_shutdown,
     on_startup,
-    parse_heimdall_review,
     process_prd,
     process_review_job,
     reap_pr_job,
@@ -861,7 +861,7 @@ async def test_on_startup_wires_a_live_pipeline(
     # the wiring is exercised without a live GitHub read.
     monkeypatch.setattr(
         worker,
-        "_github_claude_md_fetcher",
+        "github_claude_md_fetcher",
         lambda auth, client: _fake_claude_md,
     )
 
@@ -900,7 +900,7 @@ async def test_on_startup_kicks_the_resume_sweep(
     monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
     monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
     monkeypatch.setattr(
-        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+        worker, "github_claude_md_fetcher", lambda auth, client: _fake_claude_md
     )
 
     redis = _RecordingRedis()
@@ -960,7 +960,7 @@ async def test_on_startup_adhoc_drain_drives_one_issue_to_the_pipeline(
     monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
     monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
     monkeypatch.setattr(
-        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+        worker, "github_claude_md_fetcher", lambda auth, client: _fake_claude_md
     )
 
     # Fake the gh seam the drain constructs: list one ready ad-hoc issue, none in flight.
@@ -1090,7 +1090,7 @@ async def test_on_startup_wires_the_heartbeat_collaborators(
     monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
     monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
     monkeypatch.setattr(
-        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+        worker, "github_claude_md_fetcher", lambda auth, client: _fake_claude_md
     )
 
     ctx: dict[str, Any] = {}
@@ -1133,7 +1133,7 @@ async def test_on_startup_heartbeat_enumerate_yields_opted_in_due_repos(
     monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
     monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
     monkeypatch.setattr(
-        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+        worker, "github_claude_md_fetcher", lambda auth, client: _fake_claude_md
     )
     # The App is installed on these repos; the fetcher reports each as opted in.
     monkeypatch.setattr(_FakeAuth, "installed_repos", ["owner/a", "owner/b"])
@@ -1172,7 +1172,7 @@ async def test_on_startup_heartbeat_tick_drives_run_heartbeat(
     monkeypatch.setattr(worker, "settings", _worker_settings(tmp_path))
     monkeypatch.setattr(github_app, "build_installation_auth", _FakeAuth)
     monkeypatch.setattr(
-        worker, "_github_claude_md_fetcher", lambda auth, client: _fake_claude_md
+        worker, "github_claude_md_fetcher", lambda auth, client: _fake_claude_md
     )
     # One installed repo whose cron is due on every tick, opted in via the fake fetcher.
     cron_yaml = "staging_branch: staging\ncron: '* * * * *'\n"
