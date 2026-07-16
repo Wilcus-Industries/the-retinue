@@ -194,19 +194,20 @@ class FakeGitOps:
         self.merges.append((source, into))
 
 
-_CLOCK_DEFAULT = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+CLOCK_DEFAULT = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
 
 
 class FakeClock:
     """A deterministic, advanceable time source tests read ``now()`` from.
 
-    Constructable bare (defaults to :data:`_CLOCK_DEFAULT`) or with a specific instant,
+    Constructable bare (defaults to :data:`CLOCK_DEFAULT`) or with a specific instant,
     and advanceable via :meth:`advance` — one clock satisfying the budget, cron, and
-    heartbeat call sites.
+    heartbeat call sites. Tests that anchor ancillary timestamps (e.g. issue
+    ``created_at``) relative to the clock should reference :data:`CLOCK_DEFAULT`.
     """
 
     def __init__(self, start: datetime | None = None) -> None:
-        self._now = start if start is not None else _CLOCK_DEFAULT
+        self._now = start if start is not None else CLOCK_DEFAULT
 
     def now(self) -> datetime:
         return self._now

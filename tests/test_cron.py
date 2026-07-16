@@ -43,7 +43,7 @@ from retinue.cron import (
 from retinue.orchestrator import BuildOutcome, BuildResult, integration_branch
 from retinue.repo_config import RepoConfig
 from retinue.vocab import Severity
-from tests.fakes import FakeClock
+from tests.fakes import CLOCK_DEFAULT, FakeClock
 
 
 class FakeCronGh:
@@ -89,8 +89,8 @@ class OneAtATimeLock:
 
 
 def _issue(number: int, *, priority: str | None, age_days: float) -> BacklogIssue:
-    """A backlog issue ``age_days`` old relative to the fake clock's 2026-06-01 start."""
-    created = datetime(2026, 6, 1, tzinfo=UTC) - timedelta(days=age_days)
+    """A backlog issue ``age_days`` old relative to the fake clock's default instant."""
+    created = CLOCK_DEFAULT - timedelta(days=age_days)
     labels = ["backlog"] + ([f"priority:{priority}"] if priority else [])
     return BacklogIssue(number=number, labels=labels, created_at=created)
 
