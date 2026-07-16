@@ -26,7 +26,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict, runtime_checkable
 
 import httpx
 
@@ -58,6 +58,7 @@ class InstallationAuth(Protocol):
         ...
 
 
+@runtime_checkable
 class InstalledRepos(Protocol):
     """Lists every repo the GitHub App is installed on. The repo-enumeration seam.
 
@@ -67,6 +68,8 @@ class InstalledRepos(Protocol):
     installations, and pages each installation's repositories; tests inject a fake that
     returns a fixed set. The opt-in filter (a fetchable ``.github/retinue.yml``) is applied
     by the caller, so this seam lists *installed* repos, not yet *opted-in* ones.
+    Runtime-checkable so the worker's heartbeat bind can probe an
+    :class:`InstallationAuth` for the optional enumeration capability.
     """
 
     async def installed_repositories(self) -> list[str]:

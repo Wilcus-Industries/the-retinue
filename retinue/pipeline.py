@@ -48,14 +48,13 @@ from retinue.adhoc_build import (
     build_adhoc_issue,
 )
 from retinue.budget import (
-    AuthMode,
+    BUILD_ESTIMATED_AMOUNT,
+    CLASSIFIER_ESTIMATED_AMOUNT,
     BudgetGovernor,
-    BudgetLedger,
-    SystemClock,
 )
 from retinue.classifier import ClaudeIssueClassifier
 from retinue.container import DockerRuntime
-from retinue.cron import CronBuild
+from retinue.cron import CronBuild, SliceBuilder
 from retinue.done_check import (
     DoneCheckError,
     EnvSecretResolver,
@@ -723,32 +722,28 @@ def run_state_store_path(settings: Settings) -> Path:
     return _state_dir(settings) / "run-state.sqlite3"
 
 
-# The orchestrator build's estimated charge, gated against the rolling-24h budget cap.
-# The build's true cost is only known after the implementer/done-check runs, so the gate
-# uses a conservative fixed estimate; the meter (the governor's mid-run pause/resume)
-# tracks the real spend once the run is underway. Kept here (not a Settings field) so the
-# public config schema is unchanged.
-_BUILD_ESTIMATED_AMOUNT = 1.0
-
-# The estimated charge one classifier call meters against the shared ledger. Kept small
-# (a Haiku-class call) and separate from the build gate estimate, which is unchanged.
-_CLASSIFIER_ESTIMATED_AMOUNT = 0.01
+# Builds a :class:`Pipeline` for an accepted repo. Async so the production factory can
+# mint a per-repo installation token before constructing the gh adapters. Injected onto
+# the Arq context by :func:`retinue.worker.on_startup` so the worker tasks stay testable
+# with a fake factory; production binds it to :func:`build_pipeline_factory`'s factory.
+PipelineFactory = Callable[[str, RepoConfig], Awaitable[Pipeline]]
 
 
 def build_pipeline_factory(
     settings: Settings,
     auth: InstallationAuth,
     *,
+    governor: BudgetGovernor,
     build_prd: BuildPrd | None = None,
     fetch_claude_md: ClaudeMdFetcher | None = None,
-) -> Callable[[str, RepoConfig], Awaitable[Pipeline]]:
+) -> PipelineFactory:
     """Build the production pipeline factory over the real adapters.
 
     Returns an async ``(repo_full_name, config) -> Pipeline`` that mints a per-repo
     installation token, then constructs every gh/Anthropic/push/build adapter against it:
     the slicer's gh issue creator and Agent-SDK generator, the PR-opener gh ops, the reap
     and reconcile gh seams, the heimdall rebuilder, the shared notifier (push + comment +
-    label), the shared budget governor, and the orchestrator build lane.
+    label), and the orchestrator build lane.
 
     The orchestrator ``build_prd`` seam defaults to the real budget-gated, triaged build
     bound per repo via :func:`retinue.wiring.bind_build_prd` over the real
@@ -759,6 +754,9 @@ def build_pipeline_factory(
     Args:
         settings: The runtime settings carrying budget, Anthropic, and push config.
         auth: The GitHub App installation auth used to mint per-repo tokens.
+        governor: The one service-level budget governor (constructed by the worker's
+            startup and shared with the ad-hoc and cron lanes, so every lane meters the
+            same rolling-24h window).
         build_prd: An explicit build seam overriding the real per-repo bind (e.g. a fake).
         fetch_claude_md: Reads the target repo's ``CLAUDE.md`` text (the done-check
             command source); ``None`` falls back to empty text, which the done-check
@@ -767,15 +765,6 @@ def build_pipeline_factory(
     Returns:
         An async pipeline factory keyed by repo and config.
     """
-    governor = BudgetGovernor(
-        BudgetLedger(
-            settings.budget_db_path,
-            clock=SystemClock(),
-            auth_mode=AuthMode.from_config(settings.auth_mode),
-            weekly_budget=settings.weekly_budget,
-            daily_cap_fraction=settings.budget_daily_cap_fraction,
-        )
-    )
     push = build_push_sink(settings)
     state_dir = _state_dir(settings)
     retry_store_path = state_dir / "impl-retries.sqlite3"
@@ -931,7 +920,7 @@ def _bind_build_prd_for_repo(
             comment_sink=GhCommentSink(token=token),
             issue_facts=issue_facts,
             governor=governor,
-            classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+            classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
         )
     bound = bind_build_prd(
         implementer=implementer,
@@ -939,7 +928,7 @@ def _bind_build_prd_for_repo(
         notifier=notifier,
         create_issue=create_issue,
         retry_store_path=retry_store_path,
-        estimated_amount=_BUILD_ESTIMATED_AMOUNT,
+        estimated_amount=BUILD_ESTIMATED_AMOUNT,
         git=git,
         auth=auth,
         runtime=runtime,
@@ -990,8 +979,6 @@ async def build_cron_slice_builder(
     Returns:
         The bound cron build the backlog tick drives for the picked issue.
     """
-    from retinue.cron import SliceBuilder
-
     config = RepoConfig()
     claude_md = await _fetch_claude_md(fetch_claude_md, repo_full_name)
     runtime = DockerRuntime()
@@ -1070,7 +1057,7 @@ async def _resolve_adhoc_level(
             comment_sink=comment_sink,
             issue_facts=issue_facts,
             governor=governor,
-            classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+            classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
         )
     except asyncio.CancelledError:
         raise

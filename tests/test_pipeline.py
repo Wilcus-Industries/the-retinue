@@ -792,7 +792,11 @@ async def test_build_pipeline_factory_wires_a_pipeline(tmp_path: Path) -> None:
     from retinue.pipeline import build_pipeline_factory
 
     settings = _settings(tmp_path, ntfy_topic="alerts")
-    factory = build_pipeline_factory(settings, _FakeAuth())  # type: ignore[arg-type]
+    factory = build_pipeline_factory(
+        settings,  # type: ignore[arg-type]
+        _FakeAuth(),  # type: ignore[arg-type]
+        governor=_governor(tmp_path),
+    )
     pipeline = await factory("owner/repo", _config())
 
     assert pipeline.rebuild is not None
@@ -816,6 +820,7 @@ async def test_build_pipeline_factory_sources_claude_md(tmp_path: Path) -> None:
     factory = build_pipeline_factory(
         settings,  # type: ignore[arg-type]
         _FakeAuth(),  # type: ignore[arg-type]
+        governor=_governor(tmp_path),
         fetch_claude_md=fetch_claude_md,
     )
     pipeline = await factory("owner/repo", _config())
@@ -867,7 +872,11 @@ async def test_build_pipeline_factory_applies_routing_default_to_slicer(
         ),
     )
     settings = _settings(tmp_path, ntfy_topic="alerts")
-    factory = build_pipeline_factory(settings, _FakeAuth())  # type: ignore[arg-type]
+    factory = build_pipeline_factory(
+        settings,  # type: ignore[arg-type]
+        _FakeAuth(),  # type: ignore[arg-type]
+        governor=_governor(tmp_path),
+    )
     await factory("owner/repo", config)
 
     assert captured["model"] == "slicer-custom"

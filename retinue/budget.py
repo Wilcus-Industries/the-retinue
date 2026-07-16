@@ -429,3 +429,25 @@ class BudgetGovernor:
             return True
         return await self._ledger.try_record_if_within_cap(amount=amount)
 
+
+# --- the lanes' estimated charges -----------------------------------------------------
+#
+# Every lane meters the one shared ledger with a flat, conservative estimate; the
+# constants live together here so the cross-lane relationships stay visible.
+
+# The orchestrator build's estimated charge, gated against the rolling-24h budget cap.
+# The build's true cost is only known after the implementer/done-check runs, so the gate
+# uses a conservative fixed estimate; the meter (the governor's mid-run pause/resume)
+# tracks the real spend once the run is underway. Kept here (not a Settings field) so the
+# public config schema is unchanged.
+BUILD_ESTIMATED_AMOUNT = 1.0
+
+# The estimated charge one classifier call meters against the shared ledger. Kept small
+# (a Haiku-class call) and separate from the build gate estimate, which is unchanged.
+CLASSIFIER_ESTIMATED_AMOUNT = 0.01
+
+# The flat per-build charge the ad-hoc drain meters against the shared rolling-24h cap,
+# matching the PRD lane's estimate (:data:`BUILD_ESTIMATED_AMOUNT`); a
+# build that would cross the cap is skipped so the one shared budget is never overshot.
+ADHOC_DRAIN_ESTIMATED_AMOUNT = 1.0
+

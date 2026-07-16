@@ -1,15 +1,16 @@
-"""Tests for the orchestrator-build + cron-tick production wiring (retinue.wiring).
+"""Tests for the lanes' production wiring (retinue.wiring).
 
 ``bind_build_prd`` wraps the orchestrator's ``build_prd`` with the budget gate (defer a
 run that would start over the cap) and triage (reason about an implementer failure /
-notes against the persisted retry cap). ``bind_cron_tick`` drives the cron backlog lane
-over its real collaborators. The implementer-spawn seam is the one injected dependency;
-everything else is a real adapter, exercised here with fakes — no Docker, gh, or network.
+notes against the persisted retry cap). ``bind_cron_tick`` and ``bind_adhoc_drain`` are
+the per-lane production binds: each constructs its per-repo collaborators itself, so
+their leaf module seams (the gh CLIs, the build binders) are monkeypatched and everything
+between runs for real — no Docker, gh, or network.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,11 +18,16 @@ from typing import cast
 
 import pytest
 
-from retinue.adhoc_drain import AdhocGh, FlightState
-from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
+from retinue.adhoc_drain import FlightState
+from retinue.budget import (
+    ADHOC_DRAIN_ESTIMATED_AMOUNT,
+    AuthMode,
+    BudgetGovernor,
+    BudgetLedger,
+)
+from retinue.config import Settings
 from retinue.container import ContainerRuntime
 from retinue.container_build import Implementer, Slice
-from retinue.cron import CronGh
 from retinue.github_app import InstallationAuth
 from retinue.notify import (
     CommentRequest,
@@ -30,6 +36,7 @@ from retinue.notify import (
     PushRequest,
 )
 from retinue.orchestrator import GitOps, PrdSlice
+from retinue.pipeline import PipelineFactory
 from retinue.repo_config import RepoConfig
 from retinue.slicer import IssueCreator
 from retinue.triage import ImplementerNotes
@@ -320,28 +327,53 @@ async def test_bind_round_reviewer_reviews_diff_and_returns_fix_slices() -> None
 
 
 @pytest.mark.asyncio
-async def test_cron_tick_drains_when_in_budget(tmp_path: Path) -> None:
-    """A cron tick within budget picks a backlog issue and runs its downstream build."""
+async def test_cron_tick_drains_when_in_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound cron tick mints a per-repo token and drains one backlog issue.
+
+    The production bind constructs the backlog gh seam and the cron build itself, so the
+    test patches those module seams (a scripted backlog, a recording build) and asserts
+    the bound ``(*, repo_full_name, tick_number)`` callable threads them: the listed
+    issue is picked and its downstream build runs.
+    """
+    import retinue.cron as cron_mod
+    import retinue.pipeline as pipeline_mod
     from retinue.cron import BacklogIssue
 
     clock = _Clock()
     governor = _governor(tmp_path, clock)
     built: list[int] = []
-
-    async def build(*, repo_full_name: str, issue_number: int) -> None:
-        built.append(issue_number)
-
     issue = BacklogIssue(
         number=42, labels=["backlog", "priority:low"], created_at=clock.now()
     )
+
+    class _FakeCronGhCli:
+        def __init__(self, *, token: str) -> None:
+            self.token = token
+
+        async def list_backlog(self, *, repo_full_name: str) -> list[BacklogIssue]:
+            return [issue]
+
+    monkeypatch.setattr(cron_mod, "GhCli", _FakeCronGhCli)
+
+    async def _fake_builder(
+        settings: object, auth: object, **kwargs: object
+    ) -> object:
+        async def build(*, repo_full_name: str, issue_number: int) -> None:
+            built.append(issue_number)
+
+        return build
+
+    monkeypatch.setattr(pipeline_mod, "build_cron_slice_builder", _fake_builder)
+
     tick = bind_cron_tick(
-        gh=cast(CronGh, _FakeCronGh([issue])),
+        cast(Settings, object()),
+        cast(InstallationAuth, _NoAuth()),
         governor=governor,
-        clock=clock,
-        build=build,
-        lock=_Lock(),
+        fetch_claude_md=_canned_claude_md,
     )
-    result = await tick(repo_full_name="owner/repo", tick_number=1, estimated_amount=1.0)
+    result = await tick(repo_full_name="owner/repo", tick_number=1)
     assert result.issue_number == 42
     assert built == [42]
 
@@ -349,21 +381,73 @@ async def test_cron_tick_drains_when_in_budget(tmp_path: Path) -> None:
 # --- bind_adhoc_drain ------------------------------------------------------------
 
 
+def _bind_test_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    governor: BudgetGovernor,
+    listed: list[str],
+    built: list[object],
+) -> Callable[..., Awaitable[None]]:
+    """Bind the production ad-hoc drain over patched leaf seams for the tests below.
+
+    The production bind constructs the gh seam and the build+PR primitive itself, so the
+    module seams are patched (one scripted ready issue, a recording build) and a fake
+    pipeline factory stands in for the worker's; everything between — token mint, ranking,
+    metering, the per-repo lock — runs for real.
+    """
+    import retinue.adhoc_drain as adhoc_drain_mod
+    import retinue.pipeline as pipeline_mod
+    from retinue.adhoc_drain import ReadyIssue
+
+    class _FakeAdhocGhCli:
+        def __init__(self, *, token: str) -> None:
+            self.token = token
+
+        async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
+            listed.append(repo_full_name)
+            return [ReadyIssue(number=7, labels=["ready-for-agent"], body="")]
+
+        async def flight_state(
+            self, *, repo_full_name: str, issue_number: int
+        ) -> FlightState:
+            return FlightState.ABSENT
+
+    monkeypatch.setattr(adhoc_drain_mod, "GhCli", _FakeAdhocGhCli)
+
+    def _fake_bind_adhoc_build(
+        settings: object, auth: object, **kwargs: object
+    ) -> object:
+        async def build(issue: object, *, repo_full_name: str) -> None:
+            built.append(issue)
+
+        return build
+
+    monkeypatch.setattr(pipeline_mod, "bind_adhoc_build", _fake_bind_adhoc_build)
+
+    async def pipeline_factory(repo_full_name: str, config: RepoConfig) -> object:
+        return object()
+
+    return bind_adhoc_drain(
+        cast(Settings, object()),
+        cast(InstallationAuth, _NoAuth()),
+        governor=governor,
+        pipeline_factory=cast(PipelineFactory, pipeline_factory),
+        fetch_claude_md=_canned_claude_md,
+    )
+
+
 @pytest.mark.asyncio
 async def test_adhoc_drain_drives_run_adhoc_drain_with_its_collaborators(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The bound drain drives ``run_adhoc_drain`` over exactly the wired collaborators.
 
-    Binds the ad-hoc drain with a fake gh seam (one scripted ready issue), a recording
-    build, the shared service-level governor, and a real single-run lock, then fires the
-    returned ``(*, repo_full_name, config)`` callable. The scripted issue must reach the
-    recording build (the gh seam was listed, the issue ranked + built), the lock must have
-    been entered, and the governor must have metered the build against the shared cap.
+    Fires the returned ``(*, repo_full_name, config)`` callable over the patched leaf
+    seams. The scripted issue must reach the recording build (the gh seam was listed,
+    the issue ranked + built) and the shared governor must have metered the drain's
+    flat per-build charge against the shared cap.
     """
-    from retinue.adhoc_build import AdhocIssue
-    from retinue.adhoc_drain import ReadyIssue
-
     clock = _Clock()
     ledger = BudgetLedger(
         tmp_path / "budget.sqlite3",
@@ -372,103 +456,42 @@ async def test_adhoc_drain_drives_run_adhoc_drain_with_its_collaborators(
         weekly_budget=1000.0,
     )
     governor = BudgetGovernor(ledger)
-    gh = _FakeAdhocGh([ReadyIssue(number=7, labels=["ready-for-agent"], body="")])
-    built: list[AdhocIssue] = []
-
-    async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
-        built.append(issue)
-
-    lock = _AdhocLock()
-    drain = bind_adhoc_drain(
-        gh=cast(AdhocGh, gh),
-        build=build,
-        open_pr=_noop_open_pr,
-        governor=governor,
-        estimated_amount=3.0,
-        lock=lock,
+    listed: list[str] = []
+    built: list[object] = []
+    drain = _bind_test_drain(
+        tmp_path, monkeypatch, governor=governor, listed=listed, built=built
     )
 
     await drain(repo_full_name="owner/repo", config=_config())
 
     # The gh seam was queried for the repo, the scripted issue reached the build, and the
-    # lock was entered+exited (single-run guard wired).
-    assert gh.calls == ["owner/repo"]
-    assert [issue.issue_number for issue in built] == [7]
-    assert lock.entered == 1
-    assert lock.exited == 1
-    # The governor metered the build's charge against the shared rolling-24h ledger.
-    assert await ledger.trailing_24h_spend() == 3.0
+    # governor metered the flat per-build charge against the shared rolling-24h ledger.
+    assert listed == ["owner/repo"]
+    assert [issue.issue_number for issue in built] == [7]  # type: ignore[attr-defined]
+    assert await ledger.trailing_24h_spend() == ADHOC_DRAIN_ESTIMATED_AMOUNT
 
 
 @pytest.mark.asyncio
 async def test_adhoc_drain_skips_the_build_when_the_shared_budget_is_spent(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A drain whose shared cap is spent meters every issue away — nothing builds.
 
     Proves the *shared governor* is the one the bound drain meters through: a zero-cap
-    ledger declines the metered charge, so the recording build is never called even though
-    the gh seam listed a ready issue and the lock was entered.
+    ledger declines the metered charge, so the recording build is never called even
+    though the gh seam listed a ready issue.
     """
-    from retinue.adhoc_build import AdhocIssue
-    from retinue.adhoc_drain import ReadyIssue
-
     clock = _Clock()
-    governor = _governor(tmp_path, clock, weekly=1.0)  # cap 0.12 < the 1.0 estimate -> declined
-    gh = _FakeAdhocGh([ReadyIssue(number=7, labels=["ready-for-agent"], body="")])
-    built: list[AdhocIssue] = []
-
-    async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
-        built.append(issue)
-
-    drain = bind_adhoc_drain(
-        gh=cast(AdhocGh, gh),
-        build=build,
-        open_pr=_noop_open_pr,
-        governor=governor,
-        estimated_amount=1.0,
-        lock=_AdhocLock(),
+    # cap 0.12 < the flat 1.0 per-build estimate -> declined
+    governor = _governor(tmp_path, clock, weekly=1.0)
+    built: list[object] = []
+    drain = _bind_test_drain(
+        tmp_path, monkeypatch, governor=governor, listed=[], built=built
     )
 
     await drain(repo_full_name="owner/repo", config=_config())
 
     assert built == []
-
-
-@dataclass
-class _FakeAdhocGh:
-    """An in-memory ``AdhocGh``: lists the scripted ready issues, none in flight."""
-
-    issues: list[object]
-    calls: list[str] = field(default_factory=list)
-
-    async def list_ready(self, *, repo_full_name: str) -> list[object]:
-        self.calls.append(repo_full_name)
-        return list(self.issues)
-
-    async def flight_state(
-        self, *, repo_full_name: str, issue_number: int
-    ) -> FlightState:
-        return FlightState.ABSENT
-
-
-async def _noop_open_pr(issue: object, *, repo_full_name: str) -> None:
-    """The PR-open-only recovery seam; never reached when no issue is stranded."""
-
-
-class _AdhocLock:
-    """A recording single-run lock proving the drain entered+exited it once."""
-
-    def __init__(self) -> None:
-        self.entered = 0
-        self.exited = 0
-
-    async def __aenter__(self) -> _AdhocLock:
-        self.entered += 1
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        self.exited += 1
 
 
 # --- inert collaborators ---------------------------------------------------------
@@ -487,6 +510,11 @@ class _NoAuth:
 
 
 _CLAUDE_MD = "## Definition of done\n```\nuv run pytest\n```\n"
+
+
+async def _canned_claude_md(repo_full_name: str) -> str:
+    """The lane binds' ``fetch_claude_md`` seam: canned text, no contents-API read."""
+    return _CLAUDE_MD
 
 
 class _RedContainer:
@@ -521,19 +549,3 @@ async def _no_secret(ref: str) -> str | None:
 
 async def _no_report(report: object) -> None:
     return None
-
-
-@dataclass
-class _FakeCronGh:
-    issues: list[object]
-
-    async def list_backlog(self, *, repo_full_name: str) -> list[object]:
-        return list(self.issues)
-
-
-class _Lock:
-    async def __aenter__(self) -> _Lock:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        return None

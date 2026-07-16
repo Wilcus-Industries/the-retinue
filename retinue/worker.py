@@ -23,14 +23,16 @@ from typing import Any
 import httpx
 from arq import cron
 from arq.connections import RedisSettings
-from arq.worker import Retry
+from arq.worker import Retry, run_worker
 from arq.worker import func as arq_func
 
-from retinue.budget import SystemClock
-from retinue.cron import CronTickResult
+import retinue.github_app as github_app
+from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
+from retinue.config import Settings
 from retinue.dedupe import PrdDedupeStore, prd_dedupe_key
 from retinue.github_app import (
     InstallationAuth,
+    InstalledRepos,
     github_claude_md_fetcher,
     github_config_fetcher,
     github_issue_body_fetcher,
@@ -38,21 +40,20 @@ from retinue.github_app import (
 from retinue.handoff import MergedPullRequest
 from retinue.heartbeat import (
     DueRepo,
-    HeartbeatCronTick,
     HeartbeatDrain,
     RepoEnumerator,
     heartbeat_tick,
 )
 from retinue.loopback import parse_heimdall_review, round_key
 from retinue.pipeline import (
-    ClaudeMdFetcher,
-    Pipeline,
+    PipelineFactory,
     build_pipeline_factory,
     run_state_store_path,
 )
 from retinue.queue import RESUME_ROUND_TASK, RESUME_ROUNDS_TASK, PrdJob
 from retinue.reconcile import RunStateStore
 from retinue.repo_config import RepoConfig, load_repo_config
+from retinue.wiring import bind_adhoc_drain, bind_cron_tick
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +62,6 @@ logger = logging.getLogger(__name__)
 # gate is testable without network;
 # :func:`retinue.github_app.github_config_fetcher` builds the real one.
 ConfigFetcher = Callable[[str], Awaitable[str | None]]
-
-# Builds a :class:`~retinue.pipeline.Pipeline` for an accepted repo. Async so the
-# production factory can mint a per-repo installation token before constructing the gh
-# adapters. Injected onto the Arq context by :func:`on_startup` so the worker tasks stay
-# testable with a fake factory; production binds it to a factory over the real adapters.
-PipelineFactory = Callable[[str, RepoConfig], Awaitable[Pipeline]]
 
 # Async callable returning a PRD/issue body text given (repo, issue number). The gh
 # issue read the slicer needs, injected so the worker is testable without a live gh.
@@ -633,8 +628,21 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     else:
         auth, client = wiring
         fetch_claude_md = github_claude_md_fetcher(auth, client)
+        # The ONE service-level budget governor: the pipeline factory's build gate, the
+        # ad-hoc drain, and the cron tick all meter this same instance, so every lane
+        # charges one shared rolling-24h ledger over ``settings.budget_db_path``.
+        governor = BudgetGovernor(
+            BudgetLedger(
+                settings.budget_db_path,
+                clock=SystemClock(),
+                auth_mode=AuthMode.from_config(settings.auth_mode),
+                weekly_budget=settings.weekly_budget,
+                daily_cap_fraction=settings.budget_daily_cap_fraction,
+            )
+        )
+        ctx["governor"] = governor
         pipeline_factory = build_pipeline_factory(
-            settings, auth, fetch_claude_md=fetch_claude_md
+            settings, auth, governor=governor, fetch_claude_md=fetch_claude_md
         )
         ctx["github_client"] = client
         ctx["fetch_config"] = github_config_fetcher(auth, client)
@@ -644,9 +652,10 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         # from ctx; bind it here so a kick on a deployed worker actually drains. The
         # heartbeat's safety-net sweep fires this *same* bound drain (below) so a kick and a
         # sweep are identical work under one single-run lock.
-        adhoc_drain = _bind_adhoc_drain(
+        adhoc_drain = bind_adhoc_drain(
             settings,
             auth,
+            governor=governor,
             pipeline_factory=pipeline_factory,
             fetch_claude_md=fetch_claude_md,
         )
@@ -661,10 +670,10 @@ async def on_startup(ctx: dict[str, Any]) -> None:
             auth, fetch_config=ctx["fetch_config"]
         )
         ctx["heartbeat_drain"] = adhoc_drain
-        ctx["heartbeat_cron_tick"] = _bind_heartbeat_cron_tick(
+        ctx["heartbeat_cron_tick"] = bind_cron_tick(
             settings,
             auth,
-            pipeline_factory=pipeline_factory,
+            governor=governor,
             fetch_claude_md=fetch_claude_md,
         )
         # Crash-resume: install the run-state store the sweep enumerates (the same file
@@ -682,82 +691,6 @@ async def on_startup(ctx: dict[str, Any]) -> None:
                 "No redis on the worker context; the resume sweep was not enqueued"
             )
     ctx["dedupe"] = PrdDedupeStore(settings.dedupe_db_path)
-
-
-def _bind_adhoc_drain(
-    settings: Any,
-    auth: InstallationAuth,
-    *,
-    pipeline_factory: PipelineFactory,
-    fetch_claude_md: ClaudeMdFetcher,
-) -> HeartbeatDrain:
-    """Bind the production ad-hoc drain to a ``(*, repo_full_name, config)`` callable.
-
-    The webhook's kick (:func:`run_adhoc_drain_job`) and — once issue #43 wires it — the
-    heartbeat's sweep both fire the drain through this one seam, so they are the *same* work
-    under one single-run lock. The shared collaborators are built once: the service-level
-    :class:`~retinue.budget.BudgetGovernor` over ``settings.budget_db_path`` (the *same*
-    durable rolling-24h ledger the PRD and cron lanes meter, so the budget is one window) and
-    a per-repo single-run lock registry, so two repos drain concurrently while a repo's own
-    kicked and swept drains serialize.
-
-    Each call mints a per-repo installation token, then constructs the per-repo gh seam
-    (:class:`retinue.adhoc_drain.GhCli`), reuses the worker's ``pipeline_factory`` to build
-    the repo's pipeline (its ``process_adhoc_pr`` opens the PR), binds the real ad-hoc
-    build+PR primitive (:func:`retinue.pipeline.bind_adhoc_build`) and the PR-open-only
-    stranded-branch recovery (:func:`retinue.pipeline.bind_adhoc_pr_open`), and drives
-    :func:`retinue.adhoc_drain.run_adhoc_drain` via :func:`retinue.wiring.bind_adhoc_drain`.
-
-    Args:
-        settings: The runtime settings carrying the budget + Anthropic config.
-        auth: The GitHub App installation auth used to mint per-repo tokens.
-        pipeline_factory: The worker's pipeline factory, reused so the ad-hoc PR step rides
-            the same per-repo pipeline the PRD lane builds.
-        fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
-
-    Returns:
-        The bound drain — an async ``(*, repo_full_name, config) -> None``.
-    """
-    from retinue.adhoc_drain import AdhocDrainLock, GhCli
-    from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
-    from retinue.pipeline import bind_adhoc_build, bind_adhoc_pr_open
-    from retinue.wiring import bind_adhoc_drain
-
-    governor = BudgetGovernor(
-        BudgetLedger(
-            settings.budget_db_path,
-            clock=SystemClock(),
-            auth_mode=AuthMode.from_config(settings.auth_mode),
-            weekly_budget=settings.weekly_budget,
-            daily_cap_fraction=settings.budget_daily_cap_fraction,
-        )
-    )
-    locks: dict[str, AdhocDrainLock] = {}
-
-    async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
-        token = (await auth.installation_token(repo_full_name)).token
-        gh = GhCli(token=token)
-        pipeline = await pipeline_factory(repo_full_name, config)
-        build = bind_adhoc_build(
-            settings,
-            auth,
-            pipeline=pipeline,
-            repo_full_name=repo_full_name,
-            token=token,
-            config=config,
-            claude_md=await fetch_claude_md(repo_full_name),
-        )
-        bound = bind_adhoc_drain(
-            gh=gh,
-            build=build,
-            open_pr=bind_adhoc_pr_open(pipeline),
-            governor=governor,
-            estimated_amount=_ADHOC_DRAIN_ESTIMATED_AMOUNT,
-            lock=locks.setdefault(repo_full_name, AdhocDrainLock()),
-        )
-        await bound(repo_full_name=repo_full_name, config=config)
-
-    return drain
 
 
 def _bind_heartbeat_enumerate(
@@ -779,11 +712,10 @@ def _bind_heartbeat_enumerate(
     """
 
     async def enumerate_repos() -> list[DueRepo]:
-        list_repos = getattr(auth, "installed_repositories", None)
-        if list_repos is None:
+        if not isinstance(auth, InstalledRepos):
             return []
         due: list[DueRepo] = []
-        for repo_full_name in await list_repos():
+        for repo_full_name in await auth.installed_repositories():
             raw = await fetch_config(repo_full_name)
             if raw is None:
                 continue
@@ -794,91 +726,6 @@ def _bind_heartbeat_enumerate(
         return due
 
     return enumerate_repos
-
-
-def _bind_heartbeat_cron_tick(
-    settings: Any,
-    auth: InstallationAuth,
-    *,
-    pipeline_factory: PipelineFactory,
-    fetch_claude_md: ClaudeMdFetcher,
-) -> HeartbeatCronTick:
-    """Bind the heartbeat's backlog cron tick to ``run_cron_tick`` over the real adapters.
-
-    Returns an async ``(*, repo_full_name, tick_number) -> CronTickResult`` — the
-    :data:`retinue.heartbeat.HeartbeatCronTick` shape — that drives one repo's backlog lane
-    through :func:`retinue.wiring.bind_cron_tick`. The shared collaborators are built once:
-    the service-level :class:`~retinue.budget.BudgetGovernor` over ``settings.budget_db_path``
-    (the *same* durable rolling-24h ledger the PRD and ad-hoc lanes meter, so the budget is
-    one window) and a per-repo single-run lock registry, so two repos tick concurrently while
-    a repo's own ticks serialize.
-
-    Each call mints a per-repo installation token, constructs the per-repo backlog gh seam
-    (:class:`retinue.cron.GhCli`) and the cron build (:class:`retinue.cron.SliceBuilder`
-    over the same orchestrator adapters the PRD lane builds), binds them through
-    :func:`retinue.wiring.bind_cron_tick`, and runs one tick. The heartbeat owns the
-    per-tick estimate (the flat per-build charge), so the bound callable supplies it.
-
-    Args:
-        settings: The runtime settings carrying the budget + Anthropic config.
-        auth: The GitHub App installation auth used to mint per-repo tokens.
-        pipeline_factory: The worker's pipeline factory (accepted for symmetry with the
-            other binders; the cron build assembles its own orchestrator adapters).
-        fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
-
-    Returns:
-        The bound cron tick — an async ``(*, repo_full_name, tick_number) -> CronTickResult``.
-    """
-    from contextlib import AbstractAsyncContextManager
-
-    from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
-    from retinue.cron import CronLock, GhCli
-    from retinue.pipeline import build_cron_slice_builder
-    from retinue.wiring import bind_cron_tick
-
-    governor = BudgetGovernor(
-        BudgetLedger(
-            settings.budget_db_path,
-            clock=SystemClock(),
-            auth_mode=AuthMode.from_config(settings.auth_mode),
-            weekly_budget=settings.weekly_budget,
-            daily_cap_fraction=settings.budget_daily_cap_fraction,
-        )
-    )
-    locks: dict[str, AbstractAsyncContextManager[object]] = {}
-
-    async def cron_tick(
-        *, repo_full_name: str, tick_number: int
-    ) -> CronTickResult:
-        token = (await auth.installation_token(repo_full_name)).token
-        gh = GhCli(token=token)
-        build = await build_cron_slice_builder(
-            settings,
-            auth,
-            repo_full_name=repo_full_name,
-            token=token,
-            fetch_claude_md=fetch_claude_md,
-        )
-        bound = bind_cron_tick(
-            gh=gh,
-            governor=governor,
-            clock=SystemClock(),
-            build=build,
-            lock=locks.setdefault(repo_full_name, CronLock()),
-        )
-        return await bound(
-            repo_full_name=repo_full_name,
-            tick_number=tick_number,
-            estimated_amount=_ADHOC_DRAIN_ESTIMATED_AMOUNT,
-        )
-
-    return cron_tick
-
-
-# The flat per-build charge the ad-hoc drain meters against the shared rolling-24h cap,
-# matching the PRD lane's estimate (:data:`retinue.pipeline._BUILD_ESTIMATED_AMOUNT`); a
-# build that would cross the cap is skipped so the one shared budget is never overshot.
-_ADHOC_DRAIN_ESTIMATED_AMOUNT = 1.0
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
@@ -913,12 +760,10 @@ def _load_github_client() -> tuple[InstallationAuth, httpx.AsyncClient] | None:
     :class:`~retinue.github_app.InstallationAuthError` because the GitHub App is not yet
     configured (no ``github_app_id`` / private-key path). A deploy with only
     ``WEBHOOK_SECRET`` set must boot and log SKIPs (see DEPLOY.md), so an unconfigured App
-    is graceful degradation, not a startup failure. Resolved lazily so registering the
-    task (e.g. in tests) needs no GitHub App credentials and opens no network client at
-    import time.
+    is graceful degradation, not a startup failure. The builder is invoked lazily, per
+    startup, so registering the task (e.g. in tests) needs no GitHub App credentials and
+    opens no network client at import time.
     """
-    import retinue.github_app as github_app
-
     builder = getattr(github_app, "build_installation_auth", None)
     if builder is None:
         return None
@@ -929,14 +774,12 @@ def _load_github_client() -> tuple[InstallationAuth, httpx.AsyncClient] | None:
     return auth, httpx.AsyncClient(timeout=30.0)
 
 
-# Module-level settings, loaded lazily in main() so importing this module does
+# Module-level settings, instantiated lazily in main() so importing this module does
 # not require the env vars to be present (e.g. when registering the task in tests).
 settings: Any = None
 
 
 def _load_settings() -> Any:
-    from retinue.config import Settings
-
     return Settings()  # type: ignore[call-arg]
 
 
@@ -947,8 +790,6 @@ def main() -> None:
     here, at process start: arq reads that class attribute when it constructs the
     Worker, before ``on_startup`` runs, so the override must be applied now.
     """
-    from arq.worker import run_worker
-
     _configure_logging()
 
     global settings

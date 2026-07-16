@@ -1,8 +1,7 @@
-"""Production wiring for the orchestrator build + cron lanes (the budget/triage glue).
+"""Production wiring for the retinue's lanes (the budget/triage glue).
 
-Two bindings live here, each taking the implementer-spawn seam as their one injected
-dependency (the Agent-SDK subagent is owned by a separate layer) and wiring every other
-collaborator to its real adapter:
+One binding per lane lives here — the composition root between the worker's startup and
+the lanes' pure drivers — each wiring its lane's collaborators to their real adapters:
 
 * :func:`bind_build_prd` — the orchestrator build lane. It gates the run on the shared
   :class:`retinue.budget.BudgetGovernor` (deferring a run whose estimate would start it
@@ -13,9 +12,13 @@ collaborator to its real adapter:
 * :func:`bind_cron_tick` — the cron backlog lane. It binds :func:`retinue.cron.run_cron_tick`
   to its real collaborators (the gh backlog query, the shared governor, the clock, the
   single-run lock, and the downstream build) so a scheduled tick drains one backlog issue.
+* :func:`bind_adhoc_drain` — the ad-hoc lane. It binds
+  :func:`retinue.adhoc_drain.run_adhoc_drain` to the per-repo gh seam, the real build+PR
+  primitive, and the single-run lock, behind one ``(*, repo_full_name, config)`` callable
+  the webhook kick and the heartbeat sweep both fire.
 
-The budget gate is enforced through the governor passed in, which the cron lane and the
-build lane share — one service-level governor across both.
+The budget gate is enforced through the governor passed in — the one service-level
+governor the worker's startup constructs, shared across every lane.
 """
 
 from __future__ import annotations
@@ -26,15 +29,20 @@ from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from retinue.adhoc_drain import AdhocBuild, AdhocGh, AdhocPrOpen, run_adhoc_drain
-from retinue.budget import BudgetGovernor, Clock
+from retinue.adhoc_drain import AdhocDrainLock, run_adhoc_drain
+from retinue.budget import (
+    ADHOC_DRAIN_ESTIMATED_AMOUNT,
+    BudgetGovernor,
+    SystemClock,
+)
 from retinue.container import Container, ContainerRuntime
 from retinue.container_build import Implementer, Slice
-from retinue.cron import CronBuild, CronGh, CronTickResult, run_cron_tick
+from retinue.cron import CronLock, CronTickResult, run_cron_tick
 from retinue.done_check import ReportSink, SecretResolver
 from retinue.github_app import InstallationAuth
+from retinue.heartbeat import HeartbeatCronTick, HeartbeatDrain
 from retinue.impl_retry import ImplRetryStore
 from retinue.notify import Notifier
 from retinue.orchestrator import (
@@ -56,6 +64,10 @@ from retinue.routing import PerIssueImplementer
 from retinue.slicer import IssueCreator
 from retinue.triage import TriageImplementer, triage_implementer
 from retinue.vocab import issue_branch
+
+if TYPE_CHECKING:
+    from retinue.config import Settings
+    from retinue.pipeline import ClaudeMdFetcher, PipelineFactory
 
 logger = logging.getLogger(__name__)
 
@@ -348,103 +360,151 @@ class _TriagingImplementer:
 
 
 def bind_cron_tick(
+    settings: Settings,
+    auth: InstallationAuth,
     *,
-    gh: CronGh,
     governor: BudgetGovernor,
-    clock: Clock,
-    build: CronBuild,
-    lock: AbstractAsyncContextManager[object],
+    fetch_claude_md: ClaudeMdFetcher,
     quota_every: int = 5,
-) -> Callable[..., Awaitable[CronTickResult]]:
-    """Bind the cron backlog-drain tick to its real collaborators.
+) -> HeartbeatCronTick:
+    """Bind the heartbeat's backlog cron tick to ``run_cron_tick`` over the real adapters.
 
-    Returns an async ``(repo_full_name, tick_number, estimated_amount) -> CronTickResult``
-    that drives :func:`retinue.cron.run_cron_tick`: gate on the shared ``governor``, pick
-    the next backlog issue by weighted score (or the quota floor on every Nth tick), and
-    run its downstream ``build``. The governor is the *same* service-level governor the
-    orchestrator build lane shares, so both lanes meter against one rolling-24h window.
+    Returns an async ``(*, repo_full_name, tick_number) -> CronTickResult`` — the
+    :data:`retinue.heartbeat.HeartbeatCronTick` shape — that drives one repo's backlog
+    lane through :func:`retinue.cron.run_cron_tick`: gate on the shared ``governor``,
+    pick the next backlog issue by weighted score (or the quota floor on every Nth
+    tick), and run its downstream build. The governor is the *same* service-level
+    governor the orchestrator and ad-hoc lanes meter, so the budget is one rolling-24h
+    window; a per-repo single-run lock registry lets two repos tick concurrently while a
+    repo's own ticks serialize.
+
+    Each call mints a per-repo installation token, constructs the per-repo backlog gh
+    seam (:class:`retinue.cron.GhCli`) and the cron build (:class:`retinue.cron.SliceBuilder`
+    over the same orchestrator adapters the PRD lane builds), and runs one tick. The
+    heartbeat owns the per-tick estimate (the flat per-build charge), so the bound
+    callable supplies it.
 
     Args:
-        gh: The backlog gh seam (lists ``backlog`` issues with labels + ages).
+        settings: The runtime settings carrying the Anthropic config.
+        auth: The GitHub App installation auth used to mint per-repo tokens.
         governor: The shared service-level budget governor.
-        clock: The injected time source for age-weighting.
-        build: The downstream build chain run for the picked issue.
-        lock: The single-run lock (raises when a tick is already in flight).
+        fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
         quota_every: Take the oldest low-priority issue on every Nth tick.
 
     Returns:
-        An async cron-tick callable returning a :class:`retinue.cron.CronTickResult`.
+        The bound cron tick — an async ``(*, repo_full_name, tick_number) -> CronTickResult``.
     """
+    # Deferred: retinue.pipeline imports this module (bind_build_prd et al.), so a
+    # module-level import of the cron builder would be a cycle. GhCli is resolved at
+    # bind time for the same reason worker startup runs late: it keeps the gh seam a
+    # monkeypatchable module attribute (tests patch retinue.cron.GhCli before startup).
+    from retinue.cron import GhCli
+    from retinue.pipeline import build_cron_slice_builder
 
-    async def tick(
-        *, repo_full_name: str, tick_number: int, estimated_amount: float
+    locks: dict[str, AbstractAsyncContextManager[object]] = {}
+
+    async def cron_tick(
+        *, repo_full_name: str, tick_number: int
     ) -> CronTickResult:
+        token = (await auth.installation_token(repo_full_name)).token
+        gh = GhCli(token=token)
+        build = await build_cron_slice_builder(
+            settings,
+            auth,
+            repo_full_name=repo_full_name,
+            token=token,
+            fetch_claude_md=fetch_claude_md,
+        )
         return await run_cron_tick(
             repo_full_name=repo_full_name,
             gh=gh,
             governor=governor,
-            clock=clock,
+            clock=SystemClock(),
             build=build,
             tick_number=tick_number,
-            estimated_amount=estimated_amount,
-            lock=lock,
+            estimated_amount=ADHOC_DRAIN_ESTIMATED_AMOUNT,
+            lock=locks.setdefault(repo_full_name, CronLock()),
             quota_every=quota_every,
         )
 
-    return tick
+    return cron_tick
 
 
 def bind_adhoc_drain(
+    settings: Settings,
+    auth: InstallationAuth,
     *,
-    gh: AdhocGh,
-    build: AdhocBuild,
-    open_pr: AdhocPrOpen,
     governor: BudgetGovernor,
-    estimated_amount: float,
-    lock: AbstractAsyncContextManager[object],
-) -> Callable[..., Awaitable[None]]:
-    """Bind the ad-hoc drain to its real collaborators behind one ``(repo, config)`` callable.
+    pipeline_factory: PipelineFactory,
+    fetch_claude_md: ClaudeMdFetcher,
+) -> HeartbeatDrain:
+    """Bind the production ad-hoc drain to a ``(*, repo_full_name, config)`` callable.
 
     Returns an async ``(*, repo_full_name, config) -> None`` — the
     :data:`retinue.heartbeat.HeartbeatDrain` shape — that drives
-    :func:`retinue.adhoc_drain.run_adhoc_drain` with the gh seam, the per-issue build, the
-    shared service-level governor, and the single-run lock already bound. The two callers of
-    the bound drain fire the *same* drain: the webhook's low-latency ad-hoc kick
+    :func:`retinue.adhoc_drain.run_adhoc_drain`. The two callers of the bound drain fire
+    the *same* drain: the webhook's low-latency ad-hoc kick
     (:func:`retinue.worker.run_adhoc_drain_job`) and the heartbeat's safety-net sweep
-    (issue #43 wires the heartbeat's ``drain`` to this same seam), so a kicked drain and a
-    swept drain are identical work under one single-run lock.
+    (issue #43 wires the heartbeat's ``drain`` to this same seam), so a kicked drain and
+    a swept drain are identical work under one single-run lock. The per-repo lock
+    registry lets two repos drain concurrently while a repo's own kicked and swept
+    drains serialize.
 
-    The governor is the *same* service-level governor the orchestrator and cron lanes share,
-    so every ad-hoc build meters against the one rolling-24h window. ``prd_in_flight`` is left
-    at the drain's default (False): the kick path has no live PRD-build signal to thread, so
-    the drain ranks and builds every ad-hoc issue rather than deferring to a PRD it cannot
-    observe — PRD-first preemption stays a heartbeat-side refinement.
+    Each call mints a per-repo installation token, then constructs the per-repo gh seam
+    (:class:`retinue.adhoc_drain.GhCli`), reuses the worker's ``pipeline_factory`` to
+    build the repo's pipeline (its ``process_adhoc_pr`` opens the PR), and binds the real
+    ad-hoc build+PR primitive (:func:`retinue.pipeline.bind_adhoc_build`) and the
+    PR-open-only stranded-branch recovery (:func:`retinue.pipeline.bind_adhoc_pr_open`).
+
+    The governor is the *same* service-level governor the orchestrator and cron lanes
+    share, so every ad-hoc build meters against the one rolling-24h window.
+    ``prd_in_flight`` is left at the drain's default (False): the kick path has no live
+    PRD-build signal to thread, so the drain ranks and builds every ad-hoc issue rather
+    than deferring to a PRD it cannot observe — PRD-first preemption stays a
+    heartbeat-side refinement.
 
     Args:
-        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues; answers the flight-state
-            classification query).
-        build: The downstream ad-hoc build+PR primitive run per buildable issue.
-        open_pr: The PR-open-only recovery run per stranded issue (a green branch with no
-            PR), opening its PR without a rebuild.
+        settings: The runtime settings carrying the Anthropic config.
+        auth: The GitHub App installation auth used to mint per-repo tokens.
         governor: The shared service-level budget governor each build meters through.
-        estimated_amount: The per-build charge metered against the shared cap.
-        lock: The single-run lock; a second concurrent drain for the repo raises
-            :class:`retinue.adhoc_drain.AdhocDrainBusyError`.
+        pipeline_factory: The worker's pipeline factory, reused so the ad-hoc PR step
+            rides the same per-repo pipeline the PRD lane builds.
+        fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
 
     Returns:
-        An async drain callable taking ``repo_full_name`` and the repo's ``config``.
+        The bound drain — an async ``(*, repo_full_name, config) -> None``.
     """
+    # Deferred: retinue.pipeline imports this module (bind_build_prd et al.), so a
+    # module-level import of its ad-hoc binders would be a cycle. GhCli is resolved at
+    # bind time to keep the gh seam a monkeypatchable module attribute (tests patch
+    # retinue.adhoc_drain.GhCli / retinue.pipeline.bind_adhoc_build before startup).
+    from retinue.adhoc_drain import GhCli
+    from retinue.pipeline import bind_adhoc_build, bind_adhoc_pr_open
+
+    locks: dict[str, AdhocDrainLock] = {}
 
     async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
+        token = (await auth.installation_token(repo_full_name)).token
+        gh = GhCli(token=token)
+        pipeline = await pipeline_factory(repo_full_name, config)
+        build = bind_adhoc_build(
+            settings,
+            auth,
+            pipeline=pipeline,
+            repo_full_name=repo_full_name,
+            token=token,
+            config=config,
+            claude_md=await fetch_claude_md(repo_full_name),
+        )
         await run_adhoc_drain(
             repo_full_name=repo_full_name,
             gh=gh,
             build=build,
-            open_pr=open_pr,
+            open_pr=bind_adhoc_pr_open(pipeline),
             config=config,
             governor=governor,
-            estimated_amount=estimated_amount,
-            lock=lock,
+            estimated_amount=ADHOC_DRAIN_ESTIMATED_AMOUNT,
+            lock=locks.setdefault(repo_full_name, AdhocDrainLock()),
         )
 
     return drain

@@ -683,7 +683,7 @@ def test_main_drives_job_timeout_from_settings(
         job_timeout_seconds = 1234
 
     monkeypatch.setattr(worker, "settings", _FakeSettings())
-    monkeypatch.setattr("arq.worker.run_worker", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "run_worker", lambda *a, **k: None)
     monkeypatch.setattr(worker, "_configure_logging", lambda: None)
 
     worker.main()
@@ -948,9 +948,9 @@ async def test_on_startup_adhoc_drain_drives_one_issue_to_the_pipeline(
     Extends the live-wiring path by *invoking* the bound drain (not merely asserting it is
     callable): a fake gh seam lists one ready issue, and the ad-hoc build (faked to avoid a
     container) drives the per-repo pipeline's ``process_adhoc_pr``. This proves
-    ``_bind_adhoc_drain`` wires the per-repo lock registry + shared governor and threads the
-    factory-built pipeline into ``bind_adhoc_build`` — the whole assembly runs end to end
-    with no Docker, gh, model, or network.
+    ``wiring.bind_adhoc_drain`` wires the per-repo lock registry + shared governor and
+    threads the factory-built pipeline into ``bind_adhoc_build`` — the whole assembly runs
+    end to end with no Docker, gh, model, or network.
     """
     import retinue.adhoc_drain as adhoc_drain_mod
     import retinue.pipeline as pipeline_mod
