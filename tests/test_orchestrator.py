@@ -11,7 +11,6 @@ A green done-check merges ``issue-<N>`` into the integration branch ``retinue/pr
 
 from __future__ import annotations
 
-import base64
 import logging
 from collections.abc import Mapping
 
@@ -19,6 +18,12 @@ import pytest
 
 from retinue.classifier import ClassifyInput
 from retinue.container import Container, RunResult
+from retinue.container_build import (
+    GitOpsError,
+    Implementer,
+    ImplementError,
+    Slice,
+)
 from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
     _DEFAULT_IMPLEMENT_MAX_TURNS,
@@ -27,16 +32,10 @@ from retinue.orchestrator import (
     BuildResult,
     ContainerGitOps,
     ContainerImplementer,
-    GitOpsError,
-    Implementer,
-    ImplementError,
     MergeConflict,
-    Slice,
     _claude_argv,
     _claude_result_is_error,
-    _implement_env,
     _implement_prompt,
-    _write_file_command,
     build_slice,
     integration_branch,
 )
@@ -642,17 +641,6 @@ async def test_round_diff_empty_when_no_branches_merged() -> None:
     assert container.commands == []
 
 
-def test_write_file_command_round_trips_arbitrary_content() -> None:
-    """The write-file argv carries content base64-encoded as a positional arg, byte-exact."""
-    content = '<<<<<<< ours\n"x" & $y\n=======\nz\n>>>>>>> theirs\n'
-    argv = _write_file_command("dir/f.py", content)
-
-    # No shell interpolation: the body is a base64 positional arg, the path another.
-    assert argv[0] == "sh" and argv[-1] == "dir/f.py"
-    blob = argv[-2]
-    assert base64.b64decode(blob).decode() == content
-
-
 # --- real container-exec implementer ---------------------------------------------
 #
 # Exercises the production ContainerImplementer's pure parts (prompt assembly, env-routed
@@ -707,22 +695,6 @@ def test_implement_prompt_without_facts_carries_no_issue_section() -> None:
 
     assert "Issue title:" not in prompt
     assert "Issue body:" not in prompt
-
-
-def test_implement_env_api_key_mode_uses_anthropic_api_key() -> None:
-    """api_key mode threads the credential to the CLI as ANTHROPIC_API_KEY."""
-    env = _implement_env("sk-ant-api03-secret", "api_key")
-
-    assert env == {"ANTHROPIC_API_KEY": "sk-ant-api03-secret"}
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
-
-
-def test_implement_env_subscription_mode_uses_oauth_token() -> None:
-    """subscription mode threads the credential as CLAUDE_CODE_OAUTH_TOKEN."""
-    env = _implement_env("sk-ant-oat01-secret", "subscription")
-
-    assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-secret"}
-    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_claude_argv_assembles_headless_invocation() -> None:

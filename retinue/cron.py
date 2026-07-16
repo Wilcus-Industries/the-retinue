@@ -38,14 +38,13 @@ from typing import Protocol
 
 from retinue.budget import BudgetGovernor, Clock
 from retinue.container import ContainerRuntime
+from retinue.container_build import Implementer, Slice
 from retinue.done_check import DEFAULT_IMAGE, ReportSink, SecretResolver
 from retinue.gh import GhBytesRunner, auth_env, parse_json_array, run_gh_subprocess
 from retinue.github_app import InstallationAuth
 from retinue.orchestrator import (
     BuildResult,
     GitOps,
-    Implementer,
-    Slice,
     build_slice,
 )
 from retinue.repo_config import RepoConfig

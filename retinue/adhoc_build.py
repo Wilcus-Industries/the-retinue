@@ -17,7 +17,9 @@ from. The whole build runs in **one disposable container** that is destroyed on 
    write-capable implementer through the workspace rather than a second model call,
 4. **implement** — the same implementer the PRD lane uses (Sonnet/high on the in-container
    CLI) is pointed at :data:`PLAN_FILE` via its ``plan_path`` and told to read the plan
-   before building, then implements TDD-first and commits to the ``issue-<N>`` branch,
+   before building, then implements TDD-first and commits to the ``issue-<N>`` branch; an
+   implement run that lands **zero commits** on the branch fails the build (the shared
+   hollow-implement guard) instead of pushing an empty branch,
 5. **done-check** — the repo's done-check runs in the *same* container over the real
    changes, and the outcome is posted to the report sink,
 6. **push** — only on a green done-check is ``issue-<N>`` pushed to origin; a red check
@@ -43,42 +45,39 @@ from. The whole build runs in **one disposable container** that is destroyed on 
 Every side-effecting collaborator — the planner spawn, the implementer spawn, the
 reviewer, the container runtime, the auth, the secret resolver, and the report sink — is
 injected, so the whole flow is exercised in tests with no Agent SDK, no Docker, no gh, and
-no network. The container/git/done-check/credential mechanics are reused wholesale from
-:mod:`retinue.orchestrator` and :mod:`retinue.done_check`, and the review filing reuses the
-internal reviewer's :class:`~retinue.reviewer.ReviewGenerator` seam, ``review-fix`` label,
-and gh issue creator; this module only adds the planner seam, the plan materialization,
-threading :data:`PLAN_FILE` into the implementer as its ``plan_path``, the no-merge
-plan->execute ordering, and the advisory, chain-depth-bounded third review pass.
+no network. The whole container lifecycle — start, clone+branch, implement, the
+hollow-implement guard, done-check, push-on-green, report, teardown — is the shared
+:func:`retinue.container_build.build_issue_in_container` (the same lifecycle the PRD lane
+runs), and the review filing reuses the internal reviewer's
+:class:`~retinue.reviewer.ReviewGenerator` seam, ``review-fix`` label, and gh issue
+creator; this module only adds the planner seam, the plan materialization, threading
+:data:`PLAN_FILE` into the implementer as its ``plan_path``, the no-merge plan->execute
+ordering, and the advisory, chain-depth-bounded third review pass.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from retinue.container import Container, ContainerRuntime
-from retinue.done_check import (
-    DEFAULT_IMAGE,
-    DoneCheckReport,
-    ReportSink,
-    SecretResolver,
-    parse_done_check,
-    resolve_secrets_or_escalate,
-    run_done_check_commands,
-)
-from retinue.github_app import InstallationAuth
-from retinue.orchestrator import (
-    _GIT_COMMITTER_ENV,
+from retinue.container_build import (
     GitOpsError,
     Implementer,
     Slice,
-    _clone_and_branch,
-    _implement_env,
-    _push_branch,
-    _write_file_command,
+    build_issue_in_container,
+    implement_env,
+    write_file_command,
 )
+from retinue.done_check import (
+    DEFAULT_IMAGE,
+    ReportSink,
+    SecretResolver,
+)
+from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
     REVIEW_FIX_LABEL,
@@ -216,7 +215,7 @@ def _materialize_plan_command(plan: str) -> list[str]:
     backticks, quotes, newlines — survives untouched and nothing in it is interpreted as
     shell syntax. The parent dot-dir is created first so the write into it can't fail.
     """
-    return _write_file_command(PLAN_FILE, plan)
+    return write_file_command(PLAN_FILE, plan)
 
 
 _ENSURE_PLAN_DIR_COMMAND = ["mkdir", "-p", ".retinue"]
@@ -267,7 +266,7 @@ class ContainerPlanner:
 
     def auth_env(self) -> dict[str, str]:
         """The credential env the orchestration merges into the build container at start."""
-        return _implement_env(self.credential, self.auth_mode)
+        return implement_env(self.credential, self.auth_mode)
 
 
 class AdhocReviewer(Protocol):
@@ -304,12 +303,13 @@ def _issue_diff_command(branch: str, base: str) -> list[str]:
     Uses the three-dot form (``origin/<base>...branch``) so the diff is the issue branch's
     own contribution since it was cut off the staging base — the work the build produced —
     rather than also folding in whatever else advanced staging in parallel. Both sides must
-    resolve against the refs the build container actually has: :func:`_clone_and_branch`
-    runs ``git fetch origin <base>`` then ``git checkout -B issue-<N> origin/<base>``, so
-    it creates the remote-tracking ``origin/<base>`` ref and the local ``issue-<N>`` branch
-    but **no** bare local ``<base>`` (that exists only when ``staging_branch`` happens to be
-    the clone's default HEAD). The base is therefore ``origin/<base>`` — mirroring the
-    orchestrator's :func:`~retinue.orchestrator._branch_diff_command`, whose base side is
+    resolve against the refs the build container actually has:
+    :func:`retinue.container_build.clone_and_branch` runs ``git fetch origin <base>`` then
+    ``git checkout -B issue-<N> origin/<base>``, so it creates the remote-tracking
+    ``origin/<base>`` ref and the local ``issue-<N>`` branch but **no** bare local
+    ``<base>`` (that exists only when ``staging_branch`` happens to be the clone's default
+    HEAD). The base is therefore ``origin/<base>`` — mirroring the orchestrator's
+    :func:`~retinue.orchestrator._branch_diff_command`, whose base side is
     also a resolvable ref — while the branch stays the *local* ``issue-<N>`` ref the build
     just committed to (no ``origin/`` prefix): the review runs in the same container that
     built it, so the local tip is the surface to review.
@@ -437,7 +437,7 @@ class ContainerAdhocReviewer:
         """
         if not self.credential:
             return {}
-        return _implement_env(self.credential, self.auth_mode)
+        return implement_env(self.credential, self.auth_mode)
 
 
 @dataclass(frozen=True)
@@ -470,25 +470,24 @@ async def build_adhoc_issue(
 ) -> AdhocBuildResult:
     """Build one ad-hoc issue in one container: plan -> implement -> push -> review.
 
-    Runs the whole build in a single disposable container, destroyed on every path:
+    Runs the shared per-issue lifecycle
+    (:func:`retinue.container_build.build_issue_in_container`) in a single disposable
+    container, destroyed on every path — parse the done-check, resolve the secrets, start
+    the container, clone and cut ``issue-<N>`` off ``config.staging_branch``, implement,
+    guard against a hollow implement (zero commits fails the build), done-check, push on
+    green, report — with the ad-hoc lane's hooks threaded in:
 
-    1. parse the done-check and resolve the config's secrets (a missing one escalates on
-       the report sink and propagates *before* any container starts),
-    2. start the container with the secrets, the git committer identity, and the planner's
-       and the implementer's credential env — the two roles that exec in-container (the env
-       is fixed at ``start``); the reviewer runs over HTTP, so its credential is not injected,
-    3. clone the repo and check out a fresh ``issue-<N>`` branch off ``config.staging_branch``,
-    4. run the read-only planner to produce a plan, captured from its output,
-    5. materialize the plan into :data:`PLAN_FILE` for the implementer to read,
-    6. exec the implementer — pointed at :data:`PLAN_FILE` via ``plan_path`` so it reads
-       the plan first — to build and commit the issue on ``issue-<N>``,
-    7. run the done-check over the real changes and post the outcome,
-    8. push ``issue-<N>`` to origin only when the done-check is green (a red build pushes
-       nothing),
-    9. on a green build only, run the injected ``reviewer`` (when present) over the
-       ``issue-<N>`` diff to file review-fix follow-ups. The review is **advisory**: any
-       error it raises is logged and swallowed so it never undoes the green build or its
-       push, and a red build is never reviewed (there is no built work to review).
+    1. **pre-implement**: run the read-only planner to produce a plan, captured from its
+       output, and materialize it into :data:`PLAN_FILE` for the implementer to read,
+    2. **plan_path**: the implementer is pointed at :data:`PLAN_FILE` so it reads the plan
+       first,
+    3. **credentials**: the planner's and the implementer's credential env ride the
+       container at ``start`` — the two roles that exec in-container; the reviewer runs
+       over HTTP, so its credential is not injected,
+    4. **on green**: run the injected ``reviewer`` (when present) over the ``issue-<N>``
+       diff to file review-fix follow-ups. The review is **advisory**: any error it raises
+       is logged and swallowed so it never undoes the green build or its push, and a red
+       build is never reviewed (there is no built work to review).
 
     Args:
         issue: The ad-hoc issue to build (repo, issue number).
@@ -511,67 +510,43 @@ async def build_adhoc_issue(
 
     Raises:
         Propagates whatever the build container raises (e.g. a missing secret, a clone
-        failure, or a :class:`PlanError` from the planner exec). The advisory review pass
-        is the one step that never propagates: its errors are swallowed.
+        failure, a :class:`PlanError` from the planner exec, or an
+        :class:`~retinue.container_build.ImplementError` from a hollow implement). The
+        advisory review pass is the one step that never propagates: its errors are
+        swallowed.
     """
-    commands = parse_done_check(claude_md)
-    env = await resolve_secrets_or_escalate(
-        issue.repo_full_name, issue.issue_number, config, resolve_secret, report
-    )
-    # Only the in-container roles' credentials are injected: the planner and implementer
-    # exec inside the container, but the reviewer's model call goes out over HTTP from the
-    # generator, so its credential has no in-container use — injecting it would be dead
-    # weight and needless secret exposure.
-    auth_envs = [
-        planner.auth_env(),
-        implementer.auth_env(),
-    ]
-    start_env = {**env, **_GIT_COMMITTER_ENV}
-    for auth_env in auth_envs:
-        start_env.update(auth_env)
-    # The exact secret values injected into the container, so a failing done-check has them
-    # scrubbed from its report — repo-declared secrets plus the in-container credentials.
-    secret_values = [*env.values(), *(v for a in auth_envs for v in a.values())]
-    token = await auth.installation_token(issue.repo_full_name)
-    container = await runtime.start(image=image, env=start_env)
-    try:
-        await _clone_and_branch(
-            container,
-            token.clone_url,
-            branch=issue.branch,
-            base=config.staging_branch,
-        )
+
+    async def plan_and_materialize(container: Container) -> None:
         plan = await planner.plan(issue, container=container)
         await _materialize_plan(container, plan)
-        await implementer.implement(
-            _slice_for_issue(issue), container=container, plan_path=PLAN_FILE
-        )
-        passed, detail = await run_done_check_commands(
-            container, commands, secret_values=secret_values
-        )
-        if passed:
-            await _push_branch(container, issue.branch)
-        await report(
-            DoneCheckReport(
-                repo_full_name=issue.repo_full_name,
-                issue_number=issue.issue_number,
-                passed=passed,
-                escalated=False,
-                detail=detail,
-            )
-        )
-        logger.info(
-            "Ad-hoc issue %s done-check %s",
-            issue.branch,
-            "passed" if passed else "failed",
-        )
-        if passed and reviewer is not None:
-            await _review_advisory(reviewer, issue, container)
-        return AdhocBuildResult(branch=issue.branch, passed=passed)
-    finally:
-        # Guaranteed teardown: the disposable container is destroyed on every path,
-        # including when clone, plan, implement, the done-check, or push raises.
-        await container.destroy()
+
+    on_green: Callable[[Container], Awaitable[None]] | None = None
+    if reviewer is not None:
+        present_reviewer = reviewer
+
+        async def review_on_green(container: Container) -> None:
+            await _review_advisory(present_reviewer, issue, container)
+
+        on_green = review_on_green
+
+    passed = await build_issue_in_container(
+        _slice_for_issue(issue),
+        config,
+        claude_md,
+        base=config.staging_branch,
+        implementer=implementer,
+        auth=auth,
+        runtime=runtime,
+        resolve_secret=resolve_secret,
+        report=report,
+        image=image,
+        lane_label="Ad-hoc issue",
+        extra_auth_envs=[planner.auth_env()],
+        pre_implement=plan_and_materialize,
+        plan_path=PLAN_FILE,
+        on_green=on_green,
+    )
+    return AdhocBuildResult(branch=issue.branch, passed=passed)
 
 
 async def _review_advisory(

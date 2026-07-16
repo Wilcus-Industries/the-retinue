@@ -2,7 +2,8 @@
 
 The single-slice primitive (issue #6) is :func:`build_slice`. For one ready slice the
 orchestrator runs the whole build inside **one disposable container** that is destroyed
-on every path (:func:`_build_slice_in_container`):
+on every path (the shared :func:`retinue.container_build.build_issue_in_container`
+lifecycle, which the ad-hoc lane also runs):
 
 1. **clone + branch** — the container clones the repo over the installation token and
    checks out a fresh ``issue-<N>`` branch off the integration branch ``retinue/prd-<n>``
@@ -36,7 +37,6 @@ with no Agent SDK, no Docker, no gh, no network, and no concurrency races.
 from __future__ import annotations
 
 import asyncio
-import base64
 import enum
 import heapq
 import json
@@ -51,14 +51,22 @@ import httpx
 
 from retinue.classifier import ClassifyInput
 from retinue.container import Container, ContainerRuntime, RunResult
+from retinue.container_build import (
+    GIT_AUTHOR_EMAIL,
+    GIT_AUTHOR_NAME,
+    GitOpsError,
+    Implementer,
+    ImplementError,
+    Slice,
+    build_issue_in_container,
+    create_branch_commands,
+    implement_env,
+    push_branch_command,
+)
 from retinue.done_check import (
     DEFAULT_IMAGE,
-    DoneCheckReport,
     ReportSink,
     SecretResolver,
-    parse_done_check,
-    resolve_secrets_or_escalate,
-    run_done_check_commands,
 )
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
@@ -67,70 +75,13 @@ from retinue.roles import (
     Role,
     resolve_model,
 )
-from retinue.vocab import issue_branch
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class Slice:
-    """One ready slice: a single issue an implementer builds on its own branch.
-
-    Attributes:
-        repo_full_name: The target repo, e.g. "owner/repo".
-        issue_number: The slice's GitHub issue number; the implementer commits to
-            the ``issue-<N>`` branch derived from it.
-        prd_number: The parent PRD number; the integration branch is
-            ``retinue/prd-<prd_number>``.
-    """
-
-    repo_full_name: str
-    issue_number: int
-    prd_number: int
-
-    @property
-    def branch(self) -> str:
-        """The branch the implementer commits the slice to: ``issue-<N>``."""
-        return issue_branch(self.issue_number)
 
 
 def integration_branch(prd_number: int) -> str:
     """The integration branch a PRD's slices are merged onto: ``retinue/prd-<n>``."""
     return f"retinue/prd-{prd_number}"
-
-
-class Implementer(Protocol):
-    """Spawns one implementer subagent that builds a slice. The Agent SDK seam.
-
-    A production implementation execs the headless ``claude`` CLI *inside the disposable
-    build container* the orchestrator passes in; the subagent implements TDD-first and
-    commits to the slice's ``issue-<N>`` branch already checked out there. Tests inject a
-    fake that records the request (and may mark the container log) without any real spawn.
-    The contract is the commit on ``slice.branch``; the orchestrator does not read a
-    return value, it gates on the done-check that follows.
-    """
-
-    async def implement(
-        self, slice_: Slice, *, container: Container, plan_path: str | None = None
-    ) -> None:
-        """Build ``slice_`` in ``container``, committing to its ``issue-<N>`` branch.
-
-        ``plan_path`` is the in-container path of a materialized implementation plan the
-        subagent must read before building. The PRD lane passes nothing (``None``), so its
-        prompt is unchanged; the ad-hoc lane passes its ``PLAN_FILE`` so the subagent is
-        pointed at the plan the planner wrote.
-        """
-        ...
-
-    def auth_env(self) -> dict[str, str]:
-        """The env the agent authenticates with, merged into the container at start.
-
-        Returned by the implementer (which owns the Anthropic credential) so the
-        orchestrator can inject it into the build container's environment at ``start``
-        without knowing how the credential is routed. A fake that needs no credential
-        returns an empty mapping.
-        """
-        ...
 
 
 # --- real container-exec implementer (production adapter behind the Implementer seam) ---
@@ -231,19 +182,6 @@ def _implement_prompt(
     )
 
 
-def _implement_env(credential: str, auth_mode: str) -> dict[str, str]:
-    """Build the env the ``claude`` CLI authenticates with, routing the credential by mode.
-
-    ``api_key`` mode threads the credential as ``ANTHROPIC_API_KEY``; ``subscription`` mode
-    threads it as ``CLAUDE_CODE_OAUTH_TOKEN`` (the Claude subscription OAuth env var the
-    headless CLI reads). Only the credential env var is set here — the orchestrator merges
-    it into the build container's environment at ``start``.
-    """
-    if auth_mode == "subscription":
-        return {"CLAUDE_CODE_OAUTH_TOKEN": credential}
-    return {"ANTHROPIC_API_KEY": credential}
-
-
 def _claude_argv(*, prompt: str, model: str, max_turns: int) -> list[str]:
     """Assemble the headless ``claude`` CLI argv for one in-container implement run.
 
@@ -320,16 +258,6 @@ def _claude_result_summary(stdout: str) -> str:
     return f" ({turns} turns): {text}"
 
 
-class ImplementError(RuntimeError):
-    """The container-exec implementer run ended in an error rather than a clean build.
-
-    Distinct from a *clean-but-insufficient* build, which the orchestrator catches via the
-    done-check that follows: this is the ``claude`` CLI exec itself failing (a non-zero exit
-    code, or a json result flagged ``is_error``), so the slice surfaces the failure rather
-    than proceeding to a done-check over a half-built tree.
-    """
-
-
 @dataclass(frozen=True)
 class ContainerImplementer:
     """Real :class:`Implementer`: build a slice by exec-ing ``claude`` in the build container.
@@ -402,7 +330,7 @@ class ContainerImplementer:
 
     def auth_env(self) -> dict[str, str]:
         """The credential env the orchestrator merges into the build container at start."""
-        return _implement_env(self.credential, self.auth_mode)
+        return implement_env(self.credential, self.auth_mode)
 
 
 class MergeConflict(Exception):
@@ -447,28 +375,16 @@ class GitOps(Protocol):
 # argv assembly and classifying a failed merge as a conflict vs. a hard git error — are
 # factored into the free functions below so they are tested without a live container.
 
-# Identity used for the merge commit ``git`` records. Merges are non-interactive, so a
-# committer identity must be configured or ``git commit`` refuses to run; it is set
-# per-command via ``-c`` rather than mutating global config in the shared workspace.
-_GIT_AUTHOR_NAME = "the-retinue"
-_GIT_AUTHOR_EMAIL = "retinue@users.noreply.github.com"
+# Per-command git identity for the merge commit ``git`` records. Merges are
+# non-interactive, so a committer identity must be configured or ``git commit`` refuses
+# to run; it is set per-command via ``-c`` rather than mutating global config in the
+# shared workspace. The identity itself is the shared retinue committer.
 _GIT_IDENTITY_FLAGS = [
     "-c",
-    f"user.name={_GIT_AUTHOR_NAME}",
+    f"user.name={GIT_AUTHOR_NAME}",
     "-c",
-    f"user.email={_GIT_AUTHOR_EMAIL}",
+    f"user.email={GIT_AUTHOR_EMAIL}",
 ]
-
-# The committer identity injected into the build container's env so the *agent's* own
-# ``git commit`` (and the push) run non-interactively. The container env is fixed at
-# ``start``, so the identity must ride it there rather than per-command ``-c`` flags the
-# agent would not use; git reads these four vars without any repo config.
-_GIT_COMMITTER_ENV = {
-    "GIT_AUTHOR_NAME": _GIT_AUTHOR_NAME,
-    "GIT_AUTHOR_EMAIL": _GIT_AUTHOR_EMAIL,
-    "GIT_COMMITTER_NAME": _GIT_AUTHOR_NAME,
-    "GIT_COMMITTER_EMAIL": _GIT_AUTHOR_EMAIL,
-}
 
 # Substrings git prints to stdout/stderr when a merge stops on a content conflict, as
 # opposed to a hard error (unknown ref, not a repo, …). Matched case-insensitively.
@@ -479,16 +395,6 @@ _CONFLICT_MARKERS = (
 )
 
 
-def _clone_command(clone_url: str) -> list[str]:
-    """Argv that clones the repo (over the installation-token URL) into the workspace."""
-    return ["git", "clone", clone_url, "."]
-
-
-def _push_branch_command(branch: str) -> list[str]:
-    """Argv that pushes ``branch`` to ``origin`` (authenticated by the cloned remote URL)."""
-    return ["git", "push", "origin", branch]
-
-
 def _remote_branch_exists_command(branch: str) -> list[str]:
     """Argv that exits 0 iff ``branch`` already exists on ``origin``.
 
@@ -497,19 +403,6 @@ def _remote_branch_exists_command(branch: str) -> list[str]:
     against the remote, not the local ``refs/heads``.
     """
     return ["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"]
-
-
-def _create_branch_commands(branch: str, base: str) -> list[list[str]]:
-    """Argv list that creates ``branch`` off ``base`` and checks it out.
-
-    ``base`` is referenced via ``origin/<base>`` so the branch is rooted on the freshly
-    cloned remote tip rather than whatever happens to be checked out, then a local
-    ``branch`` is created at that point and made current.
-    """
-    return [
-        ["git", "fetch", "origin", base],
-        ["git", "checkout", "-B", branch, f"origin/{base}"],
-    ]
 
 
 def _merge_commands(source: str, into: str) -> list[list[str]]:
@@ -591,10 +484,10 @@ class ContainerGitOps:
         if exists.ok:
             logger.info("Integration branch %s already exists on origin", branch)
             return
-        for command in _create_branch_commands(branch, base):
+        for command in create_branch_commands(branch, base):
             await self._run_checked(command, action=f"create {branch} off {base}")
         await self._run_checked(
-            _push_branch_command(branch), action=f"push {branch} to origin"
+            push_branch_command(branch), action=f"push {branch} to origin"
         )
         logger.info("Created integration branch %s off %s and pushed to origin", branch, base)
 
@@ -612,7 +505,7 @@ class ContainerGitOps:
         result = await self._container.run_command(commands[-1])
         if result.ok:
             await self._run_checked(
-                _push_branch_command(into), action=f"push {into} after merge"
+                push_branch_command(into), action=f"push {into} after merge"
             )
             logger.info("Merged %s into %s and pushed %s", source, into, into)
             return
@@ -652,16 +545,6 @@ class ContainerGitOps:
         return result
 
 
-class GitOpsError(RuntimeError):
-    """A ``git`` command failed for a reason other than a recoverable merge conflict.
-
-    Distinct from :class:`MergeConflict`: a conflict is handed to the resolver, but a
-    hard error (unknown ref, not a repository, checkout failure) means the integration
-    branch could not be advanced at all, so it propagates rather than masquerading as a
-    conflict the resolver could fix.
-    """
-
-
 class ConflictResolution(enum.Enum):
     """Whether a conflict resolver believes it fixed the merge."""
 
@@ -683,20 +566,6 @@ class ConflictResolver(Protocol):
     async def __call__(self, *, source: str, into: str) -> ConflictResolution:
         """Attempt to resolve the conflict merging ``source`` into ``into``."""
         ...
-
-
-def _write_file_command(path: str, content: str) -> list[str]:
-    """Argv that writes ``content`` to ``path`` inside the container, byte-exact.
-
-    ``run_command`` execs the argv directly (no shell, no stdin), so arbitrary file
-    bodies can't be passed as a here-doc or piped. The content is base64-encoded and
-    decoded in-container via positional args (``$1``/``$2``) — never interpolated into
-    the command string — so conflict markers, quotes, and newlines survive untouched and
-    nothing in the file body is interpreted as shell syntax.
-    """
-    blob = base64.b64encode(content.encode()).decode()
-    script = 'printf %s "$1" | base64 -d > "$2"'
-    return ["sh", "-c", script, "sh", blob, path]
 
 
 class BuildOutcome(enum.Enum):
@@ -743,7 +612,8 @@ async def build_slice(
 
     The integration branch ``retinue/prd-<n>`` is ensured on origin first (created off
     ``config.staging_branch`` when absent), then the whole build runs in one disposable
-    container (:func:`_build_slice_in_container`): clone, check out a fresh ``issue-<N>``
+    container (the shared :func:`retinue.container_build.build_issue_in_container`
+    lifecycle): clone, check out a fresh ``issue-<N>``
     branch off the integration branch's tip, let the implementer exec ``claude`` inside it
     and commit, run the repo's done-check over the real changes, and push ``issue-<N>``
     only when green. The done-check result gates the merge: a green check merges the pushed
@@ -779,7 +649,7 @@ async def build_slice(
     # integration branch, not staging).
     await git.ensure_integration_branch(branch=branch, base=config.staging_branch)
 
-    passed = await _build_slice_in_container(
+    passed = await build_issue_in_container(
         slice_,
         config,
         claude_md,
@@ -803,127 +673,6 @@ async def build_slice(
 
     await _merge_green_slice(slice_, branch, git=git)
     return BuildResult(outcome=BuildOutcome.MERGED, integration_branch=branch)
-
-
-async def _build_slice_in_container(
-    slice_: Slice,
-    config: RepoConfig,
-    claude_md: str,
-    *,
-    base: str,
-    implementer: Implementer,
-    auth: InstallationAuth,
-    runtime: ContainerRuntime,
-    resolve_secret: SecretResolver,
-    report: ReportSink,
-    image: str,
-) -> bool:
-    """Run one slice's full build in a single disposable container; return green/red.
-
-    Owns the whole per-slice lifecycle, destroying the container on every path:
-
-    1. parse the done-check and resolve the config's secrets (a missing one escalates on
-       the report sink and propagates *before* any container starts),
-    2. start the container with the secrets, the git committer identity, and the agent's
-       credential all in its env (the env is fixed at ``start``),
-    3. clone the repo and check out a fresh ``issue-<N>`` branch off ``base`` — the
-       integration branch ``retinue/prd-<n>`` (already created off staging at build start),
-       so a later-round slice builds on its already-merged sibling work,
-    4. exec the implementer (``claude``) inside the container to build and commit the slice,
-    5. run the done-check over the real changes and post the outcome,
-    6. push ``issue-<N>`` to ``origin`` only when the done-check is green (so the merge seam
-       can fetch it; a red slice pushes nothing).
-
-    Returns:
-        True only when the done-check passed (and the branch was pushed); False on red.
-    """
-    commands = parse_done_check(claude_md)
-    env = await resolve_secrets_or_escalate(
-        slice_.repo_full_name, slice_.issue_number, config, resolve_secret, report
-    )
-    auth_env = implementer.auth_env()
-    start_env = {**env, **_GIT_COMMITTER_ENV, **auth_env}
-    # The exact secret values injected into the container, scrubbed from a failing
-    # done-check's report (repo-declared secrets plus the auth credential).
-    secret_values = [*env.values(), *auth_env.values()]
-    token = await auth.installation_token(slice_.repo_full_name)
-    container = await runtime.start(image=image, env=start_env)
-    try:
-        await _clone_and_branch(
-            container, token.clone_url, branch=slice_.branch, base=base
-        )
-        await implementer.implement(slice_, container=container)
-        await _ensure_commits_landed(container, branch=slice_.branch, base=base)
-        passed, detail = await run_done_check_commands(
-            container, commands, secret_values=secret_values
-        )
-        if passed:
-            await _push_branch(container, slice_.branch)
-        await report(
-            DoneCheckReport(
-                repo_full_name=slice_.repo_full_name,
-                issue_number=slice_.issue_number,
-                passed=passed,
-                escalated=False,
-                detail=detail,
-            )
-        )
-        logger.info(
-            "Slice %s done-check %s", slice_.branch, "passed" if passed else "failed"
-        )
-        return passed
-    finally:
-        # Guaranteed teardown: the disposable container is destroyed on every path,
-        # including when clone, implement, the done-check, the push, or report raises.
-        await container.destroy()
-
-
-async def _ensure_commits_landed(
-    container: Container, *, branch: str, base: str
-) -> None:
-    """Raise :class:`ImplementError` when the implement run committed nothing.
-
-    A hollow implement — the agent no-ops and exits 0 — leaves the tree at
-    ``origin/<base>``; the done-check then passes vacuously over the untouched tree and
-    an empty branch merges. Counting the commits since ``origin/<base>`` right after the
-    implement catches that before the done-check runs. A probe that itself fails (bad
-    exit, empty stdout) also raises: an unreadable count must not pass as "commits
-    exist".
-    """
-    result = await container.run_command(
-        ["git", "rev-list", "--count", f"origin/{base}..HEAD"]
-    )
-    count = result.stdout.strip()
-    if not result.ok or count in ("", "0"):
-        raise ImplementError(
-            f"implementer for {branch} landed no commits "
-            f"(rev-list exit {result.exit_code}, count {count!r})"
-        )
-
-
-async def _clone_and_branch(
-    container: Container, clone_url: str, *, branch: str, base: str
-) -> None:
-    """Clone the repo into ``container`` and check out a fresh ``branch`` off ``base``."""
-    clone = await container.run_command(_clone_command(clone_url))
-    if not clone.ok:
-        raise GitOpsError(f"clone failed (exit {clone.exit_code}): {clone.stderr}")
-    for command in _create_branch_commands(branch, base):
-        result = await container.run_command(command)
-        if not result.ok:
-            raise GitOpsError(
-                f"failed to create slice branch {branch} off {base} "
-                f"(exit {result.exit_code}): {result.stderr}"
-            )
-
-
-async def _push_branch(container: Container, branch: str) -> None:
-    """Push ``branch`` to ``origin`` from inside ``container``; raise on failure."""
-    result = await container.run_command(_push_branch_command(branch))
-    if not result.ok:
-        raise GitOpsError(
-            f"failed to push {branch} (exit {result.exit_code}): {result.stderr}"
-        )
 
 
 async def _merge_green_slice(slice_: Slice, branch: str, *, git: GitOps) -> None:
@@ -1247,7 +996,7 @@ async def _build_round(
 
     async def build_one(slice_: PrdSlice) -> _SliceBuildOutcome:
         async with semaphore:
-            passed = await _build_slice_in_container(
+            passed = await build_issue_in_container(
                 slice_,
                 config,
                 claude_md,

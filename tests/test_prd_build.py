@@ -23,13 +23,12 @@ import httpx
 import pytest
 
 from retinue.container import Container, RunResult
+from retinue.container_build import ImplementError, Slice
 from retinue.orchestrator import (
     _DEFAULT_MAX_PARALLEL,
     ConflictResolution,
-    ImplementError,
     PrdBuildResult,
     PrdSlice,
-    Slice,
     _topo_merge_order,
     build_prd,
 )

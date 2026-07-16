@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 import retinue.impl_retry as impl_retry_module
+from retinue.container_build import Slice
 from retinue.impl_retry import ImplRetryStore, impl_retry_key
-from retinue.orchestrator import Slice
 
 
 @pytest.fixture()

@@ -32,9 +32,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from retinue.container import Container
+from retinue.container_build import Slice
 from retinue.impl_retry import ImplRetryStore, impl_retry_key
 from retinue.notify import Notification, Notifier
-from retinue.orchestrator import Slice
 from retinue.repo_config import RepoConfig
 from retinue.slicer import CreatedIssue, IssueCreator, IssueDraft
 from retinue.vocab import HITL_LABEL, READY_LABEL

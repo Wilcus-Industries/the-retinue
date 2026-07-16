@@ -31,6 +31,7 @@ from typing import Protocol
 from retinue.adhoc_drain import AdhocBuild, AdhocGh, AdhocPrOpen, run_adhoc_drain
 from retinue.budget import BudgetGovernor, Clock
 from retinue.container import Container, ContainerRuntime
+from retinue.container_build import Implementer, Slice
 from retinue.cron import CronBuild, CronGh, CronTickResult, run_cron_tick
 from retinue.done_check import ReportSink, SecretResolver
 from retinue.github_app import InstallationAuth
@@ -38,11 +39,9 @@ from retinue.impl_retry import ImplRetryStore
 from retinue.notify import Notifier
 from retinue.orchestrator import (
     GitOps,
-    Implementer,
     PrdBuildResult,
     PrdSlice,
     RoundReviewer,
-    Slice,
     build_prd,
     integration_branch,
 )

@@ -1,9 +1,9 @@
 """Done-check building blocks: parse the gate, resolve its secrets, run it, report it.
 
 Issue #4 originally owned the whole disposable-container orchestration here. Since the
-B-full refactor the orchestrator owns the per-slice container lifecycle (clone → branch
+B-full refactor the shared container-build lifecycle owns the per-issue flow (clone → branch
 → implement → done-check → push → destroy, see
-:func:`retinue.orchestrator._build_slice_in_container`), so this module is now the set of
+:func:`retinue.container_build.build_issue_in_container`), so this module is now the set of
 reusable, container-agnostic pieces that lifecycle drives:
 
 1. **parse** — :func:`parse_done_check` reads the done-check command from ``CLAUDE.md``,

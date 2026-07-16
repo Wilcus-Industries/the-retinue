@@ -40,6 +40,7 @@ from retinue.adhoc_build import (
 )
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
 from retinue.classifier import ClassifyInput, ClassifyResult, ClaudeIssueClassifier
+from retinue.container_build import Slice
 from retinue.messages_api import HttpResponse
 from retinue.notify import (
     CommentRequest,
@@ -49,7 +50,7 @@ from retinue.notify import (
     Notifier,
     PushRequest,
 )
-from retinue.orchestrator import ContainerImplementer, PrdSlice, Slice
+from retinue.orchestrator import ContainerImplementer, PrdSlice
 from retinue.pipeline import _CLASSIFIER_ESTIMATED_AMOUNT, _resolve_adhoc_level
 from retinue.repo_config import RepoConfig, RoutingConfig, RoutingLevel
 from retinue.reviewer import AgentSdkReviewGenerator

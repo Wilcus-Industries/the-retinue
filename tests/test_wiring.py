@@ -20,6 +20,7 @@ import pytest
 from retinue.adhoc_drain import AdhocGh, FlightState
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
 from retinue.container import ContainerRuntime
+from retinue.container_build import Implementer, Slice
 from retinue.cron import CronGh
 from retinue.github_app import InstallationAuth
 from retinue.notify import (
@@ -28,7 +29,7 @@ from retinue.notify import (
     Notifier,
     PushRequest,
 )
-from retinue.orchestrator import GitOps, Implementer, PrdSlice, Slice
+from retinue.orchestrator import GitOps, PrdSlice
 from retinue.repo_config import RepoConfig
 from retinue.slicer import IssueCreator
 from retinue.triage import ImplementerNotes

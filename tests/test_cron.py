@@ -30,6 +30,7 @@ from typing import Any, cast
 import pytest
 
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
+from retinue.container_build import Slice
 from retinue.cron import (
     BacklogIssue,
     CronBusyError,
@@ -39,7 +40,7 @@ from retinue.cron import (
     SliceBuilder,
     run_cron_tick,
 )
-from retinue.orchestrator import BuildOutcome, BuildResult, Slice, integration_branch
+from retinue.orchestrator import BuildOutcome, BuildResult, integration_branch
 from retinue.repo_config import RepoConfig
 from retinue.vocab import Severity
 
