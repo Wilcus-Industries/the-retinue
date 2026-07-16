@@ -25,7 +25,6 @@ from retinue.handoff import MergedPullRequest, ReapOutcome, ReapResult
 from retinue.loopback import (
     HeimdallReview,
     ReviewState,
-    Severity,
     VerdictOutcome,
     VerdictResult,
 )
@@ -33,6 +32,7 @@ from retinue.pipeline import PrdJobResult, ResumeRoundOutcome
 from retinue.queue import RESUME_ROUND_TASK, RESUME_ROUNDS_TASK, RUN_ADHOC_DRAIN_TASK
 from retinue.reconcile import ReconcileResult, ResumePhase, RunStateStore
 from retinue.repo_config import RepoConfig
+from retinue.vocab import Severity
 from retinue.worker import (
     WorkerSettings,
     on_shutdown,

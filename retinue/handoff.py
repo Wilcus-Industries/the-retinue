@@ -33,13 +33,9 @@ from typing import Protocol
 
 from retinue.gh import GhTextRunner, run_gh
 from retinue.notify import Notification, Notifier
-from retinue.slicer import HITL_LABEL
+from retinue.vocab import HITL_LABEL, TEST_AND_MERGE_LABEL
 
 logger = logging.getLogger(__name__)
-
-# The "test & merge" handoff is a heads-up for a human, not an escalation. It carries a
-# findable label so the converged-but-unmerged PRs are routable, but it never merges.
-TEST_AND_MERGE_LABEL = "test-and-merge"
 
 
 async def announce_handoff(

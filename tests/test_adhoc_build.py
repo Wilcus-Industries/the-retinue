@@ -43,7 +43,6 @@ from retinue.impl_retry import ImplRetryStore, impl_retry_key
 from retinue.orchestrator import GitOpsError, Implementer, Slice, _implement_prompt
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
-    READY_LABEL,
     REVIEW_FIX_LABEL,
     CreatedIssue,
     IssueDraft,
@@ -52,6 +51,7 @@ from retinue.reviewer import (
     ReviewPlan,
 )
 from retinue.roles import Role, planner_cli_argv, resolve_model
+from retinue.vocab import READY_LABEL
 from tests.test_done_check import (
     CLAUDE_MD,
     FakeAuth,

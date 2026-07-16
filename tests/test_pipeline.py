@@ -21,7 +21,6 @@ from retinue.loopback import (
     HeimdallFinding,
     HeimdallReview,
     ReviewState,
-    Severity,
     VerdictOutcome,
 )
 from retinue.orchestrator import PrdBuildResult, PrdSlice
@@ -42,6 +41,7 @@ from retinue.slicer import (
     IssueDraft,
     SlicePlan,
 )
+from retinue.vocab import Severity
 from tests.test_reconcile import FakeReconcileGh
 
 

@@ -27,26 +27,24 @@ import pytest
 
 from retinue.gh import GhCommandError, GhResult
 from retinue.loopback import (
-    BACKLOG_LABEL,
     GhCliRebuilder,
     HeimdallFinding,
     HeimdallReview,
     HeimdallRoundStore,
     RebuildRequest,
     ReviewState,
-    Severity,
     VerdictDecision,
     VerdictOutcome,
     VerdictResult,
     _parse_review_requested,
     _re_review_args,
     decide_verdict,
-    priority_label,
     process_review,
 )
 from retinue.notify import CommentRequest, LabelRequest, Notifier, PushRequest
 from retinue.repo_config import RepoConfig
-from retinue.slicer import READY_LABEL, CreatedIssue, IssueDraft
+from retinue.slicer import CreatedIssue, IssueDraft
+from retinue.vocab import BACKLOG_LABEL, READY_LABEL, Severity, priority_label
 
 
 class _RecordingSinks:

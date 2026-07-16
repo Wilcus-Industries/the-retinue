@@ -45,7 +45,6 @@ from retinue.loopback import (
     HeimdallFinding,
     HeimdallReview,
     ReviewState,
-    Severity,
     round_key,
 )
 from retinue.pipeline import (
@@ -57,6 +56,7 @@ from retinue.pipeline import (
 from retinue.queue import RESUME_ROUND_TASK, RESUME_ROUNDS_TASK, PrdJob
 from retinue.reconcile import RunStateStore
 from retinue.repo_config import RepoConfig, load_repo_config
+from retinue.vocab import Severity
 
 logger = logging.getLogger(__name__)
 

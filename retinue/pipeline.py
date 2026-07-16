@@ -126,7 +126,6 @@ from retinue.routing import (
     resolve_issue_level,
 )
 from retinue.slicer import (
-    HITL_LABEL,
     ClaudeSliceGenerator,
     GhCliIssueCreator,
     IssueCreator,
@@ -134,6 +133,7 @@ from retinue.slicer import (
     SliceOutcome,
     slice_prd,
 )
+from retinue.vocab import HITL_LABEL
 from retinue.wiring import (
     BoundBuildResult,
     ReviewerFactory,

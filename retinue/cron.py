@@ -41,7 +41,6 @@ from retinue.container import ContainerRuntime
 from retinue.done_check import DEFAULT_IMAGE, ReportSink, SecretResolver
 from retinue.gh import GhBytesRunner, auth_env, parse_json_array, run_gh_subprocess
 from retinue.github_app import InstallationAuth
-from retinue.loopback import Severity
 from retinue.orchestrator import (
     BuildResult,
     GitOps,
@@ -50,10 +49,9 @@ from retinue.orchestrator import (
     build_slice,
 )
 from retinue.repo_config import RepoConfig
+from retinue.vocab import BACKLOG_LABEL, Severity, parse_priority
 
 logger = logging.getLogger(__name__)
-
-_PRIORITY_LABEL_PREFIX = "priority:"
 
 # A day's age is worth this much weighted score; one severity step is worth a day's worth
 # multiplied by this lever. Keeping a severity step strictly larger than any realistic age
@@ -132,14 +130,8 @@ class BacklogIssue:
 
     def severity(self) -> Severity:
         """The issue's ``priority:<severity>`` as a :class:`Severity` (LOW when absent)."""
-        for label in self.labels:
-            if label.startswith(_PRIORITY_LABEL_PREFIX):
-                name = label[len(_PRIORITY_LABEL_PREFIX) :].upper()
-                try:
-                    return Severity[name]
-                except KeyError:
-                    continue
-        return _DEFAULT_SEVERITY
+        severity = parse_priority(self.labels)
+        return _DEFAULT_SEVERITY if severity is None else severity
 
 
 class CronGh(Protocol):
@@ -155,10 +147,6 @@ class CronGh(Protocol):
         """Return the repo's open ``backlog`` issues with their labels and ages."""
         ...
 
-
-# The label the backlog drainer scans for — the non-blocking heimdall nits filed by
-# :mod:`retinue.loopback` carry it. Kept here so the query and the doc agree.
-_BACKLOG_LABEL = "backlog"
 
 # How many backlog issues to pull per tick. The drainer only ever picks one, but it
 # scores across the visible set, so a generous-but-bounded page keeps the score honest
@@ -226,7 +214,7 @@ def _list_backlog_argv(repo_full_name: str, *, limit: int) -> list[str]:
         "--repo",
         repo_full_name,
         "--label",
-        _BACKLOG_LABEL,
+        BACKLOG_LABEL,
         "--state",
         "open",
         "--json",

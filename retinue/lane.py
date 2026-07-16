@@ -17,7 +17,7 @@ PRD work runs first by default, but a **standalone** ``priority:critical`` /
 wait its turn in the slow backlog drain. The classifier is pure: it reads only the
 issue's labels and body (the ``Part of #<prd>`` link), with no ``gh`` and no network, so
 it is exhaustively unit-tested. The priority vocabulary is the same
-``priority:<severity>`` labels :func:`retinue.loopback.priority_label` emits.
+``priority:<severity>`` labels :func:`retinue.vocab.priority_label` emits.
 """
 
 from __future__ import annotations
@@ -26,13 +26,7 @@ import enum
 import re
 from dataclasses import dataclass, field
 
-from retinue.loopback import BACKLOG_LABEL, Severity
-from retinue.slicer import READY_LABEL
-
-# A backlog nit (or any preempting standalone) carries its severity as the
-# ``priority:<severity>`` label loopback emits. Parsed back into a Severity here so the
-# preemption threshold is a comparison rather than a string check.
-_PRIORITY_LABEL_PREFIX = "priority:"
+from retinue.vocab import BACKLOG_LABEL, READY_LABEL, Severity, parse_priority
 
 # The slicer renders the parent link as ``Part of #<prd>`` in the issue body. Matched
 # loosely (any line, surrounding text tolerated) so a real body with extra prose routes.
@@ -101,14 +95,7 @@ class IssueFacts:
         Unknown ``priority:*`` values are ignored (treated as no priority) rather than
         raising, so a stray label never breaks routing.
         """
-        for label in self.labels:
-            if label.startswith(_PRIORITY_LABEL_PREFIX):
-                name = label[len(_PRIORITY_LABEL_PREFIX) :].upper()
-                try:
-                    return Severity[name]
-                except KeyError:
-                    continue
-        return None
+        return parse_priority(self.labels)
 
 
 @dataclass(frozen=True)

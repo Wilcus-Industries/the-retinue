@@ -56,6 +56,7 @@ from retinue.reviewer import (
 from retinue.routing import PerIssueImplementer
 from retinue.slicer import IssueCreator
 from retinue.triage import TriageImplementer, triage_implementer
+from retinue.vocab import issue_branch
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,7 @@ class _BoundRoundReviewer:
         round's contribution.
         """
         diff = await self.diff_source.round_diff(
-            merged_branches=[f"issue-{n}" for n in merged_issues],
+            merged_branches=[issue_branch(n) for n in merged_issues],
             base=integration_branch(self.prd_number),
         )
         result = await review_round(

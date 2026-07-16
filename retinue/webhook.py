@@ -30,7 +30,7 @@ from retinue.queue import (
     enqueue_prd,
     enqueue_review,
 )
-from retinue.slicer import READY_LABEL
+from retinue.vocab import PRD_LABEL, READY_LABEL
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,6 @@ logger = logging.getLogger(__name__)
 # reaches the slicer. The ad-hoc kick shares the same relevant-action set: a
 # ``ready-for-agent`` issue admits work only on the actions that can newly add the label
 # or change the issue.
-PRD_LABEL = "prd"
 _ISSUE_ACTIONS = frozenset({"opened", "reopened", "edited", "labeled"})
 
 

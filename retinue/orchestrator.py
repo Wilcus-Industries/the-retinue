@@ -67,6 +67,7 @@ from retinue.roles import (
     Role,
     resolve_model,
 )
+from retinue.vocab import issue_branch
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ class Slice:
     @property
     def branch(self) -> str:
         """The branch the implementer commits the slice to: ``issue-<N>``."""
-        return f"issue-{self.issue_number}"
+        return issue_branch(self.issue_number)
 
 
 def integration_branch(prd_number: int) -> str:

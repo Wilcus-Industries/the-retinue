@@ -81,7 +81,6 @@ from retinue.orchestrator import (
 )
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
-    READY_LABEL,
     REVIEW_FIX_LABEL,
     IssueCreator,
     IssueDraft,
@@ -89,6 +88,7 @@ from retinue.reviewer import (
     ReviewInput,
 )
 from retinue.roles import Role, planner_cli_argv, resolve_model
+from retinue.vocab import READY_LABEL, issue_branch
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ class AdhocIssue:
     @property
     def branch(self) -> str:
         """The branch the build commits to: ``issue-<N>``."""
-        return f"issue-{self.issue_number}"
+        return issue_branch(self.issue_number)
 
 
 class Planner(Protocol):

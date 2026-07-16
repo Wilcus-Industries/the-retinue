@@ -40,47 +40,20 @@ import aiosqlite
 from retinue.gh import GhCommandError, GhRunner, auth_env
 from retinue.notify import Notification, Notifier
 from retinue.repo_config import RepoConfig
-from retinue.slicer import HITL_LABEL, READY_LABEL, CreatedIssue, IssueCreator, IssueDraft
+from retinue.slicer import CreatedIssue, IssueCreator, IssueDraft
+from retinue.vocab import (
+    BACKLOG_LABEL,
+    HITL_LABEL,
+    READY_LABEL,
+    Severity,
+    priority_label,
+)
 
 logger = logging.getLogger(__name__)
-
-BACKLOG_LABEL = "backlog"
-
-
-class Severity(enum.IntEnum):
-    """A heimdall finding's severity, ordered so a blocking threshold is a comparison.
-
-    The integer order encodes "more severe is greater", so a finding is *blocking*
-    when its severity is at or above the configured threshold (default
-    :attr:`Severity.HIGH`). The member *name* (lower-cased) is what maps 1:1 to a
-    ``priority:<severity>`` label for a backlog nit.
-    """
-
-    LOW = 1
-    MEDIUM = 2
-    HIGH = 3
-    CRITICAL = 4
-
 
 # Heimdall's blocking threshold: a finding at or above this severity blocks the PR.
 # Below it, the finding is a non-blocking nit routed to the backlog.
 _BLOCKING_THRESHOLD = Severity.HIGH
-
-
-def priority_label(severity: Severity) -> str:
-    """Return the backlog ``priority:<severity>`` label for a heimdall severity.
-
-    The mapping is 1:1 with the severity name, so heimdall's own severity vocabulary
-    survives onto the filed backlog issue without translation.
-
-    Args:
-        severity: The finding's heimdall severity.
-
-    Returns:
-        ``"priority:low"`` / ``"priority:medium"`` / ``"priority:high"`` /
-        ``"priority:critical"``.
-    """
-    return f"priority:{severity.name.lower()}"
 
 
 class ReviewState(enum.Enum):

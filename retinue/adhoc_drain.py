@@ -64,10 +64,8 @@ from retinue.gh import (
     run_gh_subprocess,
 )
 from retinue.lane import IssueFacts, preempts_prd_first
-from retinue.loopback import Severity
 from retinue.repo_config import RepoConfig
-from retinue.slicer import READY_LABEL
-from retinue.webhook import PRD_LABEL
+from retinue.vocab import PRD_LABEL, READY_LABEL, Severity, issue_branch
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +233,7 @@ class FlightSnapshot:
         a branch with no open PR is :attr:`FlightState.STRANDED` (pushed green, PR never
         opened).
         """
-        branch = _issue_branch(issue_number)
+        branch = issue_branch(issue_number)
         if branch not in self.issue_branches:
             return FlightState.ABSENT
         if branch in self.open_pr_heads:
@@ -359,7 +357,7 @@ class GhCli:
             ValueError: the open-PR query returned a payload that did not parse as a JSON
                 array.
         """
-        branch = _issue_branch(issue_number)
+        branch = issue_branch(issue_number)
         if not await self._branch_exists(repo_full_name, branch):
             return FlightState.ABSENT
         if await self._open_pr_exists(repo_full_name, branch):
@@ -439,11 +437,6 @@ def _list_ready_argv(repo_full_name: str, *, limit: int) -> list[str]:
         "--limit",
         str(limit),
     ]
-
-
-def _issue_branch(issue_number: int) -> str:
-    """The ``issue-<N>`` branch an ad-hoc build commits to (the dedup branch name)."""
-    return f"issue-{issue_number}"
 
 
 def _branch_ref_argv(repo_full_name: str, branch: str) -> list[str]:
@@ -828,7 +821,7 @@ async def _build_metered(
 
 
 # A no-priority issue ranks below every labeled severity, so its rank key sits one step
-# under the lowest :class:`~retinue.loopback.Severity` (``LOW``). An unknown ``priority:*``
+# under the lowest :class:`~retinue.vocab.Severity` (``LOW``). An unknown ``priority:*``
 # value parses to ``None`` too (:meth:`retinue.lane.IssueFacts.priority`), so it lands here.
 _NO_PRIORITY_RANK = Severity.LOW - 1
 

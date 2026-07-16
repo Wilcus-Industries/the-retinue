@@ -44,8 +44,8 @@ from retinue.adhoc_drain import (
     run_adhoc_drain,
 )
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
-from retinue.loopback import Severity
 from retinue.repo_config import RepoConfig
+from retinue.vocab import Severity
 from tests.test_budget import FakeClock
 
 

@@ -39,9 +39,9 @@ from retinue.cron import (
     SliceBuilder,
     run_cron_tick,
 )
-from retinue.loopback import Severity
 from retinue.orchestrator import BuildOutcome, BuildResult, Slice, integration_branch
 from retinue.repo_config import RepoConfig
+from retinue.vocab import Severity
 
 
 class FakeClock:

@@ -42,11 +42,11 @@ from retinue.roles import (
     structured_output_config,
 )
 from retinue.slicer import (
-    READY_LABEL,
     CreatedIssue,
     IssueCreator,
     IssueDraft,
 )
+from retinue.vocab import READY_LABEL
 
 logger = logging.getLogger(__name__)
 

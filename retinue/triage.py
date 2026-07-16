@@ -36,7 +36,8 @@ from retinue.impl_retry import ImplRetryStore, impl_retry_key
 from retinue.notify import Notification, Notifier
 from retinue.orchestrator import Slice
 from retinue.repo_config import RepoConfig
-from retinue.slicer import HITL_LABEL, READY_LABEL, CreatedIssue, IssueCreator, IssueDraft
+from retinue.slicer import CreatedIssue, IssueCreator, IssueDraft
+from retinue.vocab import HITL_LABEL, READY_LABEL
 
 logger = logging.getLogger(__name__)
 

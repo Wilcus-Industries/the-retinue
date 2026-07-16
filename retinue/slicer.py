@@ -35,17 +35,9 @@ from retinue.roles import (
     resolve_model,
     structured_output_config,
 )
+from retinue.vocab import HITL_LABEL, PRD_SLICE_LABEL, READY_LABEL
 
 logger = logging.getLogger(__name__)
-
-READY_LABEL = "ready-for-agent"
-HITL_LABEL = "hitl"
-# Provenance marker: a slice the slicer filed off a PRD. Stamped alongside
-# ``ready-for-agent`` so a PRD slice is distinguishable from ad-hoc ``ready-for-agent``
-# work at the label layer (the lane router reads the ``Part of #<prd>`` link, not this
-# label, but downstream tooling and humans can tell a slice apart from pickup). See
-# :mod:`retinue.lane`.
-PRD_SLICE_LABEL = "prd-slice"
 
 # The slicing model and effort tier are owned by :mod:`retinue.roles` (the
 # :data:`Role.SLICER` registry entry), resolved at construction/request time rather than
