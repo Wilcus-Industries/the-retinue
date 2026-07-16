@@ -486,11 +486,16 @@ class ScriptedContainer:
     def __init__(self, results: dict[str, RunResult] | None = None) -> None:
         self._results = results or {}
         self.commands: list[list[str]] = []
+        # Per-exec env overrides, keyed by the first argv token, so a test can assert
+        # what env a command was exec'd with (e.g. the implementer's IS_SANDBOX).
+        self.command_env: dict[str, Mapping[str, str]] = {}
 
     async def run_command(
         self, command: list[str], *, env: Mapping[str, str] | None = None
     ) -> RunResult:
         self.commands.append(command)
+        if env is not None:
+            self.command_env[command[0]] = env
         joined = " ".join(command)
         for marker, result in self._results.items():
             if marker in joined:
@@ -1242,6 +1247,23 @@ async def test_container_implementer_raises_on_is_error_json_result() -> None:
 
     with pytest.raises(ImplementError):
         await ContainerImplementer(credential="k").implement(_slice(), container=container)
+
+
+@pytest.mark.asyncio
+async def test_container_implementer_execs_claude_with_is_sandbox_env() -> None:
+    """The claude exec carries IS_SANDBOX=1 so bypassPermissions runs as root.
+
+    The runner container execs as root, and the CLI refuses
+    ``--dangerously-skip-permissions`` (bypassPermissions) under root unless
+    ``IS_SANDBOX=1`` marks the environment as a disposable sandbox — which this
+    container is. Without it every implement exits 1 instantly (seen live: the whole
+    retry budget burned in two seconds).
+    """
+    container = ScriptedContainer()
+
+    await ContainerImplementer(credential="k").implement(_slice(), container=container)
+
+    assert container.command_env["claude"]["IS_SANDBOX"] == "1"
 
 
 @pytest.mark.asyncio

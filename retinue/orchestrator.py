@@ -380,7 +380,10 @@ class ContainerImplementer:
             )
         prompt = _implement_prompt(slice_, plan_path=plan_path, facts=facts)
         argv = _claude_argv(prompt=prompt, model=self.model, max_turns=self.max_turns)
-        result = await container.run_command(argv)
+        # The runner container execs as root, and the CLI refuses bypassPermissions
+        # under root unless IS_SANDBOX=1 marks the env as a disposable sandbox —
+        # which this container is.
+        result = await container.run_command(argv, env={"IS_SANDBOX": "1"})
         if not result.ok:
             raise ImplementError(
                 f"implementer for {slice_.branch} exited {result.exit_code}: "
