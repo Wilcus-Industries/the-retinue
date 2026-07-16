@@ -39,6 +39,7 @@ import asyncio
 import enum
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -46,6 +47,7 @@ from urllib.parse import quote
 
 import aiosqlite
 
+from retinue.gh import run_gh
 from retinue.orchestrator import PrdSlice, integration_branch
 
 logger = logging.getLogger(__name__)
@@ -360,6 +362,22 @@ def gh_env(token: str, base_env: dict[str, str] | None = None) -> dict[str, str]
     env["GH_TOKEN"] = token
     env["GH_PROMPT_DISABLED"] = "1"
     return env
+
+
+class ReconcileGhRunner:
+    """Production :class:`GhRunner`: one ``gh`` argv, token-authenticated, stdout back.
+
+    Delegates the spawn to :func:`retinue.gh.run_gh` with :func:`gh_env` layered over
+    the ambient environment, so a failed reconcile query raises
+    (:class:`retinue.gh.GhCommandError`) rather than reading as empty truth.
+    """
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    async def __call__(self, argv: list[str]) -> str:
+        """Run ``gh`` with ``argv`` and return its captured stdout (raises on failure)."""
+        return await run_gh(argv, gh_env(self._token, dict(os.environ)))
 
 
 def _issue_state_argv(repo_full_name: str, issue_number: int) -> list[str]:

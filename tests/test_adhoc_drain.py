@@ -926,7 +926,7 @@ class _RunnerWithBranchMiss:
         self.pr_argv: Sequence[str] | None = None
 
     async def __call__(self, argv: Sequence[str], env: Mapping[str, str]) -> bytes:
-        from retinue.cron import GhCliError
+        from retinue.gh import GhCliError
 
         if "git/ref/heads/issue-7" in " ".join(argv) or any(
             "git/ref" in part for part in argv

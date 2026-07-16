@@ -1226,7 +1226,7 @@ async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
     monkeypatch.setattr(pipeline_mod, "HttpxTransport", lambda: transport)
     monkeypatch.setattr(pipeline_mod, "GhLabelSink", lambda token: labels)
     monkeypatch.setattr(pipeline_mod, "GhCommentSink", lambda token: comments)
-    monkeypatch.setattr(pipeline_mod, "_ReconcileGhRunner", lambda token: gh_runner)
+    monkeypatch.setattr(pipeline_mod, "ReconcileGhRunner", lambda token: gh_runner)
     captured: dict[str, object] = {}
     green = AdhocBuildResult(branch="issue-31", passed=True)
     monkeypatch.setattr(

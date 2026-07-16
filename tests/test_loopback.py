@@ -25,11 +25,10 @@ from pathlib import Path
 
 import pytest
 
+from retinue.gh import GhCommandError, GhResult
 from retinue.loopback import (
     BACKLOG_LABEL,
     GhCliRebuilder,
-    GhCommandError,
-    GhResult,
     HeimdallFinding,
     HeimdallReview,
     HeimdallRoundStore,
@@ -39,7 +38,6 @@ from retinue.loopback import (
     VerdictDecision,
     VerdictOutcome,
     VerdictResult,
-    _auth_env,
     _parse_review_requested,
     _re_review_args,
     decide_verdict,
@@ -610,11 +608,6 @@ def _rebuild_request() -> RebuildRequest:
         pr_number=42,
         fix_issues=[100, 101],
     )
-
-
-def test_auth_env_carries_only_the_gh_token_bearer() -> None:
-    """The rebuild auth env injects the token as ``GH_TOKEN`` and nothing else."""
-    assert _auth_env("ghs_abc123") == {"GH_TOKEN": "ghs_abc123"}
 
 
 def test_re_review_args_assemble_a_heimdall_review_re_request() -> None:

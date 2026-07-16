@@ -26,6 +26,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from retinue.gh import GhCommandError, GhResult, GhRunner, auth_env
 from retinue.roles import (
     Role,
     is_oauth_credential,
@@ -363,72 +364,13 @@ class ReviewGenerationError(RuntimeError):
 # read the dependent's current body (``gh issue view --json body``), add the
 # ``#<fix>`` reference to its ``## Blocked by`` block (matching the slicer's block
 # shape), then write it back (``gh issue edit --body``). The process spawn is the
-# only side effect, taken behind the injected :class:`GhRunner` protocol so the
-# pure parts — auth-env build, command assembly, body parsing, block rendering —
-# are exercised without a live ``gh`` or network.
-#
-# gh is authenticated via ``GH_TOKEN`` in the environment (gh sends it as
-# ``Authorization: Bearer`` on every REST/GraphQL call), so the adapter never
-# assembles an auth header itself — it injects the token and lets gh own the wire.
+# only side effect, taken behind the injected :class:`~retinue.gh.GhRunner` protocol
+# so the pure parts — auth-env build, command assembly, body parsing, block
+# rendering — are exercised without a live ``gh`` or network. The runner shape,
+# result shape, error, and auth env all come from the shared :mod:`retinue.gh` seam.
 # ---------------------------------------------------------------------------
 
 _BLOCKED_BY_HEADING = "## Blocked by"
-
-
-@dataclass(frozen=True)
-class GhResult:
-    """Captured result of a single ``gh`` invocation.
-
-    Attributes:
-        exit_code: ``gh``'s process exit status; ``0`` means success.
-        stdout: Captured standard output (the issue body payload to parse).
-        stderr: Captured standard error (surfaced in the error on failure).
-    """
-
-    exit_code: int
-    stdout: str = ""
-    stderr: str = ""
-
-    @property
-    def ok(self) -> bool:
-        """True when ``gh`` exited successfully (exit code 0)."""
-        return self.exit_code == 0
-
-
-class GhRunner(Protocol):
-    """Runs a single ``gh`` command. The process-spawn seam under the editor.
-
-    A production implementation spawns ``gh`` as a subprocess with ``env`` merged
-    into its environment (so ``GH_TOKEN`` authenticates the call) and returns the
-    captured :class:`GhResult`; tests inject a fake that records each ``(args, env)``
-    and returns a canned result. ``args`` never includes the leading ``"gh"`` — the
-    runner owns the executable name.
-    """
-
-    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
-        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
-        ...
-
-
-class GhCommandError(RuntimeError):
-    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
-
-    def __init__(self, command: list[str], result: GhResult) -> None:
-        self.command = command
-        self.result = result
-        super().__init__(
-            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
-        )
-
-
-def _gh_auth_env(token: str) -> dict[str, str]:
-    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
-
-    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on
-    every REST/GraphQL call, so the adapter injects the token here and lets ``gh``
-    own the wire format rather than assembling a header itself.
-    """
-    return {"GH_TOKEN": token}
 
 
 def _issue_view_args(repo_full_name: str, issue_number: int) -> list[str]:
@@ -553,7 +495,7 @@ class GhCliBlockedByEditor:
 
     async def _gh(self, args: list[str]) -> GhResult:
         """Run one ``gh`` command authenticated with the token, raising on failure."""
-        result = await self.runner.run(args, env=_gh_auth_env(self.token))
+        result = await self.runner.run(args, env=auth_env(self.token))
         if not result.ok:
             raise GhCommandError(args, result)
         return result

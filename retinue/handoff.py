@@ -28,10 +28,10 @@ import enum
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from retinue.gh import GhTextRunner, run_gh
 from retinue.notify import Notification, Notifier
 from retinue.slicer import HITL_LABEL
 
@@ -287,12 +287,6 @@ async def _all_non_hitl_children_closed(
 # slicer's ``Part of #<prd>`` marker, returning just the fields the reap gate reads.
 _CHILD_JSON_FIELDS = "number,state,labels"
 
-# A subprocess runner: given the ``gh`` argv (no leading "gh") and the auth env, returns
-# the command's stdout. The default runs a real ``gh`` child; tests inject a fake to
-# exercise the pure command-assembly + payload-parsing without a network or a real CLI.
-GhRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[str]]
-
-
 # The only parent-environment variables the ``gh`` child needs: ``PATH`` to locate the
 # ``gh`` executable (and the ``git`` it shells out to) and ``HOME`` for its config / the
 # host's own ``gh auth`` state. The rest of the worker's environment — Anthropic
@@ -375,28 +369,6 @@ def _parse_children(stdout: str) -> list[ChildIssue]:
     return children
 
 
-async def _run_gh(argv: Sequence[str], env: Mapping[str, str]) -> str:
-    """Run a real ``gh`` subprocess, returning stdout; raise on a non-zero exit.
-
-    Uses ``create_subprocess_exec`` (argv list, no shell) so the assembled command is
-    passed verbatim and never interpolated through a shell.
-    """
-    process = await asyncio.create_subprocess_exec(
-        "gh",
-        *argv,
-        env=dict(env),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"gh {' '.join(argv)} exited {process.returncode}: "
-            f"{stderr.decode(errors='replace').strip()}"
-        )
-    return stdout.decode()
-
-
 @dataclass(frozen=True)
 class HandoffGh:
     """The production gh-cli :class:`Handoff`: close issues + enumerate PRD children.
@@ -409,7 +381,7 @@ class HandoffGh:
     The command assembly (:func:`_close_issue_argv`, :func:`_children_query_argv`), the
     auth env build (:func:`_auth_env`), and the payload parse (:func:`_parse_children`)
     are pure and unit-tested directly. The subprocess itself is the injected ``runner``
-    (default: a real ``gh`` child), so the seam is exercisable without a network.
+    (default: :func:`retinue.gh.run_gh`), so the seam is exercisable without a network.
 
     Attributes:
         token: An optional ``gh`` token (e.g. a GitHub App installation token), threaded
@@ -418,7 +390,7 @@ class HandoffGh:
     """
 
     token: str | None = None
-    runner: GhRunner = _run_gh
+    runner: GhTextRunner = run_gh
 
     async def close_issue(self, *, repo_full_name: str, issue_number: int) -> None:
         """Close ``issue_number`` on ``repo_full_name`` via ``gh issue close``."""

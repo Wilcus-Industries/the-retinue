@@ -23,7 +23,6 @@ from retinue.done_check import (
     DoneCheckError,
     DoneCheckReport,
     EnvSecretResolver,
-    GhCliError,
     GhReportSink,
     MissingSecretError,
     ReportSink,
@@ -35,6 +34,7 @@ from retinue.done_check import (
     resolve_secrets_or_escalate,
     run_done_check_commands,
 )
+from retinue.gh import GhCliError
 from retinue.github_app import InstallationToken
 from retinue.repo_config import RepoConfig, SecretsConfig
 

@@ -28,12 +28,9 @@ tick runs with no real ``gh``, no Docker, and no network.
 
 from __future__ import annotations
 
-import asyncio
 import enum
-import json
 import logging
-import os
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -42,6 +39,7 @@ from typing import Protocol
 from retinue.budget import BudgetGovernor, Clock
 from retinue.container import ContainerRuntime
 from retinue.done_check import DEFAULT_IMAGE, ReportSink, SecretResolver
+from retinue.gh import GhBytesRunner, auth_env, parse_json_array, run_gh_subprocess
 from retinue.github_app import InstallationAuth
 from retinue.loopback import Severity
 from retinue.orchestrator import (
@@ -167,29 +165,6 @@ _BACKLOG_LABEL = "backlog"
 # without an unbounded fetch.
 _DEFAULT_LIST_LIMIT = 200
 
-# An async runner for a ``gh`` argv: returns the command's stdout bytes, raising on a
-# non-zero exit. Injected so the command-assembly + payload-parsing of :class:`GhCli`
-# are exercised without spawning a real process, mirroring the injected-seam style of the
-# rest of the cron tick. The default (:func:`_run_gh_subprocess`) shells out to ``gh``.
-GhRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[bytes]]
-
-
-class GhCliError(RuntimeError):
-    """A ``gh`` invocation behind :class:`GhCli` failed (non-zero exit or bad output).
-
-    Carries the argv and the captured stderr so a backlog-query failure is debuggable
-    rather than a bare ``CalledProcessError``.
-    """
-
-    def __init__(self, argv: Sequence[str], *, returncode: int, stderr: str) -> None:
-        self.argv = list(argv)
-        self.returncode = returncode
-        self.stderr = stderr
-        super().__init__(
-            f"gh exited {returncode} for {' '.join(argv)}: {stderr.strip()}"
-        )
-
-
 class GhCli:
     """The production :class:`CronGh`: lists ``backlog`` issues via the ``gh`` CLI.
 
@@ -201,7 +176,7 @@ class GhCli:
     The actual subprocess spawn is the one impure edge, factored behind the injected
     ``runner`` so command assembly, the auth env, and payload parsing are unit-testable
     without a real ``gh``, Docker, or network. Production leaves ``runner`` defaulted to
-    :func:`_run_gh_subprocess`.
+    :func:`retinue.gh.run_gh_subprocess`.
 
     Args:
         token: The GitHub token ``gh`` authenticates with, placed in the child env as
@@ -215,11 +190,11 @@ class GhCli:
         self,
         *,
         token: str | None = None,
-        runner: GhRunner | None = None,
+        runner: GhBytesRunner | None = None,
         list_limit: int = _DEFAULT_LIST_LIMIT,
     ) -> None:
         self._token = token
-        self._runner = runner or _run_gh_subprocess
+        self._runner = runner or run_gh_subprocess
         self._list_limit = list_limit
 
     async def list_backlog(self, *, repo_full_name: str) -> list[BacklogIssue]:
@@ -234,16 +209,8 @@ class GhCli:
                 issue listing.
         """
         argv = _list_backlog_argv(repo_full_name, limit=self._list_limit)
-        stdout = await self._runner(argv, self._auth_env())
+        stdout = await self._runner(argv, auth_env(self._token))
         return _parse_backlog(stdout)
-
-    def _auth_env(self) -> Mapping[str, str]:
-        """The child-process env carrying the token as ``GH_TOKEN`` (empty when none).
-
-        The token goes in the env, never on the argv, so it never lands in a process
-        listing or a log of the command.
-        """
-        return {"GH_TOKEN": self._token} if self._token else {}
 
 
 def _list_backlog_argv(repo_full_name: str, *, limit: int) -> list[str]:
@@ -269,23 +236,6 @@ def _list_backlog_argv(repo_full_name: str, *, limit: int) -> list[str]:
     ]
 
 
-def _parse_json_array(stdout: bytes) -> list[object]:
-    """Parse a ``gh issue list --json`` payload into its JSON array of issue entries.
-
-    ``gh`` emits a JSON array of objects; a payload that is not valid JSON or not an array
-    raises :class:`ValueError` rather than silently yielding nothing. Shared with the
-    ad-hoc drain's :class:`retinue.adhoc_drain.GhCli` so both gh listers parse the array
-    envelope identically; each lister maps the entries into its own issue dataclass.
-    """
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"gh issue list returned non-JSON output: {exc}") from exc
-    if not isinstance(payload, list):
-        raise ValueError(f"gh issue list expected a JSON array, got {type(payload)}")
-    return payload
-
-
 def _parse_backlog(stdout: bytes) -> list[BacklogIssue]:
     """Parse a ``gh issue list --json`` payload into :class:`BacklogIssue` objects.
 
@@ -293,7 +243,7 @@ def _parse_backlog(stdout: bytes) -> list[BacklogIssue]:
     UTC), and ``labels`` (a list of ``{"name": ...}`` objects). A malformed payload raises
     :class:`ValueError` rather than silently dropping issues.
     """
-    return [_parse_issue(entry) for entry in _parse_json_array(stdout)]
+    return [_parse_issue(entry) for entry in parse_json_array(stdout)]
 
 
 def _parse_issue(entry: object) -> BacklogIssue:
@@ -312,29 +262,6 @@ def _parse_issue(entry: object) -> BacklogIssue:
 def _parse_timestamp(raw: str) -> datetime:
     """Parse gh's ISO-8601 ``createdAt`` (``Z``-suffixed UTC) into an aware datetime."""
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-
-
-async def _run_gh_subprocess(argv: Sequence[str], env: Mapping[str, str]) -> bytes:
-    """Spawn ``gh`` with ``env`` layered over the ambient env; return stdout bytes.
-
-    The default :data:`GhRunner`. Uses :func:`asyncio.create_subprocess_exec` (no shell,
-    so the repo name is never interpolated into a command line) and raises
-    :class:`GhCliError` on a non-zero exit so the backlog query fails loudly.
-    """
-    process = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, **env},
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise GhCliError(
-            argv,
-            returncode=process.returncode or -1,
-            stderr=stderr.decode(errors="replace"),
-        )
-    return stdout
 
 
 # The downstream a cron tick drives for the picked issue: the same build -> PR ->

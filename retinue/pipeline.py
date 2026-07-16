@@ -34,17 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import retinue.loopback as _loopback_gh
-import retinue.pr_opener as _pr_gh
-import retinue.reviewer as _reviewer_gh
-import retinue.slicer as _slicer_gh
 from retinue.adhoc_build import (
     AdhocBuildResult,
     AdhocIssue,
@@ -70,6 +65,7 @@ from retinue.done_check import (
     SecretResolver,
     parse_done_check,
 )
+from retinue.gh import SubprocessGhRunner
 from retinue.handoff import (
     Handoff,
     HandoffGh,
@@ -109,6 +105,7 @@ from retinue.reconcile import (
     GhCliReconcile,
     PrState,
     ReconcileGh,
+    ReconcileGhRunner,
     ReconcileResult,
     ResumePhase,
     RunStateStore,
@@ -118,6 +115,7 @@ from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
     AgentSdkReviewGenerator,
     GhCliBlockedByEditor,
+    HttpResponse,
     ReviewGenerator,
 )
 from retinue.roles import Role, resolve_effort, resolve_model
@@ -705,73 +703,6 @@ def _slices_from_numbers(
 # --- production wiring: build the real pipeline from Settings ----------------------
 
 
-class SubprocessGhRunner[R]:
-    """Real ``GhRunner`` for the ``run(args, *, env) -> GhResult`` seam (slicer/pr/loopback).
-
-    Spawns ``gh`` as a child (argv list, no shell, so nothing is interpolated into a
-    command line) with ``env`` merged over the ambient environment, then builds the
-    *target module's own* ``GhResult`` from the captured ``(exit_code, stdout, stderr)``
-    via the injected ``result`` factory. The slicer, PR-opener, and loopback each define a
-    structurally-identical ``GhResult``; constructing the real one per call keeps each
-    module's runner Protocol satisfied with a single subprocess implementation.
-
-    Args:
-        result: The module's ``GhResult`` constructor (``(exit_code, stdout, stderr)``).
-    """
-
-    def __init__(
-        self, result: Callable[..., R]
-    ) -> None:
-        self._result = result
-
-    async def run(self, args: list[str], *, env: dict[str, str]) -> R:
-        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
-        merged_env = {**os.environ, **env}
-        process = await asyncio.create_subprocess_exec(
-            "gh",
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=merged_env,
-        )
-        stdout, stderr = await process.communicate()
-        return self._result(
-            exit_code=process.returncode or 0,
-            stdout=stdout.decode(errors="replace"),
-            stderr=stderr.decode(errors="replace"),
-        )
-
-
-class _ReconcileGhRunner:
-    """Real reconcile gh runner (``__call__(argv) -> str``) authenticated by token.
-
-    Satisfies :class:`retinue.reconcile.GhRunner`: runs one ``gh`` argv with the
-    installation token in ``GH_TOKEN`` and returns stdout, raising on a non-zero exit so
-    a failed reconcile query surfaces rather than reading as empty truth.
-    """
-
-    def __init__(self, token: str) -> None:
-        self._token = token
-
-    async def __call__(self, argv: list[str]) -> str:
-        from retinue.reconcile import gh_env
-
-        process = await asyncio.create_subprocess_exec(
-            "gh",
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=gh_env(self._token, dict(os.environ)),
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            raise RuntimeError(
-                f"gh {' '.join(argv)} exited {process.returncode}: "
-                f"{stderr.decode(errors='replace').strip()}"
-            )
-        return stdout.decode()
-
-
 def _build_push_sink(settings: Settings) -> PushSink:
     """Pick the push sink from settings: ntfy (topic) or Pushover (token+user).
 
@@ -934,11 +865,9 @@ def build_pipeline_factory(
     push = _build_push_sink(settings)
     state_dir = _state_dir(settings)
     retry_store_path = state_dir / "impl-retries.sqlite3"
-    # One subprocess runner per module's own GhResult (structurally identical), so each
-    # adapter's runner Protocol is satisfied by the same real ``gh`` spawn.
-    slicer_runner = SubprocessGhRunner(_slicer_gh.GhResult)
-    pr_runner = SubprocessGhRunner(_pr_gh.GhResult)
-    loopback_runner = SubprocessGhRunner(_loopback_gh.GhResult)
+    # One stateless subprocess runner satisfies every ``run(args, *, env)`` gh seam
+    # (slicer / PR-opener / loopback) — the shape now lives in :mod:`retinue.gh`.
+    gh_runner = SubprocessGhRunner()
 
     async def factory(repo_full_name: str, config: RepoConfig) -> Pipeline:
         token = (await auth.installation_token(repo_full_name)).token
@@ -948,7 +877,7 @@ def build_pipeline_factory(
             label=GhLabelSink(token=token),
         )
         create_issue = GhCliIssueCreator(
-            slicer_runner, token=token, repo_full_name=repo_full_name
+            gh_runner, token=token, repo_full_name=repo_full_name
         )
         slice_generate = ClaudeSliceGenerator(
             token=settings.anthropic_credential,
@@ -956,15 +885,15 @@ def build_pipeline_factory(
             model=resolve_model(Role.SLICER, config),
             effort=resolve_effort(Role.SLICER, config),
         ).generate
-        pr_ops = GhCliPrOps(pr_runner, token=token)
+        pr_ops = GhCliPrOps(gh_runner, token=token)
         reap_gh = HandoffGh(token=token)
         rebuild = GhCliRebuilder(
-            loopback_runner,
+            gh_runner,
             token=token,
             reviewer_login=settings.heimdall_bot_login,
         )
         reconcile_gh = GhCliReconcile(
-            _ReconcileGhRunner(token), merge_base=config.staging_branch
+            ReconcileGhRunner(token), merge_base=config.staging_branch
         )
         bound_build_prd = build_prd or _bind_build_prd_for_repo(
             settings,
@@ -1034,13 +963,13 @@ class HttpxTransport:
 
     async def post(
         self, url: str, *, headers: dict[str, str], json: dict[str, object]
-    ) -> _reviewer_gh.HttpResponse:
+    ) -> HttpResponse:
         """POST ``json`` to ``url`` with ``headers``; return status + parsed JSON body."""
         import httpx
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(url, headers=headers, json=json)
-        return _reviewer_gh.HttpResponse(
+        return HttpResponse(
             status_code=response.status_code, body=response.json()
         )
 
@@ -1085,7 +1014,7 @@ def _bind_build_prd_for_repo(
     git = _MergeContainerGitOps(
         repo_full_name=repo_full_name, auth=auth, runtime=runtime
     )
-    issue_facts = GhCliIssueFacts(_ReconcileGhRunner(token))
+    issue_facts = GhCliIssueFacts(ReconcileGhRunner(token))
     implementer = ContainerImplementer(
         credential=settings.anthropic_credential,
         auth_mode=settings.auth_mode,
@@ -1193,7 +1122,7 @@ async def build_cron_slice_builder(
         auth_mode=settings.auth_mode,
         model=resolve_model(Role.IMPLEMENTER, config),
         max_turns=settings.implement_max_turns,
-        issue_facts=GhCliIssueFacts(_ReconcileGhRunner(token)),
+        issue_facts=GhCliIssueFacts(ReconcileGhRunner(token)),
     )
     builder = SliceBuilder(
         config=config,
@@ -1329,7 +1258,7 @@ def bind_adhoc_build(
     # The classifier (and its sinks) is constructed only when the repo declares a
     # routing table, so a table-less repo makes zero classifier calls — invocations
     # identical to pre-routing. This mirrors _bind_build_prd_for_repo.
-    issue_facts = GhCliIssueFacts(_ReconcileGhRunner(token))
+    issue_facts = GhCliIssueFacts(ReconcileGhRunner(token))
     classifier: ClaudeIssueClassifier | None = None
     label_sink: GhLabelSink | None = None
     comment_sink: GhCommentSink | None = None
@@ -1458,7 +1387,7 @@ def _build_review_reviewer_factory(
         effort=resolve_effort(Role.REVIEWER, config),
     )
     edit_blocked_by = GhCliBlockedByEditor(
-        runner=SubprocessGhRunner(_reviewer_gh.GhResult), token=token
+        runner=SubprocessGhRunner(), token=token
     )
 
     def factory(factory_repo: str, prd_number: int) -> RoundReviewer:

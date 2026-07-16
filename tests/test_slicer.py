@@ -13,6 +13,7 @@ import json
 
 import pytest
 
+from retinue.gh import GhCommandError, GhResult
 from retinue.notify import (
     CommentRequest,
     LabelRequest,
@@ -25,8 +26,6 @@ from retinue.slicer import (
     ClaudeSliceGenerator,
     CreatedIssue,
     GhCliIssueCreator,
-    GhCommandError,
-    GhResult,
     IssueDraft,
     SliceOutcome,
     SlicePlan,
@@ -488,13 +487,6 @@ def test_parse_issue_number_rejects_output_with_no_number() -> None:
     """A URL-less / number-less output raises rather than yielding a bogus number."""
     with pytest.raises(ValueError):
         _parse_issue_number("not a url")
-
-
-def test_auth_uses_gh_token_env_no_leading_gh_in_argv() -> None:
-    """The runner is handed GH_TOKEN in env and an argv that omits the leading 'gh'."""
-    from retinue.slicer import _auth_env
-
-    assert _auth_env("tok-123") == {"GH_TOKEN": "tok-123"}
 
 
 @pytest.mark.asyncio

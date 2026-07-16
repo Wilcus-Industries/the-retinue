@@ -19,12 +19,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import urllib.error
 import urllib.request
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlencode
+
+from retinue.gh import GhCliError, auth_env, run_gh_subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -396,7 +397,7 @@ class GhCommentSink:
         process listing or a log of the command. With no token, an empty mapping
         lets the runner fall back to the host's own ``gh`` auth.
         """
-        return {"GH_TOKEN": self._token} if self._token else {}
+        return auth_env(self._token)
 
     async def __call__(self, request: CommentRequest) -> None:
         """Post ``request`` as an issue comment. Raises on a non-zero ``gh`` exit."""
@@ -408,26 +409,17 @@ async def _run_gh_comment_subprocess(
 ) -> None:
     """Spawn ``gh`` with ``env`` layered over the ambient env; raise on failure.
 
-    The default :data:`GhCommentRunner`. Uses :func:`asyncio.create_subprocess_exec`
-    (an argv list, no shell, so the body and repo name are never interpolated into a
-    command line) and raises :class:`CommentDeliveryError` on a non-zero exit so a
-    lost comment fails loudly — the comment is the durable record the caller must
-    not silently lose.
+    The default :data:`GhCommentRunner`: delegates the spawn to
+    :func:`retinue.gh.run_gh_subprocess` and surfaces a non-zero exit as
+    :class:`CommentDeliveryError` so a lost comment fails loudly — the comment is the
+    durable record the caller must not silently lose.
     """
-    process = await asyncio.create_subprocess_exec(
-        "gh",
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, **env},
-    )
-    _, stderr = await process.communicate()
-    if process.returncode != 0:
+    try:
+        await run_gh_subprocess(["gh", *argv], env)
+    except GhCliError as exc:
         raise CommentDeliveryError(
-            argv,
-            returncode=process.returncode or -1,
-            stderr=stderr.decode(errors="replace"),
-        )
+            argv, returncode=exc.returncode, stderr=exc.stderr
+        ) from exc
 
 
 # --- Real label sink: gh issue edit --add-label ------------------------------
@@ -520,7 +512,7 @@ class GhLabelSink:
         process listing or a log of the command. With no token, an empty mapping
         lets the runner fall back to the host's own ``gh`` auth.
         """
-        return {"GH_TOKEN": self._token} if self._token else {}
+        return auth_env(self._token)
 
     async def __call__(self, request: LabelRequest) -> None:
         """Apply ``request``'s label. Raises on a non-zero ``gh`` exit."""
@@ -532,23 +524,14 @@ async def _run_gh_label_subprocess(
 ) -> None:
     """Spawn ``gh`` with ``env`` layered over the ambient env; raise on failure.
 
-    The default :data:`GhLabelRunner`. Uses :func:`asyncio.create_subprocess_exec`
-    (an argv list, no shell, so the label and repo name are never interpolated into
-    a command line) and raises :class:`LabelDeliveryError` on a non-zero exit so a
-    lost label fails loudly — the label routes the agent loop and the caller must
-    not silently lose it.
+    The default :data:`GhLabelRunner`: delegates the spawn to
+    :func:`retinue.gh.run_gh_subprocess` and surfaces a non-zero exit as
+    :class:`LabelDeliveryError` so a lost label fails loudly — the label routes the
+    agent loop and the caller must not silently lose it.
     """
-    process = await asyncio.create_subprocess_exec(
-        "gh",
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, **env},
-    )
-    _, stderr = await process.communicate()
-    if process.returncode != 0:
+    try:
+        await run_gh_subprocess(["gh", *argv], env)
+    except GhCliError as exc:
         raise LabelDeliveryError(
-            argv,
-            returncode=process.returncode or -1,
-            stderr=stderr.decode(errors="replace"),
-        )
+            argv, returncode=exc.returncode, stderr=exc.stderr
+        ) from exc

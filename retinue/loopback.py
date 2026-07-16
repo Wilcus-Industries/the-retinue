@@ -34,10 +34,10 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
 
 import aiosqlite
 
+from retinue.gh import GhCommandError, GhRunner, auth_env
 from retinue.notify import Notification, Notifier
 from retinue.repo_config import RepoConfig
 from retinue.slicer import HITL_LABEL, READY_LABEL, CreatedIssue, IssueCreator, IssueDraft
@@ -606,64 +606,8 @@ async def _file_backlog(
 # The adapter never shells out itself: every pure/parseable part — the auth-env build, the
 # ``gh pr edit --add-reviewer`` command assembly, and parsing the re-review payload — is a
 # free function tested with a recording fake runner, never a live ``gh``/heimdall/network.
-# The local :class:`GhRunner`/:class:`GhResult` mirror the gh-seam shape used in
-# :mod:`retinue.slicer` / :mod:`retinue.pr_opener`; each module keeps its own copy so the
-# layers stay edit-isolated.
-
-@dataclass(frozen=True)
-class GhResult:
-    """Captured result of a single ``gh`` invocation.
-
-    Attributes:
-        exit_code: ``gh``'s process exit status; ``0`` means success.
-        stdout: Captured standard output (the re-review payload parsed below).
-        stderr: Captured standard error (surfaced in the error on failure).
-    """
-
-    exit_code: int
-    stdout: str = ""
-    stderr: str = ""
-
-    @property
-    def ok(self) -> bool:
-        """True when ``gh`` exited successfully (exit code 0)."""
-        return self.exit_code == 0
-
-
-class GhRunner(Protocol):
-    """Runs a single ``gh`` command. The process-spawn seam under :class:`GhCliRebuilder`.
-
-    A production implementation spawns ``gh`` as a subprocess with ``env`` merged into its
-    environment (so ``GH_TOKEN`` authenticates the call) and returns the captured
-    :class:`GhResult`; tests inject a fake that records each ``(args, env)`` and returns a
-    canned result. ``args`` never includes the leading ``"gh"`` — the runner owns the
-    executable name.
-    """
-
-    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
-        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
-        ...
-
-
-class GhCommandError(RuntimeError):
-    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
-
-    def __init__(self, command: list[str], result: GhResult) -> None:
-        self.command = command
-        self.result = result
-        super().__init__(
-            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
-        )
-
-
-def _auth_env(token: str) -> dict[str, str]:
-    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
-
-    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on every
-    REST/GraphQL call, so the adapter never assembles a header itself — it injects the
-    token here and lets ``gh`` own the wire format.
-    """
-    return {"GH_TOKEN": token}
+# The runner shape, result shape, error, and auth env all come from the shared
+# :mod:`retinue.gh` seam.
 
 
 def _re_review_args(request: RebuildRequest, reviewer_login: str) -> list[str]:
@@ -712,8 +656,9 @@ class GhCliRebuilder:
     already filed the round's fix-issues before this trigger fires (re-filing them here
     would double every finding), so the trigger's single job is re-requesting the heimdall
     bot review on the same PR: it dispatches the assembled ``gh pr edit`` argv
-    (:func:`_re_review_args`) through the injected :class:`GhRunner`, authenticated with a
-    ``GH_TOKEN`` bearer (:func:`_auth_env`), and confirms the PR number echoed back
+    (:func:`_re_review_args`) through the injected :class:`~retinue.gh.GhRunner`,
+    authenticated with a ``GH_TOKEN`` bearer (:func:`retinue.gh.auth_env`), and confirms
+    the PR number echoed back
     (:func:`_parse_review_requested`).
 
     The runner is the only side-effecting seam, which keeps the command assembly and
@@ -742,7 +687,7 @@ class GhCliRebuilder:
     async def __call__(self, request: RebuildRequest) -> None:
         """Re-request the heimdall review on the rebuilt PR."""
         args = _re_review_args(request, self._reviewer_login)
-        result = await self._runner.run(args, env=_auth_env(self._token))
+        result = await self._runner.run(args, env=auth_env(self._token))
         if not result.ok:
             raise GhCommandError(args, result)
         pr_number = _parse_review_requested(result.stdout)
