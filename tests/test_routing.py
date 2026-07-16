@@ -296,6 +296,33 @@ async def test_router_classify_success_routes_model_labels_and_charges(
 
 
 @pytest.mark.asyncio
+async def test_router_logs_the_routed_level_and_model(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each routed slice leaves a log line naming its level and implementer model.
+
+    The routed model is otherwise invisible in production — the implementer runs
+    silently in its container — so the log line is the live-verification surface
+    for per-issue routing (PRD #58's dogfood gate reads it).
+    """
+    facts = _FactsFor({1: ClassifyInput(title="typo", body="b", labels=[])})
+    router = _router(
+        tmp_path,
+        classify=_RecordingClassifier(ClassifyResult(level="trivial")),
+        labels=_RecordingLabels(),
+        comments=_RecordingComments(),
+        facts=facts,
+        governor=_governor(tmp_path),
+    )
+
+    with caplog.at_level("INFO", logger="retinue.routing"):
+        await router(_slice(1))
+
+    assert "level 'trivial'" in caplog.text
+    assert "implementer-trivial" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_router_preexisting_label_short_circuits_without_charge(
     tmp_path: Path,
 ) -> None:

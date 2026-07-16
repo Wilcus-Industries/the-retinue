@@ -251,4 +251,13 @@ class PerIssueImplementerRouter:
             classifier_charge=self.classifier_charge,
         )
         model = resolve_model(Role.IMPLEMENTER, self.config, level=level)
+        # The implementer runs silently in its container, so this line is the only
+        # production surface showing which model a slice was routed to.
+        logger.info(
+            "Routed %s#%d at level %r: implementer model %s",
+            slice_.repo_full_name,
+            slice_.issue_number,
+            level,
+            model,
+        )
         return replace(self.base_implementer, model=model)
