@@ -65,6 +65,7 @@ from retinue.gh import (
 )
 from retinue.lane import IssueFacts, preempts_prd_first
 from retinue.repo_config import RepoConfig
+from retinue.single_run import SingleRunLock
 from retinue.vocab import PRD_LABEL, READY_LABEL, Severity, issue_branch
 
 logger = logging.getLogger(__name__)
@@ -84,37 +85,17 @@ class AdhocDrainBusyError(Exception):
         super().__init__("an ad-hoc drain is already in flight")
 
 
-class AdhocDrainLock:
-    """The production single-run lock: a non-blocking in-process guard for one repo's drain.
+class AdhocDrainLock(SingleRunLock):
+    """One repo's ad-hoc drain single-run lock: a second concurrent drain is rejected.
 
-    Satisfies the ``AbstractAsyncContextManager`` :func:`run_adhoc_drain` enters: the first
-    holder enters, and a *second* concurrent ``__aenter__`` raises :class:`AdhocDrainBusyError`
-    rather than blocking — so the "at most one ad-hoc drain per repo at a time" contract is
-    observable to the caller (mirroring the test fake's reject-don't-block behavior). One lock
-    instance guards one repo; the worker keeps a per-repo registry so two repos drain
-    concurrently while a repo's own kicked and swept drains serialize through the same lock.
-
-    The guard is a plain in-process flag (no real wall-clock, Redis, or file lock), which is
-    correct because the whole drain runs inside a single worker process; a cross-process lock
-    is out of scope for the single-worker deployment.
+    A :class:`~retinue.single_run.SingleRunLock` raising :class:`AdhocDrainBusyError`.
+    One instance guards one repo; the worker keeps a per-repo registry so two repos drain
+    concurrently while a repo's own kicked and swept drains serialize through the same
+    lock. Separate from the cron and PRD locks, so an ad-hoc drain runs concurrently with
+    those lanes.
     """
 
-    def __init__(self) -> None:
-        self._held = False
-
-    async def __aenter__(self) -> AdhocDrainLock:
-        if self._held:
-            raise AdhocDrainBusyError
-        self._held = True
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: object | None,
-    ) -> None:
-        self._held = False
+    busy_error = AdhocDrainBusyError
 
 
 # How many ready-for-agent issues to pull per drain. The cap on concurrent *builds* is
