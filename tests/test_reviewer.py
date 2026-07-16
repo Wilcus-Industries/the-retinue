@@ -35,8 +35,8 @@ from retinue.reviewer import (
     add_blocked_by,
     review_round,
 )
-from retinue.roles import CLAUDE_CODE_IDENTITY
-from retinue.slicer import _EFFORT_MAX, CreatedIssue, IssueDraft
+from retinue.roles import CLAUDE_CODE_IDENTITY, EFFORT_MAX
+from retinue.slicer import CreatedIssue, IssueDraft
 from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
 from tests.test_orchestrator import FakeGitOps, FakeImplementer
 from tests.test_prd_build import OneAtATimeLock
@@ -334,8 +334,8 @@ def test_payload_carries_max_effort() -> None:
 
     payload = gen._payload(_input(PLANTED_DEFECT_DIFF))
 
-    assert payload["output_config"]["effort"] == _EFFORT_MAX
-    assert _EFFORT_MAX == "max"
+    assert payload["output_config"]["effort"] == EFFORT_MAX
+    assert EFFORT_MAX == "max"
     assert "thinking" not in payload
 
 

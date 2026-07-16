@@ -8,7 +8,7 @@ cron lane's per-tick driver.
 Each :func:`run_cron_tick`:
 
 1. runs under an injected single-run **lock** so at most one cron run executes at a time,
-   mirroring the orchestrator's :class:`retinue.orchestrator.OrchestratorBusyError` guard;
+   mirroring the orchestrator's single-run lock;
 2. **gates** on the shared :class:`retinue.budget.BudgetGovernor` — the *same*
    service-level governor the orchestrator shares — and **defers** when the budget is
    spent, picking nothing and running no downstream; an admitted tick's estimate is
@@ -78,8 +78,7 @@ class CronBusyError(Exception):
 
     The single-run guarantee: :func:`run_cron_tick` runs inside an injected lock that
     rejects a concurrent holder rather than blocking, so the "at most one cron run at a
-    time" contract is observable to the caller. Mirrors
-    :class:`retinue.orchestrator.OrchestratorBusyError`.
+    time" contract is observable to the caller.
     """
 
     def __init__(self) -> None:

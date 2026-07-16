@@ -19,9 +19,8 @@ from retinue.notify import (
     Notifier,
     PushRequest,
 )
-from retinue.roles import CLAUDE_CODE_IDENTITY
+from retinue.roles import CLAUDE_CODE_IDENTITY, EFFORT_XHIGH
 from retinue.slicer import (
-    _EFFORT_XHIGH,
     _SLICE_SYSTEM,
     ClaudeSliceGenerator,
     CreatedIssue,
@@ -352,8 +351,8 @@ def test_request_kwargs_carry_xhigh_effort() -> None:
 
     kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
 
-    assert kwargs["output_config"]["effort"] == _EFFORT_XHIGH
-    assert _EFFORT_XHIGH == "xhigh"
+    assert kwargs["output_config"]["effort"] == EFFORT_XHIGH
+    assert EFFORT_XHIGH == "xhigh"
     # Effort lives alongside the schema format, not as a separate thinking budget.
     assert kwargs["output_config"]["format"]["type"] == "json_schema"
     assert "thinking" not in kwargs

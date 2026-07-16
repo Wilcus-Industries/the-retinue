@@ -27,7 +27,6 @@ from retinue.orchestrator import (
     _DEFAULT_MAX_PARALLEL,
     ConflictResolution,
     ImplementError,
-    OrchestratorBusyError,
     PrdBuildResult,
     PrdSlice,
     Slice,
@@ -63,6 +62,10 @@ class RecordingImplementer:
 
     def auth_env(self) -> dict[str, str]:
         return {}
+
+
+class OrchestratorBusyError(Exception):
+    """Raised by the test lock when a second concurrent run is attempted."""
 
 
 class OneAtATimeLock:

@@ -17,7 +17,6 @@ module and call :meth:`Notifier.notify`; they never re-implement the fan-out.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -277,16 +276,6 @@ class PushoverPushSink:
         """Send ``request`` to Pushover. Raises on transport or status failure."""
         payload = await _send(self.build_request(request), self._timeout)
         self.parse_response(payload)
-
-
-def build_basic_auth_header(user: str, password: str) -> str:
-    """Build an HTTP Basic ``Authorization`` header value for ``user:password``.
-
-    Pulled out as a pure helper so the credential encoding is unit-testable and
-    reusable by any sink that fronts a Basic-auth-protected push endpoint.
-    """
-    raw = f"{user}:{password}".encode()
-    return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
 class PushDeliveryError(RuntimeError):

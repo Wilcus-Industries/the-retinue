@@ -940,18 +940,6 @@ async def _merge_green_slice(slice_: Slice, branch: str, *, git: GitOps) -> None
 # --- full-PRD driver (issue #7) --------------------------------------------------
 
 
-class OrchestratorBusyError(Exception):
-    """A second orchestrator run was attempted while one is already in flight.
-
-    The single-run guarantee: :func:`build_prd` runs inside an injected lock that
-    rejects a concurrent holder. Catching this (rather than blocking) makes the
-    "at most one run at a time" contract observable to the caller.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("an orchestrator run is already in flight")
-
-
 @dataclass(frozen=True)
 class PrdSlice(Slice):
     """A PRD slice: a :class:`Slice` plus the issue numbers it is blocked by.
@@ -1052,8 +1040,8 @@ async def build_prd(
         runtime: Spawns the disposable container the done-check runs in (Docker seam).
         resolve_secret: Resolves the config's declared secret names/refs to values.
         report: Sink the done-check outcome is posted to.
-        lock: The single-run lock; entering it raises :class:`OrchestratorBusyError`
-            when a run is already in flight.
+        lock: The single-run lock; entering it raises when a run is already in
+            flight, so a concurrent second run is rejected rather than serialized.
         resolve_conflict: Attempts to resolve a merge conflict; absent means any
             conflict escalates.
         review_round: The internal reviewer run after each round's merge (the reviewer
@@ -1067,7 +1055,7 @@ async def build_prd(
         the reviewer filed and built mid-run land in ``merged`` alongside the originals.
 
     Raises:
-        OrchestratorBusyError: A run is already in flight (from the injected lock).
+        Exception: Whatever the injected lock raises when a run is already in flight.
     """
     branch = integration_branch(slices[0].prd_number) if slices else integration_branch(0)
     async with lock:

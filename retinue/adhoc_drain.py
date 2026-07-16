@@ -72,9 +72,8 @@ class AdhocDrainBusyError(Exception):
     The single-run guarantee: :func:`run_adhoc_drain` runs inside an injected lock that
     rejects a concurrent holder rather than blocking, so the "at most one ad-hoc drain
     per repo at a time" contract is observable to the caller. This lock is *separate* from
-    the orchestrator's :class:`retinue.orchestrator.OrchestratorBusyError` lock, so an
-    ad-hoc drain still runs concurrently with a PRD build. Mirrors
-    :class:`retinue.cron.CronBusyError`.
+    the orchestrator's single-run lock, so an ad-hoc drain still runs concurrently with
+    a PRD build. Mirrors :class:`retinue.cron.CronBusyError`.
     """
 
     def __init__(self) -> None:

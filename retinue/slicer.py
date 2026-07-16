@@ -27,8 +27,6 @@ from typing import Any, Protocol
 
 from retinue.notify import Notification, Notifier
 from retinue.roles import (
-    EFFORT_MAX,
-    EFFORT_XHIGH,
     Role,
     oauth_system,
     resolve_effort,
@@ -53,12 +51,6 @@ PRD_SLICE_LABEL = "prd-slice"
 # resolved at construction/request time rather than pinned to a local constant.
 _OAUTH_BETA = "oauth-2025-04-20"
 _MAX_TOKENS = 16_000
-
-# Re-exported from :mod:`retinue.roles` so the conflict resolver and internal reviewer
-# keep importing the shared effort tiers from the slicer; the registry is the source of
-# truth, these names are aliases that preserve the existing import surface.
-_EFFORT_XHIGH = EFFORT_XHIGH
-_EFFORT_MAX = EFFORT_MAX
 
 # Strict JSON schema the headless slicer must emit: an ordered list of vertical
 # slices, each with its 1-based intra-PRD blocked_by indices and a hitl flag.
