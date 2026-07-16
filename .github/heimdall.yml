@@ -1,0 +1,9 @@
+# Opt this repo into heimdall PR review (the file's presence is the opt-in).
+#
+# The retinue's staging PRs are authored by its GitHub App — a bot account —
+# which heimdall's skip_bot_authors default would silently skip. Reviewing
+# exactly those PRs is the point of installing heimdall here, so bot authors
+# are allowed; every other field keeps its default (severity_threshold: high
+# matches the retinue loopback's blocking threshold).
+scope:
+  skip_bot_authors: false
