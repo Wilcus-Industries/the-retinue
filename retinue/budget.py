@@ -1,38 +1,28 @@
-"""Budget governor: a rolling-24h spend ledger with mid-run pause/resume (issue #14).
+"""Budget governor: a rolling-24h spend ledger (issue #14).
 
 The retinue meters agent token spend against a service-level weekly budget and enforces
 a per-rolling-24h-window ceiling (``cap`` = a fraction, by default 12%, of the weekly
-budget). The budget is shared across both lanes — the orchestrator's :func:`build_prd`
-run and the cron lane — so the ledger is a single service-level SQLite store, mirroring
-the durable-SQLite style of :class:`retinue.dedupe.PrdDedupeStore` and
+budget). The budget is shared across all lanes — the orchestrator's :func:`build_prd`
+run, the ad-hoc lane, and the cron lane — so the ledger is a single service-level SQLite
+store, mirroring the durable-SQLite style of :class:`retinue.dedupe.PrdDedupeStore` and
 :class:`retinue.impl_retry.ImplRetryStore`.
 
-Two enforcement points:
-
-* **gate at run start** (:meth:`BudgetGovernor.gate`) — if the run's estimated charge
-  would push the trailing-24h spend over the cap, the run is *deferred* until the window
-  frees enough room for that estimate (the charges expire oldest-first until the trailing
-  spend leaves room for the estimate under the cap). An admitted run's estimate is
-  *charged* to the ledger atomically with the check, so the PRD and cron lanes' spend
-  counts against the shared window.
-* **meter mid-run** (:meth:`BudgetGovernor.meter`) — a charge that would cross the cap
-  *pauses* the run and checkpoints it (the owned slice set is recorded in the reconcile
-  :class:`~retinue.reconcile.RunStateStore`). :meth:`BudgetGovernor.try_resume` resumes
-  it once the window frees by reusing the reconciliation machinery
-  (:func:`~retinue.reconcile.reconcile_run`), so only the unfinished slices rebuild — no
-  duplicate issue, branch, or PR. The check-and-record is atomic
-  (:meth:`BudgetLedger.try_record_if_within_cap`, a ``BEGIN IMMEDIATE`` transaction), so
-  two lanes metering concurrently against the shared ledger serialize on the write lock
-  and the second sees the first's charge before deciding — the cap can't be overshot.
+Enforcement happens at admission (:meth:`BudgetGovernor.gate` for PRD/cron runs,
+:meth:`BudgetGovernor.meter_adhoc` for ad-hoc builds): if the charge would push the
+trailing-24h spend over the cap, the work is *deferred/declined* until the window frees
+enough room (charges expire oldest-first). An admitted charge is recorded atomically
+with the check (:meth:`BudgetLedger.try_record_if_within_cap`, a ``BEGIN IMMEDIATE``
+transaction), so two lanes admitting concurrently against the shared ledger serialize on
+the write lock and the second sees the first's charge before deciding — the cap can't be
+overshot.
 
 Auth-aware metering: an API key meters dollars against a weekly-$ budget; subscription
 OAuth meters tokens against a weekly-token budget. The math is identical; only the unit
 and the weekly budget differ, both carried on the ledger.
 
 The clock is injected (:class:`Clock`) so the rolling-24h window is deterministic in
-tests rather than tied to wall-clock; the ledger lives in a SQLite file and the gh
-queries flow through the injected reconcile seam, so the whole flow runs with no real
-``gh`` and no network.
+tests rather than tied to wall-clock, and the ledger lives in a SQLite file, so the
+whole flow runs with no network.
 """
 
 from __future__ import annotations
@@ -48,14 +38,6 @@ from typing import Protocol
 import aiosqlite
 
 from retinue.db import connect_daemon
-from retinue.orchestrator import PrdSlice
-from retinue.reconcile import (
-    ReconcileGh,
-    ReconcileResult,
-    RunStateStore,
-    reconcile_run,
-    run_state_key,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -74,40 +56,6 @@ CREATE TABLE IF NOT EXISTS spend_entries (
     amount  REAL NOT NULL
 )
 """
-
-_PAUSE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS budget_pauses (
-    prd_key   TEXT PRIMARY KEY,
-    resume_at TEXT NOT NULL,
-    amount    REAL NOT NULL DEFAULT 0
-)
-"""
-
-# The ledger is a durable, service-level store: a DB file created before issue #21 holds
-# the original two-column budget_pauses table (prd_key, resume_at). CREATE TABLE IF NOT
-# EXISTS is a no-op against it, so the #21 ``amount`` column never lands and every read
-# that selects it raises. Detecting the missing column and ALTER-ing it in lets the same
-# schema-ensure path heal both fresh and legacy DBs (issue #23).
-_PAUSE_AMOUNT_MIGRATION = (
-    "ALTER TABLE budget_pauses ADD COLUMN amount REAL NOT NULL DEFAULT 0"
-)
-
-
-async def _ensure_pause_schema(db: aiosqlite.Connection) -> None:
-    """Ensure budget_pauses exists and carries the ``amount`` column, migrating in place.
-
-    Creates the table when absent, then adds the issue-#21 ``amount`` column to a legacy
-    two-column table that predates it. Idempotent: ``CREATE TABLE IF NOT EXISTS`` plus a
-    PRAGMA-guarded ALTER, so re-running against an already-migrated DB is a no-op. Must be
-    called outside any started transaction (this issues DDL) so it never deadlocks the
-    ``BEGIN IMMEDIATE`` check-and-record path (issue #22).
-    """
-    await db.execute(_PAUSE_SCHEMA)
-    async with db.execute("PRAGMA table_info(budget_pauses)") as cursor:
-        columns = {row[1] for row in await cursor.fetchall()}
-    if "amount" not in columns:
-        await db.execute(_PAUSE_AMOUNT_MIGRATION)
-        await db.commit()
 
 
 class AuthMode(enum.Enum):
@@ -388,80 +336,27 @@ class GateDecision:
     defer_until: datetime | None
 
 
-@dataclass(frozen=True)
-class MeterDecision:
-    """The mid-run meter verdict.
-
-    Attributes:
-        paused: True when the charge would cross the cap, so the run was paused and
-            checkpointed.
-        resume_at: When the window frees enough to resume; ``None`` when the charge was
-            metered through without a pause.
-    """
-
-    paused: bool
-    resume_at: datetime | None
-
-
 class BudgetGovernor:
-    """Gates a run at start and meters it mid-flight against the rolling-24h cap.
+    """Gates and meters agent spend against the rolling-24h cap.
 
     Wraps a :class:`BudgetLedger`. :meth:`gate` defers a run that would start over the
-    cap and charges an admitted run's estimate to the shared ledger. :meth:`meter`
-    pauses and checkpoints a run whose next charge would cross the cap,
-    recording the owned slice set in the reconcile :class:`~retinue.reconcile.RunStateStore`
-    so :meth:`try_resume` can rebuild only the unfinished work via
-    :func:`~retinue.reconcile.reconcile_run` once the window frees.
+    cap and charges an admitted run's estimate to the shared ledger; :meth:`meter_adhoc`
+    admits-or-declines one ad-hoc build's flat charge; :meth:`record_charge` records a
+    cheap after-the-fact side charge.
 
     Args:
         ledger: The rolling-24h spend ledger to enforce against.
-        run_state: The reconcile run-state store the pause checkpoints into; defaults to a
-            store on the ledger's DB file so the whole budget state is one service-level
-            store.
     """
 
-    def __init__(
-        self, ledger: BudgetLedger, *, run_state: RunStateStore | None = None
-    ) -> None:
+    def __init__(self, ledger: BudgetLedger) -> None:
         self._ledger = ledger
-        self._run_state = run_state or RunStateStore(ledger._db_path)
-        self._db_path = ledger._db_path
-        # In-process cache of each paused PRD's blocked_by graph. The reconcile
-        # RunStateStore persists only slice numbers, so the dependency edges are held
-        # here for a same-process resume; a cross-restart resume falls back to an empty
-        # graph (reconcile still resumes the unfinished slices correctly).
-        self._blocked_by: dict[str, dict[int, list[int]]] = {}
-        # One long-lived connection for the pause table, opened lazily and guarded by a
-        # per-store lock (same rationale as BudgetLedger's connection).
-        self._db: aiosqlite.Connection | None = None
-        self._lock = asyncio.Lock()
         if ledger.metering_disabled:
             logger.warning(
                 "budget disabled — set WEEKLY_BUDGET to enforce spend caps"
             )
 
-    async def _conn(self) -> aiosqlite.Connection:
-        """Return the governor's long-lived pause-table connection, tuning it once.
-
-        Lazily opens the connection (creating the parent dir), enables WAL with
-        ``synchronous=NORMAL`` and the busy-timeout, and runs the pause-schema migration —
-        all once per instance. Callers must hold :attr:`_lock` around this and the
-        statements that follow.
-        """
-        if self._db is None:
-            self._db = await connect_daemon(self._db_path, isolation_level=None)
-            await self._db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-            await self._db.execute("PRAGMA journal_mode=WAL")
-            await self._db.execute("PRAGMA synchronous=NORMAL")
-            await _ensure_pause_schema(self._db)
-        return self._db
-
     async def close(self) -> None:
-        """Release the governor's pause connection and the wrapped ledger's connection."""
-        async with self._lock:
-            if self._db is not None:
-                await self._db.close()
-                self._db = None
+        """Release the wrapped ledger's connection."""
         await self._ledger.close()
 
     async def gate(self, *, estimated_amount: float) -> GateDecision:
@@ -515,14 +410,13 @@ class BudgetGovernor:
     async def meter_adhoc(self, *, amount: float) -> bool:
         """Meter one ad-hoc build's flat charge against the shared rolling-24h cap.
 
-        The ad-hoc lane has no PRD slice set to checkpoint, so it never pauses+resumes
-        the PRD way; it just charges the *same* service-level ledger the PRD lane meters,
-        atomically. A charge that still fits under the cap is recorded and the build is
-        admitted; one that would cross it records nothing and the build is declined. The
-        check-and-record is the identical atomic primitive the PRD :meth:`meter` uses
-        (:meth:`BudgetLedger.try_record_if_within_cap`), so an ad-hoc build and a PRD meter
-        racing on the shared ledger serialize on the write lock and the cap is never
-        overshot.
+        The ad-hoc lane charges the *same* service-level ledger the PRD lane gates
+        against, atomically. A charge that still fits under the cap is recorded and the
+        build is admitted; one that would cross it records nothing and the build is
+        declined. The check-and-record is the identical atomic primitive the PRD
+        :meth:`gate` uses (:meth:`BudgetLedger.try_record_if_within_cap`), so an ad-hoc
+        build and a PRD gate racing on the shared ledger serialize on the write lock and
+        the cap is never overshot.
 
         Args:
             amount: The build's charge in the ledger's unit (dollars or tokens).
@@ -535,218 +429,3 @@ class BudgetGovernor:
             return True
         return await self._ledger.try_record_if_within_cap(amount=amount)
 
-    async def meter(
-        self,
-        *,
-        repo_full_name: str,
-        prd_number: int,
-        amount: float,
-        slices: list[PrdSlice],
-    ) -> MeterDecision:
-        """Meter a mid-run charge; pause + checkpoint if it would cross the cap.
-
-        A charge that fits under the cap is recorded and the run continues. A charge that
-        would cross the cap is *not* recorded; instead the run is checkpointed (its owned
-        slice set saved to the run-state store) and a paused decision is returned, to be
-        picked up later by :meth:`try_resume`.
-
-        Args:
-            repo_full_name: The target repo, e.g. "owner/repo".
-            prd_number: The PRD round's tracking issue number.
-            amount: The prospective charge in the ledger's unit.
-            slices: The PRD round's slices, checkpointed so the resume rebuilds only the
-                unfinished ones.
-
-        Returns:
-            A :class:`MeterDecision`: ``paused`` with a ``resume_at`` when the charge
-            would cross the cap, else a metered-through decision.
-        """
-        # Atomic check-and-record: a second lane metering concurrently serializes behind
-        # this one on the ledger's write lock and re-reads the updated trailing total, so
-        # two charges that would jointly cross the cap can never both record (issue #22).
-        if await self._ledger.try_record_if_within_cap(amount=amount):
-            return MeterDecision(paused=False, resume_at=None)
-
-        resume_at = await self._ledger.window_frees_at(amount=amount)
-        await self._checkpoint(
-            repo_full_name=repo_full_name,
-            prd_number=prd_number,
-            slices=slices,
-            resume_at=resume_at,
-            amount=amount,
-        )
-        logger.info(
-            "Budget meter pausing PRD #%d (%s): charge %.4g would cross the 24h cap "
-            "(%.4g); checkpointed, resume at %s",
-            prd_number,
-            repo_full_name,
-            amount,
-            self._ledger.cap(),
-            resume_at,
-        )
-        return MeterDecision(paused=True, resume_at=resume_at)
-
-    async def try_resume(
-        self,
-        *,
-        repo_full_name: str,
-        prd_number: int,
-        gh: ReconcileGh,
-    ) -> ReconcileResult | None:
-        """Resume a budget-paused run once the window frees, reusing reconcile.
-
-        Returns ``None`` while the run is still paused before its ``resume_at`` (the
-        window has not freed). It also re-verifies the cap once the clock passes
-        ``resume_at``: if the window still has not freed enough for the paused charge
-        (:meth:`BudgetLedger.would_exceed` is still True), it returns ``None`` and leaves
-        the pause record intact rather than resuming over-cap. Only when the cap genuinely
-        has room is the pause cleared and the checkpointed slice set reconciled against
-        GitHub via :func:`~retinue.reconcile.reconcile_run`, so only the unfinished slices
-        are rebuilt — no duplicate issue, branch, or PR.
-
-        Args:
-            repo_full_name: The target repo, e.g. "owner/repo".
-            prd_number: The paused PRD round's tracking issue number.
-            gh: The reconcile gh seam GitHub truth is read through.
-
-        Returns:
-            A :class:`~retinue.reconcile.ReconcileResult` to route the resumed run on, or
-            ``None`` when the run is not paused or the window has not freed enough yet.
-        """
-        pause = await self._pause_record(repo_full_name, prd_number)
-        if pause is None:
-            return None
-        resume_at, amount = pause
-        if self._ledger._clock.now() < resume_at:
-            return None
-        # Re-verify the cap: a too-early resume_at (or any other in-window spend since the
-        # pause) could leave the window still over-cap. Stay paused rather than resume into
-        # an over-budget state.
-        if await self._ledger.would_exceed(amount=self._recheck_charge(amount)):
-            return None
-
-        slice_numbers = await self._run_state.slices_of(
-            repo_full_name=repo_full_name, prd_number=prd_number
-        )
-        slices = await self._checkpointed_slices(
-            repo_full_name, prd_number, slice_numbers
-        )
-        await self._clear_pause(repo_full_name, prd_number)
-        logger.info(
-            "Budget resume of PRD #%d (%s): window freed, reconciling %d slices",
-            prd_number,
-            repo_full_name,
-            len(slices),
-        )
-        return await reconcile_run(
-            repo_full_name=repo_full_name,
-            prd_number=prd_number,
-            slices=slices,
-            gh=gh,
-        )
-
-    async def is_paused(self, *, repo_full_name: str, prd_number: int) -> bool:
-        """Whether a PRD round is currently budget-paused (checkpointed, not yet resumed)."""
-        return await self._resume_at(repo_full_name, prd_number) is not None
-
-    async def _checkpoint(
-        self,
-        *,
-        repo_full_name: str,
-        prd_number: int,
-        slices: list[PrdSlice],
-        resume_at: datetime | None,
-        amount: float,
-    ) -> None:
-        """Persist the paused run's slice set, resume time, and charge for a later resume.
-
-        The ``amount`` is stored so :meth:`try_resume` can re-verify the cap against the
-        paused charge before clearing the pause, never resuming into an over-cap window.
-        """
-        await self._run_state.record_slices(
-            repo_full_name=repo_full_name,
-            prd_number=prd_number,
-            issue_numbers=[s.issue_number for s in slices],
-        )
-        self._checkpoint_blocked_by(repo_full_name, prd_number, slices)
-        key = run_state_key(repo_full_name, prd_number)
-        stamp = (resume_at or self._ledger._clock.now()).isoformat()
-        async with self._lock:
-            db = await self._conn()
-            await db.execute(
-                """
-                INSERT INTO budget_pauses (prd_key, resume_at, amount) VALUES (?, ?, ?)
-                ON CONFLICT(prd_key) DO UPDATE SET
-                    resume_at = excluded.resume_at, amount = excluded.amount
-                """,
-                (key, stamp, amount),
-            )
-
-    def _checkpoint_blocked_by(
-        self, repo_full_name: str, prd_number: int, slices: list[PrdSlice]
-    ) -> None:
-        """Stash the slices' blocked_by graph so the resume preserves dependency order.
-
-        The reconcile :class:`RunStateStore` persists only the slice issue numbers; the
-        ``blocked_by`` edges are held in memory keyed by PRD so a resume in the same
-        process rebuilds full :class:`PrdSlice` objects. A cross-restart resume falls back
-        to an empty graph (reconcile still resumes the unfinished slices correctly).
-        """
-        self._blocked_by[run_state_key(repo_full_name, prd_number)] = {
-            s.issue_number: list(s.blocked_by) for s in slices
-        }
-
-    async def _checkpointed_slices(
-        self, repo_full_name: str, prd_number: int, slice_numbers: list[int]
-    ) -> list[PrdSlice]:
-        """Rebuild :class:`PrdSlice` objects from the checkpointed numbers + blocked_by."""
-        graph = self._blocked_by.get(run_state_key(repo_full_name, prd_number), {})
-        return [
-            PrdSlice(
-                repo_full_name=repo_full_name,
-                issue_number=number,
-                prd_number=prd_number,
-                blocked_by=graph.get(number, []),
-            )
-            for number in slice_numbers
-        ]
-
-    def _recheck_charge(self, amount: float) -> float:
-        """The charge :meth:`try_resume` re-verifies the cap against before resuming.
-
-        A pause recorded by issue #21 onward carries the real paused charge. A legacy row
-        migrated in by issue #23 has no recorded charge (its ``amount`` defaults to 0 from
-        the migration's column DEFAULT); trusting that 0 would let ``would_exceed`` pass
-        the instant trailing merely dips to the cap, reintroducing the over-cap resume #21
-        fixed. So a non-positive (legacy/unknown) charge is treated conservatively as a
-        full ``cap()`` — the pause holds until the window has genuine headroom for a whole
-        cap's worth, i.e. is essentially empty, rather than resuming over-budget.
-        """
-        return amount if amount > 0 else self._ledger.cap()
-
-    async def _resume_at(self, repo_full_name: str, prd_number: int) -> datetime | None:
-        """Return the recorded resume time for a paused PRD, or None when not paused."""
-        pause = await self._pause_record(repo_full_name, prd_number)
-        return pause[0] if pause is not None else None
-
-    async def _pause_record(
-        self, repo_full_name: str, prd_number: int
-    ) -> tuple[datetime, float] | None:
-        """Return the paused PRD's (resume time, charge), or None when not paused."""
-        key = run_state_key(repo_full_name, prd_number)
-        async with self._lock:
-            db = await self._conn()
-            async with db.execute(
-                "SELECT resume_at, amount FROM budget_pauses WHERE prd_key = ?", (key,)
-            ) as cursor:
-                row = await cursor.fetchone()
-        if row is None:
-            return None
-        return datetime.fromisoformat(row[0]), float(row[1])
-
-    async def _clear_pause(self, repo_full_name: str, prd_number: int) -> None:
-        """Remove the pause record once a run resumes."""
-        key = run_state_key(repo_full_name, prd_number)
-        async with self._lock:
-            db = await self._conn()
-            await db.execute("DELETE FROM budget_pauses WHERE prd_key = ?", (key,))

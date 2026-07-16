@@ -14,8 +14,8 @@ collaborator to its real adapter:
   to its real collaborators (the gh backlog query, the shared governor, the clock, the
   single-run lock, and the downstream build) so a scheduled tick drains one backlog issue.
 
-The budget *meter* (mid-run pause/resume) is exposed through the governor passed in, which
-the cron lane and the build lane share — one service-level governor across both.
+The budget gate is enforced through the governor passed in, which the cron lane and the
+build lane share — one service-level governor across both.
 """
 
 from __future__ import annotations
