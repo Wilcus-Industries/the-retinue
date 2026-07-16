@@ -18,13 +18,17 @@ parsing are all exercised without network or ``cryptography``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict, runtime_checkable
+
+import httpx
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,7 @@ class InstallationAuth(Protocol):
         ...
 
 
+@runtime_checkable
 class InstalledRepos(Protocol):
     """Lists every repo the GitHub App is installed on. The repo-enumeration seam.
 
@@ -63,6 +68,8 @@ class InstalledRepos(Protocol):
     installations, and pages each installation's repositories; tests inject a fake that
     returns a fixed set. The opt-in filter (a fetchable ``.github/retinue.yml``) is applied
     by the caller, so this seam lists *installed* repos, not yet *opted-in* ones.
+    Runtime-checkable so the worker's heartbeat bind can probe an
+    :class:`InstallationAuth` for the optional enumeration capability.
     """
 
     async def installed_repositories(self) -> list[str]:
@@ -487,7 +494,6 @@ def httpx_edges(
     JSON array for ``GET /app/installations``. A non-JSON body is reported as an empty
     mapping so the caller's status check still surfaces the failure.
     """
-    import httpx  # local: only production wiring needs the HTTP client
 
     def _parse_body(response: httpx.Response) -> object:
         try:
@@ -556,3 +562,187 @@ def build_installation_auth() -> GitHubInstallationAuth:
     return GitHubInstallationAuth(
         credentials, http_get=http_get, http_post=http_post
     )
+
+
+# --- installation-token REST reads: contents + issues API ----------------------------
+#
+# The worker's per-repo GitHub reads — the opt-in config, the PRD body, and the repo's
+# CLAUDE.md — live here because they are this module's domain: installation-token-
+# authenticated REST reads. They share one fetch shape (mint a per-repo token, GET the
+# resource with it, map "not found" per caller), factored into :func:`_installation_get`
+# and :func:`_repo_file_fetcher`.
+
+# Path of the opt-in config file inside each repo, fetched over the contents API.
+RETINUE_CONFIG_PATH = ".github/retinue.yml"
+# Path of the repo's CLAUDE.md, fetched over the contents API to source the done-check
+# command the build gates on (a missing file reads as empty text).
+CLAUDE_MD_PATH = "CLAUDE.md"
+GITHUB_API_BASE_URL = "https://api.github.com"
+
+
+def _repo_contents_url(repo_full_name: str, path: str) -> str:
+    """Build the GitHub contents-API URL for a file at ``path`` in a repo."""
+    return f"{GITHUB_API_BASE_URL}/repos/{repo_full_name}/contents/{path}"
+
+
+def _issue_url(repo_full_name: str, issue_number: int) -> str:
+    """Build the GitHub issues-API URL for one issue."""
+    return f"{GITHUB_API_BASE_URL}/repos/{repo_full_name}/issues/{issue_number}"
+
+
+def _auth_headers(token: str) -> dict[str, str]:
+    """Build the request headers authorising a GitHub contents-API read.
+
+    Uses the documented ``Bearer`` scheme and pins the v3 contents media type and API
+    version so the response shape (a base64 ``content`` field) is stable.
+    """
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _decode_contents_payload(payload: dict[str, Any]) -> str:
+    """Decode a GitHub contents-API payload into the raw file text.
+
+    The contents API returns the file body base64-encoded in ``content`` (with
+    embedded newlines) under ``encoding: base64``. Decode it to UTF-8 text — the same
+    raw YAML the fake fetcher hands :func:`retinue.worker.gate_prd` for parsing.
+
+    Raises:
+        ValueError: when the payload is not a base64-encoded file (unexpected shape,
+            e.g. a directory listing or an unknown encoding).
+    """
+    encoding = payload.get("encoding")
+    if encoding != "base64" or not isinstance(payload.get("content"), str):
+        raise ValueError(f"unexpected contents payload encoding: {encoding!r}")
+    try:
+        return base64.b64decode(payload["content"]).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError) as exc:
+        raise ValueError(f"undecodable contents payload: {exc}") from exc
+
+
+async def _installation_get(
+    auth: InstallationAuth,
+    client: httpx.AsyncClient,
+    *,
+    repo_full_name: str,
+    url: str,
+) -> httpx.Response:
+    """GET ``url`` authorised by a freshly minted installation token for the repo.
+
+    The shared fetch shape of every fetcher below. Status handling stays with each
+    caller — a 404 means something different per resource.
+    """
+    installation = await auth.installation_token(repo_full_name)
+    return await client.get(url, headers=_auth_headers(installation.token))
+
+
+def _repo_file_fetcher(
+    auth: InstallationAuth, client: httpx.AsyncClient, *, path: str
+) -> Callable[[str], Awaitable[str | None]]:
+    """Build a fetcher for one repo file over the contents API; a 404 reads as None.
+
+    The parameterized core of the config and CLAUDE.md fetchers: GET the file at
+    ``path``, map a 404 (no such file) to ``None``, raise any other HTTP error (a
+    transient failure must retry the job, not be silently mistaken for a missing
+    file), and decode the base64 payload to text.
+    """
+
+    async def fetch(repo_full_name: str) -> str | None:
+        response = await _installation_get(
+            auth,
+            client,
+            repo_full_name=repo_full_name,
+            url=_repo_contents_url(repo_full_name, path),
+        )
+        if response.status_code == httpx.codes.NOT_FOUND:
+            return None
+        response.raise_for_status()
+        return _decode_contents_payload(response.json())
+
+    return fetch
+
+
+def github_config_fetcher(
+    auth: InstallationAuth, client: httpx.AsyncClient
+) -> Callable[[str], Awaitable[str | None]]:
+    """Build the production config fetcher backed by the GitHub contents API.
+
+    The returned async callable mints an installation token for the repo, reads
+    ``.github/retinue.yml`` over the contents API, and returns its raw YAML text — the
+    exact shape :func:`retinue.worker.gate_prd` expects. A 404 (no such file) maps to
+    ``None`` so the gate reads the repo as not opted in, matching the injected fake.
+    Any other HTTP error is raised: a transient failure must retry the job, not be
+    silently mistaken for an opted-out repo.
+
+    Args:
+        auth: Mints an installation token scoped to the target repo.
+        client: A shared httpx client used for the contents read.
+
+    Returns:
+        A :data:`retinue.worker.ConfigFetcher` returning the raw config text, or
+        ``None`` on 404.
+    """
+    return _repo_file_fetcher(auth, client, path=RETINUE_CONFIG_PATH)
+
+
+def github_issue_body_fetcher(
+    auth: InstallationAuth, client: httpx.AsyncClient
+) -> Callable[[str, int], Awaitable[str]]:
+    """Build the production issue-body fetcher backed by the GitHub issues API.
+
+    Returns an async ``(repo, issue) -> body`` that mints an installation token and reads
+    the issue's ``body`` so the slicer slices the real PRD text. A missing body (``null``)
+    reads as empty string — the slicer escalates an empty PRD as too thin. Any HTTP error
+    is raised so the job retries rather than slicing a phantom body.
+
+    Args:
+        auth: Mints an installation token scoped to the target repo.
+        client: A shared httpx client used for the issue read.
+
+    Returns:
+        An :data:`retinue.worker.IssueBodyFetcher` returning the issue body text.
+    """
+
+    async def fetch(repo_full_name: str, issue_number: int) -> str:
+        response = await _installation_get(
+            auth,
+            client,
+            repo_full_name=repo_full_name,
+            url=_issue_url(repo_full_name, issue_number),
+        )
+        response.raise_for_status()
+        return str(response.json().get("body") or "")
+
+    return fetch
+
+
+def github_claude_md_fetcher(
+    auth: InstallationAuth, client: httpx.AsyncClient
+) -> Callable[[str], Awaitable[str]]:
+    """Build the production ``CLAUDE.md`` fetcher backed by the GitHub contents API.
+
+    Returns an async ``(repo) -> claude_md`` that mints an installation token and reads
+    the target repo's root ``CLAUDE.md`` so the build's done-check command is parsed from
+    the *real* repo text (not an empty default). A repo with no ``CLAUDE.md`` (404) reads
+    as empty text — the pipeline then finds no parseable done-check gate and escalates
+    (:meth:`retinue.pipeline.Pipeline._has_done_check_gate`) rather than running a phantom
+    gate or crash-looping the build. Any other HTTP error is raised so the job retries
+    rather than building against a degraded, empty done-check spec.
+
+    Args:
+        auth: Mints an installation token scoped to the target repo.
+        client: A shared httpx client used for the contents read.
+
+    Returns:
+        A :data:`~retinue.pipeline.ClaudeMdFetcher` returning the ``CLAUDE.md`` text.
+    """
+    fetch_file = _repo_file_fetcher(auth, client, path=CLAUDE_MD_PATH)
+
+    async def fetch(repo_full_name: str) -> str:
+        text = await fetch_file(repo_full_name)
+        return "" if text is None else text
+
+    return fetch

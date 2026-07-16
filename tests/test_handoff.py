@@ -351,7 +351,7 @@ from retinue.handoff import (  # noqa: E402
     _close_issue_argv,
     _parse_children,
 )
-from retinue.slicer import HITL_LABEL  # noqa: E402
+from retinue.vocab import HITL_LABEL  # noqa: E402
 
 
 class _RecordingRunner:

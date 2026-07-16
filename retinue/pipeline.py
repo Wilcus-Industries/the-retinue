@@ -34,17 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import retinue.loopback as _loopback_gh
-import retinue.pr_opener as _pr_gh
-import retinue.reviewer as _reviewer_gh
-import retinue.slicer as _slicer_gh
 from retinue.adhoc_build import (
     AdhocBuildResult,
     AdhocIssue,
@@ -53,16 +48,14 @@ from retinue.adhoc_build import (
     build_adhoc_issue,
 )
 from retinue.budget import (
-    AuthMode,
+    BUILD_ESTIMATED_AMOUNT,
+    CLASSIFIER_ESTIMATED_AMOUNT,
     BudgetGovernor,
-    BudgetLedger,
-    SystemClock,
 )
 from retinue.classifier import ClaudeIssueClassifier
-from retinue.container import Container, ContainerRuntime, DockerRuntime
-from retinue.cron import CronBuild
+from retinue.container import DockerRuntime
+from retinue.cron import CronBuild, SliceBuilder
 from retinue.done_check import (
-    DEFAULT_IMAGE,
     DoneCheckError,
     EnvSecretResolver,
     GhReportSink,
@@ -70,6 +63,7 @@ from retinue.done_check import (
     SecretResolver,
     parse_done_check,
 )
+from retinue.gh import SubprocessGhRunner
 from retinue.handoff import (
     Handoff,
     HandoffGh,
@@ -86,19 +80,17 @@ from retinue.loopback import (
     VerdictResult,
     process_review,
 )
+from retinue.messages_api import HttpxTransport
 from retinue.notify import (
     GhCommentSink,
     GhLabelSink,
     Notification,
     Notifier,
-    NtfyPushSink,
-    PushoverPushSink,
-    PushRequest,
-    PushSink,
+    build_push_sink,
 )
 from retinue.orchestrator import (
-    ContainerGitOps,
     ContainerImplementer,
+    MergeContainerGitOps,
     PrdBuildResult,
     PrdSlice,
     RoundReviewer,
@@ -109,6 +101,7 @@ from retinue.reconcile import (
     GhCliReconcile,
     PrState,
     ReconcileGh,
+    ReconcileGhRunner,
     ReconcileResult,
     ResumePhase,
     RunStateStore,
@@ -128,7 +121,6 @@ from retinue.routing import (
     resolve_issue_level,
 )
 from retinue.slicer import (
-    HITL_LABEL,
     ClaudeSliceGenerator,
     GhCliIssueCreator,
     IssueCreator,
@@ -136,6 +128,7 @@ from retinue.slicer import (
     SliceOutcome,
     slice_prd,
 )
+from retinue.vocab import HITL_LABEL
 from retinue.wiring import (
     BoundBuildResult,
     ReviewerFactory,
@@ -705,205 +698,52 @@ def _slices_from_numbers(
 # --- production wiring: build the real pipeline from Settings ----------------------
 
 
-class SubprocessGhRunner[R]:
-    """Real ``GhRunner`` for the ``run(args, *, env) -> GhResult`` seam (slicer/pr/loopback).
+def _state_dir(settings: Settings) -> Path:
+    """The directory the pipeline's durable SQLite stores live in.
 
-    Spawns ``gh`` as a child (argv list, no shell, so nothing is interpolated into a
-    command line) with ``env`` merged over the ambient environment, then builds the
-    *target module's own* ``GhResult`` from the captured ``(exit_code, stdout, stderr)``
-    via the injected ``result`` factory. The slicer, PR-opener, and loopback each define a
-    structurally-identical ``GhResult``; constructing the real one per call keeps each
-    module's runner Protocol satisfied with a single subprocess implementation.
+    Co-locates the run-state/round/retry stores next to the dedupe DB so a single mounted
+    volume holds all of the worker's durable state.
+    """
+    return Path(settings.dedupe_db_path).resolve().parent
+
+
+def run_state_store_path(settings: Settings) -> Path:
+    """The run-state SQLite file the factory's pipelines and the startup sweep share.
+
+    The sweep (:func:`retinue.worker.resume_rounds_job`) enumerates the same store every
+    factory-built :class:`Pipeline` records into, so the path is derived in one place.
 
     Args:
-        result: The module's ``GhResult`` constructor (``(exit_code, stdout, stderr)``).
+        settings: The runtime settings locating the worker's durable state directory.
+
+    Returns:
+        The run-state database path.
     """
-
-    def __init__(
-        self, result: Callable[..., R]
-    ) -> None:
-        self._result = result
-
-    async def run(self, args: list[str], *, env: dict[str, str]) -> R:
-        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
-        merged_env = {**os.environ, **env}
-        process = await asyncio.create_subprocess_exec(
-            "gh",
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=merged_env,
-        )
-        stdout, stderr = await process.communicate()
-        return self._result(
-            exit_code=process.returncode or 0,
-            stdout=stdout.decode(errors="replace"),
-            stderr=stderr.decode(errors="replace"),
-        )
+    return _state_dir(settings) / "run-state.sqlite3"
 
 
-class _ReconcileGhRunner:
-    """Real reconcile gh runner (``__call__(argv) -> str``) authenticated by token.
-
-    Satisfies :class:`retinue.reconcile.GhRunner`: runs one ``gh`` argv with the
-    installation token in ``GH_TOKEN`` and returns stdout, raising on a non-zero exit so
-    a failed reconcile query surfaces rather than reading as empty truth.
-    """
-
-    def __init__(self, token: str) -> None:
-        self._token = token
-
-    async def __call__(self, argv: list[str]) -> str:
-        from retinue.reconcile import gh_env
-
-        process = await asyncio.create_subprocess_exec(
-            "gh",
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=gh_env(self._token, dict(os.environ)),
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            raise RuntimeError(
-                f"gh {' '.join(argv)} exited {process.returncode}: "
-                f"{stderr.decode(errors='replace').strip()}"
-            )
-        return stdout.decode()
-
-
-def _build_push_sink(settings: Settings) -> PushSink:
-    """Pick the push sink from settings: ntfy (topic) or Pushover (token+user).
-
-    Exactly one backend is expected; with neither configured the push is a logged no-op
-    so the comment + label (the durable record) still land. ntfy wins when both are set.
-    """
-    if settings.ntfy_topic:
-        return NtfyPushSink(
-            topic=settings.ntfy_topic, token=settings.ntfy_token or None
-        )
-    if settings.pushover_token and settings.pushover_user:
-        return PushoverPushSink(token=settings.pushover_token, user=settings.pushover_user)
-
-    async def _noop(request: PushRequest) -> None:
-        logger.warning("No push channel configured; skipping push %r", request.title)
-
-    return _noop
-
-
-# The orchestrator build's estimated charge, gated against the rolling-24h budget cap.
-# The build's true cost is only known after the implementer/done-check runs, so the gate
-# uses a conservative fixed estimate; the meter (the governor's mid-run pause/resume)
-# tracks the real spend once the run is underway. Kept here (not a Settings field) so the
-# public config schema is unchanged.
-_BUILD_ESTIMATED_AMOUNT = 1.0
-
-# The estimated charge one classifier call meters against the shared ledger. Kept small
-# (a Haiku-class call) and separate from the build gate estimate, which is unchanged.
-_CLASSIFIER_ESTIMATED_AMOUNT = 0.01
-
-
-class _MergeContainerGitOps:
-    """A :class:`GitOps` that lazily starts its own merge container, then delegates.
-
-    The orchestrator's merge phase runs ``git`` inside a container holding a clone of the
-    repo, but ``build_prd`` starts no such container — the done-check's per-slice
-    containers are created and destroyed inside the build round, before any merge. This
-    adapter closes that gap: on the first branch/merge call it starts a fresh container
-    via the injected :class:`ContainerRuntime`, clones the repo over the installation
-    token, and wraps it in :class:`ContainerGitOps`; every later call within the same
-    build reuses that one container (so the integration branch persists across the
-    round's merges). :meth:`aclose` destroys it, and the build seam wrapper calls it in a
-    ``finally`` so the container is never leaked.
-
-    Args:
-        repo_full_name: The repo to clone for the merges, e.g. "owner/repo".
-        auth: Mints the installation token whose URL the clone authenticates with.
-        runtime: Spawns the disposable merge container (the Docker seam).
-        image: The container image the merges run in; defaults to the done-check image.
-    """
-
-    def __init__(
-        self,
-        *,
-        repo_full_name: str,
-        auth: InstallationAuth,
-        runtime: ContainerRuntime,
-        image: str = DEFAULT_IMAGE,
-    ) -> None:
-        self._repo_full_name = repo_full_name
-        self._auth = auth
-        self._runtime = runtime
-        self._image = image
-        self._container: Container | None = None
-        self._delegate: ContainerGitOps | None = None
-
-    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
-        """Ensure ``branch`` exists in the (lazily started) merge container."""
-        delegate = await self._ensure_delegate()
-        await delegate.ensure_integration_branch(branch=branch, base=base)
-
-    async def merge(self, *, source: str, into: str) -> None:
-        """Merge ``source`` into ``into`` in the (lazily started) merge container."""
-        delegate = await self._ensure_delegate()
-        await delegate.merge(source=source, into=into)
-
-    async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
-        """Diff a round's ``merged_branches`` over ``base`` in the merge container.
-
-        The merge container is already started (the round merged into ``base`` through it),
-        so the internal reviewer reads the round's merged surface from the same clone the
-        merges advanced — no second container or clone.
-        """
-        delegate = await self._ensure_delegate()
-        return await delegate.round_diff(merged_branches=merged_branches, base=base)
-
-    async def _ensure_delegate(self) -> ContainerGitOps:
-        """Start + clone the merge container on first use; reuse it thereafter."""
-        if self._delegate is not None:
-            return self._delegate
-        token = await self._auth.installation_token(self._repo_full_name)
-        container = await self._runtime.start(image=self._image, env={})
-        result = await container.run_command(["git", "clone", token.clone_url, "."])
-        if not result.ok:
-            await container.destroy()
-            raise GitOpsCloneError(
-                f"clone of {self._repo_full_name} for merge failed "
-                f"(exit {result.exit_code}): {result.stderr}"
-            )
-        self._container = container
-        self._delegate = ContainerGitOps(container)
-        return self._delegate
-
-    async def aclose(self) -> None:
-        """Destroy the merge container if one was started. Idempotent."""
-        container, self._container, self._delegate = self._container, None, None
-        if container is not None:
-            await container.destroy()
-
-
-class GitOpsCloneError(RuntimeError):
-    """The merge container could not clone the repo, so no merge can run.
-
-    Raised rather than returning a sentinel so a doomed merge round fails loudly instead
-    of silently reporting an empty integration branch.
-    """
+# Builds a :class:`Pipeline` for an accepted repo. Async so the production factory can
+# mint a per-repo installation token before constructing the gh adapters. Injected onto
+# the Arq context by :func:`retinue.worker.on_startup` so the worker tasks stay testable
+# with a fake factory; production binds it to :func:`build_pipeline_factory`'s factory.
+PipelineFactory = Callable[[str, RepoConfig], Awaitable[Pipeline]]
 
 
 def build_pipeline_factory(
     settings: Settings,
     auth: InstallationAuth,
     *,
+    governor: BudgetGovernor,
     build_prd: BuildPrd | None = None,
     fetch_claude_md: ClaudeMdFetcher | None = None,
-) -> Callable[[str, RepoConfig], Awaitable[Pipeline]]:
+) -> PipelineFactory:
     """Build the production pipeline factory over the real adapters.
 
     Returns an async ``(repo_full_name, config) -> Pipeline`` that mints a per-repo
     installation token, then constructs every gh/Anthropic/push/build adapter against it:
     the slicer's gh issue creator and Agent-SDK generator, the PR-opener gh ops, the reap
     and reconcile gh seams, the heimdall rebuilder, the shared notifier (push + comment +
-    label), the shared budget governor, and the orchestrator build lane.
+    label), and the orchestrator build lane.
 
     The orchestrator ``build_prd`` seam defaults to the real budget-gated, triaged build
     bound per repo via :func:`retinue.wiring.bind_build_prd` over the real
@@ -914,6 +754,9 @@ def build_pipeline_factory(
     Args:
         settings: The runtime settings carrying budget, Anthropic, and push config.
         auth: The GitHub App installation auth used to mint per-repo tokens.
+        governor: The one service-level budget governor (constructed by the worker's
+            startup and shared with the ad-hoc and cron lanes, so every lane meters the
+            same rolling-24h window).
         build_prd: An explicit build seam overriding the real per-repo bind (e.g. a fake).
         fetch_claude_md: Reads the target repo's ``CLAUDE.md`` text (the done-check
             command source); ``None`` falls back to empty text, which the done-check
@@ -922,23 +765,12 @@ def build_pipeline_factory(
     Returns:
         An async pipeline factory keyed by repo and config.
     """
-    governor = BudgetGovernor(
-        BudgetLedger(
-            settings.budget_db_path,
-            clock=SystemClock(),
-            auth_mode=AuthMode.from_config(settings.auth_mode),
-            weekly_budget=settings.weekly_budget,
-            daily_cap_fraction=settings.budget_daily_cap_fraction,
-        )
-    )
-    push = _build_push_sink(settings)
+    push = build_push_sink(settings)
     state_dir = _state_dir(settings)
     retry_store_path = state_dir / "impl-retries.sqlite3"
-    # One subprocess runner per module's own GhResult (structurally identical), so each
-    # adapter's runner Protocol is satisfied by the same real ``gh`` spawn.
-    slicer_runner = SubprocessGhRunner(_slicer_gh.GhResult)
-    pr_runner = SubprocessGhRunner(_pr_gh.GhResult)
-    loopback_runner = SubprocessGhRunner(_loopback_gh.GhResult)
+    # One stateless subprocess runner satisfies every ``run(args, *, env)`` gh seam
+    # (slicer / PR-opener / loopback) — the shape now lives in :mod:`retinue.gh`.
+    gh_runner = SubprocessGhRunner()
 
     async def factory(repo_full_name: str, config: RepoConfig) -> Pipeline:
         token = (await auth.installation_token(repo_full_name)).token
@@ -948,7 +780,7 @@ def build_pipeline_factory(
             label=GhLabelSink(token=token),
         )
         create_issue = GhCliIssueCreator(
-            slicer_runner, token=token, repo_full_name=repo_full_name
+            gh_runner, token=token, repo_full_name=repo_full_name
         )
         slice_generate = ClaudeSliceGenerator(
             token=settings.anthropic_credential,
@@ -956,15 +788,15 @@ def build_pipeline_factory(
             model=resolve_model(Role.SLICER, config),
             effort=resolve_effort(Role.SLICER, config),
         ).generate
-        pr_ops = GhCliPrOps(pr_runner, token=token)
+        pr_ops = GhCliPrOps(gh_runner, token=token)
         reap_gh = HandoffGh(token=token)
         rebuild = GhCliRebuilder(
-            loopback_runner,
+            gh_runner,
             token=token,
             reviewer_login=settings.heimdall_bot_login,
         )
         reconcile_gh = GhCliReconcile(
-            _ReconcileGhRunner(token), merge_base=config.staging_branch
+            ReconcileGhRunner(token), merge_base=config.staging_branch
         )
         bound_build_prd = build_prd or _bind_build_prd_for_repo(
             settings,
@@ -1012,39 +844,6 @@ async def _fetch_claude_md(
     return await fetch_claude_md(repo_full_name)
 
 
-# The internal reviewer's single Anthropic Messages API call runs at the "max" effort
-# tier on Opus 4.8; a high-effort Opus turn can take minutes, so the transport's timeout
-# matches the SDK's 10-minute default rather than a short connect-style cap.
-_REVIEW_HTTP_TIMEOUT_SECONDS = 600.0
-
-
-@dataclass(frozen=True)
-class HttpxTransport:
-    """Production :class:`~retinue.reviewer.HttpTransport`: POST one request via httpx.
-
-    The reviewer assembles the full request body and headers (model, effort tier, the
-    json-schema response format, and the credential's auth header); this transport only
-    POSTs them and reads the status code + JSON body back into the reviewer's
-    :class:`~retinue.reviewer.HttpResponse`. The single POST is the only network edge, so
-    it sits behind the reviewer's injected seam and the rest of the review flow is
-    exercised in tests with a fake transport — no httpx, no network.
-    """
-
-    timeout: float = _REVIEW_HTTP_TIMEOUT_SECONDS
-
-    async def post(
-        self, url: str, *, headers: dict[str, str], json: dict[str, object]
-    ) -> _reviewer_gh.HttpResponse:
-        """POST ``json`` to ``url`` with ``headers``; return status + parsed JSON body."""
-        import httpx
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(url, headers=headers, json=json)
-        return _reviewer_gh.HttpResponse(
-            status_code=response.status_code, body=response.json()
-        )
-
-
 def _bind_build_prd_for_repo(
     settings: Settings,
     auth: InstallationAuth,
@@ -1082,10 +881,10 @@ def _bind_build_prd_for_repo(
         The bound ``build_prd`` seam the pipeline drives.
     """
     runtime = DockerRuntime()
-    git = _MergeContainerGitOps(
+    git = MergeContainerGitOps(
         repo_full_name=repo_full_name, auth=auth, runtime=runtime
     )
-    issue_facts = GhCliIssueFacts(_ReconcileGhRunner(token))
+    issue_facts = GhCliIssueFacts(ReconcileGhRunner(token))
     implementer = ContainerImplementer(
         credential=settings.anthropic_credential,
         auth_mode=settings.auth_mode,
@@ -1121,7 +920,7 @@ def _bind_build_prd_for_repo(
             comment_sink=GhCommentSink(token=token),
             issue_facts=issue_facts,
             governor=governor,
-            classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+            classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
         )
     bound = bind_build_prd(
         implementer=implementer,
@@ -1129,7 +928,7 @@ def _bind_build_prd_for_repo(
         notifier=notifier,
         create_issue=create_issue,
         retry_store_path=retry_store_path,
-        estimated_amount=_BUILD_ESTIMATED_AMOUNT,
+        estimated_amount=BUILD_ESTIMATED_AMOUNT,
         git=git,
         auth=auth,
         runtime=runtime,
@@ -1180,12 +979,10 @@ async def build_cron_slice_builder(
     Returns:
         The bound cron build the backlog tick drives for the picked issue.
     """
-    from retinue.cron import SliceBuilder
-
     config = RepoConfig()
     claude_md = await _fetch_claude_md(fetch_claude_md, repo_full_name)
     runtime = DockerRuntime()
-    git = _MergeContainerGitOps(
+    git = MergeContainerGitOps(
         repo_full_name=repo_full_name, auth=auth, runtime=runtime
     )
     implementer = ContainerImplementer(
@@ -1193,7 +990,7 @@ async def build_cron_slice_builder(
         auth_mode=settings.auth_mode,
         model=resolve_model(Role.IMPLEMENTER, config),
         max_turns=settings.implement_max_turns,
-        issue_facts=GhCliIssueFacts(_ReconcileGhRunner(token)),
+        issue_facts=GhCliIssueFacts(ReconcileGhRunner(token)),
     )
     builder = SliceBuilder(
         config=config,
@@ -1260,7 +1057,7 @@ async def _resolve_adhoc_level(
             comment_sink=comment_sink,
             issue_facts=issue_facts,
             governor=governor,
-            classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+            classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
         )
     except asyncio.CancelledError:
         raise
@@ -1329,7 +1126,7 @@ def bind_adhoc_build(
     # The classifier (and its sinks) is constructed only when the repo declares a
     # routing table, so a table-less repo makes zero classifier calls — invocations
     # identical to pre-routing. This mirrors _bind_build_prd_for_repo.
-    issue_facts = GhCliIssueFacts(_ReconcileGhRunner(token))
+    issue_facts = GhCliIssueFacts(ReconcileGhRunner(token))
     classifier: ClaudeIssueClassifier | None = None
     label_sink: GhLabelSink | None = None
     comment_sink: GhCommentSink | None = None
@@ -1458,7 +1255,7 @@ def _build_review_reviewer_factory(
         effort=resolve_effort(Role.REVIEWER, config),
     )
     edit_blocked_by = GhCliBlockedByEditor(
-        runner=SubprocessGhRunner(_reviewer_gh.GhResult), token=token
+        runner=SubprocessGhRunner(), token=token
     )
 
     def factory(factory_repo: str, prd_number: int) -> RoundReviewer:
@@ -1498,27 +1295,3 @@ def _prd_build_from_bound(
         deferred=result.deferred,
         defer_until=result.defer_until,
     )
-
-
-def _state_dir(settings: Settings) -> Path:
-    """The directory the pipeline's durable SQLite stores live in.
-
-    Co-locates the run-state/round/retry stores next to the dedupe DB so a single mounted
-    volume holds all of the worker's durable state.
-    """
-    return Path(settings.dedupe_db_path).resolve().parent
-
-
-def run_state_store_path(settings: Settings) -> Path:
-    """The run-state SQLite file the factory's pipelines and the startup sweep share.
-
-    The sweep (:func:`retinue.worker.resume_rounds_job`) enumerates the same store every
-    factory-built :class:`Pipeline` records into, so the path is derived in one place.
-
-    Args:
-        settings: The runtime settings locating the worker's durable state directory.
-
-    Returns:
-        The run-state database path.
-    """
-    return _state_dir(settings) / "run-state.sqlite3"

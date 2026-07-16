@@ -1,9 +1,9 @@
 """Done-check building blocks: parse the gate, resolve its secrets, run it, report it.
 
 Issue #4 originally owned the whole disposable-container orchestration here. Since the
-B-full refactor the orchestrator owns the per-slice container lifecycle (clone → branch
+B-full refactor the shared container-build lifecycle owns the per-issue flow (clone → branch
 → implement → done-check → push → destroy, see
-:func:`retinue.orchestrator._build_slice_in_container`), so this module is now the set of
+:func:`retinue.container_build.build_issue_in_container`), so this module is now the set of
 reusable, container-agnostic pieces that lifecycle drives:
 
 1. **parse** — :func:`parse_done_check` reads the done-check command from ``CLAUDE.md``,
@@ -20,7 +20,6 @@ injected, so each piece is exercised in tests with no Docker and no network.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
@@ -29,6 +28,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from retinue.container import Container, RunResult
+from retinue.gh import GhBytesRunner, auth_env, run_gh_subprocess
 from retinue.repo_config import RepoConfig
 
 logger = logging.getLogger(__name__)
@@ -179,28 +179,6 @@ class DoneCheckReport:
     detail: str
 
 
-# An async runner for a ``gh`` argv: returns the command's stdout bytes, raising on a
-# non-zero exit. Injected so the command-assembly, auth env, and body rendering of
-# :class:`GhReportSink` are exercised without spawning a real process, mirroring the
-# injected-seam style of :class:`retinue.cron.GhCli`. The default
-# (:func:`_run_gh_subprocess`) shells out to ``gh``.
-GhRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[bytes]]
-
-
-class GhCliError(RuntimeError):
-    """A ``gh`` invocation behind :class:`GhReportSink` failed (non-zero exit).
-
-    Carries the argv and the captured stderr so a failed report post is debuggable
-    rather than a bare ``CalledProcessError``.
-    """
-
-    def __init__(self, argv: Sequence[str], *, returncode: int, stderr: str) -> None:
-        self.argv = list(argv)
-        self.returncode = returncode
-        self.stderr = stderr
-        super().__init__(f"gh exited {returncode} for {' '.join(argv)}: {stderr.strip()}")
-
-
 # Status markers for the rendered report body. A passed check, a failed check, and an
 # escalation (missing secret, the check never ran) each get a distinct, scannable header.
 _STATUS_PASSED = "Done-check passed"
@@ -296,29 +274,6 @@ def render_report_argv(report: DoneCheckReport) -> list[str]:
     ]
 
 
-async def _run_gh_subprocess(argv: Sequence[str], env: Mapping[str, str]) -> bytes:
-    """Spawn ``gh`` with ``env`` layered over the ambient env; return stdout bytes.
-
-    The default :data:`GhRunner`. Uses :func:`asyncio.create_subprocess_exec` (no shell,
-    so the repo name and body are never interpolated into a command line) and raises
-    :class:`GhCliError` on a non-zero exit so a failed report post fails loudly.
-    """
-    process = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, **env},
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise GhCliError(
-            argv,
-            returncode=process.returncode or -1,
-            stderr=stderr.decode(errors="replace"),
-        )
-    return stdout
-
-
 class GhReportSink:
     """The production :data:`ReportSink`: posts a done-check outcome via the ``gh`` CLI.
 
@@ -343,10 +298,10 @@ class GhReportSink:
         self,
         *,
         token: str | None = None,
-        runner: GhRunner | None = None,
+        runner: GhBytesRunner | None = None,
     ) -> None:
         self._token = token
-        self._runner = runner or _run_gh_subprocess
+        self._runner = runner or run_gh_subprocess
 
     async def __call__(self, report: DoneCheckReport) -> None:
         """Post ``report`` to its repo's tracking issue as a ``gh`` comment.
@@ -358,21 +313,13 @@ class GhReportSink:
             GhCliError: ``gh`` exited non-zero (propagated from the runner).
         """
         argv = render_report_argv(report)
-        await self._runner(argv, self._auth_env())
+        await self._runner(argv, auth_env(self._token))
         logger.info(
             "Posted done-check report for %s (passed=%s, escalated=%s)",
             report.repo_full_name,
             report.passed,
             report.escalated,
         )
-
-    def _auth_env(self) -> Mapping[str, str]:
-        """The child-process env carrying the token as ``GH_TOKEN`` (empty when none).
-
-        The token goes in the env, never on the argv, so it never lands in a process
-        listing or a log of the command.
-        """
-        return {"GH_TOKEN": self._token} if self._token else {}
 
 
 def parse_done_check(claude_md: str) -> list[list[str]]:

@@ -2,7 +2,8 @@
 
 The single-slice primitive (issue #6) is :func:`build_slice`. For one ready slice the
 orchestrator runs the whole build inside **one disposable container** that is destroyed
-on every path (:func:`_build_slice_in_container`):
+on every path (the shared :func:`retinue.container_build.build_issue_in_container`
+lifecycle, which the ad-hoc lane also runs):
 
 1. **clone + branch** — the container clones the repo over the installation token and
    checks out a fresh ``issue-<N>`` branch off the integration branch ``retinue/prd-<n>``
@@ -36,7 +37,6 @@ with no Agent SDK, no Docker, no gh, no network, and no concurrency races.
 from __future__ import annotations
 
 import asyncio
-import base64
 import enum
 import heapq
 import json
@@ -45,94 +45,43 @@ from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Protocol
 
 import httpx
 
 from retinue.classifier import ClassifyInput
 from retinue.container import Container, ContainerRuntime, RunResult
+from retinue.container_build import (
+    GIT_AUTHOR_EMAIL,
+    GIT_AUTHOR_NAME,
+    GitOpsError,
+    Implementer,
+    ImplementError,
+    Slice,
+    build_issue_in_container,
+    create_branch_commands,
+    implement_env,
+    push_branch_command,
+)
 from retinue.done_check import (
     DEFAULT_IMAGE,
-    DoneCheckReport,
     ReportSink,
     SecretResolver,
-    parse_done_check,
-    resolve_secrets_or_escalate,
-    run_done_check_commands,
 )
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import ReviewGenerationError
 from retinue.roles import (
     Role,
-    oauth_system,
-    resolve_effort,
     resolve_model,
-    structured_output_config,
 )
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class Slice:
-    """One ready slice: a single issue an implementer builds on its own branch.
-
-    Attributes:
-        repo_full_name: The target repo, e.g. "owner/repo".
-        issue_number: The slice's GitHub issue number; the implementer commits to
-            the ``issue-<N>`` branch derived from it.
-        prd_number: The parent PRD number; the integration branch is
-            ``retinue/prd-<prd_number>``.
-    """
-
-    repo_full_name: str
-    issue_number: int
-    prd_number: int
-
-    @property
-    def branch(self) -> str:
-        """The branch the implementer commits the slice to: ``issue-<N>``."""
-        return f"issue-{self.issue_number}"
-
-
 def integration_branch(prd_number: int) -> str:
     """The integration branch a PRD's slices are merged onto: ``retinue/prd-<n>``."""
     return f"retinue/prd-{prd_number}"
-
-
-class Implementer(Protocol):
-    """Spawns one implementer subagent that builds a slice. The Agent SDK seam.
-
-    A production implementation execs the headless ``claude`` CLI *inside the disposable
-    build container* the orchestrator passes in; the subagent implements TDD-first and
-    commits to the slice's ``issue-<N>`` branch already checked out there. Tests inject a
-    fake that records the request (and may mark the container log) without any real spawn.
-    The contract is the commit on ``slice.branch``; the orchestrator does not read a
-    return value, it gates on the done-check that follows.
-    """
-
-    async def implement(
-        self, slice_: Slice, *, container: Container, plan_path: str | None = None
-    ) -> None:
-        """Build ``slice_`` in ``container``, committing to its ``issue-<N>`` branch.
-
-        ``plan_path`` is the in-container path of a materialized implementation plan the
-        subagent must read before building. The PRD lane passes nothing (``None``), so its
-        prompt is unchanged; the ad-hoc lane passes its ``PLAN_FILE`` so the subagent is
-        pointed at the plan the planner wrote.
-        """
-        ...
-
-    def auth_env(self) -> dict[str, str]:
-        """The env the agent authenticates with, merged into the container at start.
-
-        Returned by the implementer (which owns the Anthropic credential) so the
-        orchestrator can inject it into the build container's environment at ``start``
-        without knowing how the credential is routed. A fake that needs no credential
-        returns an empty mapping.
-        """
-        ...
 
 
 # --- real container-exec implementer (production adapter behind the Implementer seam) ---
@@ -233,19 +182,6 @@ def _implement_prompt(
     )
 
 
-def _implement_env(credential: str, auth_mode: str) -> dict[str, str]:
-    """Build the env the ``claude`` CLI authenticates with, routing the credential by mode.
-
-    ``api_key`` mode threads the credential as ``ANTHROPIC_API_KEY``; ``subscription`` mode
-    threads it as ``CLAUDE_CODE_OAUTH_TOKEN`` (the Claude subscription OAuth env var the
-    headless CLI reads). Only the credential env var is set here — the orchestrator merges
-    it into the build container's environment at ``start``.
-    """
-    if auth_mode == "subscription":
-        return {"CLAUDE_CODE_OAUTH_TOKEN": credential}
-    return {"ANTHROPIC_API_KEY": credential}
-
-
 def _claude_argv(*, prompt: str, model: str, max_turns: int) -> list[str]:
     """Assemble the headless ``claude`` CLI argv for one in-container implement run.
 
@@ -322,16 +258,6 @@ def _claude_result_summary(stdout: str) -> str:
     return f" ({turns} turns): {text}"
 
 
-class ImplementError(RuntimeError):
-    """The container-exec implementer run ended in an error rather than a clean build.
-
-    Distinct from a *clean-but-insufficient* build, which the orchestrator catches via the
-    done-check that follows: this is the ``claude`` CLI exec itself failing (a non-zero exit
-    code, or a json result flagged ``is_error``), so the slice surfaces the failure rather
-    than proceeding to a done-check over a half-built tree.
-    """
-
-
 @dataclass(frozen=True)
 class ContainerImplementer:
     """Real :class:`Implementer`: build a slice by exec-ing ``claude`` in the build container.
@@ -404,7 +330,7 @@ class ContainerImplementer:
 
     def auth_env(self) -> dict[str, str]:
         """The credential env the orchestrator merges into the build container at start."""
-        return _implement_env(self.credential, self.auth_mode)
+        return implement_env(self.credential, self.auth_mode)
 
 
 class MergeConflict(Exception):
@@ -449,28 +375,16 @@ class GitOps(Protocol):
 # argv assembly and classifying a failed merge as a conflict vs. a hard git error — are
 # factored into the free functions below so they are tested without a live container.
 
-# Identity used for the merge commit ``git`` records. Merges are non-interactive, so a
-# committer identity must be configured or ``git commit`` refuses to run; it is set
-# per-command via ``-c`` rather than mutating global config in the shared workspace.
-_GIT_AUTHOR_NAME = "the-retinue"
-_GIT_AUTHOR_EMAIL = "retinue@users.noreply.github.com"
+# Per-command git identity for the merge commit ``git`` records. Merges are
+# non-interactive, so a committer identity must be configured or ``git commit`` refuses
+# to run; it is set per-command via ``-c`` rather than mutating global config in the
+# shared workspace. The identity itself is the shared retinue committer.
 _GIT_IDENTITY_FLAGS = [
     "-c",
-    f"user.name={_GIT_AUTHOR_NAME}",
+    f"user.name={GIT_AUTHOR_NAME}",
     "-c",
-    f"user.email={_GIT_AUTHOR_EMAIL}",
+    f"user.email={GIT_AUTHOR_EMAIL}",
 ]
-
-# The committer identity injected into the build container's env so the *agent's* own
-# ``git commit`` (and the push) run non-interactively. The container env is fixed at
-# ``start``, so the identity must ride it there rather than per-command ``-c`` flags the
-# agent would not use; git reads these four vars without any repo config.
-_GIT_COMMITTER_ENV = {
-    "GIT_AUTHOR_NAME": _GIT_AUTHOR_NAME,
-    "GIT_AUTHOR_EMAIL": _GIT_AUTHOR_EMAIL,
-    "GIT_COMMITTER_NAME": _GIT_AUTHOR_NAME,
-    "GIT_COMMITTER_EMAIL": _GIT_AUTHOR_EMAIL,
-}
 
 # Substrings git prints to stdout/stderr when a merge stops on a content conflict, as
 # opposed to a hard error (unknown ref, not a repo, …). Matched case-insensitively.
@@ -481,16 +395,6 @@ _CONFLICT_MARKERS = (
 )
 
 
-def _clone_command(clone_url: str) -> list[str]:
-    """Argv that clones the repo (over the installation-token URL) into the workspace."""
-    return ["git", "clone", clone_url, "."]
-
-
-def _push_branch_command(branch: str) -> list[str]:
-    """Argv that pushes ``branch`` to ``origin`` (authenticated by the cloned remote URL)."""
-    return ["git", "push", "origin", branch]
-
-
 def _remote_branch_exists_command(branch: str) -> list[str]:
     """Argv that exits 0 iff ``branch`` already exists on ``origin``.
 
@@ -499,19 +403,6 @@ def _remote_branch_exists_command(branch: str) -> list[str]:
     against the remote, not the local ``refs/heads``.
     """
     return ["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"]
-
-
-def _create_branch_commands(branch: str, base: str) -> list[list[str]]:
-    """Argv list that creates ``branch`` off ``base`` and checks it out.
-
-    ``base`` is referenced via ``origin/<base>`` so the branch is rooted on the freshly
-    cloned remote tip rather than whatever happens to be checked out, then a local
-    ``branch`` is created at that point and made current.
-    """
-    return [
-        ["git", "fetch", "origin", base],
-        ["git", "checkout", "-B", branch, f"origin/{base}"],
-    ]
 
 
 def _merge_commands(source: str, into: str) -> list[list[str]]:
@@ -593,10 +484,10 @@ class ContainerGitOps:
         if exists.ok:
             logger.info("Integration branch %s already exists on origin", branch)
             return
-        for command in _create_branch_commands(branch, base):
+        for command in create_branch_commands(branch, base):
             await self._run_checked(command, action=f"create {branch} off {base}")
         await self._run_checked(
-            _push_branch_command(branch), action=f"push {branch} to origin"
+            push_branch_command(branch), action=f"push {branch} to origin"
         )
         logger.info("Created integration branch %s off %s and pushed to origin", branch, base)
 
@@ -614,7 +505,7 @@ class ContainerGitOps:
         result = await self._container.run_command(commands[-1])
         if result.ok:
             await self._run_checked(
-                _push_branch_command(into), action=f"push {into} after merge"
+                push_branch_command(into), action=f"push {into} after merge"
             )
             logger.info("Merged %s into %s and pushed %s", source, into, into)
             return
@@ -654,13 +545,90 @@ class ContainerGitOps:
         return result
 
 
-class GitOpsError(RuntimeError):
-    """A ``git`` command failed for a reason other than a recoverable merge conflict.
+class MergeContainerGitOps:
+    """A :class:`GitOps` that lazily starts its own merge container, then delegates.
 
-    Distinct from :class:`MergeConflict`: a conflict is handed to the resolver, but a
-    hard error (unknown ref, not a repository, checkout failure) means the integration
-    branch could not be advanced at all, so it propagates rather than masquerading as a
-    conflict the resolver could fix.
+    The orchestrator's merge phase runs ``git`` inside a container holding a clone of the
+    repo, but ``build_prd`` starts no such container — the done-check's per-slice
+    containers are created and destroyed inside the build round, before any merge. This
+    adapter closes that gap: on the first branch/merge call it starts a fresh container
+    via the injected :class:`ContainerRuntime`, clones the repo over the installation
+    token, and wraps it in :class:`ContainerGitOps`; every later call within the same
+    build reuses that one container (so the integration branch persists across the
+    round's merges). :meth:`aclose` destroys it, and the build seam wrapper calls it in a
+    ``finally`` so the container is never leaked.
+
+    Args:
+        repo_full_name: The repo to clone for the merges, e.g. "owner/repo".
+        auth: Mints the installation token whose URL the clone authenticates with.
+        runtime: Spawns the disposable merge container (the Docker seam).
+        image: The container image the merges run in; defaults to the done-check image.
+    """
+
+    def __init__(
+        self,
+        *,
+        repo_full_name: str,
+        auth: InstallationAuth,
+        runtime: ContainerRuntime,
+        image: str = DEFAULT_IMAGE,
+    ) -> None:
+        self._repo_full_name = repo_full_name
+        self._auth = auth
+        self._runtime = runtime
+        self._image = image
+        self._container: Container | None = None
+        self._delegate: ContainerGitOps | None = None
+
+    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
+        """Ensure ``branch`` exists in the (lazily started) merge container."""
+        delegate = await self._ensure_delegate()
+        await delegate.ensure_integration_branch(branch=branch, base=base)
+
+    async def merge(self, *, source: str, into: str) -> None:
+        """Merge ``source`` into ``into`` in the (lazily started) merge container."""
+        delegate = await self._ensure_delegate()
+        await delegate.merge(source=source, into=into)
+
+    async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
+        """Diff a round's ``merged_branches`` over ``base`` in the merge container.
+
+        The merge container is already started (the round merged into ``base`` through it),
+        so the internal reviewer reads the round's merged surface from the same clone the
+        merges advanced — no second container or clone.
+        """
+        delegate = await self._ensure_delegate()
+        return await delegate.round_diff(merged_branches=merged_branches, base=base)
+
+    async def _ensure_delegate(self) -> ContainerGitOps:
+        """Start + clone the merge container on first use; reuse it thereafter."""
+        if self._delegate is not None:
+            return self._delegate
+        token = await self._auth.installation_token(self._repo_full_name)
+        container = await self._runtime.start(image=self._image, env={})
+        result = await container.run_command(["git", "clone", token.clone_url, "."])
+        if not result.ok:
+            await container.destroy()
+            raise GitOpsCloneError(
+                f"clone of {self._repo_full_name} for merge failed "
+                f"(exit {result.exit_code}): {result.stderr}"
+            )
+        self._container = container
+        self._delegate = ContainerGitOps(container)
+        return self._delegate
+
+    async def aclose(self) -> None:
+        """Destroy the merge container if one was started. Idempotent."""
+        container, self._container, self._delegate = self._container, None, None
+        if container is not None:
+            await container.destroy()
+
+
+class GitOpsCloneError(RuntimeError):
+    """The merge container could not clone the repo, so no merge can run.
+
+    Raised rather than returning a sentinel so a doomed merge round fails loudly instead
+    of silently reporting an empty integration branch.
     """
 
 
@@ -685,331 +653,6 @@ class ConflictResolver(Protocol):
     async def __call__(self, *, source: str, into: str) -> ConflictResolution:
         """Attempt to resolve the conflict merging ``source`` into ``into``."""
         ...
-
-
-# --- real Agent-SDK conflict resolver --------------------------------------------
-#
-# The production :class:`ConflictResolver` re-runs the failed merge inside the same
-# disposable container ``build_prd`` already cloned into (the merge was aborted before
-# :class:`MergeConflict` surfaced, so the conflict must be recreated), reads the
-# conflicted blobs, drives Claude over the Messages API to emit a full resolution for
-# each one, writes them back, and stages + commits the merge. Two collaborators are
-# injected — the already-present :class:`~retinue.container.Container` (the only git/FS
-# side effect) and an HTTP transport for the one Anthropic call — so the bug-prone pure
-# parts (auth-header routing, request payload assembly, response parsing, and reading
-# the conflicted-path list out of git) are unit-tested without a live container, Docker,
-# gh, Claude, or network. The retried merge in ``build_prd`` is the real gate, so a
-# resolver that produces an incomplete or wrong resolution still escalates rather than
-# merging a broken tree.
-#
-# SDK conventions match the slicer/reviewer: Opus 4.8 is the default model; an OAuth
-# subscription token (``sk-ant-oat...``) rides ``Authorization: Bearer`` with the
-# ``oauth-2025-04-20`` beta header, any other credential is a raw API key on
-# ``x-api-key``; ``anthropic-version`` is always sent. The model must return only the
-# JSON object matching the schema — one resolved full-file body per conflicted path.
-
-_ANTHROPIC_VERSION = "2023-06-01"
-_RESOLVE_OAUTH_BETA = "oauth-2025-04-20"
-_ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
-_RESOLVE_MAX_TOKENS = 32_000
-
-# The conflict resolver's model and effort tier come from the
-# :data:`~retinue.roles.Role.RESOLVER` registry entry (Opus 4.8 at the ``xhigh`` tier by
-# default — the same tier the slicer uses). Drawing both from the registry keeps the tier
-# from silently drifting between the two Opus call sites and lets a repo's routing level
-# swap the model at the wiring site.
-
-# Re-runs the merge (no auto-commit) so the working tree carries the conflict markers
-# the resolver reads; ``--no-commit`` keeps it stopped at the conflict even when git
-# could otherwise auto-resolve, so the agent always sees the full picture.
-_RESOLVE_MERGE_COMMAND = ["git", "merge", "--no-ff", "--no-commit", "--no-edit"]
-# Lists every path with a merge conflict (``U`` in either status column).
-_CONFLICTED_PATHS_COMMAND = ["git", "diff", "--name-only", "--diff-filter=U"]
-
-# Strict JSON schema the resolver must emit: one entry per conflicted path carrying the
-# complete resolved file body. ``resolved`` lists exactly the paths it fixed; the caller
-# stages those and lets the retried merge verify nothing was left conflicted.
-_RESOLVE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "resolved": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["resolved"],
-    "additionalProperties": False,
-}
-
-# The resolver's brief. Frozen (no per-request interpolation) so the request prefix is
-# cacheable across conflicts; the conflicted blobs ride in the user message.
-_RESOLVE_SYSTEM = (
-    "You resolve git merge conflicts. Each file below contains conflict markers "
-    "(<<<<<<<, =======, >>>>>>>). For every file, return its complete resolved "
-    "content with all markers removed, integrating both sides faithfully so the "
-    "result is correct and compiles — never drop one side's changes wholesale. "
-    "Return only the JSON object matching the schema; emit one 'resolved' entry per "
-    "input file, each with the file's full post-resolution body. No prose."
-)
-
-
-@dataclass(frozen=True)
-class AnthropicResponse:
-    """The slice of an Anthropic Messages API response the resolver reads."""
-
-    status_code: int
-    body: dict[str, Any]
-
-
-class AnthropicTransport(Protocol):
-    """Async HTTP POST seam (httpx-style). The network edge of the resolver.
-
-    A production implementation wraps an httpx client; tests inject a fake returning a
-    canned :class:`AnthropicResponse`. Kept narrow — one POST — so the resolution flow
-    is exercisable without network.
-    """
-
-    async def post(
-        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
-    ) -> AnthropicResponse:
-        """POST ``json`` to ``url`` with ``headers`` and return the response."""
-        ...
-
-
-class ConflictResolutionError(RuntimeError):
-    """The resolver could not obtain a usable resolution (bad API status / payload).
-
-    Distinct from a *claimed-but-wrong* resolution, which is caught downstream by the
-    retried merge: this is a hard failure to even produce a candidate (non-200 API
-    response, unparseable body), so the conflict escalates rather than silently merging.
-    """
-
-
-@dataclass(frozen=True)
-class _ConflictedFile:
-    """One conflicted path and its working-tree blob (with conflict markers)."""
-
-    path: str
-    content: str
-
-
-def _write_file_command(path: str, content: str) -> list[str]:
-    """Argv that writes ``content`` to ``path`` inside the container, byte-exact.
-
-    ``run_command`` execs the argv directly (no shell, no stdin), so arbitrary file
-    bodies can't be passed as a here-doc or piped. The content is base64-encoded and
-    decoded in-container via positional args (``$1``/``$2``) — never interpolated into
-    the command string — so conflict markers, quotes, and newlines survive untouched and
-    nothing in the file body is interpreted as shell syntax.
-    """
-    blob = base64.b64encode(content.encode()).decode()
-    script = 'printf %s "$1" | base64 -d > "$2"'
-    return ["sh", "-c", script, "sh", blob, path]
-
-
-def _conflicted_paths(stdout: str) -> list[str]:
-    """Parse ``git diff --name-only --diff-filter=U`` output into a path list.
-
-    One path per non-blank line; surrounding whitespace is trimmed. An empty result
-    means git reported no conflicted paths, which the caller treats as nothing to do.
-    """
-    return [line.strip() for line in stdout.splitlines() if line.strip()]
-
-
-def _resolve_headers(credential: str) -> dict[str, str]:
-    """Build the Messages API request headers, routing the credential to its scheme.
-
-    An OAuth subscription token (``sk-ant-oat...``) is sent as ``Authorization: Bearer``
-    with the OAuth beta header; any other value is treated as a raw API key on
-    ``x-api-key``. ``anthropic-version`` is always sent.
-    """
-    headers = {
-        "anthropic-version": _ANTHROPIC_VERSION,
-        "content-type": "application/json",
-    }
-    if credential.startswith("sk-ant-oat"):
-        headers["authorization"] = f"Bearer {credential}"
-        headers["anthropic-beta"] = _RESOLVE_OAUTH_BETA
-    else:
-        headers["x-api-key"] = credential
-    return headers
-
-
-def _resolve_payload(
-    files: list[_ConflictedFile],
-    *,
-    source: str,
-    into: str,
-    model: str,
-    effort: str,
-    is_oauth: bool,
-) -> dict[str, Any]:
-    """Assemble the Messages API request body for one conflict resolution.
-
-    The frozen system brief leads; the user message carries the merge context plus each
-    conflicted file's full marked-up body, fenced by path so the model can address each
-    one. The shared :func:`~retinue.roles.structured_output_config` helper carries
-    ``effort`` (the caller's resolved reasoning-effort tier) and the strict per-file
-    schema on one ``output_config`` dict — the canonical Messages API structured-output
-    shape (the OpenAI-style top-level ``response_format`` is not a Claude API parameter
-    and 400s).
-
-    ``is_oauth`` is required, not defaulted: a subscription OAuth token reaches the premium
-    resolving model only when the leading ``system`` block is the Claude Code identity
-    string (see :func:`retinue.roles.oauth_system`), so the caller must state the auth mode
-    explicitly rather than silently defaulting to the API-key wire.
-    """
-    blocks = "\n\n".join(
-        f"### {file.path}\n```\n{file.content}\n```" for file in files
-    )
-    user = (
-        f"Merging branch '{source}' into '{into}' hit conflicts in "
-        f"{len(files)} file(s). Resolve each and return the full resolved body:\n\n"
-        f"{blocks}"
-    )
-    return {
-        "model": model,
-        "max_tokens": _RESOLVE_MAX_TOKENS,
-        "output_config": structured_output_config(
-            Role.RESOLVER, _RESOLVE_SCHEMA, model=model, effort=effort
-        ),
-        "system": oauth_system(_RESOLVE_SYSTEM, is_oauth=is_oauth),
-        "messages": [{"role": "user", "content": user}],
-    }
-
-
-def _parse_resolution(body: dict[str, Any]) -> dict[str, str]:
-    """Parse a Messages API response body into a ``{path: resolved_content}`` map.
-
-    Reads the concatenated ``text`` content blocks, loads them as the schema JSON, and
-    maps each entry's path to its resolved body. A response missing text, carrying
-    malformed JSON, or a non-list ``resolved`` raises :class:`ConflictResolutionError`
-    rather than silently resolving nothing (which would let the retried merge merge an
-    unresolved tree only if git could auto-resolve — never on a real conflict).
-    """
-    text = "".join(
-        block.get("text", "")
-        for block in body.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-    if not text.strip():
-        raise ConflictResolutionError("resolver response carried no text content")
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ConflictResolutionError(f"resolver emitted invalid JSON: {exc}") from exc
-    raw = parsed.get("resolved")
-    if not isinstance(raw, list):
-        raise ConflictResolutionError("resolver JSON missing a 'resolved' list")
-    return {str(item["path"]): str(item["content"]) for item in raw}
-
-
-@dataclass(frozen=True)
-class AgentSdkConflictResolver:
-    """Real :class:`ConflictResolver`: resolve a merge conflict via the Agent SDK.
-
-    Satisfies the resolver protocol ``(*, source, into) -> ConflictResolution`` via
-    :meth:`__call__`, so it drops in where the fake resolver sits in tests and at the
-    wiring site. It recreates the aborted merge in the injected container, reads the
-    conflicted blobs, calls Claude once to resolve them, writes each resolution back,
-    and stages + commits the merge — then returns ``RESOLVED``. With no conflicts to
-    find it returns ``UNRESOLVED`` (nothing to fix); a hard API/parse failure raises
-    :class:`ConflictResolutionError`. The retried merge in ``build_prd`` is the real
-    gate, so an incomplete resolution still escalates rather than merging a broken tree.
-
-    Attributes:
-        container: The cloned-repo container the merge/resolution runs in.
-        transport: The injected Anthropic HTTP POST seam.
-        credential: The Anthropic credential (OAuth subscription token or API key).
-        model: The resolving model id; defaults to the
-            :data:`~retinue.roles.Role.RESOLVER` registry entry (Opus 4.8), which a
-            repo's routing level can replace at the wiring site.
-        effort: The resolving request's reasoning-effort tier; defaults to the
-            registry entry's tier, which a repo's routing level can replace at
-            the wiring site.
-    """
-
-    container: Container
-    transport: AnthropicTransport
-    credential: str
-    model: str = field(default_factory=lambda: resolve_model(Role.RESOLVER))
-    effort: str = field(default_factory=lambda: resolve_effort(Role.RESOLVER))
-
-    async def __call__(self, *, source: str, into: str) -> ConflictResolution:
-        """Resolve the conflict merging ``source`` into ``into``; stage and commit it."""
-        files = await self._recreate_and_read(source)
-        if not files:
-            logger.warning("No conflicted paths found resolving %s into %s", source, into)
-            return ConflictResolution.UNRESOLVED
-        resolutions = await self._ask_claude(files, source=source, into=into)
-        await self._apply(files, resolutions)
-        logger.info("Resolved %d conflicted file(s) merging %s into %s", len(files), source, into)
-        return ConflictResolution.RESOLVED
-
-    async def _recreate_and_read(self, source: str) -> list[_ConflictedFile]:
-        """Re-run the aborted merge to surface the conflict, then read each blob.
-
-        The merge is expected to fail (that is the conflict being resolved), so its exit
-        is not checked; the conflicted-path listing is the source of truth. Each path's
-        working-tree content (carrying the conflict markers) is read back for the agent.
-        """
-        await self.container.run_command([*_RESOLVE_MERGE_COMMAND, f"origin/{source}"])
-        listing = await self.container.run_command(_CONFLICTED_PATHS_COMMAND)
-        files: list[_ConflictedFile] = []
-        for path in _conflicted_paths(listing.stdout):
-            blob = await self.container.run_command(["cat", path])
-            files.append(_ConflictedFile(path=path, content=blob.stdout))
-        return files
-
-    async def _ask_claude(
-        self, files: list[_ConflictedFile], *, source: str, into: str
-    ) -> dict[str, str]:
-        """Call the Messages API once and parse the per-path resolution map."""
-        response = await self.transport.post(
-            _ANTHROPIC_MESSAGES_URL,
-            headers=_resolve_headers(self.credential),
-            json=_resolve_payload(
-                files,
-                source=source,
-                into=into,
-                model=self.model,
-                effort=self.effort,
-                is_oauth=self.credential.startswith("sk-ant-oat"),
-            ),
-        )
-        if response.status_code != 200:
-            raise ConflictResolutionError(
-                f"Anthropic Messages API returned {response.status_code}"
-            )
-        return _parse_resolution(response.body)
-
-    async def _apply(
-        self, files: list[_ConflictedFile], resolutions: dict[str, str]
-    ) -> None:
-        """Write each resolved body back, stage it, then commit the merge.
-
-        Only the paths the resolver actually returned are written and staged; any
-        conflicted path it omitted is left unresolved, so the retried merge catches the
-        gap and the slice escalates rather than committing a partial resolution.
-        """
-        for file in files:
-            content = resolutions.get(file.path)
-            if content is None:
-                logger.warning("Resolver omitted conflicted path %s", file.path)
-                continue
-            await self.container.run_command(_write_file_command(file.path, content))
-            await self.container.run_command(["git", "add", file.path])
-        await self.container.run_command(
-            ["git", *_GIT_IDENTITY_FLAGS, "commit", "--no-edit"]
-        )
 
 
 class BuildOutcome(enum.Enum):
@@ -1056,7 +699,8 @@ async def build_slice(
 
     The integration branch ``retinue/prd-<n>`` is ensured on origin first (created off
     ``config.staging_branch`` when absent), then the whole build runs in one disposable
-    container (:func:`_build_slice_in_container`): clone, check out a fresh ``issue-<N>``
+    container (the shared :func:`retinue.container_build.build_issue_in_container`
+    lifecycle): clone, check out a fresh ``issue-<N>``
     branch off the integration branch's tip, let the implementer exec ``claude`` inside it
     and commit, run the repo's done-check over the real changes, and push ``issue-<N>``
     only when green. The done-check result gates the merge: a green check merges the pushed
@@ -1092,7 +736,7 @@ async def build_slice(
     # integration branch, not staging).
     await git.ensure_integration_branch(branch=branch, base=config.staging_branch)
 
-    passed = await _build_slice_in_container(
+    passed = await build_issue_in_container(
         slice_,
         config,
         claude_md,
@@ -1118,127 +762,6 @@ async def build_slice(
     return BuildResult(outcome=BuildOutcome.MERGED, integration_branch=branch)
 
 
-async def _build_slice_in_container(
-    slice_: Slice,
-    config: RepoConfig,
-    claude_md: str,
-    *,
-    base: str,
-    implementer: Implementer,
-    auth: InstallationAuth,
-    runtime: ContainerRuntime,
-    resolve_secret: SecretResolver,
-    report: ReportSink,
-    image: str,
-) -> bool:
-    """Run one slice's full build in a single disposable container; return green/red.
-
-    Owns the whole per-slice lifecycle, destroying the container on every path:
-
-    1. parse the done-check and resolve the config's secrets (a missing one escalates on
-       the report sink and propagates *before* any container starts),
-    2. start the container with the secrets, the git committer identity, and the agent's
-       credential all in its env (the env is fixed at ``start``),
-    3. clone the repo and check out a fresh ``issue-<N>`` branch off ``base`` — the
-       integration branch ``retinue/prd-<n>`` (already created off staging at build start),
-       so a later-round slice builds on its already-merged sibling work,
-    4. exec the implementer (``claude``) inside the container to build and commit the slice,
-    5. run the done-check over the real changes and post the outcome,
-    6. push ``issue-<N>`` to ``origin`` only when the done-check is green (so the merge seam
-       can fetch it; a red slice pushes nothing).
-
-    Returns:
-        True only when the done-check passed (and the branch was pushed); False on red.
-    """
-    commands = parse_done_check(claude_md)
-    env = await resolve_secrets_or_escalate(
-        slice_.repo_full_name, slice_.issue_number, config, resolve_secret, report
-    )
-    auth_env = implementer.auth_env()
-    start_env = {**env, **_GIT_COMMITTER_ENV, **auth_env}
-    # The exact secret values injected into the container, scrubbed from a failing
-    # done-check's report (repo-declared secrets plus the auth credential).
-    secret_values = [*env.values(), *auth_env.values()]
-    token = await auth.installation_token(slice_.repo_full_name)
-    container = await runtime.start(image=image, env=start_env)
-    try:
-        await _clone_and_branch(
-            container, token.clone_url, branch=slice_.branch, base=base
-        )
-        await implementer.implement(slice_, container=container)
-        await _ensure_commits_landed(container, branch=slice_.branch, base=base)
-        passed, detail = await run_done_check_commands(
-            container, commands, secret_values=secret_values
-        )
-        if passed:
-            await _push_branch(container, slice_.branch)
-        await report(
-            DoneCheckReport(
-                repo_full_name=slice_.repo_full_name,
-                issue_number=slice_.issue_number,
-                passed=passed,
-                escalated=False,
-                detail=detail,
-            )
-        )
-        logger.info(
-            "Slice %s done-check %s", slice_.branch, "passed" if passed else "failed"
-        )
-        return passed
-    finally:
-        # Guaranteed teardown: the disposable container is destroyed on every path,
-        # including when clone, implement, the done-check, the push, or report raises.
-        await container.destroy()
-
-
-async def _ensure_commits_landed(
-    container: Container, *, branch: str, base: str
-) -> None:
-    """Raise :class:`ImplementError` when the implement run committed nothing.
-
-    A hollow implement — the agent no-ops and exits 0 — leaves the tree at
-    ``origin/<base>``; the done-check then passes vacuously over the untouched tree and
-    an empty branch merges. Counting the commits since ``origin/<base>`` right after the
-    implement catches that before the done-check runs. A probe that itself fails (bad
-    exit, empty stdout) also raises: an unreadable count must not pass as "commits
-    exist".
-    """
-    result = await container.run_command(
-        ["git", "rev-list", "--count", f"origin/{base}..HEAD"]
-    )
-    count = result.stdout.strip()
-    if not result.ok or count in ("", "0"):
-        raise ImplementError(
-            f"implementer for {branch} landed no commits "
-            f"(rev-list exit {result.exit_code}, count {count!r})"
-        )
-
-
-async def _clone_and_branch(
-    container: Container, clone_url: str, *, branch: str, base: str
-) -> None:
-    """Clone the repo into ``container`` and check out a fresh ``branch`` off ``base``."""
-    clone = await container.run_command(_clone_command(clone_url))
-    if not clone.ok:
-        raise GitOpsError(f"clone failed (exit {clone.exit_code}): {clone.stderr}")
-    for command in _create_branch_commands(branch, base):
-        result = await container.run_command(command)
-        if not result.ok:
-            raise GitOpsError(
-                f"failed to create slice branch {branch} off {base} "
-                f"(exit {result.exit_code}): {result.stderr}"
-            )
-
-
-async def _push_branch(container: Container, branch: str) -> None:
-    """Push ``branch`` to ``origin`` from inside ``container``; raise on failure."""
-    result = await container.run_command(_push_branch_command(branch))
-    if not result.ok:
-        raise GitOpsError(
-            f"failed to push {branch} (exit {result.exit_code}): {result.stderr}"
-        )
-
-
 async def _merge_green_slice(slice_: Slice, branch: str, *, git: GitOps) -> None:
     """Merge a green slice onto the integration branch.
 
@@ -1252,18 +775,6 @@ async def _merge_green_slice(slice_: Slice, branch: str, *, git: GitOps) -> None
 
 
 # --- full-PRD driver (issue #7) --------------------------------------------------
-
-
-class OrchestratorBusyError(Exception):
-    """A second orchestrator run was attempted while one is already in flight.
-
-    The single-run guarantee: :func:`build_prd` runs inside an injected lock that
-    rejects a concurrent holder. Catching this (rather than blocking) makes the
-    "at most one run at a time" contract observable to the caller.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("an orchestrator run is already in flight")
 
 
 @dataclass(frozen=True)
@@ -1366,8 +877,8 @@ async def build_prd(
         runtime: Spawns the disposable container the done-check runs in (Docker seam).
         resolve_secret: Resolves the config's declared secret names/refs to values.
         report: Sink the done-check outcome is posted to.
-        lock: The single-run lock; entering it raises :class:`OrchestratorBusyError`
-            when a run is already in flight.
+        lock: The single-run lock; entering it raises when a run is already in
+            flight, so a concurrent second run is rejected rather than serialized.
         resolve_conflict: Attempts to resolve a merge conflict; absent means any
             conflict escalates.
         review_round: The internal reviewer run after each round's merge (the reviewer
@@ -1381,7 +892,7 @@ async def build_prd(
         the reviewer filed and built mid-run land in ``merged`` alongside the originals.
 
     Raises:
-        OrchestratorBusyError: A run is already in flight (from the injected lock).
+        Exception: Whatever the injected lock raises when a run is already in flight.
     """
     branch = integration_branch(slices[0].prd_number) if slices else integration_branch(0)
     async with lock:
@@ -1572,7 +1083,7 @@ async def _build_round(
 
     async def build_one(slice_: PrdSlice) -> _SliceBuildOutcome:
         async with semaphore:
-            passed = await _build_slice_in_container(
+            passed = await build_issue_in_container(
                 slice_,
                 config,
                 claude_md,

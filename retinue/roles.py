@@ -1,8 +1,8 @@
 """The agent-role registry: one table owning every agent role's model and effort.
 
 The retinue runs six agent roles — the PRD :class:`~retinue.slicer.ClaudeSliceGenerator`,
-the :class:`~retinue.orchestrator.ContainerImplementer`, the
-:class:`~retinue.orchestrator.AgentSdkConflictResolver`, the internal
+the :class:`~retinue.orchestrator.ContainerImplementer`, the conflict resolver
+(a :data:`Role.RESOLVER` registry entry with no production adapter yet), the internal
 :class:`~retinue.reviewer.AgentSdkReviewGenerator`, the read-only ``planner`` (Opus
 on the in-container CLI, run with no write/edit/commit capability — it maps the code via
 an Explore subagent and emits a plan as its captured output), and the
@@ -244,6 +244,11 @@ def resolve_effort(
 # existing OAuth detection, so an OAuth request leads with the identity block and an
 # API-key request keeps the brief unchanged. The literal must match the CLI byte-for-byte.
 CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def is_oauth_credential(credential: str) -> bool:
+    """True when ``credential`` is a subscription OAuth token (``sk-ant-oat...``)."""
+    return credential.startswith("sk-ant-oat")
 
 
 def oauth_system(role_system: str, *, is_oauth: bool) -> str | list[dict[str, str]]:

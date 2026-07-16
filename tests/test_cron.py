@@ -30,6 +30,7 @@ from typing import Any, cast
 import pytest
 
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
+from retinue.container_build import Slice
 from retinue.cron import (
     BacklogIssue,
     CronBusyError,
@@ -39,22 +40,10 @@ from retinue.cron import (
     SliceBuilder,
     run_cron_tick,
 )
-from retinue.loopback import Severity
-from retinue.orchestrator import BuildOutcome, BuildResult, Slice, integration_branch
+from retinue.orchestrator import BuildOutcome, BuildResult, integration_branch
 from retinue.repo_config import RepoConfig
-
-
-class FakeClock:
-    """A deterministic, advanceable clock (the budget/cron time source)."""
-
-    def __init__(self, start: datetime | None = None) -> None:
-        self._now = start or datetime(2026, 6, 1, tzinfo=UTC)
-
-    def now(self) -> datetime:
-        return self._now
-
-    def advance(self, delta: timedelta) -> None:
-        self._now += delta
+from retinue.vocab import Severity
+from tests.fakes import CLOCK_DEFAULT, FakeClock
 
 
 class FakeCronGh:
@@ -100,8 +89,8 @@ class OneAtATimeLock:
 
 
 def _issue(number: int, *, priority: str | None, age_days: float) -> BacklogIssue:
-    """A backlog issue ``age_days`` old relative to the fake clock's 2026-06-01 start."""
-    created = datetime(2026, 6, 1, tzinfo=UTC) - timedelta(days=age_days)
+    """A backlog issue ``age_days`` old relative to the fake clock's default instant."""
+    created = CLOCK_DEFAULT - timedelta(days=age_days)
     labels = ["backlog"] + ([f"priority:{priority}"] if priority else [])
     return BacklogIssue(number=number, labels=labels, created_at=created)
 

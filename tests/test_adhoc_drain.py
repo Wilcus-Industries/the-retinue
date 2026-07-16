@@ -44,9 +44,9 @@ from retinue.adhoc_drain import (
     run_adhoc_drain,
 )
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
-from retinue.loopback import Severity
 from retinue.repo_config import RepoConfig
-from tests.test_budget import FakeClock
+from retinue.vocab import Severity
+from tests.fakes import FakeAdhocGh, FakeClock
 
 
 def _ready(
@@ -152,57 +152,6 @@ async def _drain(
         # leaked one is torn down at GC against whatever loop is current then. close()
         # reconnects lazily, so tests that meter the governor afterwards still work.
         await governor.close()
-
-
-class FakeAdhocGh:
-    """In-memory ready-for-agent query + whole-repo flight-state truth (the fast path).
-
-    ``flight_snapshot`` answers the dedup + stranded-recovery question for the whole repo in
-    one shot (the query the drain prefers): an issue in ``in_flight_numbers`` has a branch
-    *and* an open PR (a build under way or landed -> :attr:`FlightState.IN_FLIGHT`, skip); an
-    issue in ``stranded_numbers`` has a pushed ``issue-<N>`` branch but *no* open PR (a green
-    build whose PR never opened -> :attr:`FlightState.STRANDED`, open its PR without
-    rebuilding); every other issue is :attr:`FlightState.ABSENT` (build it). ``flight_state``
-    is retained so this fake still satisfies :class:`AdhocGh`, but the drain classifies from
-    the snapshot, so ``flight_state`` is not exercised on the fast path.
-    """
-
-    def __init__(
-        self,
-        issues: list[ReadyIssue],
-        *,
-        in_flight_numbers: set[int] | None = None,
-        stranded_numbers: set[int] | None = None,
-    ) -> None:
-        self._issues = issues
-        self._in_flight = in_flight_numbers or set()
-        self._stranded = stranded_numbers or set()
-        self.calls: list[str] = []
-        self.snapshot_calls: list[str] = []
-        self.flight_state_calls: list[int] = []
-
-    async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
-        self.calls.append(repo_full_name)
-        return list(self._issues)
-
-    async def flight_snapshot(self, *, repo_full_name: str) -> FlightSnapshot:
-        self.snapshot_calls.append(repo_full_name)
-        return FlightSnapshot(
-            open_pr_heads=frozenset(f"issue-{n}" for n in self._in_flight),
-            issue_branches=frozenset(
-                f"issue-{n}" for n in self._in_flight | self._stranded
-            ),
-        )
-
-    async def flight_state(
-        self, *, repo_full_name: str, issue_number: int
-    ) -> FlightState:
-        self.flight_state_calls.append(issue_number)
-        if issue_number in self._in_flight:
-            return FlightState.IN_FLIGHT
-        if issue_number in self._stranded:
-            return FlightState.STRANDED
-        return FlightState.ABSENT
 
 
 class _FlightStateOnlyGh:
@@ -926,7 +875,7 @@ class _RunnerWithBranchMiss:
         self.pr_argv: Sequence[str] | None = None
 
     async def __call__(self, argv: Sequence[str], env: Mapping[str, str]) -> bytes:
-        from retinue.cron import GhCliError
+        from retinue.gh import GhCliError
 
         if "git/ref/heads/issue-7" in " ".join(argv) or any(
             "git/ref" in part for part in argv

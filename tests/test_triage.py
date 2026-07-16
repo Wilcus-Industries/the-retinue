@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from retinue.container import RunResult
+from retinue.container_build import Slice
 from retinue.impl_retry import ImplRetryStore
 from retinue.notify import (
     CommentRequest,
@@ -32,7 +33,6 @@ from retinue.notify import (
     Notifier,
     PushRequest,
 )
-from retinue.orchestrator import Slice
 from retinue.repo_config import RepoConfig
 from retinue.slicer import CreatedIssue, IssueDraft
 from retinue.triage import (

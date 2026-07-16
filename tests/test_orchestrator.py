@@ -11,126 +11,49 @@ A green done-check merges ``issue-<N>`` into the integration branch ``retinue/pr
 
 from __future__ import annotations
 
-import base64
-import json
 import logging
 from collections.abc import Mapping
 
 import pytest
 
 from retinue.classifier import ClassifyInput
-from retinue.container import Container, RunResult
+from retinue.container import RunResult
+from retinue.container_build import (
+    GitOpsError,
+    Implementer,
+    ImplementError,
+    Slice,
+)
 from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
     _DEFAULT_IMPLEMENT_MAX_TURNS,
     _IMPLEMENT_SYSTEM,
-    _RESOLVE_SYSTEM,
-    AgentSdkConflictResolver,
-    AnthropicResponse,
     BuildOutcome,
     BuildResult,
-    ConflictResolution,
-    ConflictResolutionError,
     ContainerGitOps,
     ContainerImplementer,
-    GitOpsError,
-    Implementer,
-    ImplementError,
     MergeConflict,
-    Slice,
     _claude_argv,
     _claude_result_is_error,
-    _conflicted_paths,
-    _ConflictedFile,
-    _implement_env,
     _implement_prompt,
-    _parse_resolution,
-    _resolve_headers,
-    _resolve_payload,
-    _write_file_command,
     build_slice,
     integration_branch,
 )
 from retinue.repo_config import (
-    ModelEffort,
     RepoConfig,
-    RoutingConfig,
-    RoutingLevel,
     SecretsConfig,
 )
-from retinue.roles import CLAUDE_CODE_IDENTITY, ROLE_REGISTRY, Role, resolve_effort, resolve_model
-from retinue.slicer import _EFFORT_XHIGH
-from tests.test_done_check import (
+from retinue.roles import ROLE_REGISTRY, Role
+from tests.fakes import (
     CLAUDE_MD,
     FakeAuth,
+    FakeGitOps,
+    FakeImplementer,
     FakeRuntime,
+    MergeConflictError,
     _resolver,
     _sink,
 )
-
-
-class FakeImplementer:
-    """Records the slice it was asked to build and marks the build container.
-
-    Appends an ``implement`` marker to the container log so the per-slice lifecycle
-    order (clone -> checkout -> implement -> done-check -> push) is assertable, and
-    returns an empty ``auth_env`` (a fake needs no real Anthropic credential).
-    """
-
-    def __init__(self) -> None:
-        self.built: list[Slice] = []
-
-    async def implement(
-        self, slice_: Slice, *, container: Container, plan_path: str | None = None
-    ) -> None:
-        self.built.append(slice_)
-        await container.run_command(["implement", slice_.branch])
-
-    def auth_env(self) -> dict[str, str]:
-        return {}
-
-
-class FakeGitOps:
-    """In-memory git: records branch creation and merges, scripts existence/conflicts.
-
-    ``existing`` is the set of branches that already exist on the remote. ``conflicts``
-    is the set of source branches whose merge should raise (a conflict the orchestrator
-    surfaces). ``log`` records each ensure/merge event in order.
-    """
-
-    def __init__(
-        self,
-        existing: set[str] | None = None,
-        conflicts: set[str] | None = None,
-        timeline: list[str] | None = None,
-    ) -> None:
-        self.existing = set(existing or set())
-        self._conflicts = set(conflicts or set())
-        self.log: list[str] = []
-        self.merges: list[tuple[str, str]] = []
-        # Optional shared event list, written to by both this seam and the runtime, so a
-        # test can assert ordering *across* the git and container seams.
-        self._timeline = timeline
-
-    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
-        if branch in self.existing:
-            self.log.append(f"exists:{branch}")
-            return
-        event = f"create:{branch}<-{base}"
-        self.log.append(event)
-        if self._timeline is not None:
-            self._timeline.append(event)
-        self.existing.add(branch)
-
-    async def merge(self, *, source: str, into: str) -> None:
-        self.log.append(f"merge:{source}->{into}")
-        if source in self._conflicts:
-            raise MergeConflictError(source, into)
-        self.merges.append((source, into))
-
-
-class MergeConflictError(MergeConflict):
-    """A merge could not complete because of a conflict (a typed ``MergeConflict``)."""
 
 
 def _slice(issue_number: int = 7, prd_number: int = 1) -> Slice:
@@ -657,342 +580,6 @@ async def test_round_diff_empty_when_no_branches_merged() -> None:
     assert container.commands == []
 
 
-# --- real Agent-SDK conflict resolver --------------------------------------------
-#
-# Exercises the production AgentSdkConflictResolver's pure/parseable parts (auth header,
-# request payload, response parsing, conflicted-path + write-file argv) and its
-# container/transport collaboration over an in-memory container + fake transport. No
-# live container/Docker/Claude/network.
-
-
-class FakeAnthropicTransport:
-    """Records the POST and returns a canned :class:`AnthropicResponse`."""
-
-    def __init__(self, response: AnthropicResponse) -> None:
-        self._response = response
-        self.calls: list[tuple[str, dict[str, str], dict[str, object]]] = []
-
-    async def post(
-        self, url: str, *, headers: dict[str, str], json: dict[str, object]
-    ) -> AnthropicResponse:
-        self.calls.append((url, headers, json))
-        return self._response
-
-
-def _text_response(payload: dict[str, object], *, status: int = 200) -> AnthropicResponse:
-    """An Anthropic response whose single text block carries ``payload`` as JSON."""
-    return AnthropicResponse(
-        status_code=status,
-        body={"content": [{"type": "text", "text": json.dumps(payload)}]},
-    )
-
-
-def test_resolve_headers_routes_oauth_token_to_bearer() -> None:
-    """An OAuth subscription token rides Authorization: Bearer + the OAuth beta header."""
-    headers = _resolve_headers("sk-ant-oat01-secret")
-
-    assert headers["authorization"] == "Bearer sk-ant-oat01-secret"
-    assert headers["anthropic-beta"] == "oauth-2025-04-20"
-    assert headers["anthropic-version"] == "2023-06-01"
-    assert "x-api-key" not in headers
-
-
-def test_resolve_headers_routes_api_key_to_x_api_key() -> None:
-    """A raw API key rides x-api-key with no OAuth beta header."""
-    headers = _resolve_headers("sk-ant-api03-secret")
-
-    assert headers["x-api-key"] == "sk-ant-api03-secret"
-    assert "authorization" not in headers
-    assert "anthropic-beta" not in headers
-
-
-def test_resolve_payload_carries_each_conflicted_blob_and_schema() -> None:
-    """The request payload fences each conflicted file and forces the strict schema.
-
-    The schema must ride ``output_config.format`` (the canonical Messages API shape);
-    the OpenAI-style top-level ``response_format`` is not a Claude API parameter and
-    400s on the live wire.
-    """
-    files = [
-        _ConflictedFile(path="a.py", content="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"),
-        _ConflictedFile(path="b.py", content="conflict-b"),
-    ]
-    payload = _resolve_payload(
-        files,
-        source="issue-7",
-        into="retinue/prd-1",
-        model="m",
-        effort=_EFFORT_XHIGH,
-        is_oauth=False,
-    )
-
-    assert payload["model"] == "m"
-    fmt = payload["output_config"]["format"]
-    assert fmt["type"] == "json_schema"
-    assert fmt["schema"]["required"] == ["resolved"]
-    assert "response_format" not in payload
-    user = payload["messages"][0]["content"]
-    # Both paths and both blobs ride in the user message, fenced by path.
-    assert "### a.py" in user and "### b.py" in user
-    assert "<<<<<<< ours" in user and "conflict-b" in user
-    assert "issue-7" in user and "retinue/prd-1" in user
-
-
-def test_resolve_payload_carries_xhigh_effort() -> None:
-    """The conflict resolver's default (registry) effort tier threads through unchanged.
-
-    Opus 4.8 removed the ``thinking`` budget mechanism (400 on the live Messages API);
-    ``output_config.effort`` is the current effort control. Passing the registry's
-    ``xhigh`` tier explicitly proves the value round-trips onto the payload.
-    """
-    files = [_ConflictedFile(path="a.py", content="conflict-a")]
-
-    payload = _resolve_payload(
-        files,
-        source="issue-7",
-        into="retinue/prd-1",
-        model="m",
-        effort=_EFFORT_XHIGH,
-        is_oauth=False,
-    )
-
-    assert payload["output_config"]["effort"] == _EFFORT_XHIGH
-    assert _EFFORT_XHIGH == "xhigh"
-    assert "thinking" not in payload
-
-
-def test_resolve_payload_carries_the_given_effort_tier() -> None:
-    """The resolver's effort tier is not hardcoded — a caller-supplied tier threads through."""
-    files = [_ConflictedFile(path="a.py", content="conflict-a")]
-
-    payload = _resolve_payload(
-        files,
-        source="issue-7",
-        into="retinue/prd-1",
-        model="m",
-        effort="low",
-        is_oauth=False,
-    )
-
-    assert payload["output_config"]["effort"] == "low"
-
-
-def test_resolve_payload_oauth_leads_system_with_claude_code_identity() -> None:
-    """With an OAuth credential the system field leads with the identity block.
-
-    A subscription OAuth token reaches the premium resolving model over the raw Messages
-    API only when the first system block is the Claude Code identity string; the
-    resolver's own brief follows it as the second block.
-    """
-    files = [_ConflictedFile(path="a.py", content="conflict-a")]
-
-    payload = _resolve_payload(
-        files,
-        source="issue-7",
-        into="retinue/prd-1",
-        model="m",
-        effort=_EFFORT_XHIGH,
-        is_oauth=True,
-    )
-
-    assert payload["system"] == [
-        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
-        {"type": "text", "text": _RESOLVE_SYSTEM},
-    ]
-
-
-def test_resolve_payload_api_key_keeps_plain_string_system() -> None:
-    """With an API-key credential the system field stays the unchanged plain brief."""
-    files = [_ConflictedFile(path="a.py", content="conflict-a")]
-
-    payload = _resolve_payload(
-        files,
-        source="issue-7",
-        into="retinue/prd-1",
-        model="m",
-        effort=_EFFORT_XHIGH,
-        is_oauth=False,
-    )
-
-    assert payload["system"] == _RESOLVE_SYSTEM
-    assert isinstance(payload["system"], str)
-
-
-def test_parse_resolution_maps_paths_to_resolved_bodies() -> None:
-    """A well-formed response yields a {path: resolved_content} map."""
-    response_body = {
-        "content": [
-            {
-                "type": "text",
-                "text": '{"resolved": ['
-                '{"path": "a.py", "content": "merged-a"},'
-                '{"path": "b.py", "content": "merged-b"}]}',
-            }
-        ]
-    }
-
-    resolutions = _parse_resolution(response_body)
-
-    assert resolutions == {"a.py": "merged-a", "b.py": "merged-b"}
-
-
-def test_parse_resolution_raises_on_missing_text() -> None:
-    """A response with no text block escalates rather than resolving nothing."""
-    with pytest.raises(ConflictResolutionError):
-        _parse_resolution({"content": []})
-
-
-def test_parse_resolution_raises_on_invalid_json() -> None:
-    """A non-JSON text body is a hard resolver error, not a silent empty resolution."""
-    with pytest.raises(ConflictResolutionError):
-        _parse_resolution({"content": [{"type": "text", "text": "not json"}]})
-
-
-def test_parse_resolution_raises_on_non_list_resolved() -> None:
-    """A payload missing the 'resolved' list fails loudly."""
-    with pytest.raises(ConflictResolutionError):
-        _parse_resolution({"content": [{"type": "text", "text": '{"resolved": {}}'}]})
-
-
-def test_conflicted_paths_parses_one_path_per_nonblank_line() -> None:
-    """``git diff --name-only --diff-filter=U`` output splits into trimmed paths."""
-    assert _conflicted_paths("a.py\n  b/c.py  \n\n") == ["a.py", "b/c.py"]
-    assert _conflicted_paths("") == []
-
-
-def test_write_file_command_round_trips_arbitrary_content() -> None:
-    """The write-file argv carries content base64-encoded as a positional arg, byte-exact."""
-    content = '<<<<<<< ours\n"x" & $y\n=======\nz\n>>>>>>> theirs\n'
-    argv = _write_file_command("dir/f.py", content)
-
-    # No shell interpolation: the body is a base64 positional arg, the path another.
-    assert argv[0] == "sh" and argv[-1] == "dir/f.py"
-    blob = argv[-2]
-    assert base64.b64decode(blob).decode() == content
-
-
-@pytest.mark.asyncio
-async def test_resolver_recreates_merge_resolves_and_commits() -> None:
-    """A conflict is recreated, resolved via Claude, written back, staged, and committed."""
-    container = ScriptedContainer(
-        {
-            "diff --name-only": RunResult(exit_code=1, stdout="a.py\n"),
-            "cat a.py": RunResult(
-                exit_code=0, stdout="<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs"
-            ),
-        }
-    )
-    transport = FakeAnthropicTransport(
-        _text_response({"resolved": [{"path": "a.py", "content": "merged"}]})
-    )
-    resolver = AgentSdkConflictResolver(
-        container=container, transport=transport, credential="sk-ant-api03-k"
-    )
-
-    result = await resolver(source="issue-7", into="retinue/prd-1")
-
-    assert result is ConflictResolution.RESOLVED
-    cmds = _joined(container)
-    # The merge is recreated no-commit, the resolved blob is written + staged, committed.
-    assert any("merge --no-ff --no-commit --no-edit origin/issue-7" in c for c in cmds)
-    assert "git add a.py" in cmds
-    assert any(c.startswith("git ") and "commit --no-edit" in c for c in cmds)
-    # The resolved body was written byte-exact via the base64 round-trip.
-    write = next(cmd for cmd in container.commands if cmd[0] == "sh")
-    assert base64.b64decode(write[-2]).decode() == "merged"
-
-
-@pytest.mark.asyncio
-async def test_resolver_unresolved_when_no_conflicted_paths() -> None:
-    """No conflicted paths means nothing to fix: UNRESOLVED, no Claude call, no commit."""
-    container = ScriptedContainer({"diff --name-only": RunResult(exit_code=0, stdout="")})
-    transport = FakeAnthropicTransport(_text_response({"resolved": []}))
-    resolver = AgentSdkConflictResolver(
-        container=container, transport=transport, credential="k"
-    )
-
-    result = await resolver(source="issue-7", into="retinue/prd-1")
-
-    assert result is ConflictResolution.UNRESOLVED
-    assert transport.calls == []
-    assert "git commit --no-edit" not in " ".join(_joined(container))
-
-
-@pytest.mark.asyncio
-async def test_resolver_escalates_on_non_200_status() -> None:
-    """A non-200 Messages API response is a hard error: escalate, don't commit junk."""
-    container = ScriptedContainer(
-        {
-            "diff --name-only": RunResult(exit_code=1, stdout="a.py\n"),
-            "cat a.py": RunResult(exit_code=0, stdout="conflict"),
-        }
-    )
-    transport = FakeAnthropicTransport(_text_response({"resolved": []}, status=500))
-    resolver = AgentSdkConflictResolver(
-        container=container, transport=transport, credential="k"
-    )
-
-    with pytest.raises(ConflictResolutionError):
-        await resolver(source="issue-7", into="retinue/prd-1")
-    # No commit and no staging happened on a failed resolution. ``commit`` is a discrete
-    # argv element here, so matching the token avoids the ``--no-commit`` recreate flag.
-    assert not any("commit" in cmd for cmd in container.commands)
-    assert not any("add" in cmd for cmd in container.commands)
-
-
-@pytest.mark.asyncio
-async def test_conflict_resolver_reads_model_and_effort_from_a_default_level_override() -> None:
-    """The resolver's model + effort resolve via the routing table's ``default:`` level.
-
-    ``AgentSdkConflictResolver`` has no production wiring site (``resolve_conflict`` is
-    always ``None`` in ``build_prd`` today), so this drives the mechanism directly: a
-    ``RoutingConfig`` whose ``default`` level overrides :data:`Role.RESOLVER` with a
-    custom model *and* effort, resolved via :func:`resolve_model`/:func:`resolve_effort`
-    (the same helpers a future wiring site would call), and asserts both land on the
-    request the resolver sends.
-    """
-    config = RepoConfig(
-        routing=RoutingConfig(
-            default="standard",
-            levels={
-                "standard": RoutingLevel(
-                    description="Ordinary work.",
-                    roles={
-                        Role.RESOLVER.value: ModelEffort(
-                            model="resolver-custom", effort="low"
-                        )
-                    },
-                )
-            },
-        )
-    )
-    container = ScriptedContainer(
-        {
-            "diff --name-only": RunResult(exit_code=1, stdout="a.py\n"),
-            "cat a.py": RunResult(exit_code=0, stdout="conflict"),
-        }
-    )
-    transport = FakeAnthropicTransport(
-        _text_response({"resolved": [{"path": "a.py", "content": "merged"}]})
-    )
-    resolver = AgentSdkConflictResolver(
-        container=container,
-        transport=transport,
-        credential="k",
-        model=resolve_model(Role.RESOLVER, config),
-        effort=resolve_effort(Role.RESOLVER, config),
-    )
-
-    result = await resolver(source="issue-7", into="retinue/prd-1")
-
-    assert result is ConflictResolution.RESOLVED
-    _, _, payload = transport.calls[0]
-    assert payload["model"] == "resolver-custom"
-    output_config = payload["output_config"]
-    assert isinstance(output_config, dict)
-    assert output_config["effort"] == "low"
-
-
 # --- real container-exec implementer ---------------------------------------------
 #
 # Exercises the production ContainerImplementer's pure parts (prompt assembly, env-routed
@@ -1047,22 +634,6 @@ def test_implement_prompt_without_facts_carries_no_issue_section() -> None:
 
     assert "Issue title:" not in prompt
     assert "Issue body:" not in prompt
-
-
-def test_implement_env_api_key_mode_uses_anthropic_api_key() -> None:
-    """api_key mode threads the credential to the CLI as ANTHROPIC_API_KEY."""
-    env = _implement_env("sk-ant-api03-secret", "api_key")
-
-    assert env == {"ANTHROPIC_API_KEY": "sk-ant-api03-secret"}
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
-
-
-def test_implement_env_subscription_mode_uses_oauth_token() -> None:
-    """subscription mode threads the credential as CLAUDE_CODE_OAUTH_TOKEN."""
-    env = _implement_env("sk-ant-oat01-secret", "subscription")
-
-    assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-secret"}
-    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_claude_argv_assembles_headless_invocation() -> None:

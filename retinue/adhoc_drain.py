@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from enum import Enum
@@ -56,12 +56,17 @@ from typing import Protocol, runtime_checkable
 
 from retinue.adhoc_build import AdhocIssue
 from retinue.budget import BudgetGovernor
-from retinue.cron import GhCliError, GhRunner, _parse_json_array, _run_gh_subprocess
+from retinue.gh import (
+    GhBytesRunner,
+    GhCliError,
+    auth_env,
+    parse_json_array,
+    run_gh_subprocess,
+)
 from retinue.lane import IssueFacts, preempts_prd_first
-from retinue.loopback import Severity
 from retinue.repo_config import RepoConfig
-from retinue.slicer import READY_LABEL
-from retinue.webhook import PRD_LABEL
+from retinue.single_run import SingleRunLock
+from retinue.vocab import PRD_LABEL, READY_LABEL, Severity, issue_branch
 
 logger = logging.getLogger(__name__)
 
@@ -72,46 +77,25 @@ class AdhocDrainBusyError(Exception):
     The single-run guarantee: :func:`run_adhoc_drain` runs inside an injected lock that
     rejects a concurrent holder rather than blocking, so the "at most one ad-hoc drain
     per repo at a time" contract is observable to the caller. This lock is *separate* from
-    the orchestrator's :class:`retinue.orchestrator.OrchestratorBusyError` lock, so an
-    ad-hoc drain still runs concurrently with a PRD build. Mirrors
-    :class:`retinue.cron.CronBusyError`.
+    the orchestrator's single-run lock, so an ad-hoc drain still runs concurrently with
+    a PRD build. Mirrors :class:`retinue.cron.CronBusyError`.
     """
 
     def __init__(self) -> None:
         super().__init__("an ad-hoc drain is already in flight")
 
 
-class AdhocDrainLock:
-    """The production single-run lock: a non-blocking in-process guard for one repo's drain.
+class AdhocDrainLock(SingleRunLock):
+    """One repo's ad-hoc drain single-run lock: a second concurrent drain is rejected.
 
-    Satisfies the ``AbstractAsyncContextManager`` :func:`run_adhoc_drain` enters: the first
-    holder enters, and a *second* concurrent ``__aenter__`` raises :class:`AdhocDrainBusyError`
-    rather than blocking — so the "at most one ad-hoc drain per repo at a time" contract is
-    observable to the caller (mirroring the test fake's reject-don't-block behavior). One lock
-    instance guards one repo; the worker keeps a per-repo registry so two repos drain
-    concurrently while a repo's own kicked and swept drains serialize through the same lock.
-
-    The guard is a plain in-process flag (no real wall-clock, Redis, or file lock), which is
-    correct because the whole drain runs inside a single worker process; a cross-process lock
-    is out of scope for the single-worker deployment.
+    A :class:`~retinue.single_run.SingleRunLock` raising :class:`AdhocDrainBusyError`.
+    One instance guards one repo; the worker keeps a per-repo registry so two repos drain
+    concurrently while a repo's own kicked and swept drains serialize through the same
+    lock. Separate from the cron and PRD locks, so an ad-hoc drain runs concurrently with
+    those lanes.
     """
 
-    def __init__(self) -> None:
-        self._held = False
-
-    async def __aenter__(self) -> AdhocDrainLock:
-        if self._held:
-            raise AdhocDrainBusyError
-        self._held = True
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: object | None,
-    ) -> None:
-        self._held = False
+    busy_error = AdhocDrainBusyError
 
 
 # How many ready-for-agent issues to pull per drain. The cap on concurrent *builds* is
@@ -230,7 +214,7 @@ class FlightSnapshot:
         a branch with no open PR is :attr:`FlightState.STRANDED` (pushed green, PR never
         opened).
         """
-        branch = _issue_branch(issue_number)
+        branch = issue_branch(issue_number)
         if branch not in self.issue_branches:
             return FlightState.ABSENT
         if branch in self.open_pr_heads:
@@ -302,9 +286,9 @@ class GhCli:
     command line.
 
     The subprocess spawn is the one impure edge, factored behind the injected ``runner``
-    (the cron lane's :data:`~retinue.cron.GhRunner` and :func:`~retinue.cron._run_gh_subprocess`,
-    reused) so command assembly, the auth env, and payload parsing are unit-testable
-    without a real ``gh``, Docker, or network.
+    (the shared :data:`~retinue.gh.GhBytesRunner` seam, production
+    :func:`~retinue.gh.run_gh_subprocess`) so command assembly, the auth env, and payload
+    parsing are unit-testable without a real ``gh``, Docker, or network.
 
     Args:
         token: The GitHub token ``gh`` authenticates with, placed in the child env as
@@ -317,11 +301,11 @@ class GhCli:
         self,
         *,
         token: str | None = None,
-        runner: GhRunner | None = None,
+        runner: GhBytesRunner | None = None,
         list_limit: int = _DEFAULT_LIST_LIMIT,
     ) -> None:
         self._token = token
-        self._runner = runner or _run_gh_subprocess
+        self._runner = runner or run_gh_subprocess
         self._list_limit = list_limit
 
     async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
@@ -333,8 +317,8 @@ class GhCli:
                 issue listing.
         """
         argv = _list_ready_argv(repo_full_name, limit=self._list_limit)
-        stdout = await self._runner(argv, self._auth_env())
-        return [_parse_ready_issue(entry) for entry in _parse_json_array(stdout)]
+        stdout = await self._runner(argv, auth_env(self._token))
+        return [_parse_ready_issue(entry) for entry in parse_json_array(stdout)]
 
     async def flight_state(
         self, *, repo_full_name: str, issue_number: int
@@ -354,7 +338,7 @@ class GhCli:
             ValueError: the open-PR query returned a payload that did not parse as a JSON
                 array.
         """
-        branch = _issue_branch(issue_number)
+        branch = issue_branch(issue_number)
         if not await self._branch_exists(repo_full_name, branch):
             return FlightState.ABSENT
         if await self._open_pr_exists(repo_full_name, branch):
@@ -384,20 +368,20 @@ class GhCli:
     async def _open_pr_heads(self, repo_full_name: str) -> frozenset[str]:
         """The head branch names of every open PR on the repo (the whole in-flight set)."""
         argv = _open_pr_heads_argv(repo_full_name, limit=self._list_limit)
-        stdout = await self._runner(argv, self._auth_env())
+        stdout = await self._runner(argv, auth_env(self._token))
         return frozenset(_parse_pr_heads(stdout))
 
     async def _issue_branches(self, repo_full_name: str) -> frozenset[str]:
         """Every existing ``issue-<N>`` branch name on the repo (the whole branch set)."""
         argv = _issue_refs_argv(repo_full_name)
-        stdout = await self._runner(argv, self._auth_env())
+        stdout = await self._runner(argv, auth_env(self._token))
         return frozenset(_parse_issue_branches(stdout))
 
     async def _branch_exists(self, repo_full_name: str, branch: str) -> bool:
         """Whether ``branch`` resolves to a ref on the repo (a 404 means it does not)."""
         argv = _branch_ref_argv(repo_full_name, branch)
         try:
-            await self._runner(argv, self._auth_env())
+            await self._runner(argv, auth_env(self._token))
         except GhCliError:
             # A missing ref is a 404 / non-zero exit — not an error to propagate, just a
             # False answer to the existence question (mirrors pr_opener's staging_exists).
@@ -407,16 +391,8 @@ class GhCli:
     async def _open_pr_exists(self, repo_full_name: str, branch: str) -> bool:
         """Whether an open PR with ``branch`` as its head exists on the repo."""
         argv = _open_pr_argv(repo_full_name, branch)
-        stdout = await self._runner(argv, self._auth_env())
-        return len(_parse_json_array(stdout)) > 0
-
-    def _auth_env(self) -> Mapping[str, str]:
-        """The child-process env carrying the token as ``GH_TOKEN`` (empty when none).
-
-        The token goes in the env, never on the argv, so it never lands in a process
-        listing or a log of the command.
-        """
-        return {"GH_TOKEN": self._token} if self._token else {}
+        stdout = await self._runner(argv, auth_env(self._token))
+        return len(parse_json_array(stdout)) > 0
 
 
 def _list_ready_argv(repo_full_name: str, *, limit: int) -> list[str]:
@@ -442,11 +418,6 @@ def _list_ready_argv(repo_full_name: str, *, limit: int) -> list[str]:
         "--limit",
         str(limit),
     ]
-
-
-def _issue_branch(issue_number: int) -> str:
-    """The ``issue-<N>`` branch an ad-hoc build commits to (the dedup branch name)."""
-    return f"issue-{issue_number}"
 
 
 def _branch_ref_argv(repo_full_name: str, branch: str) -> list[str]:
@@ -534,7 +505,7 @@ def _parse_pr_heads(stdout: bytes) -> set[str]:
     rather than silently dropping an in-flight PR — which would risk a duplicate build.
     """
     heads: set[str] = set()
-    for entry in _parse_json_array(stdout):
+    for entry in parse_json_array(stdout):
         if not isinstance(entry, dict) or "headRefName" not in entry:
             raise ValueError(f"gh pr list entry is malformed: {entry!r}")
         heads.add(str(entry["headRefName"]))
@@ -549,7 +520,7 @@ def _parse_issue_branches(stdout: bytes) -> set[str]:
     rather than silently dropping a branch — which would risk a duplicate build.
     """
     branches: set[str] = set()
-    for entry in _parse_json_array(stdout):
+    for entry in parse_json_array(stdout):
         if not isinstance(entry, dict) or "ref" not in entry:
             raise ValueError(f"gh matching-refs entry is malformed: {entry!r}")
         ref = str(entry["ref"])
@@ -831,7 +802,7 @@ async def _build_metered(
 
 
 # A no-priority issue ranks below every labeled severity, so its rank key sits one step
-# under the lowest :class:`~retinue.loopback.Severity` (``LOW``). An unknown ``priority:*``
+# under the lowest :class:`~retinue.vocab.Severity` (``LOW``). An unknown ``priority:*``
 # value parses to ``None`` too (:meth:`retinue.lane.IssueFacts.priority`), so it lands here.
 _NO_PRIORITY_RANK = Severity.LOW - 1
 

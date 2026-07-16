@@ -38,8 +38,10 @@ from retinue.adhoc_build import (
     ContainerPlanner,
     build_adhoc_issue,
 )
-from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
+from retinue.budget import CLASSIFIER_ESTIMATED_AMOUNT, AuthMode, BudgetGovernor, BudgetLedger
 from retinue.classifier import ClassifyInput, ClassifyResult, ClaudeIssueClassifier
+from retinue.container_build import Slice
+from retinue.messages_api import HttpResponse
 from retinue.notify import (
     CommentRequest,
     CommentSink,
@@ -48,10 +50,10 @@ from retinue.notify import (
     Notifier,
     PushRequest,
 )
-from retinue.orchestrator import ContainerImplementer, PrdSlice, Slice
-from retinue.pipeline import _CLASSIFIER_ESTIMATED_AMOUNT, _resolve_adhoc_level
+from retinue.orchestrator import ContainerImplementer, PrdSlice
+from retinue.pipeline import _resolve_adhoc_level
 from retinue.repo_config import RepoConfig, RoutingConfig, RoutingLevel
-from retinue.reviewer import AgentSdkReviewGenerator, HttpResponse
+from retinue.reviewer import AgentSdkReviewGenerator
 from retinue.roles import Role, resolve_effort, resolve_model
 from retinue.routing import (
     _FAILURE_COMMENT,
@@ -63,9 +65,15 @@ from retinue.routing import (
     resolve_issue_level,
 )
 from retinue.wiring import BoundBuildResult, bind_build_prd
-from tests.test_budget import FakeClock
-from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
-from tests.test_orchestrator import FakeGitOps
+from tests.fakes import (
+    CLAUDE_MD,
+    FakeAuth,
+    FakeClock,
+    FakeGitOps,
+    FakeRuntime,
+    _resolver,
+    _sink,
+)
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore::pytest.PytestUnhandledThreadExceptionWarning"
@@ -263,7 +271,7 @@ def _router(
         comment_sink=comments,
         issue_facts=facts,
         governor=governor,
-        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
     )
 
 
@@ -291,7 +299,7 @@ async def test_router_classify_success_routes_model_labels_and_charges(
     assert [r.label for r in labels.calls] == ["level:trivial"]
     assert comments.calls == []
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        _CLASSIFIER_ESTIMATED_AMOUNT
+        CLASSIFIER_ESTIMATED_AMOUNT
     )
 
 
@@ -375,7 +383,7 @@ async def test_router_classification_failure_defaults_and_comments(
     assert comments.calls[0].issue_number == 1
     # The classifier ran, so its charge is metered even on failure.
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        _CLASSIFIER_ESTIMATED_AMOUNT
+        CLASSIFIER_ESTIMATED_AMOUNT
     )
 
 
@@ -400,7 +408,7 @@ async def test_router_facts_failure_falls_back_to_base_implementer(
         comment_sink=comments,
         issue_facts=_RaisingFacts(RuntimeError("gh view exited non-zero")),
         governor=governor,
-        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
     )
 
     implementer = await router(_slice(1))
@@ -430,7 +438,7 @@ async def test_router_misuse_without_a_routing_table_fails_loudly(
         comment_sink=_RecordingComments(),
         issue_facts=_FactsFor({1: ClassifyInput(title="x", body="b", labels=[])}),
         governor=_governor(tmp_path),
-        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
     )
 
     with pytest.raises(AssertionError):
@@ -454,7 +462,7 @@ async def test_router_failure_comment_post_failure_falls_back_to_base(
         comment_sink=_RaisingComments(),
         issue_facts=facts,
         governor=governor,
-        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
     )
 
     implementer = await router(_slice(1))
@@ -550,7 +558,7 @@ def _build_router(
         comment_sink=comments,
         issue_facts=facts,
         governor=governor,
-        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
     )
 
 
@@ -719,7 +727,7 @@ async def test_classifier_charge_lands_and_gate_estimate_unchanged(
     )
 
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        1.0 + _CLASSIFIER_ESTIMATED_AMOUNT
+        1.0 + CLASSIFIER_ESTIMATED_AMOUNT
     )
 
 
@@ -782,14 +790,14 @@ async def test_resolve_issue_level_classify_success_labels_and_charges(
         comment_sink=comments,
         issue_facts=facts,
         governor=governor,
-        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
     )
 
     assert level == "trivial"
     assert [r.label for r in labels.calls] == ["level:trivial"]
     assert comments.calls == []
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        _CLASSIFIER_ESTIMATED_AMOUNT
+        CLASSIFIER_ESTIMATED_AMOUNT
     )
 
 
@@ -813,7 +821,7 @@ async def test_resolve_issue_level_preexisting_label_short_circuits(
         comment_sink=comments,
         issue_facts=facts,
         governor=governor,
-        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
     )
 
     assert level == "standard"
@@ -839,7 +847,7 @@ async def test_resolve_issue_level_failure_defaults_and_comments(
         comment_sink=comments,
         issue_facts=facts,
         governor=governor,
-        classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
+        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
     )
 
     assert level == "standard"
@@ -847,7 +855,7 @@ async def test_resolve_issue_level_failure_defaults_and_comments(
     assert len(comments.calls) == 1
     assert comments.calls[0].body == _FAILURE_COMMENT.format(level="standard")
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        _CLASSIFIER_ESTIMATED_AMOUNT
+        CLASSIFIER_ESTIMATED_AMOUNT
     )
 
 
@@ -916,7 +924,7 @@ async def test_loopback_fix_issue_classifies_labels_and_routes(tmp_path: Path) -
     assert _launched_models(runtime) == ["implementer-trivial"]
     # The classifier charge was metered on top of the build gate estimate.
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        1.0 + _CLASSIFIER_ESTIMATED_AMOUNT
+        1.0 + CLASSIFIER_ESTIMATED_AMOUNT
     )
 
 
@@ -1026,7 +1034,7 @@ async def test_resolve_adhoc_level_classify_success_labels_and_charges(
     assert [r.label for r in labels.calls] == ["level:trivial"]
     assert comments.calls == []
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        _CLASSIFIER_ESTIMATED_AMOUNT
+        CLASSIFIER_ESTIMATED_AMOUNT
     )
 
 
@@ -1208,7 +1216,7 @@ async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
     """
     import retinue.pipeline as pipeline_mod
     from retinue.pipeline import bind_adhoc_build
-    from tests.test_pipeline import (
+    from tests.fakes import (
         _fake_build_adhoc_issue,
         _RecordingAdhocPipeline,
         _settings,
@@ -1226,7 +1234,7 @@ async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
     monkeypatch.setattr(pipeline_mod, "HttpxTransport", lambda: transport)
     monkeypatch.setattr(pipeline_mod, "GhLabelSink", lambda token: labels)
     monkeypatch.setattr(pipeline_mod, "GhCommentSink", lambda token: comments)
-    monkeypatch.setattr(pipeline_mod, "_ReconcileGhRunner", lambda token: gh_runner)
+    monkeypatch.setattr(pipeline_mod, "ReconcileGhRunner", lambda token: gh_runner)
     captured: dict[str, object] = {}
     green = AdhocBuildResult(branch="issue-31", passed=True)
     monkeypatch.setattr(
@@ -1265,7 +1273,7 @@ async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
     assert kwargs["reviewer"].generate.effort == "low"
     # The classifier charge landed on the pipeline's own governor's ledger.
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        _CLASSIFIER_ESTIMATED_AMOUNT
+        CLASSIFIER_ESTIMATED_AMOUNT
     )
     # The green result still chained into process_adhoc_pr.
     assert pipeline.pr_calls == [(issue, green)]

@@ -38,12 +38,12 @@ from retinue.adhoc_build import (
     render_chain_depth,
 )
 from retinue.container import Container, RunResult
+from retinue.container_build import GitOpsError, Implementer, ImplementError, Slice
 from retinue.done_check import DoneCheckReport
 from retinue.impl_retry import ImplRetryStore, impl_retry_key
-from retinue.orchestrator import GitOpsError, Implementer, Slice, _implement_prompt
+from retinue.orchestrator import _implement_prompt
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
-    READY_LABEL,
     REVIEW_FIX_LABEL,
     CreatedIssue,
     IssueDraft,
@@ -52,7 +52,8 @@ from retinue.reviewer import (
     ReviewPlan,
 )
 from retinue.roles import Role, planner_cli_argv, resolve_model
-from tests.test_done_check import (
+from retinue.vocab import READY_LABEL
+from tests.fakes import (
     CLAUDE_MD,
     FakeAuth,
     FakeRuntime,
@@ -258,6 +259,58 @@ async def test_red_done_check_pushes_nothing() -> None:
     assert result.passed is False
     assert not any(event.startswith("run:git push") for event in runtime.log)
     assert [r.passed for r in captured] == [False]
+
+
+# --- hollow implement: zero commits fails the ad-hoc build -------------------------
+
+
+@pytest.mark.asyncio
+async def test_implement_landing_no_commits_raises_instead_of_vacuous_green() -> None:
+    """An implementer run that lands zero commits fails the build before the done-check.
+
+    The hollow-implement failure the PRD lane already guards against: the agent no-ops,
+    exits 0, and the done-check passes vacuously over the untouched tree — pushing an
+    empty branch a PR is then opened from. Counting commits since ``origin/<base>``
+    right after the implement catches it: a ``0`` count raises ``ImplementError``,
+    pushes nothing, and still tears the container down.
+    """
+    runtime = FakeRuntime(
+        results={"git rev-list": RunResult(exit_code=0, stdout="0\n")}
+    )
+
+    with pytest.raises(ImplementError, match="landed no commits"):
+        await _build(runtime=runtime)
+
+    assert not any("git push" in e for e in runtime.log)
+    assert runtime.container is not None and runtime.container.destroyed
+
+
+@pytest.mark.asyncio
+async def test_failed_commit_count_probe_raises_not_passes() -> None:
+    """A rev-list probe that itself fails (empty stdout, bad exit) raises, not passes.
+
+    An unreadable count must not be read as "commits exist" — that would re-open the
+    vacuous-green hole whenever the probe breaks.
+    """
+    runtime = FakeRuntime(
+        results={"git rev-list": RunResult(exit_code=128, stderr="fatal: bad rev")}
+    )
+
+    with pytest.raises(ImplementError):
+        await _build(runtime=runtime)
+
+
+@pytest.mark.asyncio
+async def test_commit_count_probe_runs_between_implement_and_done_check() -> None:
+    """The guard probes commits after the implement and before the done-check runs."""
+    runtime = FakeRuntime()
+
+    await _build(runtime=runtime)
+
+    implement_at = runtime.log.index("run:implement issue-29")
+    probe_at = next(i for i, e in enumerate(runtime.log) if "git rev-list" in e)
+    check_at = next(i for i, e in enumerate(runtime.log) if "uv run pytest" in e)
+    assert implement_at < probe_at < check_at
 
 
 # --- the container is always destroyed --------------------------------------------
@@ -487,7 +540,7 @@ class _DiffContainer:
 class _RefAwareDiffContainer:
     """A container that resolves a diff only when its base ref actually exists.
 
-    Models the refs ``_clone_and_branch`` leaves in the build container: the
+    Models the refs ``clone_and_branch`` leaves in the build container: the
     remote-tracking ``origin/<base>`` and the local ``issue-<N>`` branch, but **no** bare
     local ``<base>`` unless it is the clone's default HEAD. A ``git diff`` whose base side
     names an unknown revision exits non-zero (mirroring git's "unknown revision" 404),
@@ -551,7 +604,7 @@ def _reviewer(
 def test_issue_diff_command_bases_on_the_remote_tracking_staging_ref() -> None:
     """AC1: the diff base is ``origin/<base>``, a ref the build container actually has.
 
-    ``_clone_and_branch`` only ever creates ``origin/<base>`` (the remote-tracking ref)
+    ``clone_and_branch`` only ever creates ``origin/<base>`` (the remote-tracking ref)
     and the local ``issue-<N>`` branch; a bare local ``staging`` exists only when it is
     the clone's default HEAD. Basing on ``origin/<base>`` resolves in every case, while
     the local issue tip stays on the right since the review runs in the build container.

@@ -18,8 +18,8 @@ from retinue.classifier import (
     ClassifyResult,
     ClaudeIssueClassifier,
 )
+from retinue.messages_api import HttpResponse
 from retinue.repo_config import ModelEffort, RoutingConfig, RoutingLevel
-from retinue.reviewer import HttpResponse
 from retinue.roles import CLAUDE_CODE_IDENTITY, ROLE_REGISTRY, Role
 
 

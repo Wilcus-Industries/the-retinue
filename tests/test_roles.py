@@ -24,6 +24,7 @@ from retinue.roles import (
     ROLE_REGISTRY,
     Role,
     Transport,
+    is_oauth_credential,
     oauth_system,
     planner_cli_argv,
     resolve_effort,
@@ -391,6 +392,16 @@ def test_structured_output_config_keeps_effort_for_models_that_support_it(
     """Effort-capable models keep the resolved effort tier when ``model=`` is given."""
     config = structured_output_config(Role.REVIEWER, {"type": "object"}, model=model)
     assert config["effort"] == EFFORT_MAX
+
+
+def test_is_oauth_credential_true_for_subscription_token() -> None:
+    """An ``sk-ant-oat...`` credential is recognized as a subscription OAuth token."""
+    assert is_oauth_credential("sk-ant-oat01-secret") is True
+
+
+def test_is_oauth_credential_false_for_api_key() -> None:
+    """A raw ``sk-ant-api...`` API key is not a subscription OAuth token."""
+    assert is_oauth_credential("sk-ant-api01-secret") is False
 
 
 def test_claude_code_identity_is_the_exact_cli_string() -> None:

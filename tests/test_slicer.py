@@ -13,21 +13,19 @@ import json
 
 import pytest
 
+from retinue.gh import GhCommandError, GhResult
 from retinue.notify import (
     CommentRequest,
     LabelRequest,
     Notifier,
     PushRequest,
 )
-from retinue.roles import CLAUDE_CODE_IDENTITY
+from retinue.roles import CLAUDE_CODE_IDENTITY, EFFORT_XHIGH
 from retinue.slicer import (
-    _EFFORT_XHIGH,
     _SLICE_SYSTEM,
     ClaudeSliceGenerator,
     CreatedIssue,
     GhCliIssueCreator,
-    GhCommandError,
-    GhResult,
     IssueDraft,
     SliceOutcome,
     SlicePlan,
@@ -352,8 +350,8 @@ def test_request_kwargs_carry_xhigh_effort() -> None:
 
     kwargs = gen._build_request_kwargs("Slice this PRD into vertical slices.")
 
-    assert kwargs["output_config"]["effort"] == _EFFORT_XHIGH
-    assert _EFFORT_XHIGH == "xhigh"
+    assert kwargs["output_config"]["effort"] == EFFORT_XHIGH
+    assert EFFORT_XHIGH == "xhigh"
     # Effort lives alongside the schema format, not as a separate thinking budget.
     assert kwargs["output_config"]["format"]["type"] == "json_schema"
     assert "thinking" not in kwargs
@@ -489,13 +487,6 @@ def test_parse_issue_number_rejects_output_with_no_number() -> None:
     """A URL-less / number-less output raises rather than yielding a bogus number."""
     with pytest.raises(ValueError):
         _parse_issue_number("not a url")
-
-
-def test_auth_uses_gh_token_env_no_leading_gh_in_argv() -> None:
-    """The runner is handed GH_TOKEN in env and an argv that omits the leading 'gh'."""
-    from retinue.slicer import _auth_env
-
-    assert _auth_env("tok-123") == {"GH_TOKEN": "tok-123"}
 
 
 @pytest.mark.asyncio

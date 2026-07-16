@@ -27,7 +27,6 @@ from retinue.notify import (
     PushDeliveryError,
     PushoverPushSink,
     PushRequest,
-    build_basic_auth_header,
 )
 
 
@@ -160,12 +159,6 @@ async def test_notify_raises_when_label_sink_fails() -> None:
 
 def _push() -> PushRequest:
     return PushRequest(title="Retinue needs a human", body="PRD #42 is too thin.")
-
-
-def test_build_basic_auth_header_encodes_credentials() -> None:
-    """The Basic auth header base64-encodes ``user:password`` per RFC 7617."""
-    # "user:pass" -> base64 -> dXNlcjpwYXNz
-    assert build_basic_auth_header("user", "pass") == "Basic dXNlcjpwYXNz"
 
 
 def test_ntfy_request_assembly_carries_title_body_and_topic() -> None:

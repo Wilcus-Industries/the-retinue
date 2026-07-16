@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import pytest
 
+from retinue.gh import GhCommandError, GhResult
 from retinue.notify import (
     CommentRequest,
     LabelRequest,
@@ -27,8 +28,6 @@ from retinue.notify import (
 )
 from retinue.pr_opener import (
     GhCliPrOps,
-    GhCommandError,
-    GhResult,
     OpenPrRequest,
     PrOpenOutcome,
     PrOpenResult,

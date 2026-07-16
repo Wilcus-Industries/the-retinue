@@ -12,11 +12,8 @@ or via the ``retinue-worker`` console script.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import enum
 import logging
-import re
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -26,50 +23,45 @@ from typing import Any
 import httpx
 from arq import cron
 from arq.connections import RedisSettings
-from arq.worker import Retry
+from arq.worker import Retry, run_worker
 from arq.worker import func as arq_func
 
-from retinue.budget import SystemClock
-from retinue.cron import CronTickResult
+import retinue.github_app as github_app
+from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
+from retinue.config import Settings
 from retinue.dedupe import PrdDedupeStore, prd_dedupe_key
-from retinue.github_app import InstallationAuth
+from retinue.github_app import (
+    InstallationAuth,
+    InstalledRepos,
+    github_claude_md_fetcher,
+    github_config_fetcher,
+    github_issue_body_fetcher,
+)
 from retinue.handoff import MergedPullRequest
 from retinue.heartbeat import (
     DueRepo,
-    HeartbeatCronTick,
     HeartbeatDrain,
     RepoEnumerator,
     heartbeat_tick,
 )
-from retinue.loopback import (
-    HeimdallFinding,
-    HeimdallReview,
-    ReviewState,
-    Severity,
-    round_key,
-)
+from retinue.loopback import parse_heimdall_review, round_key
 from retinue.pipeline import (
-    ClaudeMdFetcher,
-    Pipeline,
+    PipelineFactory,
     build_pipeline_factory,
     run_state_store_path,
 )
 from retinue.queue import RESUME_ROUND_TASK, RESUME_ROUNDS_TASK, PrdJob
 from retinue.reconcile import RunStateStore
 from retinue.repo_config import RepoConfig, load_repo_config
+from retinue.wiring import bind_adhoc_drain, bind_cron_tick
 
 logger = logging.getLogger(__name__)
 
 # Async callable that returns a repo's raw ``.github/retinue.yml`` text, or None
 # when the repo has no such file. The GitHub fetch is injected at this seam so the
-# gate is testable without network; :func:`github_config_fetcher` builds the real one.
+# gate is testable without network;
+# :func:`retinue.github_app.github_config_fetcher` builds the real one.
 ConfigFetcher = Callable[[str], Awaitable[str | None]]
-
-# Builds a :class:`~retinue.pipeline.Pipeline` for an accepted repo. Async so the
-# production factory can mint a per-repo installation token before constructing the gh
-# adapters. Injected onto the Arq context by :func:`on_startup` so the worker tasks stay
-# testable with a fake factory; production binds it to a factory over the real adapters.
-PipelineFactory = Callable[[str, RepoConfig], Awaitable[Pipeline]]
 
 # Async callable returning a PRD/issue body text given (repo, issue number). The gh
 # issue read the slicer needs, injected so the worker is testable without a live gh.
@@ -80,14 +72,6 @@ IssueBodyFetcher = Callable[[str, int], Awaitable[str]]
 # under it (:func:`retinue.heartbeat.cron_due`). A 15-minute tick keeps the safety-net sweep
 # responsive (a missed-webhook issue is caught within the quarter-hour) without busy-looping.
 HEARTBEAT_MINUTES = frozenset(range(0, 60, 15))
-
-# Path of the opt-in config file inside each repo, fetched over the contents API.
-RETINUE_CONFIG_PATH = ".github/retinue.yml"
-# Path of the repo's CLAUDE.md, fetched over the contents API to source the done-check
-# command the build gates on (a missing file reads as empty text).
-CLAUDE_MD_PATH = "CLAUDE.md"
-GITHUB_API_BASE_URL = "https://api.github.com"
-
 
 class GateOutcome(enum.Enum):
     """Why the opt-in gate accepted or skipped a PRD."""
@@ -597,93 +581,6 @@ async def _load_prd_body(
     return await fetch_body(repo_full_name, issue_number)
 
 
-# gh review states map onto the loopback's three-valued review state. ``dismissed`` and
-# any unrecognised state are read as a plain comment (no verdict), so an odd state never
-# blocks or converges on its own.
-_REVIEW_STATE_MAP = {
-    "approved": ReviewState.APPROVED,
-    "changes_requested": ReviewState.REQUEST_CHANGES,
-    "request_changes": ReviewState.REQUEST_CHANGES,
-    "commented": ReviewState.COMMENTED,
-}
-
-# Heimdall never submits an APPROVED review: its clean pass is a COMMENTED review whose
-# body is "Heimdall review: no concerns found across any lens." — this marker (matched
-# case-insensitively) is what flags that COMMENT as a verdict so the loopback converges
-# on it. Heimdall's verdict-less "review failed" COMMENT note carries neither this
-# marker nor finding lines, so it stays a no-verdict.
-_CLEAN_PASS_MARKER = "no concerns found"
-
-
-def parse_heimdall_review(
-    *,
-    repo_full_name: str,
-    pr_number: int,
-    prd_number: int,
-    review_state: str,
-    review_body: str,
-) -> HeimdallReview:
-    """Parse a ``pull_request_review`` into a :class:`~retinue.loopback.HeimdallReview`.
-
-    Maps the gh review ``state`` onto the loopback's three-valued state and reads
-    heimdall's findings out of the review body — one finding per
-    ``<severity>: <summary>`` line (severity is one of low/medium/high/critical,
-    case-insensitive); a line without that shape is ignored as prose. A body carrying
-    heimdall's clean-pass marker (:data:`_CLEAN_PASS_MARKER`) sets ``clean_pass`` so
-    the findings-free clean COMMENT still reads as a verdict. The integration branch
-    is derived from the PRD number (``retinue/prd-<n>``). Pure and value-free, so it
-    is unit-tested without a live gh.
-
-    Args:
-        repo_full_name: e.g. "owner/repo".
-        pr_number: The reviewed PR number.
-        prd_number: The parent PRD (resolved from run-state); also the issue an
-            escalation comments/labels and the integration branch's number.
-        review_state: The gh review state string.
-        review_body: The review body to parse findings from.
-
-    Returns:
-        The parsed :class:`HeimdallReview`.
-    """
-    from retinue.orchestrator import integration_branch
-
-    state = _REVIEW_STATE_MAP.get(review_state.lower(), ReviewState.COMMENTED)
-    return HeimdallReview(
-        repo_full_name=repo_full_name,
-        pr_number=pr_number,
-        prd_number=prd_number,
-        prd_issue_number=prd_number,
-        integration_branch=integration_branch(prd_number),
-        state=state,
-        findings=_parse_findings(review_body),
-        clean_pass=_CLEAN_PASS_MARKER in review_body.lower(),
-    )
-
-
-# A finding line is ``<severity>: <summary>``, tolerating common markdown dressing —
-# a leading bullet (``-``/``*``/``+``) or ordinal (``1.``/``2)``), and ``**bold**``
-# around the severity — so a prose-formatted heimdall review still parses instead of
-# silently reading as zero findings.
-_FINDING_LINE = re.compile(
-    r"^\s*(?:[-*+]|\d+[.)])?\s*\*{0,2}(low|medium|high|critical)\*{0,2}\s*:\s*(.+)$",
-    re.IGNORECASE,
-)
-
-
-def _parse_findings(review_body: str) -> list[HeimdallFinding]:
-    """Parse ``<severity>: <summary>`` lines from a review body into findings."""
-    findings: list[HeimdallFinding] = []
-    for line in review_body.splitlines():
-        match = _FINDING_LINE.match(line)
-        if match is None:
-            continue
-        severity = Severity[match.group(1).upper()]
-        findings.append(
-            HeimdallFinding(summary=match.group(2).strip(), severity=severity)
-        )
-    return findings
-
-
 def _configure_logging() -> None:
     """Send INFO-level logs to stdout so the worker's progress is observable.
 
@@ -698,153 +595,6 @@ def _configure_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         force=True,
     )
-
-
-def _repo_contents_url(repo_full_name: str, path: str) -> str:
-    """Build the GitHub contents-API URL for a file at ``path`` in a repo."""
-    return f"{GITHUB_API_BASE_URL}/repos/{repo_full_name}/contents/{path}"
-
-
-def _contents_url(repo_full_name: str) -> str:
-    """Build the GitHub contents-API URL for a repo's ``.github/retinue.yml``."""
-    return _repo_contents_url(repo_full_name, RETINUE_CONFIG_PATH)
-
-
-def _auth_headers(token: str) -> dict[str, str]:
-    """Build the request headers authorising a GitHub contents-API read.
-
-    Uses the documented ``Bearer`` scheme and pins the v3 contents media type and API
-    version so the response shape (a base64 ``content`` field) is stable.
-    """
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-def _decode_contents_payload(payload: dict[str, Any]) -> str:
-    """Decode a GitHub contents-API payload into the raw file text.
-
-    The contents API returns the file body base64-encoded in ``content`` (with
-    embedded newlines) under ``encoding: base64``. Decode it to UTF-8 text — the same
-    raw YAML the fake fetcher hands :func:`gate_prd` for parsing.
-
-    Raises:
-        ValueError: when the payload is not a base64-encoded file (unexpected shape,
-            e.g. a directory listing or an unknown encoding).
-    """
-    encoding = payload.get("encoding")
-    if encoding != "base64" or not isinstance(payload.get("content"), str):
-        raise ValueError(f"unexpected contents payload encoding: {encoding!r}")
-    try:
-        return base64.b64decode(payload["content"]).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError) as exc:
-        raise ValueError(f"undecodable contents payload: {exc}") from exc
-
-
-def github_config_fetcher(
-    auth: InstallationAuth, client: httpx.AsyncClient
-) -> ConfigFetcher:
-    """Build the production config fetcher backed by the GitHub contents API.
-
-    The returned async callable mints an installation token for the repo, reads
-    ``.github/retinue.yml`` over the contents API, and returns its raw YAML text — the
-    exact shape :func:`gate_prd` expects. A 404 (no such file) maps to ``None`` so the
-    gate reads the repo as not opted in, matching the injected fake. Any other HTTP
-    error is raised: a transient failure must retry the job, not be silently mistaken
-    for an opted-out repo.
-
-    Args:
-        auth: Mints an installation token scoped to the target repo.
-        client: A shared httpx client used for the contents read.
-
-    Returns:
-        A :class:`ConfigFetcher` returning the raw config text, or ``None`` on 404.
-    """
-
-    async def fetch(repo_full_name: str) -> str | None:
-        installation = await auth.installation_token(repo_full_name)
-        response = await client.get(
-            _contents_url(repo_full_name),
-            headers=_auth_headers(installation.token),
-        )
-        if response.status_code == httpx.codes.NOT_FOUND:
-            return None
-        response.raise_for_status()
-        return _decode_contents_payload(response.json())
-
-    return fetch
-
-
-def _issue_url(repo_full_name: str, issue_number: int) -> str:
-    """Build the GitHub issues-API URL for one issue."""
-    return f"{GITHUB_API_BASE_URL}/repos/{repo_full_name}/issues/{issue_number}"
-
-
-def _github_issue_body_fetcher(
-    auth: InstallationAuth, client: httpx.AsyncClient
-) -> IssueBodyFetcher:
-    """Build the production issue-body fetcher backed by the GitHub issues API.
-
-    Returns an async ``(repo, issue) -> body`` that mints an installation token and reads
-    the issue's ``body`` so the slicer slices the real PRD text. A missing body (``null``)
-    reads as empty string — the slicer escalates an empty PRD as too thin. Any HTTP error
-    is raised so the job retries rather than slicing a phantom body.
-
-    Args:
-        auth: Mints an installation token scoped to the target repo.
-        client: A shared httpx client used for the issue read.
-
-    Returns:
-        An :data:`IssueBodyFetcher` returning the issue body text.
-    """
-
-    async def fetch(repo_full_name: str, issue_number: int) -> str:
-        installation = await auth.installation_token(repo_full_name)
-        response = await client.get(
-            _issue_url(repo_full_name, issue_number),
-            headers=_auth_headers(installation.token),
-        )
-        response.raise_for_status()
-        return str(response.json().get("body") or "")
-
-    return fetch
-
-
-def _github_claude_md_fetcher(
-    auth: InstallationAuth, client: httpx.AsyncClient
-) -> ClaudeMdFetcher:
-    """Build the production ``CLAUDE.md`` fetcher backed by the GitHub contents API.
-
-    Returns an async ``(repo) -> claude_md`` that mints an installation token and reads
-    the target repo's root ``CLAUDE.md`` so the build's done-check command is parsed from
-    the *real* repo text (not an empty default). A repo with no ``CLAUDE.md`` (404) reads
-    as empty text — the pipeline then finds no parseable done-check gate and escalates
-    (:meth:`retinue.pipeline.Pipeline._has_done_check_gate`) rather than running a phantom
-    gate or crash-looping the build. Any other HTTP error is raised so the job retries
-    rather than building against a degraded, empty done-check spec.
-
-    Args:
-        auth: Mints an installation token scoped to the target repo.
-        client: A shared httpx client used for the contents read.
-
-    Returns:
-        A :data:`~retinue.pipeline.ClaudeMdFetcher` returning the ``CLAUDE.md`` text.
-    """
-
-    async def fetch(repo_full_name: str) -> str:
-        installation = await auth.installation_token(repo_full_name)
-        response = await client.get(
-            _repo_contents_url(repo_full_name, CLAUDE_MD_PATH),
-            headers=_auth_headers(installation.token),
-        )
-        if response.status_code == httpx.codes.NOT_FOUND:
-            return ""
-        response.raise_for_status()
-        return _decode_contents_payload(response.json())
-
-    return fetch
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
@@ -877,21 +627,35 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         ctx["fetch_config"] = _no_config_fetcher
     else:
         auth, client = wiring
-        fetch_claude_md = _github_claude_md_fetcher(auth, client)
+        fetch_claude_md = github_claude_md_fetcher(auth, client)
+        # The ONE service-level budget governor: the pipeline factory's build gate, the
+        # ad-hoc drain, and the cron tick all meter this same instance, so every lane
+        # charges one shared rolling-24h ledger over ``settings.budget_db_path``.
+        governor = BudgetGovernor(
+            BudgetLedger(
+                settings.budget_db_path,
+                clock=SystemClock(),
+                auth_mode=AuthMode.from_config(settings.auth_mode),
+                weekly_budget=settings.weekly_budget,
+                daily_cap_fraction=settings.budget_daily_cap_fraction,
+            )
+        )
+        ctx["governor"] = governor
         pipeline_factory = build_pipeline_factory(
-            settings, auth, fetch_claude_md=fetch_claude_md
+            settings, auth, governor=governor, fetch_claude_md=fetch_claude_md
         )
         ctx["github_client"] = client
         ctx["fetch_config"] = github_config_fetcher(auth, client)
-        ctx["fetch_prd_body"] = _github_issue_body_fetcher(auth, client)
+        ctx["fetch_prd_body"] = github_issue_body_fetcher(auth, client)
         ctx["pipeline_factory"] = pipeline_factory
         # The webhook's low-latency ad-hoc kick (run_adhoc_drain_job) reads ``adhoc_drain``
         # from ctx; bind it here so a kick on a deployed worker actually drains. The
         # heartbeat's safety-net sweep fires this *same* bound drain (below) so a kick and a
         # sweep are identical work under one single-run lock.
-        adhoc_drain = _bind_adhoc_drain(
+        adhoc_drain = bind_adhoc_drain(
             settings,
             auth,
+            governor=governor,
             pipeline_factory=pipeline_factory,
             fetch_claude_md=fetch_claude_md,
         )
@@ -906,10 +670,10 @@ async def on_startup(ctx: dict[str, Any]) -> None:
             auth, fetch_config=ctx["fetch_config"]
         )
         ctx["heartbeat_drain"] = adhoc_drain
-        ctx["heartbeat_cron_tick"] = _bind_heartbeat_cron_tick(
+        ctx["heartbeat_cron_tick"] = bind_cron_tick(
             settings,
             auth,
-            pipeline_factory=pipeline_factory,
+            governor=governor,
             fetch_claude_md=fetch_claude_md,
         )
         # Crash-resume: install the run-state store the sweep enumerates (the same file
@@ -927,82 +691,6 @@ async def on_startup(ctx: dict[str, Any]) -> None:
                 "No redis on the worker context; the resume sweep was not enqueued"
             )
     ctx["dedupe"] = PrdDedupeStore(settings.dedupe_db_path)
-
-
-def _bind_adhoc_drain(
-    settings: Any,
-    auth: InstallationAuth,
-    *,
-    pipeline_factory: PipelineFactory,
-    fetch_claude_md: ClaudeMdFetcher,
-) -> HeartbeatDrain:
-    """Bind the production ad-hoc drain to a ``(*, repo_full_name, config)`` callable.
-
-    The webhook's kick (:func:`run_adhoc_drain_job`) and — once issue #43 wires it — the
-    heartbeat's sweep both fire the drain through this one seam, so they are the *same* work
-    under one single-run lock. The shared collaborators are built once: the service-level
-    :class:`~retinue.budget.BudgetGovernor` over ``settings.budget_db_path`` (the *same*
-    durable rolling-24h ledger the PRD and cron lanes meter, so the budget is one window) and
-    a per-repo single-run lock registry, so two repos drain concurrently while a repo's own
-    kicked and swept drains serialize.
-
-    Each call mints a per-repo installation token, then constructs the per-repo gh seam
-    (:class:`retinue.adhoc_drain.GhCli`), reuses the worker's ``pipeline_factory`` to build
-    the repo's pipeline (its ``process_adhoc_pr`` opens the PR), binds the real ad-hoc
-    build+PR primitive (:func:`retinue.pipeline.bind_adhoc_build`) and the PR-open-only
-    stranded-branch recovery (:func:`retinue.pipeline.bind_adhoc_pr_open`), and drives
-    :func:`retinue.adhoc_drain.run_adhoc_drain` via :func:`retinue.wiring.bind_adhoc_drain`.
-
-    Args:
-        settings: The runtime settings carrying the budget + Anthropic config.
-        auth: The GitHub App installation auth used to mint per-repo tokens.
-        pipeline_factory: The worker's pipeline factory, reused so the ad-hoc PR step rides
-            the same per-repo pipeline the PRD lane builds.
-        fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
-
-    Returns:
-        The bound drain — an async ``(*, repo_full_name, config) -> None``.
-    """
-    from retinue.adhoc_drain import AdhocDrainLock, GhCli
-    from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
-    from retinue.pipeline import bind_adhoc_build, bind_adhoc_pr_open
-    from retinue.wiring import bind_adhoc_drain
-
-    governor = BudgetGovernor(
-        BudgetLedger(
-            settings.budget_db_path,
-            clock=SystemClock(),
-            auth_mode=AuthMode.from_config(settings.auth_mode),
-            weekly_budget=settings.weekly_budget,
-            daily_cap_fraction=settings.budget_daily_cap_fraction,
-        )
-    )
-    locks: dict[str, AdhocDrainLock] = {}
-
-    async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
-        token = (await auth.installation_token(repo_full_name)).token
-        gh = GhCli(token=token)
-        pipeline = await pipeline_factory(repo_full_name, config)
-        build = bind_adhoc_build(
-            settings,
-            auth,
-            pipeline=pipeline,
-            repo_full_name=repo_full_name,
-            token=token,
-            config=config,
-            claude_md=await fetch_claude_md(repo_full_name),
-        )
-        bound = bind_adhoc_drain(
-            gh=gh,
-            build=build,
-            open_pr=bind_adhoc_pr_open(pipeline),
-            governor=governor,
-            estimated_amount=_ADHOC_DRAIN_ESTIMATED_AMOUNT,
-            lock=locks.setdefault(repo_full_name, AdhocDrainLock()),
-        )
-        await bound(repo_full_name=repo_full_name, config=config)
-
-    return drain
 
 
 def _bind_heartbeat_enumerate(
@@ -1024,11 +712,10 @@ def _bind_heartbeat_enumerate(
     """
 
     async def enumerate_repos() -> list[DueRepo]:
-        list_repos = getattr(auth, "installed_repositories", None)
-        if list_repos is None:
+        if not isinstance(auth, InstalledRepos):
             return []
         due: list[DueRepo] = []
-        for repo_full_name in await list_repos():
+        for repo_full_name in await auth.installed_repositories():
             raw = await fetch_config(repo_full_name)
             if raw is None:
                 continue
@@ -1039,91 +726,6 @@ def _bind_heartbeat_enumerate(
         return due
 
     return enumerate_repos
-
-
-def _bind_heartbeat_cron_tick(
-    settings: Any,
-    auth: InstallationAuth,
-    *,
-    pipeline_factory: PipelineFactory,
-    fetch_claude_md: ClaudeMdFetcher,
-) -> HeartbeatCronTick:
-    """Bind the heartbeat's backlog cron tick to ``run_cron_tick`` over the real adapters.
-
-    Returns an async ``(*, repo_full_name, tick_number) -> CronTickResult`` — the
-    :data:`retinue.heartbeat.HeartbeatCronTick` shape — that drives one repo's backlog lane
-    through :func:`retinue.wiring.bind_cron_tick`. The shared collaborators are built once:
-    the service-level :class:`~retinue.budget.BudgetGovernor` over ``settings.budget_db_path``
-    (the *same* durable rolling-24h ledger the PRD and ad-hoc lanes meter, so the budget is
-    one window) and a per-repo single-run lock registry, so two repos tick concurrently while
-    a repo's own ticks serialize.
-
-    Each call mints a per-repo installation token, constructs the per-repo backlog gh seam
-    (:class:`retinue.cron.GhCli`) and the cron build (:class:`retinue.cron.SliceBuilder`
-    over the same orchestrator adapters the PRD lane builds), binds them through
-    :func:`retinue.wiring.bind_cron_tick`, and runs one tick. The heartbeat owns the
-    per-tick estimate (the flat per-build charge), so the bound callable supplies it.
-
-    Args:
-        settings: The runtime settings carrying the budget + Anthropic config.
-        auth: The GitHub App installation auth used to mint per-repo tokens.
-        pipeline_factory: The worker's pipeline factory (accepted for symmetry with the
-            other binders; the cron build assembles its own orchestrator adapters).
-        fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
-
-    Returns:
-        The bound cron tick — an async ``(*, repo_full_name, tick_number) -> CronTickResult``.
-    """
-    from contextlib import AbstractAsyncContextManager
-
-    from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
-    from retinue.cron import CronLock, GhCli
-    from retinue.pipeline import build_cron_slice_builder
-    from retinue.wiring import bind_cron_tick
-
-    governor = BudgetGovernor(
-        BudgetLedger(
-            settings.budget_db_path,
-            clock=SystemClock(),
-            auth_mode=AuthMode.from_config(settings.auth_mode),
-            weekly_budget=settings.weekly_budget,
-            daily_cap_fraction=settings.budget_daily_cap_fraction,
-        )
-    )
-    locks: dict[str, AbstractAsyncContextManager[object]] = {}
-
-    async def cron_tick(
-        *, repo_full_name: str, tick_number: int
-    ) -> CronTickResult:
-        token = (await auth.installation_token(repo_full_name)).token
-        gh = GhCli(token=token)
-        build = await build_cron_slice_builder(
-            settings,
-            auth,
-            repo_full_name=repo_full_name,
-            token=token,
-            fetch_claude_md=fetch_claude_md,
-        )
-        bound = bind_cron_tick(
-            gh=gh,
-            governor=governor,
-            clock=SystemClock(),
-            build=build,
-            lock=locks.setdefault(repo_full_name, CronLock()),
-        )
-        return await bound(
-            repo_full_name=repo_full_name,
-            tick_number=tick_number,
-            estimated_amount=_ADHOC_DRAIN_ESTIMATED_AMOUNT,
-        )
-
-    return cron_tick
-
-
-# The flat per-build charge the ad-hoc drain meters against the shared rolling-24h cap,
-# matching the PRD lane's estimate (:data:`retinue.pipeline._BUILD_ESTIMATED_AMOUNT`); a
-# build that would cross the cap is skipped so the one shared budget is never overshot.
-_ADHOC_DRAIN_ESTIMATED_AMOUNT = 1.0
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
@@ -1158,12 +760,10 @@ def _load_github_client() -> tuple[InstallationAuth, httpx.AsyncClient] | None:
     :class:`~retinue.github_app.InstallationAuthError` because the GitHub App is not yet
     configured (no ``github_app_id`` / private-key path). A deploy with only
     ``WEBHOOK_SECRET`` set must boot and log SKIPs (see DEPLOY.md), so an unconfigured App
-    is graceful degradation, not a startup failure. Resolved lazily so registering the
-    task (e.g. in tests) needs no GitHub App credentials and opens no network client at
-    import time.
+    is graceful degradation, not a startup failure. The builder is invoked lazily, per
+    startup, so registering the task (e.g. in tests) needs no GitHub App credentials and
+    opens no network client at import time.
     """
-    import retinue.github_app as github_app
-
     builder = getattr(github_app, "build_installation_auth", None)
     if builder is None:
         return None
@@ -1174,14 +774,12 @@ def _load_github_client() -> tuple[InstallationAuth, httpx.AsyncClient] | None:
     return auth, httpx.AsyncClient(timeout=30.0)
 
 
-# Module-level settings, loaded lazily in main() so importing this module does
+# Module-level settings, instantiated lazily in main() so importing this module does
 # not require the env vars to be present (e.g. when registering the task in tests).
 settings: Any = None
 
 
 def _load_settings() -> Any:
-    from retinue.config import Settings
-
     return Settings()  # type: ignore[call-arg]
 
 
@@ -1192,8 +790,6 @@ def main() -> None:
     here, at process start: arq reads that class attribute when it constructs the
     Worker, before ``on_startup`` runs, so the override must be applied now.
     """
-    from arq.worker import run_worker
-
     _configure_logging()
 
     global settings

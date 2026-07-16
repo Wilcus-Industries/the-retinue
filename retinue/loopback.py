@@ -31,56 +31,31 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
 
 import aiosqlite
 
+from retinue.gh import GhCommandError, GhRunner, auth_env
 from retinue.notify import Notification, Notifier
+from retinue.orchestrator import integration_branch
 from retinue.repo_config import RepoConfig
-from retinue.slicer import HITL_LABEL, READY_LABEL, CreatedIssue, IssueCreator, IssueDraft
+from retinue.slicer import CreatedIssue, IssueCreator, IssueDraft
+from retinue.vocab import (
+    BACKLOG_LABEL,
+    HITL_LABEL,
+    READY_LABEL,
+    Severity,
+    priority_label,
+)
 
 logger = logging.getLogger(__name__)
-
-BACKLOG_LABEL = "backlog"
-
-
-class Severity(enum.IntEnum):
-    """A heimdall finding's severity, ordered so a blocking threshold is a comparison.
-
-    The integer order encodes "more severe is greater", so a finding is *blocking*
-    when its severity is at or above the configured threshold (default
-    :attr:`Severity.HIGH`). The member *name* (lower-cased) is what maps 1:1 to a
-    ``priority:<severity>`` label for a backlog nit.
-    """
-
-    LOW = 1
-    MEDIUM = 2
-    HIGH = 3
-    CRITICAL = 4
-
 
 # Heimdall's blocking threshold: a finding at or above this severity blocks the PR.
 # Below it, the finding is a non-blocking nit routed to the backlog.
 _BLOCKING_THRESHOLD = Severity.HIGH
-
-
-def priority_label(severity: Severity) -> str:
-    """Return the backlog ``priority:<severity>`` label for a heimdall severity.
-
-    The mapping is 1:1 with the severity name, so heimdall's own severity vocabulary
-    survives onto the filed backlog issue without translation.
-
-    Args:
-        severity: The finding's heimdall severity.
-
-    Returns:
-        ``"priority:low"`` / ``"priority:medium"`` / ``"priority:high"`` /
-        ``"priority:critical"``.
-    """
-    return f"priority:{severity.name.lower()}"
 
 
 class ReviewState(enum.Enum):
@@ -156,6 +131,91 @@ class HeimdallReview:
         clean-pass body.
         """
         return bool(self.findings) or self.clean_pass
+
+
+# gh review states map onto the loopback's three-valued review state. ``dismissed`` and
+# any unrecognised state are read as a plain comment (no verdict), so an odd state never
+# blocks or converges on its own.
+_REVIEW_STATE_MAP = {
+    "approved": ReviewState.APPROVED,
+    "changes_requested": ReviewState.REQUEST_CHANGES,
+    "request_changes": ReviewState.REQUEST_CHANGES,
+    "commented": ReviewState.COMMENTED,
+}
+
+# Heimdall never submits an APPROVED review: its clean pass is a COMMENTED review whose
+# body is "Heimdall review: no concerns found across any lens." — this marker (matched
+# case-insensitively) is what flags that COMMENT as a verdict so the loopback converges
+# on it. Heimdall's verdict-less "review failed" COMMENT note carries neither this
+# marker nor finding lines, so it stays a no-verdict.
+_CLEAN_PASS_MARKER = "no concerns found"
+
+
+def parse_heimdall_review(
+    *,
+    repo_full_name: str,
+    pr_number: int,
+    prd_number: int,
+    review_state: str,
+    review_body: str,
+) -> HeimdallReview:
+    """Parse a ``pull_request_review`` into a :class:`HeimdallReview`.
+
+    Maps the gh review ``state`` onto the loopback's three-valued state and reads
+    heimdall's findings out of the review body — one finding per
+    ``<severity>: <summary>`` line (severity is one of low/medium/high/critical,
+    case-insensitive); a line without that shape is ignored as prose. A body carrying
+    heimdall's clean-pass marker (:data:`_CLEAN_PASS_MARKER`) sets ``clean_pass`` so
+    the findings-free clean COMMENT still reads as a verdict. The integration branch
+    is derived from the PRD number (``retinue/prd-<n>``). Pure and value-free, so it
+    is unit-tested without a live gh.
+
+    Args:
+        repo_full_name: e.g. "owner/repo".
+        pr_number: The reviewed PR number.
+        prd_number: The parent PRD (resolved from run-state); also the issue an
+            escalation comments/labels and the integration branch's number.
+        review_state: The gh review state string.
+        review_body: The review body to parse findings from.
+
+    Returns:
+        The parsed :class:`HeimdallReview`.
+    """
+    state = _REVIEW_STATE_MAP.get(review_state.lower(), ReviewState.COMMENTED)
+    return HeimdallReview(
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        prd_number=prd_number,
+        prd_issue_number=prd_number,
+        integration_branch=integration_branch(prd_number),
+        state=state,
+        findings=_parse_findings(review_body),
+        clean_pass=_CLEAN_PASS_MARKER in review_body.lower(),
+    )
+
+
+# A finding line is ``<severity>: <summary>``, tolerating common markdown dressing —
+# a leading bullet (``-``/``*``/``+``) or ordinal (``1.``/``2)``), and ``**bold**``
+# around the severity — so a prose-formatted heimdall review still parses instead of
+# silently reading as zero findings.
+_FINDING_LINE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])?\s*\*{0,2}(low|medium|high|critical)\*{0,2}\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_findings(review_body: str) -> list[HeimdallFinding]:
+    """Parse ``<severity>: <summary>`` lines from a review body into findings."""
+    findings: list[HeimdallFinding] = []
+    for line in review_body.splitlines():
+        match = _FINDING_LINE.match(line)
+        if match is None:
+            continue
+        severity = Severity[match.group(1).upper()]
+        findings.append(
+            HeimdallFinding(summary=match.group(2).strip(), severity=severity)
+        )
+    return findings
 
 
 @dataclass(frozen=True)
@@ -606,64 +666,8 @@ async def _file_backlog(
 # The adapter never shells out itself: every pure/parseable part — the auth-env build, the
 # ``gh pr edit --add-reviewer`` command assembly, and parsing the re-review payload — is a
 # free function tested with a recording fake runner, never a live ``gh``/heimdall/network.
-# The local :class:`GhRunner`/:class:`GhResult` mirror the gh-seam shape used in
-# :mod:`retinue.slicer` / :mod:`retinue.pr_opener`; each module keeps its own copy so the
-# layers stay edit-isolated.
-
-@dataclass(frozen=True)
-class GhResult:
-    """Captured result of a single ``gh`` invocation.
-
-    Attributes:
-        exit_code: ``gh``'s process exit status; ``0`` means success.
-        stdout: Captured standard output (the re-review payload parsed below).
-        stderr: Captured standard error (surfaced in the error on failure).
-    """
-
-    exit_code: int
-    stdout: str = ""
-    stderr: str = ""
-
-    @property
-    def ok(self) -> bool:
-        """True when ``gh`` exited successfully (exit code 0)."""
-        return self.exit_code == 0
-
-
-class GhRunner(Protocol):
-    """Runs a single ``gh`` command. The process-spawn seam under :class:`GhCliRebuilder`.
-
-    A production implementation spawns ``gh`` as a subprocess with ``env`` merged into its
-    environment (so ``GH_TOKEN`` authenticates the call) and returns the captured
-    :class:`GhResult`; tests inject a fake that records each ``(args, env)`` and returns a
-    canned result. ``args`` never includes the leading ``"gh"`` — the runner owns the
-    executable name.
-    """
-
-    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
-        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
-        ...
-
-
-class GhCommandError(RuntimeError):
-    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
-
-    def __init__(self, command: list[str], result: GhResult) -> None:
-        self.command = command
-        self.result = result
-        super().__init__(
-            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
-        )
-
-
-def _auth_env(token: str) -> dict[str, str]:
-    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
-
-    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on every
-    REST/GraphQL call, so the adapter never assembles a header itself — it injects the
-    token here and lets ``gh`` own the wire format.
-    """
-    return {"GH_TOKEN": token}
+# The runner shape, result shape, error, and auth env all come from the shared
+# :mod:`retinue.gh` seam.
 
 
 def _re_review_args(request: RebuildRequest, reviewer_login: str) -> list[str]:
@@ -712,8 +716,9 @@ class GhCliRebuilder:
     already filed the round's fix-issues before this trigger fires (re-filing them here
     would double every finding), so the trigger's single job is re-requesting the heimdall
     bot review on the same PR: it dispatches the assembled ``gh pr edit`` argv
-    (:func:`_re_review_args`) through the injected :class:`GhRunner`, authenticated with a
-    ``GH_TOKEN`` bearer (:func:`_auth_env`), and confirms the PR number echoed back
+    (:func:`_re_review_args`) through the injected :class:`~retinue.gh.GhRunner`,
+    authenticated with a ``GH_TOKEN`` bearer (:func:`retinue.gh.auth_env`), and confirms
+    the PR number echoed back
     (:func:`_parse_review_requested`).
 
     The runner is the only side-effecting seam, which keeps the command assembly and
@@ -742,7 +747,7 @@ class GhCliRebuilder:
     async def __call__(self, request: RebuildRequest) -> None:
         """Re-request the heimdall review on the rebuilt PR."""
         args = _re_review_args(request, self._reviewer_login)
-        result = await self._runner.run(args, env=_auth_env(self._token))
+        result = await self._runner.run(args, env=auth_env(self._token))
         if not result.ok:
             raise GhCommandError(args, result)
         pr_number = _parse_review_requested(result.stdout)

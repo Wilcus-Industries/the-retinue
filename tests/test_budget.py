@@ -1,14 +1,12 @@
-"""Tests for the budget governor: rolling-24h spend ledger + pause/resume (issue #14).
+"""Tests for the budget governor: the rolling-24h spend ledger (issue #14).
 
 A DB-backed rolling-24h spend ledger meters agent spend and enforces a 12%/24h cap
 against the service-level weekly budget, in both auth modes ($ for an API key, tokens
-for subscription OAuth). The governor gates at run start (over the cap -> defer) and
-meters mid-run (a charge that would cross the cap pauses + checkpoints, then resumes via
-the reconcile machinery once the trailing-24h window frees).
+for subscription OAuth). The governor gates at admission (over the cap -> defer/decline)
+for the PRD, cron, and ad-hoc lanes alike.
 
-The clock is injected (no real wall-clock, so the rolling window is deterministic), the
-ledger lives in a temp SQLite file, and the resume reuses :func:`reconcile_run` through
-the faked gh seam from the reconcile tests — no real ``gh``, no network.
+The clock is injected (no real wall-clock, so the rolling window is deterministic) and
+the ledger lives in a temp SQLite file — no real ``gh``, no network.
 """
 
 from __future__ import annotations
@@ -18,7 +16,6 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import aiosqlite
 import pytest
 
 from retinue.budget import (
@@ -27,11 +24,9 @@ from retinue.budget import (
     BudgetLedger,
     Clock,
     GateDecision,
-    MeterDecision,
     SystemClock,
 )
-from retinue.orchestrator import PrdSlice
-from tests.test_reconcile import FakeReconcileGh
+from tests.fakes import FakeClock
 
 # The stores hold a long-lived connection for their (process-lifetime) lifespan and do
 # not require callers to close them. These tests construct many short-lived stores across
@@ -43,34 +38,6 @@ pytestmark = pytest.mark.filterwarnings(
 )
 
 _T0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
-
-
-class FakeClock:
-    """A deterministic, advanceable time source the ledger reads ``now()`` from."""
-
-    def __init__(self, start: datetime = _T0) -> None:
-        self._now = start
-
-    def now(self) -> datetime:
-        return self._now
-
-    def advance(self, delta: timedelta) -> None:
-        self._now += delta
-
-
-@pytest.fixture()
-def db_path(tmp_path: Path) -> Path:
-    """An on-disk SQLite path inside the test's tmp dir."""
-    return tmp_path / "budget.sqlite3"
-
-
-def _prd_slice(issue_number: int, blocked_by: list[int] | None = None) -> PrdSlice:
-    return PrdSlice(
-        repo_full_name="owner/repo",
-        issue_number=issue_number,
-        prd_number=1,
-        blocked_by=blocked_by or [],
-    )
 
 
 # --- real SystemClock: the production adapter behind the Clock seam --------------
@@ -408,69 +375,13 @@ async def test_governor_close_releases_connections(db_path: Path) -> None:
         db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
     )
     governor = BudgetGovernor(ledger)
-    await governor.meter(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        amount=1.0,
-        slices=[_prd_slice(2)],
-    )
+    await governor.meter_adhoc(amount=1.0)
 
     await governor.close()
 
     # After close the governor still works, reconnecting lazily.
     assert await governor.meter_adhoc(amount=1.0) is True
     await governor.close()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_meters_do_not_both_record_over_cap(db_path: Path) -> None:
-    """Two overlapping meter calls that jointly exceed the cap must not both record.
-
-    cap = 12, trailing already 11 (1.0 of room). Two lanes meter 1.0 each at the same
-    instant via asyncio.gather. A single 1.0 charge fits inclusively (11+1=12 == cap),
-    but the two together (11+1+1=13) overshoot. Without an atomic check-and-record both
-    observe 11 under the cap and both record, pushing trailing to 13. The fix serializes
-    the check-and-record: the second lane must see the first's write (or its lock) and
-    pause instead. Exactly one records; trailing-24h never exceeds the cap.
-    """
-    clock = FakeClock()
-    # Two separate governors on the SAME service-level DB file, as the orchestrator and
-    # cron lanes would each hold their own object over the shared ledger.
-    orchestrator_lane = BudgetGovernor(
-        BudgetLedger(
-            db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-        )
-    )
-    cron_lane = BudgetGovernor(
-        BudgetLedger(
-            db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-        )
-    )
-    # Fill the window to 11.0 of the 12.0 cap: only one 2.0 charge can ever fit.
-    await orchestrator_lane._ledger.record_spend(amount=11.0)
-
-    decisions = await asyncio.gather(
-        orchestrator_lane.meter(
-            repo_full_name="owner/repo",
-            prd_number=1,
-            amount=1.0,
-            slices=[_prd_slice(2)],
-        ),
-        cron_lane.meter(
-            repo_full_name="owner/repo",
-            prd_number=2,
-            amount=1.0,
-            slices=[_prd_slice(3)],
-        ),
-    )
-
-    # Exactly one lane recorded; the other saw the first's write and paused.
-    paused = [d.paused for d in decisions]
-    assert sorted(paused) == [False, True]
-    # The cap is never overshot: only the single 1.0 charge that fit was recorded.
-    trailing = await orchestrator_lane._ledger.trailing_24h_spend()
-    assert trailing == pytest.approx(12.0)
-    assert trailing <= orchestrator_lane._ledger.cap()
 
 
 @pytest.mark.asyncio
@@ -707,301 +618,3 @@ async def test_gate_is_atomic_across_concurrent_lanes(db_path: Path) -> None:
     assert trailing <= prd_lane._ledger.cap()
 
 
-# --- meter mid-run: pause + checkpoint, then resume ------------------------------
-
-
-@pytest.mark.asyncio
-async def test_charge_that_crosses_cap_pauses_and_checkpoints(db_path: Path) -> None:
-    """A mid-run charge that would cross the cap pauses and checkpoints the run."""
-    clock = FakeClock()
-    ledger = BudgetLedger(
-        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-    )
-    await ledger.record_spend(amount=11.0)  # cap 12.0, 1.0 of room left
-    governor = BudgetGovernor(ledger)
-    slices = [_prd_slice(2), _prd_slice(3, blocked_by=[2])]
-
-    decision = await governor.meter(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        amount=2.0,
-        slices=slices,
-    )
-
-    assert isinstance(decision, MeterDecision)
-    assert decision.paused is True
-    assert decision.resume_at == _T0 + timedelta(hours=24)
-    # The pause did not charge the over-cap amount.
-    assert await ledger.trailing_24h_spend() == pytest.approx(11.0)
-
-
-@pytest.mark.asyncio
-async def test_charge_under_cap_is_metered_through(db_path: Path) -> None:
-    """A mid-run charge that fits under the cap is recorded and the run continues."""
-    clock = FakeClock()
-    ledger = BudgetLedger(
-        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-    )
-    await ledger.record_spend(amount=8.0)
-    governor = BudgetGovernor(ledger)
-
-    decision = await governor.meter(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        amount=2.0,
-        slices=[_prd_slice(2)],
-    )
-
-    assert decision.paused is False
-    assert await ledger.trailing_24h_spend() == pytest.approx(10.0)
-
-
-@pytest.mark.asyncio
-async def test_paused_run_resumes_via_reconcile_when_window_frees(
-    db_path: Path,
-) -> None:
-    """A budget-paused run resumes through reconcile, building only unfinished slices."""
-    clock = FakeClock()
-    ledger = BudgetLedger(
-        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-    )
-    await ledger.record_spend(amount=11.0)
-    governor = BudgetGovernor(ledger)
-    slices = [_prd_slice(2), _prd_slice(3, blocked_by=[2])]
-
-    paused = await governor.meter(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        amount=2.0,
-        slices=slices,
-    )
-    assert paused.paused is True
-
-    # The window has not freed yet: resume must still defer.
-    early = await governor.try_resume(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        gh=FakeReconcileGh(closed_issues={2}, merged_branches={"issue-2"}),
-    )
-    assert early is None
-
-    # Advance past the window; slice 2 landed before the pause, 3 is unfinished.
-    clock.advance(timedelta(hours=25))
-    result = await governor.try_resume(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        gh=FakeReconcileGh(closed_issues={2}, merged_branches={"issue-2"}),
-    )
-
-    assert result is not None
-    # Resume reuses the reconcile machinery: only the unfinished slice is rebuilt.
-    assert [s.issue_number for s in result.unfinished_slices] == [3]
-    assert result.finished_issues == [2]
-
-
-@pytest.mark.asyncio
-async def test_pause_resume_is_observable_end_to_end(db_path: Path) -> None:
-    """The pause->resume transition is observable: paused first, then a resume plan."""
-    clock = FakeClock()
-    ledger = BudgetLedger(
-        db_path, clock=clock, auth_mode=AuthMode.SUBSCRIPTION, weekly_budget=1_000_000.0
-    )
-    await ledger.record_spend(amount=115_000.0)  # cap 120_000, 5_000 of room
-    governor = BudgetGovernor(ledger)
-    slices = [_prd_slice(2)]
-
-    paused = await governor.meter(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        amount=10_000.0,
-        slices=slices,
-    )
-    assert paused.paused is True
-    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
-
-    clock.advance(timedelta(hours=25))
-    result = await governor.try_resume(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
-    )
-    assert result is not None
-    # Once resumed, the run is no longer paused.
-    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is False
-
-
-@pytest.mark.asyncio
-async def test_try_resume_stays_paused_when_still_over_cap(db_path: Path) -> None:
-    """Past the recorded resume_at but still over cap, try_resume keeps the run paused.
-
-    cap = 12. Record 1.0 at T0, then 11.0 at T0+1h (trailing = 12, full). A 5.0 charge
-    pauses the run with resume_at = T0+1h+24h. If the clock is advanced only past the
-    first (1.0) charge's expiry (T0+24h), the window has freed only 1.0 — trailing 11.0,
-    so 11+5 > 12 is still over cap. try_resume must return None and leave the pause intact
-    rather than resume the run over-budget.
-    """
-    clock = FakeClock()
-    ledger = BudgetLedger(
-        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-    )
-    await ledger.record_spend(amount=1.0)
-    clock.advance(timedelta(hours=1))
-    await ledger.record_spend(amount=11.0)
-    governor = BudgetGovernor(ledger)
-    slices = [_prd_slice(2)]
-
-    paused = await governor.meter(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        amount=5.0,
-        slices=slices,
-    )
-    assert paused.paused is True
-    assert paused.resume_at == _T0 + timedelta(hours=1) + timedelta(hours=24)
-
-    # Past T0+24h only the 1.0 charge has aged out; trailing is still 11.0, so 11+5 > 12.
-    clock._now = _T0 + timedelta(hours=24, minutes=1)
-    still_paused = await governor.try_resume(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
-    )
-    assert still_paused is None
-    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
-
-    # Once the 11.0 charge also ages out, the cap genuinely has room and resume proceeds.
-    clock._now = _T0 + timedelta(hours=1) + timedelta(hours=24, minutes=1)
-    result = await governor.try_resume(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
-    )
-    assert result is not None
-    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is False
-
-
-# --- legacy-DB migration: the amount column must be added in place (issue #23) ----
-
-
-async def _seed_legacy_pause(
-    db_path: Path, *, prd_key: str, resume_at: datetime
-) -> None:
-    """Create the original issue-#14 two-column budget_pauses table + a paused row.
-
-    This is the schema that shipped before issue #21 added the ``amount`` column, so it
-    reproduces a durable DB file upgraded in place: ``CREATE TABLE IF NOT EXISTS`` is a
-    no-op against this pre-existing table, so the column is missing until migrated.
-    """
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(
-            "CREATE TABLE budget_pauses (prd_key TEXT PRIMARY KEY, resume_at TEXT NOT NULL)"
-        )
-        await db.execute(
-            "INSERT INTO budget_pauses (prd_key, resume_at) VALUES (?, ?)",
-            (prd_key, resume_at.isoformat()),
-        )
-        await db.commit()
-
-
-@pytest.mark.asyncio
-async def test_legacy_pause_table_is_migrated_so_reads_do_not_raise(
-    db_path: Path,
-) -> None:
-    """A legacy two-column budget_pauses table is migrated in place on first use.
-
-    Before the fix, ``_pause_record`` selects ``amount`` and raises OperationalError
-    against the legacy table, breaking both try_resume and is_paused. The migration adds
-    the column transparently so both read paths succeed.
-    """
-    clock = FakeClock()
-    # The recorded resume_at is already in the past, so the only thing keeping the run
-    # paused is the cap recheck — not the resume_at gate.
-    await _seed_legacy_pause(
-        db_path, prd_key="owner/repo#1", resume_at=_T0 - timedelta(hours=1)
-    )
-    ledger = BudgetLedger(
-        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-    )
-    governor = BudgetGovernor(ledger)
-
-    # Neither read path raises OperationalError against the migrated legacy table.
-    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
-    resumed = await governor.try_resume(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
-    )
-    # With an empty window the cap has room, so the migrated legacy row can resume.
-    assert resumed is not None
-
-
-@pytest.mark.asyncio
-async def test_legacy_pause_row_does_not_resume_into_over_cap_window(
-    db_path: Path,
-) -> None:
-    """A migrated legacy row (amount defaulting to 0) must not resume over-cap.
-
-    cap = 12. A legacy pause row carries no recorded charge, so the recheck cannot trust
-    ``amount`` (a literal 0 would let ``would_exceed`` pass the instant trailing dips to
-    the cap, reintroducing the over-cap resume #21 fixed). The conservative legacy
-    semantic holds the pause while the window has no real headroom: with trailing at the
-    cap, try_resume stays paused; only once the window genuinely frees does it resume.
-    """
-    clock = FakeClock()
-    await _seed_legacy_pause(
-        db_path, prd_key="owner/repo#1", resume_at=_T0 - timedelta(hours=1)
-    )
-    ledger = BudgetLedger(
-        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-    )
-    await ledger.record_spend(amount=12.0)  # window full at the cap
-    governor = BudgetGovernor(ledger)
-
-    # Past resume_at, but the window is full: a legacy amount=0 would wrongly resume here.
-    still_paused = await governor.try_resume(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
-    )
-    assert still_paused is None
-    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
-
-    # Once the charge ages out and the window is empty, the conservative recheck clears.
-    clock.advance(timedelta(hours=25))
-    resumed = await governor.try_resume(
-        repo_full_name="owner/repo",
-        prd_number=1,
-        gh=FakeReconcileGh(closed_issues=set(), merged_branches=set()),
-    )
-    assert resumed is not None
-    assert await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is False
-
-
-@pytest.mark.asyncio
-async def test_pause_schema_migration_is_idempotent(db_path: Path) -> None:
-    """Running the migration repeatedly against an already-migrated DB is a no-op.
-
-    Re-opening the governor (each read path re-runs the schema-ensure) must not fail or
-    duplicate the column. A fresh DB and a once-migrated DB converge on the same schema.
-    """
-    clock = FakeClock()
-    await _seed_legacy_pause(
-        db_path, prd_key="owner/repo#1", resume_at=_T0 - timedelta(hours=1)
-    )
-    ledger = BudgetLedger(
-        db_path, clock=clock, auth_mode=AuthMode.API_KEY, weekly_budget=100.0
-    )
-    governor = BudgetGovernor(ledger)
-
-    # Each call re-runs the schema-ensure + migration on a fresh connection.
-    for _ in range(3):
-        assert (
-            await governor.is_paused(repo_full_name="owner/repo", prd_number=1) is True
-        )
-
-    async with (
-        aiosqlite.connect(db_path) as db,
-        db.execute("PRAGMA table_info(budget_pauses)") as cursor,
-    ):
-        columns = [row[1] for row in await cursor.fetchall()]
-    assert columns.count("amount") == 1

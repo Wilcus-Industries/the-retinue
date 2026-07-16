@@ -16,7 +16,7 @@ from pathlib import Path
 
 import aiosqlite
 
-from retinue.orchestrator import Slice
+from retinue.container_build import Slice
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS impl_retries (

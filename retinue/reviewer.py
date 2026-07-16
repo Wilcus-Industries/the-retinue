@@ -24,21 +24,29 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
+from retinue.gh import GhCommandError, GhResult, GhRunner, auth_env
+from retinue.messages_api import (
+    MESSAGES_URL,
+    HttpTransport,
+    extract_json_object,
+    request_headers,
+)
 from retinue.roles import (
     Role,
+    is_oauth_credential,
     oauth_system,
     resolve_effort,
     resolve_model,
     structured_output_config,
 )
 from retinue.slicer import (
-    READY_LABEL,
     CreatedIssue,
     IssueCreator,
     IssueDraft,
 )
+from retinue.vocab import READY_LABEL
 
 logger = logging.getLogger(__name__)
 
@@ -140,9 +148,6 @@ BlockedByEditor = Callable[[EditBlockedByRequest], Awaitable[None]]
 # matching the schema.
 # ---------------------------------------------------------------------------
 
-_ANTHROPIC_VERSION = "2023-06-01"
-_OAUTH_BETA = "oauth-2025-04-20"
-_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 _MAX_TOKENS = 16_000
 
 # Cap on the round diff interpolated into the reviewer's user message, mirroring the
@@ -206,28 +211,6 @@ def _clip_diff(diff: str) -> str:
     )
 
 
-@dataclass(frozen=True)
-class HttpResponse:
-    """The slice of an HTTP response the reviewer reads: status and JSON body."""
-
-    status_code: int
-    body: dict[str, Any]
-
-
-class HttpTransport(Protocol):
-    """Async HTTP POST seam (httpx-style). The network edge of the reviewer.
-
-    A production implementation wraps an httpx client; tests inject a fake that
-    returns a canned :class:`HttpResponse`. Kept narrow — one POST — so the real
-    review flow is exercisable without network.
-    """
-
-    async def post(
-        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
-    ) -> HttpResponse:
-        """POST ``json`` to ``url`` with ``headers`` and return the response."""
-        ...
-
 
 @dataclass(frozen=True)
 class AgentSdkReviewGenerator:
@@ -260,7 +243,7 @@ class AgentSdkReviewGenerator:
     async def __call__(self, review_input: ReviewInput) -> ReviewPlan:
         """Review ``review_input``'s diff and return the parsed :class:`ReviewPlan`."""
         response = await self.transport.post(
-            _MESSAGES_URL,
+            MESSAGES_URL,
             headers=self._headers(),
             json=self._payload(review_input),
         )
@@ -272,16 +255,7 @@ class AgentSdkReviewGenerator:
 
     def _headers(self) -> dict[str, str]:
         """Build the request headers, routing the credential to its auth scheme."""
-        headers = {
-            "anthropic-version": _ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        }
-        if self.credential.startswith("sk-ant-oat"):
-            headers["authorization"] = f"Bearer {self.credential}"
-            headers["anthropic-beta"] = _OAUTH_BETA
-        else:
-            headers["x-api-key"] = self.credential
-        return headers
+        return request_headers(self.credential)
 
     def _payload(self, review_input: ReviewInput) -> dict[str, Any]:
         """Assemble the Messages API request body for one round's review.
@@ -310,7 +284,7 @@ class AgentSdkReviewGenerator:
                 Role.REVIEWER, _REVIEW_SCHEMA, model=self.model, effort=self.effort
             ),
             "system": oauth_system(
-                _REVIEW_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")
+                _REVIEW_SYSTEM, is_oauth=is_oauth_credential(self.credential)
             ),
             "messages": [{"role": "user", "content": user}],
         }
@@ -323,18 +297,7 @@ class AgentSdkReviewGenerator:
         text, or carrying malformed JSON or a non-list ``findings``, raises
         :class:`ReviewGenerationError` rather than silently filing nothing.
         """
-        text = "".join(
-            block.get("text", "")
-            for block in body.get("content", [])
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-        if not text.strip():
-            raise ReviewGenerationError("Messages API response carried no text content")
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ReviewGenerationError(f"Reviewer emitted invalid JSON: {exc}") from exc
-
+        parsed = extract_json_object(body, who="Reviewer", error=ReviewGenerationError)
         raw_findings = parsed.get("findings")
         if not isinstance(raw_findings, list):
             raise ReviewGenerationError("Reviewer JSON missing a 'findings' list")
@@ -362,72 +325,13 @@ class ReviewGenerationError(RuntimeError):
 # read the dependent's current body (``gh issue view --json body``), add the
 # ``#<fix>`` reference to its ``## Blocked by`` block (matching the slicer's block
 # shape), then write it back (``gh issue edit --body``). The process spawn is the
-# only side effect, taken behind the injected :class:`GhRunner` protocol so the
-# pure parts — auth-env build, command assembly, body parsing, block rendering —
-# are exercised without a live ``gh`` or network.
-#
-# gh is authenticated via ``GH_TOKEN`` in the environment (gh sends it as
-# ``Authorization: Bearer`` on every REST/GraphQL call), so the adapter never
-# assembles an auth header itself — it injects the token and lets gh own the wire.
+# only side effect, taken behind the injected :class:`~retinue.gh.GhRunner` protocol
+# so the pure parts — auth-env build, command assembly, body parsing, block
+# rendering — are exercised without a live ``gh`` or network. The runner shape,
+# result shape, error, and auth env all come from the shared :mod:`retinue.gh` seam.
 # ---------------------------------------------------------------------------
 
 _BLOCKED_BY_HEADING = "## Blocked by"
-
-
-@dataclass(frozen=True)
-class GhResult:
-    """Captured result of a single ``gh`` invocation.
-
-    Attributes:
-        exit_code: ``gh``'s process exit status; ``0`` means success.
-        stdout: Captured standard output (the issue body payload to parse).
-        stderr: Captured standard error (surfaced in the error on failure).
-    """
-
-    exit_code: int
-    stdout: str = ""
-    stderr: str = ""
-
-    @property
-    def ok(self) -> bool:
-        """True when ``gh`` exited successfully (exit code 0)."""
-        return self.exit_code == 0
-
-
-class GhRunner(Protocol):
-    """Runs a single ``gh`` command. The process-spawn seam under the editor.
-
-    A production implementation spawns ``gh`` as a subprocess with ``env`` merged
-    into its environment (so ``GH_TOKEN`` authenticates the call) and returns the
-    captured :class:`GhResult`; tests inject a fake that records each ``(args, env)``
-    and returns a canned result. ``args`` never includes the leading ``"gh"`` — the
-    runner owns the executable name.
-    """
-
-    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
-        """Run ``gh <args>`` with ``env`` in the environment and capture the result."""
-        ...
-
-
-class GhCommandError(RuntimeError):
-    """A ``gh`` invocation exited non-zero. Carries the args and stderr for debugging."""
-
-    def __init__(self, command: list[str], result: GhResult) -> None:
-        self.command = command
-        self.result = result
-        super().__init__(
-            f"gh {' '.join(command)} exited {result.exit_code}: {result.stderr.strip()}"
-        )
-
-
-def _gh_auth_env(token: str) -> dict[str, str]:
-    """Build the env that authenticates ``gh``: a ``GH_TOKEN`` bearer for the API.
-
-    ``gh`` reads ``GH_TOKEN`` and sends it as ``Authorization: Bearer <token>`` on
-    every REST/GraphQL call, so the adapter injects the token here and lets ``gh``
-    own the wire format rather than assembling a header itself.
-    """
-    return {"GH_TOKEN": token}
 
 
 def _issue_view_args(repo_full_name: str, issue_number: int) -> list[str]:
@@ -552,7 +456,7 @@ class GhCliBlockedByEditor:
 
     async def _gh(self, args: list[str]) -> GhResult:
         """Run one ``gh`` command authenticated with the token, raising on failure."""
-        result = await self.runner.run(args, env=_gh_auth_env(self.token))
+        result = await self.runner.run(args, env=auth_env(self.token))
         if not result.ok:
             raise GhCommandError(args, result)
         return result

@@ -8,28 +8,21 @@ so these tests drive the orchestration with fakes — no Docker, gh, Agent SDK, 
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
-from retinue.handoff import ChildIssue, MergedPullRequest, ReapOutcome
+from retinue.handoff import MergedPullRequest, ReapOutcome
 from retinue.loopback import (
     HeimdallFinding,
     HeimdallReview,
     ReviewState,
-    Severity,
     VerdictOutcome,
 )
 from retinue.orchestrator import PrdBuildResult, PrdSlice
 from retinue.pipeline import Pipeline
-from retinue.pr_opener import (
-    OpenPrRequest,
-    PullRequest,
-)
 from retinue.reconcile import PrState, ResumePhase, RunStateStore
 from retinue.repo_config import (
     ModelEffort,
@@ -42,83 +35,23 @@ from retinue.slicer import (
     IssueDraft,
     SlicePlan,
 )
-from tests.test_reconcile import FakeReconcileGh
-
-
-class _FixedClock:
-    def now(self) -> datetime:
-        return datetime(2026, 6, 22, tzinfo=UTC)
-
-
-@dataclass
-class _RecordingNotifier:
-    notes: list[object] = field(default_factory=list)
-
-    async def notify(self, notification: object) -> None:
-        self.notes.append(notification)
-
-
-@dataclass
-class _FakePrOps:
-    heimdall: bool = True
-    staging: bool = True
-    opened: list[OpenPrRequest] = field(default_factory=list)
-
-    async def heimdall_installed(self, repo_full_name: str) -> bool:
-        return self.heimdall
-
-    async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
-        return self.staging
-
-    async def existing_open_pr(
-        self, *, repo_full_name: str, head: str, base: str
-    ) -> PullRequest | None:
-        return None
-
-    async def bring_up_to_date(
-        self, *, repo_full_name: str, branch: str, base: str
-    ) -> None:
-        return None
-
-    async def open_pr(self, request: OpenPrRequest) -> PullRequest:
-        self.opened.append(request)
-        return PullRequest(number=99, url="https://github.com/owner/repo/pull/99")
-
-
-@dataclass
-class _FakeReapGh:
-    children: list[ChildIssue] = field(default_factory=list)
-    closed: list[int] = field(default_factory=list)
-
-    async def close_issue(self, *, repo_full_name: str, issue_number: int) -> None:
-        self.closed.append(issue_number)
-
-    async def children_of(
-        self, *, repo_full_name: str, prd_number: int
-    ) -> list[ChildIssue]:
-        return self.children
+from retinue.vocab import Severity
+from tests.fakes import (
+    FakeReconcileGh,
+    _created,
+    _fake_build_adhoc_issue,
+    _FakePrOps,
+    _FakeReapGh,
+    _governor,
+    _noop_rebuild,
+    _RecordingAdhocPipeline,
+    _RecordingNotifier,
+    _settings,
+)
 
 
 def _config() -> RepoConfig:
     return RepoConfig(staging_branch="staging", retry_cap=2)
-
-
-def _governor(tmp_path: Path, *, weekly: float = 1_000_000.0) -> BudgetGovernor:
-    ledger = BudgetLedger(
-        tmp_path / "budget.sqlite3",
-        clock=_FixedClock(),
-        auth_mode=AuthMode.API_KEY,
-        weekly_budget=weekly,
-    )
-    return BudgetGovernor(ledger)
-
-
-async def _created(draft: IssueDraft) -> CreatedIssue:
-    return CreatedIssue(issue_number=1000)
-
-
-async def _noop_rebuild(request: object) -> None:
-    return None
 
 
 def _pipeline(tmp_path: Path, **overrides: object) -> Pipeline:
@@ -768,19 +701,6 @@ class _FakeAuth:
         return InstallationToken(token="ghs_x", clone_url="https://x/y.git")
 
 
-def _settings(tmp_path: Path, **extra: object) -> object:
-    from retinue.config import Settings
-
-    base = dict(
-        webhook_secret="s",
-        dedupe_db_path=str(tmp_path / "dedupe.sqlite3"),
-        budget_db_path=str(tmp_path / "budget.sqlite3"),
-        weekly_budget=1000.0,
-    )
-    base.update(extra)
-    return Settings(_env_file=None, **base)  # type: ignore[arg-type, call-arg]
-
-
 @pytest.mark.asyncio
 async def test_build_pipeline_factory_wires_a_pipeline(tmp_path: Path) -> None:
     """The production factory mints a token and builds a fully-wired Pipeline.
@@ -792,7 +712,11 @@ async def test_build_pipeline_factory_wires_a_pipeline(tmp_path: Path) -> None:
     from retinue.pipeline import build_pipeline_factory
 
     settings = _settings(tmp_path, ntfy_topic="alerts")
-    factory = build_pipeline_factory(settings, _FakeAuth())  # type: ignore[arg-type]
+    factory = build_pipeline_factory(
+        settings,  # type: ignore[arg-type]
+        _FakeAuth(),  # type: ignore[arg-type]
+        governor=_governor(tmp_path),
+    )
     pipeline = await factory("owner/repo", _config())
 
     assert pipeline.rebuild is not None
@@ -816,6 +740,7 @@ async def test_build_pipeline_factory_sources_claude_md(tmp_path: Path) -> None:
     factory = build_pipeline_factory(
         settings,  # type: ignore[arg-type]
         _FakeAuth(),  # type: ignore[arg-type]
+        governor=_governor(tmp_path),
         fetch_claude_md=fetch_claude_md,
     )
     pipeline = await factory("owner/repo", _config())
@@ -867,7 +792,11 @@ async def test_build_pipeline_factory_applies_routing_default_to_slicer(
         ),
     )
     settings = _settings(tmp_path, ntfy_topic="alerts")
-    factory = build_pipeline_factory(settings, _FakeAuth())  # type: ignore[arg-type]
+    factory = build_pipeline_factory(
+        settings,  # type: ignore[arg-type]
+        _FakeAuth(),  # type: ignore[arg-type]
+        governor=_governor(tmp_path),
+    )
     await factory("owner/repo", config)
 
     assert captured["model"] == "slicer-custom"
@@ -884,11 +813,10 @@ async def test_build_pipeline_factory_applies_routing_default_to_slicer(
 
 def test_build_push_sink_picks_pushover_when_no_ntfy(tmp_path: Path) -> None:
     """With only Pushover configured, the push sink is the Pushover backend."""
-    from retinue.notify import PushoverPushSink
-    from retinue.pipeline import _build_push_sink
+    from retinue.notify import PushoverPushSink, build_push_sink
 
     settings = _settings(tmp_path, pushover_token="pk", pushover_user="uk")
-    sink = _build_push_sink(settings)  # type: ignore[arg-type]
+    sink = build_push_sink(settings)  # type: ignore[arg-type]
     assert isinstance(sink, PushoverPushSink)
 
 
@@ -1033,62 +961,12 @@ def test_review_factory_applies_repo_config_effort_override(tmp_path: Path) -> N
 
 def test_httpx_transport_is_the_default_review_transport() -> None:
     """The factory's default review transport is the real httpx-backed adapter."""
-    from retinue.pipeline import HttpxTransport
+    from retinue.messages_api import HttpxTransport
 
     assert HttpxTransport().timeout > 0
 
 
 # --- bind_adhoc_build: the drain's downstream build+PR primitive -----------------
-
-
-@dataclass
-class _RecordingAdhocPipeline:
-    """A pipeline recording every ``process_adhoc_pr`` call the bound build makes.
-
-    Only the two collaborators :func:`bind_adhoc_build` touches are modeled: the
-    ``process_adhoc_pr`` step (recorded here) and the ``create_issue`` the advisory review
-    pass is wired through (a harmless recording stub, never invoked by these tests since
-    the build is faked).
-    """
-
-    pr_calls: list[tuple[object, object]] = field(default_factory=list)
-    pr_result: object | None = None
-    # The shared budget governor the per-issue classify hop meters on; ``None`` is fine
-    # for the table-less chain tests (they never classify) and for tests that fake the hop.
-    governor: object | None = None
-
-    async def process_adhoc_pr(self, issue: object, build: object) -> object | None:
-        self.pr_calls.append((issue, build))
-        return self.pr_result
-
-    @staticmethod
-    async def create_issue(draft: IssueDraft) -> CreatedIssue:
-        return CreatedIssue(issue_number=1000)
-
-
-def _fake_build_adhoc_issue(
-    captured: dict[str, object], result: object
-) -> object:
-    """A drop-in ``build_adhoc_issue`` capturing its call and returning ``result``.
-
-    Replaces the real build (which spawns a container + execs ``claude``) so the bound
-    build's chain — build then ``process_adhoc_pr(issue, result)`` — is exercised with no
-    Docker, gh, model, or network.
-    """
-
-    async def fake(
-        issue: object,
-        config: object,
-        claude_md: object,
-        **kwargs: object,
-    ) -> object:
-        captured["issue"] = issue
-        captured["config"] = config
-        captured["claude_md"] = claude_md
-        captured["kwargs"] = kwargs
-        return result
-
-    return fake
 
 
 @pytest.mark.asyncio

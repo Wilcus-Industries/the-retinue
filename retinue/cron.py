@@ -8,7 +8,7 @@ cron lane's per-tick driver.
 Each :func:`run_cron_tick`:
 
 1. runs under an injected single-run **lock** so at most one cron run executes at a time,
-   mirroring the orchestrator's :class:`retinue.orchestrator.OrchestratorBusyError` guard;
+   mirroring the orchestrator's single-run lock;
 2. **gates** on the shared :class:`retinue.budget.BudgetGovernor` — the *same*
    service-level governor the orchestrator shares — and **defers** when the budget is
    spent, picking nothing and running no downstream; an admitted tick's estimate is
@@ -28,12 +28,9 @@ tick runs with no real ``gh``, no Docker, and no network.
 
 from __future__ import annotations
 
-import asyncio
 import enum
-import json
 import logging
-import os
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -41,21 +38,20 @@ from typing import Protocol
 
 from retinue.budget import BudgetGovernor, Clock
 from retinue.container import ContainerRuntime
+from retinue.container_build import Implementer, Slice
 from retinue.done_check import DEFAULT_IMAGE, ReportSink, SecretResolver
+from retinue.gh import GhBytesRunner, auth_env, parse_json_array, run_gh_subprocess
 from retinue.github_app import InstallationAuth
-from retinue.loopback import Severity
 from retinue.orchestrator import (
     BuildResult,
     GitOps,
-    Implementer,
-    Slice,
     build_slice,
 )
 from retinue.repo_config import RepoConfig
+from retinue.single_run import SingleRunLock
+from retinue.vocab import BACKLOG_LABEL, Severity, parse_priority
 
 logger = logging.getLogger(__name__)
-
-_PRIORITY_LABEL_PREFIX = "priority:"
 
 # A day's age is worth this much weighted score; one severity step is worth a day's worth
 # multiplied by this lever. Keeping a severity step strictly larger than any realistic age
@@ -78,45 +74,22 @@ class CronBusyError(Exception):
 
     The single-run guarantee: :func:`run_cron_tick` runs inside an injected lock that
     rejects a concurrent holder rather than blocking, so the "at most one cron run at a
-    time" contract is observable to the caller. Mirrors
-    :class:`retinue.orchestrator.OrchestratorBusyError`.
+    time" contract is observable to the caller.
     """
 
     def __init__(self) -> None:
         super().__init__("a cron tick is already in flight")
 
 
-class CronLock:
-    """The production single-run lock for the backlog cron tick: a non-blocking guard.
+class CronLock(SingleRunLock):
+    """The backlog cron tick's single-run lock: a second concurrent tick is rejected.
 
-    Satisfies the ``AbstractAsyncContextManager`` :func:`run_cron_tick` enters: the first
-    holder enters, and a *second* concurrent ``__aenter__`` raises :class:`CronBusyError`
-    rather than blocking — so the "at most one cron tick at a time" contract is observable
-    to the caller. The worker keeps a per-repo registry so two repos tick concurrently
-    while a repo's own ticks serialize through the same lock. Mirrors
-    :class:`retinue.adhoc_drain.AdhocDrainLock`.
-
-    The guard is a plain in-process flag (no real wall-clock, Redis, or file lock), correct
-    because the whole tick runs inside a single worker process; a cross-process lock is out
-    of scope for the single-worker deployment.
+    A :class:`~retinue.single_run.SingleRunLock` raising :class:`CronBusyError`; the
+    worker keeps a per-repo registry so two repos tick concurrently while a repo's own
+    ticks serialize through the same lock.
     """
 
-    def __init__(self) -> None:
-        self._held = False
-
-    async def __aenter__(self) -> CronLock:
-        if self._held:
-            raise CronBusyError
-        self._held = True
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: object | None,
-    ) -> None:
-        self._held = False
+    busy_error = CronBusyError
 
 
 @dataclass(frozen=True)
@@ -135,14 +108,8 @@ class BacklogIssue:
 
     def severity(self) -> Severity:
         """The issue's ``priority:<severity>`` as a :class:`Severity` (LOW when absent)."""
-        for label in self.labels:
-            if label.startswith(_PRIORITY_LABEL_PREFIX):
-                name = label[len(_PRIORITY_LABEL_PREFIX) :].upper()
-                try:
-                    return Severity[name]
-                except KeyError:
-                    continue
-        return _DEFAULT_SEVERITY
+        severity = parse_priority(self.labels)
+        return _DEFAULT_SEVERITY if severity is None else severity
 
 
 class CronGh(Protocol):
@@ -159,37 +126,10 @@ class CronGh(Protocol):
         ...
 
 
-# The label the backlog drainer scans for — the non-blocking heimdall nits filed by
-# :mod:`retinue.loopback` carry it. Kept here so the query and the doc agree.
-_BACKLOG_LABEL = "backlog"
-
 # How many backlog issues to pull per tick. The drainer only ever picks one, but it
 # scores across the visible set, so a generous-but-bounded page keeps the score honest
 # without an unbounded fetch.
 _DEFAULT_LIST_LIMIT = 200
-
-# An async runner for a ``gh`` argv: returns the command's stdout bytes, raising on a
-# non-zero exit. Injected so the command-assembly + payload-parsing of :class:`GhCli`
-# are exercised without spawning a real process, mirroring the injected-seam style of the
-# rest of the cron tick. The default (:func:`_run_gh_subprocess`) shells out to ``gh``.
-GhRunner = Callable[[Sequence[str], Mapping[str, str]], Awaitable[bytes]]
-
-
-class GhCliError(RuntimeError):
-    """A ``gh`` invocation behind :class:`GhCli` failed (non-zero exit or bad output).
-
-    Carries the argv and the captured stderr so a backlog-query failure is debuggable
-    rather than a bare ``CalledProcessError``.
-    """
-
-    def __init__(self, argv: Sequence[str], *, returncode: int, stderr: str) -> None:
-        self.argv = list(argv)
-        self.returncode = returncode
-        self.stderr = stderr
-        super().__init__(
-            f"gh exited {returncode} for {' '.join(argv)}: {stderr.strip()}"
-        )
-
 
 class GhCli:
     """The production :class:`CronGh`: lists ``backlog`` issues via the ``gh`` CLI.
@@ -202,7 +142,7 @@ class GhCli:
     The actual subprocess spawn is the one impure edge, factored behind the injected
     ``runner`` so command assembly, the auth env, and payload parsing are unit-testable
     without a real ``gh``, Docker, or network. Production leaves ``runner`` defaulted to
-    :func:`_run_gh_subprocess`.
+    :func:`retinue.gh.run_gh_subprocess`.
 
     Args:
         token: The GitHub token ``gh`` authenticates with, placed in the child env as
@@ -216,11 +156,11 @@ class GhCli:
         self,
         *,
         token: str | None = None,
-        runner: GhRunner | None = None,
+        runner: GhBytesRunner | None = None,
         list_limit: int = _DEFAULT_LIST_LIMIT,
     ) -> None:
         self._token = token
-        self._runner = runner or _run_gh_subprocess
+        self._runner = runner or run_gh_subprocess
         self._list_limit = list_limit
 
     async def list_backlog(self, *, repo_full_name: str) -> list[BacklogIssue]:
@@ -235,16 +175,8 @@ class GhCli:
                 issue listing.
         """
         argv = _list_backlog_argv(repo_full_name, limit=self._list_limit)
-        stdout = await self._runner(argv, self._auth_env())
+        stdout = await self._runner(argv, auth_env(self._token))
         return _parse_backlog(stdout)
-
-    def _auth_env(self) -> Mapping[str, str]:
-        """The child-process env carrying the token as ``GH_TOKEN`` (empty when none).
-
-        The token goes in the env, never on the argv, so it never lands in a process
-        listing or a log of the command.
-        """
-        return {"GH_TOKEN": self._token} if self._token else {}
 
 
 def _list_backlog_argv(repo_full_name: str, *, limit: int) -> list[str]:
@@ -260,7 +192,7 @@ def _list_backlog_argv(repo_full_name: str, *, limit: int) -> list[str]:
         "--repo",
         repo_full_name,
         "--label",
-        _BACKLOG_LABEL,
+        BACKLOG_LABEL,
         "--state",
         "open",
         "--json",
@@ -270,23 +202,6 @@ def _list_backlog_argv(repo_full_name: str, *, limit: int) -> list[str]:
     ]
 
 
-def _parse_json_array(stdout: bytes) -> list[object]:
-    """Parse a ``gh issue list --json`` payload into its JSON array of issue entries.
-
-    ``gh`` emits a JSON array of objects; a payload that is not valid JSON or not an array
-    raises :class:`ValueError` rather than silently yielding nothing. Shared with the
-    ad-hoc drain's :class:`retinue.adhoc_drain.GhCli` so both gh listers parse the array
-    envelope identically; each lister maps the entries into its own issue dataclass.
-    """
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"gh issue list returned non-JSON output: {exc}") from exc
-    if not isinstance(payload, list):
-        raise ValueError(f"gh issue list expected a JSON array, got {type(payload)}")
-    return payload
-
-
 def _parse_backlog(stdout: bytes) -> list[BacklogIssue]:
     """Parse a ``gh issue list --json`` payload into :class:`BacklogIssue` objects.
 
@@ -294,7 +209,7 @@ def _parse_backlog(stdout: bytes) -> list[BacklogIssue]:
     UTC), and ``labels`` (a list of ``{"name": ...}`` objects). A malformed payload raises
     :class:`ValueError` rather than silently dropping issues.
     """
-    return [_parse_issue(entry) for entry in _parse_json_array(stdout)]
+    return [_parse_issue(entry) for entry in parse_json_array(stdout)]
 
 
 def _parse_issue(entry: object) -> BacklogIssue:
@@ -313,29 +228,6 @@ def _parse_issue(entry: object) -> BacklogIssue:
 def _parse_timestamp(raw: str) -> datetime:
     """Parse gh's ISO-8601 ``createdAt`` (``Z``-suffixed UTC) into an aware datetime."""
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-
-
-async def _run_gh_subprocess(argv: Sequence[str], env: Mapping[str, str]) -> bytes:
-    """Spawn ``gh`` with ``env`` layered over the ambient env; return stdout bytes.
-
-    The default :data:`GhRunner`. Uses :func:`asyncio.create_subprocess_exec` (no shell,
-    so the repo name is never interpolated into a command line) and raises
-    :class:`GhCliError` on a non-zero exit so the backlog query fails loudly.
-    """
-    process = await asyncio.create_subprocess_exec(
-        *argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, **env},
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        raise GhCliError(
-            argv,
-            returncode=process.returncode or -1,
-            stderr=stderr.decode(errors="replace"),
-        )
-    return stdout
 
 
 # The downstream a cron tick drives for the picked issue: the same build -> PR ->

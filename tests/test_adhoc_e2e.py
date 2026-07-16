@@ -37,27 +37,31 @@ from retinue.adhoc_build import (
     build_adhoc_issue,
     render_chain_depth,
 )
-from retinue.adhoc_drain import AdhocDrainLock, ReadyIssue
+from retinue.adhoc_drain import AdhocDrainLock, ReadyIssue, run_adhoc_drain
 from retinue.done_check import DoneCheckReport
 from retinue.handoff import MergedPullRequest, ReapOutcome
 from retinue.loopback import HeimdallReview, ReviewState, VerdictOutcome
+from retinue.messages_api import HttpResponse
 from retinue.orchestrator import ContainerImplementer
 from retinue.pipeline import Pipeline, bind_adhoc_pr_open
 from retinue.queue import AdhocDrainJob, enqueue_adhoc_drain
 from retinue.repo_config import RepoConfig
-from retinue.reviewer import AgentSdkReviewGenerator, HttpResponse
+from retinue.reviewer import AgentSdkReviewGenerator
 from retinue.slicer import SlicePlan
-from retinue.wiring import bind_adhoc_drain
 from retinue.worker import run_adhoc_drain_job
-from tests.test_adhoc_drain import FakeAdhocGh
-from tests.test_done_check import CLAUDE_MD, FakeAuth, FakeRuntime, _resolver, _sink
-from tests.test_pipeline import (
+from tests.fakes import (
+    CLAUDE_MD,
+    FakeAdhocGh,
+    FakeAuth,
+    FakeRuntime,
     _created,
     _FakePrOps,
     _FakeReapGh,
     _governor,
     _noop_rebuild,
     _RecordingNotifier,
+    _resolver,
+    _sink,
 )
 
 
@@ -177,22 +181,31 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
 
     # A ``Chain-depth: 1`` marker in the body proves the drain materializes the issue through
     # ``from_fetched_issue`` (the #40 gotcha): a bare ``AdhocIssue(...)`` would default to 0.
-    bound_drain = bind_adhoc_drain(
-        gh=FakeAdhocGh(
-            [
-                ReadyIssue(
-                    number=31,
-                    labels=["ready-for-agent"],
-                    body=f"Fix the flaky test.\n\n{render_chain_depth(1)}",
-                )
-            ]
-        ),
-        build=adhoc_build,
-        open_pr=bind_adhoc_pr_open(pipeline),
-        governor=governor,
-        estimated_amount=1.0,
-        lock=AdhocDrainLock(),
+    gh = FakeAdhocGh(
+        [
+            ReadyIssue(
+                number=31,
+                labels=["ready-for-agent"],
+                body=f"Fix the flaky test.\n\n{render_chain_depth(1)}",
+            )
+        ]
     )
+    lock = AdhocDrainLock()
+
+    async def bound_drain(*, repo_full_name: str, config: RepoConfig) -> None:
+        # The heartbeat-drain shape ``wiring.bind_adhoc_drain`` produces, with the leaf
+        # fakes injected at run_adhoc_drain's seams instead of the production adapters
+        # the merged bind constructs itself.
+        await run_adhoc_drain(
+            repo_full_name=repo_full_name,
+            gh=gh,
+            build=adhoc_build,
+            open_pr=bind_adhoc_pr_open(pipeline),
+            config=config,
+            governor=governor,
+            estimated_amount=1.0,
+            lock=lock,
+        )
 
     seen_ctx: dict[str, object] = {}
 

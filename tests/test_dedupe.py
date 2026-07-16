@@ -17,12 +17,6 @@ from retinue.dedupe import PrdDedupeStore, prd_dedupe_key
 from retinue.queue import PrdJob
 
 
-@pytest.fixture()
-def db_path(tmp_path: Path) -> Path:
-    """An on-disk SQLite path inside the test's tmp dir."""
-    return tmp_path / "dedupe.sqlite3"
-
-
 @pytest_asyncio.fixture()
 async def store(db_path: Path) -> AsyncIterator[PrdDedupeStore]:
     """A dedupe store closed at teardown so no worker thread outlives the test."""

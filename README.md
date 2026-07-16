@@ -512,6 +512,9 @@ Set via environment variables or a `.env` file:
 | `WEEKLY_BUDGET`              | no       | `0`                       | Service-level weekly budget (dollars or tokens)      |
 | `BUDGET_DB_PATH`             | no       | `retinue-budget.sqlite3`  | SQLite file backing the rolling-24h spend ledger     |
 | `BUDGET_DAILY_CAP_FRACTION`  | no       | `0.12`                    | Fraction of the weekly budget spendable per 24h      |
+| `JOB_TIMEOUT_SECONDS`        | no       | `1800`                    | Arq worker-global job timeout; must outlast a full build |
+| `IMPLEMENT_MAX_TURNS`        | no       | `80`                      | Hard cap on the implementer's agent loop (`claude --max-turns`) |
+| `HEIMDALL_BOT_LOGIN`         | no       | `heimdall[bot]`           | Reviewer bot login the webhook filter and loopback listen for |
 | `GITHUB_APP_ID`              | no\*     | —                         | GitHub App numeric id (the JWT `iss` claim)          |
 | `GITHUB_APP_PRIVATE_KEY_PATH`| no\*     | —                         | Path to the App RSA private key (PEM) signing app JWTs |
 | `ANTHROPIC_API_KEY`          | no\*     | —                         | Anthropic API key — used in `api_key` auth mode      |
