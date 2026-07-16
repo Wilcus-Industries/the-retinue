@@ -18,6 +18,7 @@ from collections.abc import Mapping
 
 import pytest
 
+from retinue.classifier import ClassifyInput
 from retinue.container import Container, RunResult
 from retinue.done_check import DoneCheckReport, MissingSecretError
 from retinue.orchestrator import (
@@ -335,6 +336,58 @@ async def test_red_slice_pushes_nothing() -> None:
     assert result.outcome is BuildOutcome.BLOCKED
     assert not any("git push" in e for e in runtime.log)
     assert runtime.container is not None and runtime.container.destroyed
+
+
+# --- hollow implement: zero commits fails the slice -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_implement_landing_no_commits_raises_instead_of_vacuous_green() -> None:
+    """An implementer run that lands zero commits fails the slice before the done-check.
+
+    The hollow-implement failure: the agent no-ops, exits 0, and the done-check passes
+    vacuously over the untouched tree — merging an empty branch. Counting commits since
+    ``origin/<base>`` right after the implement catches it: a ``0`` count raises
+    ``ImplementError`` (routing into the errored/escalate lane), pushes nothing, and
+    still tears the container down.
+    """
+    runtime = FakeRuntime(
+        results={"git rev-list": RunResult(exit_code=0, stdout="0\n")}
+    )
+
+    with pytest.raises(ImplementError, match="landed no commits"):
+        await _build(runtime=runtime, git=FakeGitOps())
+
+    assert not any("git push" in e for e in runtime.log)
+    assert runtime.container is not None and runtime.container.destroyed
+
+
+@pytest.mark.asyncio
+async def test_failed_commit_count_probe_raises_not_passes() -> None:
+    """A rev-list probe that itself fails (empty stdout, bad exit) raises, not passes.
+
+    An unreadable count must not be read as "commits exist" — that would re-open the
+    vacuous-green hole whenever the probe breaks.
+    """
+    runtime = FakeRuntime(
+        results={"git rev-list": RunResult(exit_code=128, stderr="fatal: bad rev")}
+    )
+
+    with pytest.raises(ImplementError):
+        await _build(runtime=runtime, git=FakeGitOps())
+
+
+@pytest.mark.asyncio
+async def test_commit_count_probe_runs_between_implement_and_done_check() -> None:
+    """The guard probes commits after the implement and before the done-check runs."""
+    runtime = FakeRuntime()
+
+    await _build(runtime=runtime, git=FakeGitOps())
+
+    implement_at = runtime.log.index("run:implement issue-7")
+    probe_at = next(i for i, e in enumerate(runtime.log) if "git rev-list" in e)
+    check_at = next(i for i, e in enumerate(runtime.log) if "uv run pytest" in e)
+    assert implement_at < probe_at < check_at
 
 
 @pytest.mark.asyncio
@@ -964,6 +1017,33 @@ def test_implement_prompt_injects_no_plan_file_for_the_prd_lane() -> None:
     assert not prompt.startswith("Read the implementation plan")
 
 
+def test_implement_prompt_appends_issue_facts_as_the_spec() -> None:
+    """With facts, the prompt carries the issue title/body as the authoritative spec.
+
+    The build container has no gh and no GitHub token in its env, so the agent cannot
+    read the issue itself; without the title/body baked into the prompt it no-ops (the
+    hollow-implement failure). The section must also say the container cannot reach
+    GitHub, so the agent works from the baked text instead of hunting for the issue.
+    """
+    facts = ClassifyInput(
+        title="Add retry cap", body="The worker must retry twice.", labels=[]
+    )
+
+    prompt = _implement_prompt(_slice(issue_number=7, prd_number=1), facts=facts)
+
+    assert "Add retry cap" in prompt
+    assert "The worker must retry twice." in prompt
+    assert "cannot reach GitHub" in prompt
+
+
+def test_implement_prompt_without_facts_carries_no_issue_section() -> None:
+    """With no facts (seam unset), the prompt is the bare pre-existing shape."""
+    prompt = _implement_prompt(_slice(issue_number=7, prd_number=1))
+
+    assert "Issue title:" not in prompt
+    assert "Issue body:" not in prompt
+
+
 def test_implement_env_api_key_mode_uses_anthropic_api_key() -> None:
     """api_key mode threads the credential to the CLI as ANTHROPIC_API_KEY."""
     env = _implement_env("sk-ant-api03-secret", "api_key")
@@ -1063,6 +1143,43 @@ async def test_container_implementer_execs_claude_with_prompt_and_model() -> Non
     # Production wires ContainerImplementer with no model override, so the default
     # constant is the source of truth. Per the PRD, implementers default to Sonnet.
     assert "claude-sonnet-4-6" in cmd
+
+
+@pytest.mark.asyncio
+async def test_container_implementer_bakes_fetched_issue_facts_into_prompt() -> None:
+    """With an issue-facts source, the exec'd prompt carries the fetched title/body.
+
+    The fetch runs on the worker (which has gh + the installation token) before the
+    container exec, so the containerized agent — which cannot reach GitHub — receives
+    the issue content it is asked to build.
+    """
+    calls: list[tuple[str, int]] = []
+
+    async def facts(repo_full_name: str, issue_number: int) -> ClassifyInput:
+        calls.append((repo_full_name, issue_number))
+        return ClassifyInput(title="Add retry cap", body="Retry twice.", labels=[])
+
+    container = ScriptedContainer()
+    implementer = ContainerImplementer(credential="k", issue_facts=facts)
+
+    await implementer.implement(_slice(issue_number=7), container=container)
+
+    assert calls == [("owner/repo", 7)]
+    cmd = next(c for c in container.commands if c and c[0] == "claude")
+    prompt = cmd[cmd.index("-p") + 1]
+    assert "Add retry cap" in prompt
+    assert "Retry twice." in prompt
+
+
+@pytest.mark.asyncio
+async def test_container_implementer_without_facts_source_keeps_bare_prompt() -> None:
+    """With no issue-facts source (the default), the prompt is unchanged."""
+    container = ScriptedContainer()
+
+    await ContainerImplementer(credential="k").implement(_slice(), container=container)
+
+    cmd = next(c for c in container.commands if c and c[0] == "claude")
+    assert "Issue title:" not in cmd[cmd.index("-p") + 1]
 
 
 @pytest.mark.asyncio

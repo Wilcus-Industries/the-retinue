@@ -66,9 +66,13 @@ class FakeAuth:
 class FakeContainer:
     """In-memory container that scripts per-command results and records teardown.
 
-    ``results`` maps the first argv token (e.g. "git", "uv") to the
-    :class:`RunResult` to return; an unscripted command returns success. ``log``
-    appends each event so a test can assert command order and that destroy ran.
+    ``results`` maps the first argv token (e.g. "git", "uv") — or the first two, for a
+    subcommand-precise script (e.g. "git rev-list") that must not also hit clone/push —
+    to the :class:`RunResult` to return; the two-token key wins. An unscripted command
+    returns success, except ``git rev-list`` which returns a count of ``1`` (the
+    orchestrator's landed-no-commits guard; the fake models an implementer that
+    committed, so green-path tests stay green by default). ``log`` appends each event
+    so a test can assert command order and that destroy ran.
     """
 
     def __init__(self, log: list[str], results: dict[str, RunResult]) -> None:
@@ -85,7 +89,12 @@ class FakeContainer:
         self._log.append("run:" + " ".join(command))
         if env is not None:
             self.command_env[command[0]] = env
-        return self._results.get(command[0], RunResult(exit_code=0))
+        for key in (" ".join(command[:2]), command[0]):
+            if key in self._results:
+                return self._results[key]
+        if command[:2] == ["git", "rev-list"]:
+            return RunResult(exit_code=0, stdout="1\n")
+        return RunResult(exit_code=0)
 
     async def destroy(self) -> None:
         self.destroyed = True

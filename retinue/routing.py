@@ -38,15 +38,21 @@ from retinue.budget import BudgetGovernor
 from retinue.classifier import ClassifyInput
 from retinue.level import Classifier, resolve_level
 from retinue.notify import CommentRequest, CommentSink, LabelSink
-from retinue.orchestrator import ContainerImplementer, Implementer, Slice
+from retinue.orchestrator import (
+    ContainerImplementer,
+    Implementer,
+    IssueFactsSource,
+    Slice,
+)
 from retinue.reconcile import GhRunner
 from retinue.repo_config import RepoConfig
 from retinue.roles import Role, resolve_model
 
 logger = logging.getLogger(__name__)
 
-# Fetch one issue's classification facts (title/body/labels) — the router's read seam.
-IssueFactsSource = Callable[[str, int], Awaitable[ClassifyInput]]
+# IssueFactsSource — fetch one issue's facts (title/body/labels), the router's read seam —
+# is defined in retinue.orchestrator (the implementer carries it too; defining it there
+# avoids a cycle) and re-exported above for this module's callers.
 
 # Resolve the implementer for one slice — the build lane's per-slice implementer seam.
 PerIssueImplementer = Callable[[Slice], Awaitable[Implementer]]

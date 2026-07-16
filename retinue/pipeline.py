@@ -1085,11 +1085,13 @@ def _bind_build_prd_for_repo(
     git = _MergeContainerGitOps(
         repo_full_name=repo_full_name, auth=auth, runtime=runtime
     )
+    issue_facts = GhCliIssueFacts(_ReconcileGhRunner(token))
     implementer = ContainerImplementer(
         credential=settings.anthropic_credential,
         auth_mode=settings.auth_mode,
         model=resolve_model(Role.IMPLEMENTER, config),
         max_turns=settings.implement_max_turns,
+        issue_facts=issue_facts,
     )
     resolve_secret: SecretResolver = EnvSecretResolver()
     report: ReportSink = GhReportSink(token=token)
@@ -1117,7 +1119,7 @@ def _bind_build_prd_for_repo(
             classify=classifier,
             label_sink=GhLabelSink(token=token),
             comment_sink=GhCommentSink(token=token),
-            issue_facts=GhCliIssueFacts(_ReconcileGhRunner(token)),
+            issue_facts=issue_facts,
             governor=governor,
             classifier_charge=_CLASSIFIER_ESTIMATED_AMOUNT,
         )
@@ -1191,6 +1193,7 @@ async def build_cron_slice_builder(
         auth_mode=settings.auth_mode,
         model=resolve_model(Role.IMPLEMENTER, config),
         max_turns=settings.implement_max_turns,
+        issue_facts=GhCliIssueFacts(_ReconcileGhRunner(token)),
     )
     builder = SliceBuilder(
         config=config,
@@ -1321,13 +1324,15 @@ def bind_adhoc_build(
     runtime = DockerRuntime()
     resolve_secret: SecretResolver = EnvSecretResolver()
     report: ReportSink = GhReportSink(token=token)
-    # The classifier (and its collaborators) is constructed only when the repo declares a
-    # routing table, so a table-less repo makes zero classifier calls and no issue-facts
-    # fetch — invocations identical to pre-routing. This mirrors _bind_build_prd_for_repo.
+    # The issue-facts fetch is unconditional: every implementer bakes the issue's
+    # title/body into its prompt (the build container cannot reach GitHub itself).
+    # The classifier (and its sinks) is constructed only when the repo declares a
+    # routing table, so a table-less repo makes zero classifier calls — invocations
+    # identical to pre-routing. This mirrors _bind_build_prd_for_repo.
+    issue_facts = GhCliIssueFacts(_ReconcileGhRunner(token))
     classifier: ClaudeIssueClassifier | None = None
     label_sink: GhLabelSink | None = None
     comment_sink: GhCommentSink | None = None
-    issue_facts: GhCliIssueFacts | None = None
     if config.routing is not None:
         classifier = ClaudeIssueClassifier(
             credential=settings.anthropic_credential,
@@ -1336,14 +1341,12 @@ def bind_adhoc_build(
         )
         label_sink = GhLabelSink(token=token)
         comment_sink = GhCommentSink(token=token)
-        issue_facts = GhCliIssueFacts(_ReconcileGhRunner(token))
 
     async def build(issue: AdhocIssue, *, repo_full_name: str) -> None:
         level: str | None = None
         if classifier is not None:
             assert label_sink is not None
             assert comment_sink is not None
-            assert issue_facts is not None
             level = await _resolve_adhoc_level(
                 issue,
                 config,
@@ -1363,6 +1366,7 @@ def bind_adhoc_build(
             auth_mode=settings.auth_mode,
             model=resolve_model(Role.IMPLEMENTER, config, level=level),
             max_turns=settings.implement_max_turns,
+            issue_facts=issue_facts,
         )
         review_generate = AgentSdkReviewGenerator(
             credential=settings.anthropic_credential,

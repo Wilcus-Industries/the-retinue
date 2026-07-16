@@ -41,6 +41,7 @@ import enum
 import heapq
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -48,6 +49,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from retinue.classifier import ClassifyInput
 from retinue.container import Container, ContainerRuntime, RunResult
 from retinue.done_check import (
     DEFAULT_IMAGE,
@@ -182,7 +184,16 @@ _IMPLEMENT_SYSTEM = (
 _DEFAULT_IMPLEMENT_MAX_TURNS = 80
 
 
-def _implement_prompt(slice_: Slice, *, plan_path: str | None = None) -> str:
+# Fetch one issue's facts (title/body/labels) — the seam the implementer bakes the issue
+# content into its prompt through. Defined here rather than in :mod:`retinue.routing`
+# (which imports this module and re-exports the alias) so :class:`ContainerImplementer`
+# can carry it without an import cycle.
+IssueFactsSource = Callable[[str, int], Awaitable[ClassifyInput]]
+
+
+def _implement_prompt(
+    slice_: Slice, *, plan_path: str | None = None, facts: ClassifyInput | None = None
+) -> str:
     """Assemble the per-slice prompt: which issue to build, on which branch.
 
     Names the target repo, the issue number to implement, and the ``issue-<N>`` branch the
@@ -190,11 +201,27 @@ def _implement_prompt(slice_: Slice, *, plan_path: str | None = None) -> str:
     merge seam expects to find it. When ``plan_path`` is given (the ad-hoc lane), the prompt
     leads with an instruction to read that materialized plan first; with no ``plan_path``
     (the PRD lane) the prompt is unchanged, so ``build_slice``/``build_prd`` are unaffected.
+
+    When ``facts`` is given, the issue's title and body are appended as the authoritative
+    spec. This is load-bearing: the build container has no ``gh`` and no GitHub token in
+    its env (the installation token only rides the clone URL), so the agent cannot read
+    the issue itself — without the baked content it no-ops and the slice builds hollow.
     """
     plan_preamble = (
         f"Read the implementation plan at '{plan_path}' first, then implement it. "
         if plan_path is not None
         else ""
+    )
+    facts_section = (
+        ""
+        if facts is None
+        else (
+            "\n\nThe issue's title and body follow; they are the authoritative "
+            "specification for this change. This container cannot reach GitHub, so "
+            "work from them rather than trying to fetch the issue.\n\n"
+            f"Issue title: {facts.title}\n\n"
+            f"Issue body:\n{facts.body}"
+        )
     )
     return (
         f"{plan_preamble}"
@@ -202,7 +229,7 @@ def _implement_prompt(slice_: Slice, *, plan_path: str | None = None) -> str:
         f"Commit your work to the '{slice_.branch}' branch (already checked out). "
         "Implement it test-driven when the change has testable behavior; a documentation- "
         "or config-only change needs no test. Ensure the repo's checks pass before "
-        "committing."
+        f"committing.{facts_section}"
     )
 
 
@@ -301,12 +328,16 @@ class ContainerImplementer:
         max_turns: Hard cap on the agent loop, threaded to ``claude --max-turns`` so a
             runaway implement stops itself rather than being killed (with its done-check)
             by the arq job_timeout. The wiring site passes ``settings.implement_max_turns``.
+        issue_facts: Fetches the issue's title/body on the worker (which has ``gh`` and
+            the installation token) so they are baked into the prompt — the container
+            cannot reach GitHub itself. ``None`` keeps the bare prompt.
     """
 
     credential: str
     auth_mode: str = "api_key"
     model: str = field(default_factory=lambda: resolve_model(Role.IMPLEMENTER))
     max_turns: int = _DEFAULT_IMPLEMENT_MAX_TURNS
+    issue_facts: IssueFactsSource | None = None
 
     async def implement(
         self, slice_: Slice, *, container: Container, plan_path: str | None = None
@@ -316,7 +347,12 @@ class ContainerImplementer:
         ``plan_path``, when given, names a materialized plan the per-slice prompt instructs
         the subagent to read before building (the ad-hoc lane); the PRD lane passes nothing.
         """
-        prompt = _implement_prompt(slice_, plan_path=plan_path)
+        facts: ClassifyInput | None = None
+        if self.issue_facts is not None:
+            facts = await self.issue_facts(
+                slice_.repo_full_name, slice_.issue_number
+            )
+        prompt = _implement_prompt(slice_, plan_path=plan_path, facts=facts)
         argv = _claude_argv(prompt=prompt, model=self.model, max_turns=self.max_turns)
         result = await container.run_command(argv)
         if not result.ok:
@@ -1094,6 +1130,7 @@ async def _build_slice_in_container(
             container, token.clone_url, branch=slice_.branch, base=base
         )
         await implementer.implement(slice_, container=container)
+        await _ensure_commits_landed(container, branch=slice_.branch, base=base)
         passed, detail = await run_done_check_commands(
             container, commands, secret_values=secret_values
         )
@@ -1116,6 +1153,29 @@ async def _build_slice_in_container(
         # Guaranteed teardown: the disposable container is destroyed on every path,
         # including when clone, implement, the done-check, the push, or report raises.
         await container.destroy()
+
+
+async def _ensure_commits_landed(
+    container: Container, *, branch: str, base: str
+) -> None:
+    """Raise :class:`ImplementError` when the implement run committed nothing.
+
+    A hollow implement — the agent no-ops and exits 0 — leaves the tree at
+    ``origin/<base>``; the done-check then passes vacuously over the untouched tree and
+    an empty branch merges. Counting the commits since ``origin/<base>`` right after the
+    implement catches that before the done-check runs. A probe that itself fails (bad
+    exit, empty stdout) also raises: an unreadable count must not pass as "commits
+    exist".
+    """
+    result = await container.run_command(
+        ["git", "rev-list", "--count", f"origin/{base}..HEAD"]
+    )
+    count = result.stdout.strip()
+    if not result.ok or count in ("", "0"):
+        raise ImplementError(
+            f"implementer for {branch} landed no commits "
+            f"(rev-list exit {result.exit_code}, count {count!r})"
+        )
 
 
 async def _clone_and_branch(
