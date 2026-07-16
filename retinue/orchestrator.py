@@ -249,13 +249,17 @@ def _implement_env(credential: str, auth_mode: str) -> dict[str, str]:
 def _claude_argv(*, prompt: str, model: str, max_turns: int) -> list[str]:
     """Assemble the headless ``claude`` CLI argv for one in-container implement run.
 
-    Runs non-interactively (``-p`` print mode), pins the implementing ``model``, accepts
-    edits without a human in the loop (``--permission-mode acceptEdits`` — the run is
-    autonomous), caps the agent loop at ``max_turns`` so a runaway/thrashing run stops
-    instead of being killed mid-implement by the arq job_timeout, appends the frozen
-    implementer brief to the system prompt, and emits a machine-readable json result so the
-    exit can be cross-checked. The CLI runs in the container's working dir (the cloned
-    repo), so no cwd flag is needed.
+    Runs non-interactively (``-p`` print mode), pins the implementing ``model``, and runs
+    with ``--permission-mode bypassPermissions``: ``acceptEdits`` only auto-accepts *file
+    edits*, leaving every Bash call — ``git commit``, the repo's checks — blocked pending
+    an approval a headless run can never give, so the agent edits its whole run and exits
+    0 with zero commits (a hollow-implement cause, seen live). The container is
+    disposable and isolated, so bypassing permissions is the intended trade. Caps the
+    agent loop at ``max_turns`` so a runaway/thrashing run stops instead of being killed
+    mid-implement by the arq job_timeout, appends the frozen implementer brief to the
+    system prompt, and emits a machine-readable json result so the exit can be
+    cross-checked. The CLI runs in the container's working dir (the cloned repo), so no
+    cwd flag is needed.
     """
     return [
         "claude",
@@ -264,7 +268,7 @@ def _claude_argv(*, prompt: str, model: str, max_turns: int) -> list[str]:
         "--model",
         model,
         "--permission-mode",
-        "acceptEdits",
+        "bypassPermissions",
         "--max-turns",
         str(max_turns),
         "--append-system-prompt",
@@ -294,6 +298,28 @@ def _claude_result_is_error(stdout: str) -> bool:
         )
         return False
     return bool(isinstance(result, dict) and result.get("is_error"))
+
+
+# The result text can carry the agent's whole closing message; the log keeps enough to
+# diagnose a wrong-but-clean run without flooding the line.
+_RESULT_SNIPPET_CHARS = 500
+
+
+def _claude_result_summary(stdout: str) -> str:
+    """A log-ready summary of the CLI's json result: turn count + result snippet.
+
+    Returns an empty string when the stdout is not the expected json object, so the
+    completion log line degrades gracefully rather than raising over telemetry.
+    """
+    try:
+        result = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(result, dict):
+        return ""
+    turns = result.get("num_turns")
+    text = str(result.get("result", ""))[:_RESULT_SNIPPET_CHARS]
+    return f" ({turns} turns): {text}"
 
 
 class ImplementError(RuntimeError):
@@ -364,7 +390,14 @@ class ContainerImplementer:
             raise ImplementError(
                 f"implementer for {slice_.branch} reported an error: {result.stdout}"
             )
-        logger.info("Implementer for %s completed in-container", slice_.branch)
+        # The CLI's stdout is consumed here and the container is destroyed after the
+        # build, so this line is the only forensic trace of what the agent reported —
+        # without it a clean-but-wrong run (e.g. "I could not commit") is invisible.
+        logger.info(
+            "Implementer for %s completed in-container%s",
+            slice_.branch,
+            _claude_result_summary(result.stdout),
+        )
 
     def auth_env(self) -> dict[str, str]:
         """The credential env the orchestrator merges into the build container at start."""

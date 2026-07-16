@@ -1061,13 +1061,21 @@ def test_implement_env_subscription_mode_uses_oauth_token() -> None:
 
 
 def test_claude_argv_assembles_headless_invocation() -> None:
-    """The argv runs the headless CLI: print mode, model, acceptEdits, json output."""
+    """The argv runs the headless CLI: print mode, model, bypassPermissions, json output.
+
+    ``acceptEdits`` only auto-accepts *file edits*; Bash calls — ``git commit``, the
+    repo's checks — stay blocked pending an approval a headless ``-p`` run can never
+    give, so the agent edits for its whole run and exits 0 with zero commits (the
+    second hollow-implement cause, verified live on slice #72). The container is
+    disposable and isolated, so the run must bypass permissions entirely.
+    """
     argv = _claude_argv(prompt="do it", model="m", max_turns=80)
 
     assert argv[0] == "claude"
     assert argv[1:3] == ["-p", "do it"]
     assert "--model" in argv and "m" in argv
-    assert "--permission-mode" in argv and "acceptEdits" in argv
+    assert "--permission-mode" in argv and "bypassPermissions" in argv
+    assert "acceptEdits" not in argv
     assert "--output-format" in argv and "json" in argv
 
 
@@ -1234,6 +1242,36 @@ async def test_container_implementer_raises_on_is_error_json_result() -> None:
 
     with pytest.raises(ImplementError):
         await ContainerImplementer(credential="k").implement(_slice(), container=container)
+
+
+@pytest.mark.asyncio
+async def test_container_implementer_logs_run_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A completed run logs the CLI result summary (turns + result snippet).
+
+    The CLI's stdout is consumed here and the container is destroyed after the build,
+    so without this line a clean-but-wrong run (e.g. the agent explaining why it could
+    not commit) leaves zero forensic trace — exactly what made the hollow-implement
+    failures blind.
+    """
+    container = ScriptedContainer(
+        {
+            "claude": RunResult(
+                exit_code=0,
+                stdout='{"is_error": false, "num_turns": 12, "result": "Committed the endpoint."}',
+            )
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger="retinue.orchestrator"):
+        await ContainerImplementer(credential="k").implement(
+            _slice(), container=container
+        )
+
+    message = "\n".join(r.getMessage() for r in caplog.records)
+    assert "12 turns" in message
+    assert "Committed the endpoint." in message
 
 
 @pytest.mark.asyncio
