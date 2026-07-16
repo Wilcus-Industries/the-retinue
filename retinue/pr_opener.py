@@ -25,6 +25,7 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -388,20 +389,24 @@ def _pr_create_args(request: OpenPrRequest) -> list[str]:
     ]
 
 
-def _parse_pr(stdout: str) -> PullRequest:
-    """Parse ``gh pr create --json number,url`` output into a :class:`PullRequest`.
+# ``gh pr create`` prints the created PR's URL to stdout; it has no ``--json`` flag
+# (json output belongs to list/view — passing it exits 1 with "unknown flag", which
+# broke the first live PR open). The URL line is the wire contract to parse.
+_PR_URL_RE = re.compile(r"https://[^\s/]+/[^\s/]+/[^\s/]+/pull/(\d+)")
 
-    ``gh`` emits a JSON object ``{"number": <int>, "url": "<str>"}``. Raises
-    :class:`ValueError` when the payload is missing either field or is not JSON, so a
-    malformed response fails loudly rather than yielding a bogus PR handle.
+
+def _parse_pr(stdout: str) -> PullRequest:
+    """Parse the PR URL ``gh pr create`` prints into a :class:`PullRequest`.
+
+    Scans stdout for the ``.../pull/<number>`` URL (create may print warnings around
+    it) and derives the number from its last path segment. Raises :class:`ValueError`
+    when no PR URL is present, so a malformed response fails loudly rather than
+    yielding a bogus PR handle.
     """
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"gh pr create returned non-JSON output: {stdout!r}") from exc
-    if not isinstance(payload, dict) or "number" not in payload or "url" not in payload:
-        raise ValueError(f"gh pr create output missing number/url: {stdout!r}")
-    return PullRequest(number=int(payload["number"]), url=str(payload["url"]))
+    match = _PR_URL_RE.search(stdout)
+    if match is None:
+        raise ValueError(f"gh pr create output carried no PR URL: {stdout!r}")
+    return PullRequest(number=int(match.group(1)), url=match.group(0))
 
 
 class GhCliPrOps:
@@ -544,5 +549,5 @@ class GhCliPrOps:
 
     async def open_pr(self, request: OpenPrRequest) -> PullRequest:
         """Open the PR via ``gh pr create`` and return the parsed PR handle."""
-        result = await self._gh([*_pr_create_args(request), "--json", "number,url"])
+        result = await self._gh(_pr_create_args(request))
         return _parse_pr(result.stdout)

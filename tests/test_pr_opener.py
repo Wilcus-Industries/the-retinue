@@ -330,9 +330,15 @@ def _ops(runner: _FakeGhRunner, *, token: str = "ghs_secret") -> GhCliPrOps:
 
 @pytest.mark.asyncio
 async def test_open_pr_assembles_gh_pr_create_with_title_body_base() -> None:
-    """open_pr builds `gh pr create` with the repo, base, head, title, and body."""
+    """open_pr builds `gh pr create` with the repo, base, head, title, and body.
+
+    ``gh pr create`` has no ``--json`` flag (json output belongs to list/view) —
+    passing it exits 1 with "unknown flag", which broke the first live PR open —
+    so the argv must carry no ``--json`` and the handle is parsed from the PR URL
+    that create prints to stdout.
+    """
     runner = _FakeGhRunner(
-        [GhResult(exit_code=0, stdout='{"number": 99, "url": "https://gh/pr/99"}')]
+        [GhResult(exit_code=0, stdout="https://github.com/owner/repo/pull/99\n")]
     )
     request = OpenPrRequest(
         repo_full_name="owner/repo",
@@ -351,15 +357,17 @@ async def test_open_pr_assembles_gh_pr_create_with_title_body_base() -> None:
     assert args[args.index("--head") + 1] == "retinue/prd-5"
     assert args[args.index("--title") + 1] == "land it"
     assert args[args.index("--body") + 1] == "the body"
-    assert args[args.index("--json") + 1] == "number,url"
-    # The returned handle is parsed straight from gh's JSON payload.
-    assert pr == PullRequest(number=99, url="https://gh/pr/99")
+    assert "--json" not in args
+    # The returned handle is parsed straight from the URL create prints.
+    assert pr == PullRequest(number=99, url="https://github.com/owner/repo/pull/99")
 
 
 @pytest.mark.asyncio
 async def test_open_pr_authenticates_with_gh_token_bearer() -> None:
     """Every gh call carries the token in GH_TOKEN so gh sends the bearer header."""
-    runner = _FakeGhRunner([GhResult(exit_code=0, stdout='{"number": 1, "url": "u"}')])
+    runner = _FakeGhRunner(
+        [GhResult(exit_code=0, stdout="https://github.com/o/r/pull/1\n")]
+    )
     request = OpenPrRequest(repo_full_name="o/r", head="h", base="b", title="t", body="x")
 
     await _ops(runner, token="ghs_abc").open_pr(request)
@@ -369,9 +377,9 @@ async def test_open_pr_authenticates_with_gh_token_bearer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_pr_rejects_non_json_output() -> None:
-    """A non-JSON gh response fails loudly rather than yielding a bogus PR handle."""
-    runner = _FakeGhRunner([GhResult(exit_code=0, stdout="not json")])
+async def test_open_pr_rejects_output_with_no_pr_url() -> None:
+    """Create output carrying no PR URL fails loudly, not a bogus PR handle."""
+    runner = _FakeGhRunner([GhResult(exit_code=0, stdout="something went sideways")])
     request = OpenPrRequest(repo_full_name="o/r", head="h", base="b", title="t", body="x")
 
     with pytest.raises(ValueError):
@@ -379,13 +387,24 @@ async def test_open_pr_rejects_non_json_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_pr_rejects_payload_missing_fields() -> None:
-    """A JSON object lacking number/url is rejected, not silently coerced."""
-    runner = _FakeGhRunner([GhResult(exit_code=0, stdout='{"number": 7}')])
+async def test_open_pr_parses_the_url_amid_other_output_lines() -> None:
+    """The PR URL is found even when create prints extra lines around it."""
+    runner = _FakeGhRunner(
+        [
+            GhResult(
+                exit_code=0,
+                stdout=(
+                    "Warning: 1 uncommitted change\n"
+                    "https://github.com/o/r/pull/123\n"
+                ),
+            )
+        ]
+    )
     request = OpenPrRequest(repo_full_name="o/r", head="h", base="b", title="t", body="x")
 
-    with pytest.raises(ValueError):
-        await _ops(runner).open_pr(request)
+    pr = await _ops(runner).open_pr(request)
+
+    assert pr == PullRequest(number=123, url="https://github.com/o/r/pull/123")
 
 
 @pytest.mark.asyncio
