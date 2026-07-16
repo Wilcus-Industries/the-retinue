@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from retinue.gh import GhCommandError, GhRunner, auth_env
+from retinue.messages_api import OAUTH_BETA
 from retinue.notify import Notification, Notifier
 from retinue.roles import (
     Role,
@@ -46,11 +47,9 @@ HITL_LABEL = "hitl"
 # :mod:`retinue.lane`.
 PRD_SLICE_LABEL = "prd-slice"
 
-# The OAuth beta header a subscription token requires. See the claude-api skill: OAuth
-# tokens go on Authorization: Bearer with the oauth beta header. The slicing model and
-# effort tier are owned by :mod:`retinue.roles` (the :data:`Role.SLICER` registry entry),
-# resolved at construction/request time rather than pinned to a local constant.
-_OAUTH_BETA = "oauth-2025-04-20"
+# The slicing model and effort tier are owned by :mod:`retinue.roles` (the
+# :data:`Role.SLICER` registry entry), resolved at construction/request time rather than
+# pinned to a local constant; the OAuth beta header comes from the shared wire constants.
 _MAX_TOKENS = 16_000
 
 # Strict JSON schema the headless slicer must emit: an ordered list of vertical
@@ -243,7 +242,7 @@ class ClaudeSliceGenerator:
         the key by the SDK).
         """
         if self.auth_mode == "subscription":
-            return {"anthropic-beta": _OAUTH_BETA}
+            return {"anthropic-beta": OAUTH_BETA}
         return {}
 
     def _build_request_kwargs(self, prd_body: str) -> dict[str, Any]:

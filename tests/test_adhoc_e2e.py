@@ -41,11 +41,12 @@ from retinue.adhoc_drain import AdhocDrainLock, ReadyIssue
 from retinue.done_check import DoneCheckReport
 from retinue.handoff import MergedPullRequest, ReapOutcome
 from retinue.loopback import HeimdallReview, ReviewState, VerdictOutcome
+from retinue.messages_api import HttpResponse
 from retinue.orchestrator import ContainerImplementer
 from retinue.pipeline import Pipeline, bind_adhoc_pr_open
 from retinue.queue import AdhocDrainJob, enqueue_adhoc_drain
 from retinue.repo_config import RepoConfig
-from retinue.reviewer import AgentSdkReviewGenerator, HttpResponse
+from retinue.reviewer import AgentSdkReviewGenerator
 from retinue.slicer import SlicePlan
 from retinue.wiring import bind_adhoc_drain
 from retinue.worker import run_adhoc_drain_job

@@ -24,9 +24,15 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
 from retinue.gh import GhCommandError, GhResult, GhRunner, auth_env
+from retinue.messages_api import (
+    MESSAGES_URL,
+    HttpTransport,
+    extract_json_object,
+    request_headers,
+)
 from retinue.roles import (
     Role,
     is_oauth_credential,
@@ -142,9 +148,6 @@ BlockedByEditor = Callable[[EditBlockedByRequest], Awaitable[None]]
 # matching the schema.
 # ---------------------------------------------------------------------------
 
-_ANTHROPIC_VERSION = "2023-06-01"
-_OAUTH_BETA = "oauth-2025-04-20"
-_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 _MAX_TOKENS = 16_000
 
 # Cap on the round diff interpolated into the reviewer's user message, mirroring the
@@ -208,28 +211,6 @@ def _clip_diff(diff: str) -> str:
     )
 
 
-@dataclass(frozen=True)
-class HttpResponse:
-    """The slice of an HTTP response the reviewer reads: status and JSON body."""
-
-    status_code: int
-    body: dict[str, Any]
-
-
-class HttpTransport(Protocol):
-    """Async HTTP POST seam (httpx-style). The network edge of the reviewer.
-
-    A production implementation wraps an httpx client; tests inject a fake that
-    returns a canned :class:`HttpResponse`. Kept narrow — one POST — so the real
-    review flow is exercisable without network.
-    """
-
-    async def post(
-        self, url: str, *, headers: dict[str, str], json: dict[str, Any]
-    ) -> HttpResponse:
-        """POST ``json`` to ``url`` with ``headers`` and return the response."""
-        ...
-
 
 @dataclass(frozen=True)
 class AgentSdkReviewGenerator:
@@ -262,7 +243,7 @@ class AgentSdkReviewGenerator:
     async def __call__(self, review_input: ReviewInput) -> ReviewPlan:
         """Review ``review_input``'s diff and return the parsed :class:`ReviewPlan`."""
         response = await self.transport.post(
-            _MESSAGES_URL,
+            MESSAGES_URL,
             headers=self._headers(),
             json=self._payload(review_input),
         )
@@ -274,16 +255,7 @@ class AgentSdkReviewGenerator:
 
     def _headers(self) -> dict[str, str]:
         """Build the request headers, routing the credential to its auth scheme."""
-        headers = {
-            "anthropic-version": _ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        }
-        if is_oauth_credential(self.credential):
-            headers["authorization"] = f"Bearer {self.credential}"
-            headers["anthropic-beta"] = _OAUTH_BETA
-        else:
-            headers["x-api-key"] = self.credential
-        return headers
+        return request_headers(self.credential)
 
     def _payload(self, review_input: ReviewInput) -> dict[str, Any]:
         """Assemble the Messages API request body for one round's review.
@@ -325,18 +297,7 @@ class AgentSdkReviewGenerator:
         text, or carrying malformed JSON or a non-list ``findings``, raises
         :class:`ReviewGenerationError` rather than silently filing nothing.
         """
-        text = "".join(
-            block.get("text", "")
-            for block in body.get("content", [])
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-        if not text.strip():
-            raise ReviewGenerationError("Messages API response carried no text content")
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ReviewGenerationError(f"Reviewer emitted invalid JSON: {exc}") from exc
-
+        parsed = extract_json_object(body, who="Reviewer", error=ReviewGenerationError)
         raw_findings = parsed.get("findings")
         if not isinstance(raw_findings, list):
             raise ReviewGenerationError("Reviewer JSON missing a 'findings' list")

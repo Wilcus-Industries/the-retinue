@@ -5,11 +5,10 @@
 optionally its parent PRD body) and a validated :class:`~retinue.repo_config.RoutingConfig`,
 it asks a Haiku-class model to pick the single level whose description best fits the
 work, constraining the answer with a JSON schema whose ``level`` is an ``enum`` of
-exactly the table's level names. It reuses the shared Messages-API wire helpers in
-:mod:`retinue.roles` (:func:`~retinue.roles.oauth_system`,
-:func:`~retinue.roles.structured_output_config`) and the HTTP seam
-(:class:`~retinue.reviewer.HttpTransport` / :class:`~retinue.reviewer.HttpResponse`) the
-reviewer already defines, so no new transport protocol is introduced.
+exactly the table's level names. It reuses the shared Messages-API wire helpers
+(:mod:`retinue.messages_api` for the transport seam, headers, and response parse;
+:func:`~retinue.roles.oauth_system` and :func:`~retinue.roles.structured_output_config`
+from the role registry), so no new transport protocol is introduced.
 
 Classification is best-effort: a non-200 status or non-conforming output triggers exactly
 one retry, and a second failure returns :class:`ClassifyResult` with ``level=None`` rather
@@ -31,10 +30,17 @@ from typing import Any
 
 import httpx
 
+from retinue.messages_api import (
+    MESSAGES_URL,
+    HttpResponse,
+    HttpTransport,
+    extract_json_object,
+    request_headers,
+)
 from retinue.repo_config import RoutingConfig
-from retinue.reviewer import HttpResponse, HttpTransport
 from retinue.roles import (
     Role,
+    is_oauth_credential,
     oauth_system,
     resolve_effort,
     resolve_model,
@@ -43,12 +49,7 @@ from retinue.roles import (
 
 logger = logging.getLogger(__name__)
 
-# Local copies of the Messages-API wire constants, mirroring the edit-isolation pattern
-# the other adapters use (reviewer, slicer, resolver each hold their own). The visible
-# output is a single level name, so the token ceiling is small.
-_ANTHROPIC_VERSION = "2023-06-01"
-_OAUTH_BETA = "oauth-2025-04-20"
-_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+# The visible output is a single level name, so the token ceiling is small.
 _MAX_TOKENS = 1_024
 
 # The classifier's frozen brief. It is appended after the Claude Code identity block in
@@ -175,7 +176,7 @@ class ClaudeIssueClassifier:
     ) -> str:
         """POST one classification request and return the chosen level name."""
         response: HttpResponse = await self.transport.post(
-            _MESSAGES_URL, headers=headers, json=payload
+            MESSAGES_URL, headers=headers, json=payload
         )
         if response.status_code != 200:
             raise ClassificationError(
@@ -186,16 +187,7 @@ class ClaudeIssueClassifier:
 
     def _headers(self) -> dict[str, str]:
         """Build the request headers, routing the credential to its auth scheme."""
-        headers = {
-            "anthropic-version": _ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        }
-        if self.credential.startswith("sk-ant-oat"):
-            headers["authorization"] = f"Bearer {self.credential}"
-            headers["anthropic-beta"] = _OAUTH_BETA
-        else:
-            headers["x-api-key"] = self.credential
-        return headers
+        return request_headers(self.credential)
 
     def _payload(self, issue: ClassifyInput) -> dict[str, Any]:
         """Assemble the Messages API request body for one classification.
@@ -214,7 +206,7 @@ class ClaudeIssueClassifier:
                 Role.CLASSIFIER, self._schema(), model=model, effort=effort
             ),
             "system": oauth_system(
-                _CLASSIFY_SYSTEM, is_oauth=self.credential.startswith("sk-ant-oat")
+                _CLASSIFY_SYSTEM, is_oauth=is_oauth_credential(self.credential)
             ),
             "messages": [{"role": "user", "content": self._build_prompt(issue)}],
         }
@@ -264,24 +256,7 @@ class ClaudeIssueClassifier:
         degenerate 200 body (non-list ``content``, unhashable ``level``) so no shape of a
         200 response can raise anything but :class:`ClassificationError`.
         """
-        content = body.get("content")
-        blocks = content if isinstance(content, list) else []
-        text = "".join(
-            block["text"]
-            for block in blocks
-            if isinstance(block, dict)
-            and block.get("type") == "text"
-            and isinstance(block.get("text"), str)
-        )
-        if not text.strip():
-            raise ClassificationError("Messages API response carried no text content")
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ClassificationError(f"Classifier emitted invalid JSON: {exc}") from exc
-
-        if not isinstance(parsed, dict):
-            raise ClassificationError("Classifier JSON is not an object")
+        parsed = extract_json_object(body, who="Classifier", error=ClassificationError)
         level = parsed.get("level")
         if not isinstance(level, str) or level not in self.routing.levels:
             raise ClassificationError(

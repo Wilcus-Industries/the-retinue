@@ -18,6 +18,7 @@ from __future__ import annotations
 import pytest
 
 from retinue.gh import GhCommandError, GhResult
+from retinue.messages_api import HttpResponse
 from retinue.orchestrator import PrdBuildResult, PrdSlice, build_prd
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
@@ -25,7 +26,6 @@ from retinue.reviewer import (
     AgentSdkReviewGenerator,
     EditBlockedByRequest,
     GhCliBlockedByEditor,
-    HttpResponse,
     ReviewFinding,
     ReviewGenerationError,
     ReviewInput,

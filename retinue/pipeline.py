@@ -82,6 +82,7 @@ from retinue.loopback import (
     VerdictResult,
     process_review,
 )
+from retinue.messages_api import HttpResponse
 from retinue.notify import (
     GhCommentSink,
     GhLabelSink,
@@ -115,7 +116,6 @@ from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
     AgentSdkReviewGenerator,
     GhCliBlockedByEditor,
-    HttpResponse,
     ReviewGenerator,
 )
 from retinue.roles import Role, resolve_effort, resolve_model
@@ -949,13 +949,13 @@ _REVIEW_HTTP_TIMEOUT_SECONDS = 600.0
 
 @dataclass(frozen=True)
 class HttpxTransport:
-    """Production :class:`~retinue.reviewer.HttpTransport`: POST one request via httpx.
+    """Production :class:`~retinue.messages_api.HttpTransport`: POST one request via httpx.
 
     The reviewer assembles the full request body and headers (model, effort tier, the
     json-schema response format, and the credential's auth header); this transport only
     POSTs them and reads the status code + JSON body back into the reviewer's
-    :class:`~retinue.reviewer.HttpResponse`. The single POST is the only network edge, so
-    it sits behind the reviewer's injected seam and the rest of the review flow is
+    :class:`~retinue.messages_api.HttpResponse`. The single POST is the only network edge,
+    so it sits behind the reviewer's injected seam and the rest of the review flow is
     exercised in tests with a fake transport — no httpx, no network.
     """
 
