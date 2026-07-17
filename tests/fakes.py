@@ -262,17 +262,33 @@ class FakeAdhocGh:
         *,
         in_flight_numbers: set[int] | None = None,
         stranded_numbers: set[int] | None = None,
+        closed_numbers: set[int] | None = None,
+        native_blockers: dict[int, list[int]] | None = None,
     ) -> None:
         self._issues = issues
         self._in_flight = in_flight_numbers or set()
         self._stranded = stranded_numbers or set()
+        self._closed = closed_numbers or set()
+        self._native_blockers = native_blockers or {}
         self.calls: list[str] = []
+        self.list_labels: list[str] = []
         self.snapshot_calls: list[str] = []
         self.flight_state_calls: list[int] = []
 
-    async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
+    async def list_ready(
+        self, *, repo_full_name: str, label: str
+    ) -> list[ReadyIssue]:
         self.calls.append(repo_full_name)
+        self.list_labels.append(label)
         return list(self._issues)
+
+    async def native_blockers(
+        self, *, repo_full_name: str, issue_number: int
+    ) -> list[int]:
+        return list(self._native_blockers.get(issue_number, []))
+
+    async def is_closed(self, *, repo_full_name: str, issue_number: int) -> bool:
+        return issue_number in self._closed
 
     async def flight_snapshot(self, *, repo_full_name: str) -> FlightSnapshot:
         self.snapshot_calls.append(repo_full_name)
