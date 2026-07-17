@@ -2,7 +2,9 @@
 
 A signed-webhook transport spine: a FastAPI `/webhook` endpoint that verifies the
 GitHub `X-Hub-Signature-256` HMAC, acts on `issues` events, enqueues a job onto an
-Arq/Redis queue, and a worker that dequeues and processes it.
+Arq/Redis queue, and a worker that dequeues and drives **one unified scheduler lane** —
+list the ready work, rank it by severity, build each admitted issue in a disposable
+container, and gate it through an in-session pre-PR review before opening the PR.
 
 ## Architecture
 
@@ -10,494 +12,295 @@ Arq/Redis queue, and a worker that dequeues and processes it.
 GitHub issues webhook
         │  POST /webhook  (HMAC-SHA256 verified, 401 on mismatch/missing)
         ▼
-FastAPI app (retinue.app)  ──enqueue_prd──▶  Arq / Redis queue
-        │  202 Accepted                              │
-                                                     ▼
-                                  Worker (retinue.worker.process_prd)
-                                  gates on opt-in + validity + novelty, then drives the
-                                  pipeline: slice → build → open the staging PR
+FastAPI app (retinue.app)  ──enqueue_adhoc_drain──▶  Arq / Redis queue
+        │  202 Accepted                                    │
+                                                           ▼
+                                    Worker (retinue.worker.run_adhoc_drain_job)
+                                    run_adhoc_drain: list trigger-labeled issues →
+                                    admit → readiness gate → flight-state classify →
+                                    two-queue scheduler select → build each →
+                                    in-session review gate → open PR
 ```
+
+There is **one** scheduler lane. No PRD lane, no orchestrator, no heimdall staging-PR
+loopback, no slicer — all deleted. Every issue is standalone work built directly on its
+own `issue-<N>` branch. A separate **cron lane** trickles the `backlog` (nits the review
+gate files) back into the scheduler queue.
 
 - `retinue.config` — `Settings` loaded from env / `.env` (`WEBHOOK_SECRET`, `REDIS_URL`,
   `DEDUPE_DB_PATH`, the GitHub App / Anthropic / push-channel credentials).
-- `retinue.webhook` — HMAC verification then event dispatch: a `prd`-labeled `issues`
-  event (action opened/reopened/edited/labeled) enqueues a PRD job, a `ready-for-agent`
-  non-`prd` issue enqueues a single ad-hoc drain kick (`prd` wins when both labels are
-  present), a merged `pull_request` (closed + merged) enqueues the reap, and a
-  `pull_request_review` from heimdall's bot enqueues the loopback. Off-target events (an
-  issue with neither relevant label, a review from anyone but heimdall) are acked 204 and
-  enqueue nothing, so the slicer, the ad-hoc drain, and the loopback never see them. Same
-  401/204/202 contract for all.
-- `retinue.queue` — the `PrdJob` / `ReviewJob` / `MergedPrJob` / `AdhocDrainJob` models
-  and their `enqueue_prd` / `enqueue_review` / `enqueue_merged_pr` / `enqueue_adhoc_drain`
-  helpers. The drain kick pins a per-repo `_job_id` so a burst of `ready-for-agent` events
-  collapses to one in-flight drain.
-- `retinue.pipeline` — `Pipeline`, the orchestration object the worker drives once a PRD
-  is accepted: slice → build → open the staging PR, plus the `process_review` /
-  `reap_pr` / `reconcile` entry points the webhook events and a restart route into.
-  `build_pipeline_factory` wires it over the real adapters (the orchestrator `build_prd`
-  seam stays injected, pending the implementer-spawn adapter).
-- `retinue.wiring` — `bind_build_prd` (budget-gate + triage glue around the orchestrator
-  build) and `bind_cron_tick` (the cron backlog lane over its real collaborators). Both
-  take the implementer-spawn seam as their one injected dependency and share the
-  service-level `BudgetGovernor`. `bind_build_prd` also accepts an optional
-  `resolve_implementer` (`retinue.routing`) that classifies each slice at its first build
-  and swaps in that level's implementer model; `None` keeps one model for every slice.
-- `retinue.routing` — per-issue routing shared by every build lane. `resolve_issue_level`
-  is the one hop that fetches an issue's facts (`GhCliIssueFacts`), resolves its routing
-  level via `retinue.level.resolve_level` (honoring a pre-existing `level:` label), meters
-  each classifier call on the shared ledger, and comments on a classification failure. The
-  PRD lane's `PerIssueImplementerRouter` routes through it and returns the base
-  `ContainerImplementer` at the level's model; the ad-hoc lane routes through it too
-  (`pipeline._resolve_adhoc_level`) to classify each issue once and launch its planner,
-  implementer, and ad-hoc reviewer at that level. Loopback fix-issues are orchestrator-lane
-  slices (`ready-for-agent` + `Part of #<prd>`), so they classify and route through the
-  exact same seam at their first build. Only wired when the repo declares a `routing:`
-  table, so a table-less repo makes zero classifier calls and builds at the registry
-  defaults.
-- `retinue.app` — FastAPI factory; an Arq Redis pool is created in the lifespan and
-  stored on `app.state.arq_pool`.
+- `retinue.webhook` — HMAC verification then event dispatch: a `ready-for-agent` `issues`
+  event (action opened/reopened/edited/labeled) kicks a single scheduler drain, and a
+  merged `pull_request` (closed + merged) enqueues the reap. Off-target events (an issue
+  with neither the trigger label nor a relevant action, any non-merge PR) are acked 204 and
+  enqueue nothing. Same 401/204/202 contract for all. The enqueue is awaited before the ack
+  so a failed enqueue surfaces as a 5xx (GitHub redelivers) rather than vanishing.
+- `retinue.queue` — the `MergedPrJob` / `AdhocDrainJob` models and their `enqueue_merged_pr`
+  / `enqueue_adhoc_drain` helpers. The drain kick pins a per-repo `_job_id` so a burst of
+  `ready-for-agent` events collapses to one in-flight drain.
+- `retinue.scheduler` — the pure two-queue queue model: each candidate's tier is its
+  `priority:<tier>` label matched against `config.severity_tiers`; candidates in the top
+  range (`config.priority_tiers`) form the **priority queue**, the rest the **main queue**,
+  both ranked by tier then ascending number. `select_to_build` honors a **reserved priority
+  slot** — with a parallel-build cap `N ≥ 2` the main queue holds at most `N-1` slots so one
+  is always free for priority work; the priority queue always drains first. No `gh`, no I/O.
+- `retinue.readiness` — blocked-by readiness: an issue is schedulable only when every
+  blocker is closed. Blockers are the **union** of the `## Blocked by #N` refs in the body
+  (`parse_body_blockers`) and GitHub's native "blocked by" relations (the `ReadinessGh`
+  seam). Only same-repo blockers count; the computation is pure over an injected seam.
+- `retinue.adhoc_drain` — `run_adhoc_drain`, the retinue's central mechanism: the single
+  drain the webhook kick and the heartbeat both invoke, one per repo under a single-run
+  lock, in one stateless pass (see *Scheduler drain* below).
+- `retinue.adhoc_build` — `build_adhoc_issue`, the build primitive: plan → materialize →
+  implement → done-check → push-on-green → in-session review gate, in one disposable
+  container (see *Ad-hoc build + review gate* below).
+- `retinue.container_build` — `build_issue_in_container`, the per-issue container-build
+  lifecycle: parse the done-check, resolve secrets, start the container, clone + branch off
+  the target, exec the implementer, guard against a hollow (zero-commit) implement, run the
+  done-check, push only on green, report. The one shared lifecycle the build primitive wraps.
+- `retinue.reviewer` — the internal reviewer: the headless Messages-API seam the review gate
+  runs after a green push over one `issue-<N>` diff, returning a `ReviewPlan` of
+  `ReviewFinding`s each carrying a `Severity`. It never files, wires, or edits anything —
+  the gate partitions and acts on its findings.
+- `retinue.pipeline` — `Pipeline`, the object the drain drives per built issue:
+  `process_adhoc_pr` consumes the build's review-gate outcome (blocking → escalate, no PR;
+  backlog → file nits, then PR; clean → PR), plus the `reap_pr` / `reconcile` entry points.
+- `retinue.pr_opener` — `open_staging_pr`: once a build pushes a green `issue-<N>` branch,
+  opens exactly one PR `issue-<N>` → `config.require_target_branch()`, behind one precheck
+  (the target branch must exist); a missing one escalates through `Notifier` and opens no PR.
+- `retinue.cron` — `run_cron_tick`, the cron lane's per-tick driver: drains loose `backlog`
+  issues one at a time under a single-run lock, gated on the shared budget, picking by a
+  weighted priority+age score with an every-Nth-tick quota floor for low-priority items.
+  WS1's backlog job is the **trickle promotion** (`GhCliBacklogPromoter`): one `gh issue
+  edit` swaps `backlog` for the trigger label so the nit re-enters the scheduler queue.
+- `retinue.heartbeat` — `run_heartbeat`, the worker-global arq `cron_jobs` tick. Each tick
+  sweeps the opted-in repos: fires the safety-net **scheduler drain** for each repo whose
+  `repo_config.cron` cadence is due (catching up issues labeled while the webhook was missed
+  or the worker down) and drives the **backlog cron lane** for every repo.
+- `retinue.wiring` — the composition root: `bind_adhoc_drain` (the scheduler lane over its
+  real gh/readiness/build seams, resolving `target_branch`) and `bind_cron_tick` (the
+  backlog cron lane + its promoter). The webhook kick and the heartbeat sweep fire the *same*
+  bound drain.
+- `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push channel
+  (ntfy / Pushover), an issue comment, and a label, through injected sinks.
+- `retinue.issues` — `IssueDraft` / `CreatedIssue` / the `IssueCreator` seam
+  (`GhCliIssueCreator`): the one `gh issue create` vocabulary every filer shares (the review
+  gate's backlog nits, the escalation flows).
+- `retinue.handoff` — `reap_merged_pr`: on the human's merge (`pull_request` closed+merged),
+  closes the PR's owned issues. "The retinue never merges" — a human merges, the reap reacts.
+- `retinue.reconcile` — `RunStateStore` (the durable PR↔issue mapping keyed by issue) plus
+  the gh seam it reads truth through, so a later merge webhook resolves a PR back to its issue.
+- `retinue.routing` / `retinue.level` / `retinue.classifier` — per-issue model/effort
+  routing over the repo's optional `routing:` table: `resolve_level` honors a pre-existing
+  `level:` label else classifies (`ClaudeIssueClassifier`, a Haiku-class Messages-API call),
+  and each level's `roles:` map overrides the model/effort. A table-less repo makes zero
+  classifier calls and builds at the registry defaults.
+- `retinue.roles` — the agent-role registry: one `ROLE_REGISTRY` mapping each `Role`
+  (implementer / reviewer / resolver / planner / classifier) to its model id,
+  reasoning-effort tier, and transport. `resolve_model` / `resolve_effort` are level-aware
+  over the routing table.
+- `retinue.budget` — `BudgetGovernor` over a service-level weekly budget with a
+  per-rolling-24h ceiling (see *Budget governor* below). The scheduler and cron lanes meter
+  against one shared ledger.
+- `retinue.single_run` — the shared non-blocking single-run lock: admits the first holder
+  and *rejects* a second (`CronBusyError`, `AdhocDrainBusyError`), so "at most one run at a
+  time" is observable.
+- `retinue.done_check` — `run_done_check_commands`, which runs a repo's done-check in a
+  fresh container; the command is parsed from the first fenced code block under a
+  "Definition of done" heading in the repo's `CLAUDE.md`.
+- `retinue.github_app` — `InstallationAuth`, the seam that mints a GitHub App installation
+  token the worker clones with.
+- `retinue.container` — `ContainerRuntime` / `Container`, the disposable-container seam.
+- `retinue.impl_retry` — `ImplRetryStore`, the SQLite-backed per-issue attempt counter.
+- `retinue.vocab` — shared labels, `Severity`, and `issue-<N>` branch naming; the bottom
+  layer every lane imports.
+- `retinue.gh` — the shared `gh` subprocess seams (argv runner, auth env, JSON parse).
+- `retinue.app` — FastAPI factory; an Arq Redis pool is created in the lifespan and stored
+  on `app.state.arq_pool`.
 - `retinue.repo_config` — the per-repo `.github/retinue.yml` schema (`RepoConfig`) and
   `load_repo_config`, which never raises on bad input.
-- `retinue.roles` — the agent-role registry: one `ROLE_REGISTRY` table mapping each
-  `Role` (slicer / implementer / resolver / reviewer / planner) to its model id,
-  reasoning-effort tier, and invocation transport. The role adapters resolve their model
-  and effort here via `resolve_model` / `resolve_effort` instead of hand-rolled constants;
-  `resolve_model` / `resolve_effort` are level-aware over the repo's routing table: a
-  level's `roles:` map overrides the model (and effort for Messages-API roles), registry
-  defaults otherwise. The
-  read-only `planner` (Opus on the CLI) also owns `planner_cli_argv`, which builds its
-  explore-first, no-write invocation and captures the plan as the run's output.
-- `retinue.dedupe` — `PrdDedupeStore`, SQLite-backed first-claim-wins PRD dedupe.
-- `retinue.worker` — the `process_prd` Arq task (gate → drive the pipeline), the
-  `process_review_job` / `reap_pr_job` tasks the webhook events enqueue, the
-  `run_adhoc_drain_job` task the webhook's ad-hoc kick (`RUN_ADHOC_DRAIN_TASK`) dequeues to
-  fire one ad-hoc drain (no-op when unwired), the `gate_prd` opt-in gate, and
-  `WorkerSettings`. `on_startup` wires the real `fetch_config`, PRD-body fetcher,
-  `pipeline_factory`, and the bound `adhoc_drain` onto the Arq context — the *same* bound
-  drain the heartbeat sweep fires, under one per-repo single-run lock.
-- `retinue.github_app` — `InstallationAuth`, the seam that mints a GitHub App
-  installation token (`InstallationToken`) the worker clones with.
-- `retinue.container` — `ContainerRuntime` / `Container`, the disposable-container
-  seam the done-check runs inside (real Docker lives behind it).
-- `retinue.done_check` — `run_done_check`, which runs an accepted repo's done-check in
-  a fresh container and reports the outcome.
-- `retinue.orchestrator` — `build_slice`, the single-slice orchestrator: spawn one
-  implementer subagent on an `issue-<N>` branch, gate on `run_done_check`, and merge
-  the green slice into the integration branch `retinue/prd-<n>` (a red check blocks it).
-- `retinue.adhoc_build` — `build_adhoc_issue`, the ad-hoc-lane build primitive: in one
-  disposable container, run the read-only `planner` then materialize its captured plan
-  into `.retinue/plan.md`, run the same implementer the PRD lane uses — pointed at that
-  plan file via its `plan_path` so it reads the plan first — on an `issue-<N>` branch cut
-  off `config.staging_branch`, gate on `run_done_check`, and push the branch only when
-  green (a red check pushes nothing). On a green build the injected `AdhocReviewer`
-  (`ContainerAdhocReviewer`) reviews the `issue-<N>` diff and files each finding as a flat
-  `review-fix` + `ready-for-agent` follow-up that loops back as ordinary ad-hoc work; the
-  review is advisory (never blocks the build/push) and the review-fix chain is bounded by a
-  `Chain-depth: <n>` lineage marker on each filed fix (not a shared store), so it terminates
-  at `retry_cap` hops without colliding with triage's build-retry budget. No integration
-  branch, no merge.
-- `retinue.adhoc_drain` — `run_adhoc_drain`, the ad-hoc lane's per-repo drain, hardened for
-  production: list every open `ready-for-agent` non-PRD issue via the gh seam (`GhCli`,
-  surfacing each issue's body), keep only the ad-hoc lane (drop `prd`-labeled and
-  `Part of #<prd>` issues, mirroring `lane.classify`), rank by `priority:<sev>` (no-priority
-  lowest), **dedup** against GitHub truth (skip any issue whose `issue-<N>` branch or open PR
-  exists, via `AdhocGh.in_flight`, mirroring `reconcile`), then drive the
-  `build_adhoc_issue` + `process_adhoc_pr` primitive for each up to `config.max_parallel`.
-  The whole drain runs under its own **single-run lock** (`AdhocDrainBusyError`, separate
-  from the PRD lock so it runs alongside a PRD build), each build **meters** the one shared
-  `BudgetGovernor`, and **PRD-first ordering** holds — except a `priority:critical|high`
-  issue preempts when a PRD is in flight. Each issue is rebuilt through
-  `AdhocIssue.from_fetched_issue` (fed the fetched body) so the `Chain-depth:` marker is read
-  back and the review-fix chain bound stays live.
-- `retinue.heartbeat` — `run_heartbeat` + `heartbeat_tick`, the worker-global arq `cron_jobs`
-  tick. Registered in `WorkerSettings.cron_jobs`, it fires every Nth minute (the global tick)
-  and, per opted-in repo: fires the safety-net **ad-hoc drain** (`run_adhoc_drain`) when the
-  repo's `repo_config.cron` cadence is due on this tick (`cron_due`, the per-repo "is this repo
-  due?" filter under the global tick) — the catch-up for issues labeled while the webhook was
-  missed or the worker was down — and drives the **backlog cron lane** (`run_cron_tick`) for
-  every repo, the first runtime caller of the previously-dead lane. The clock, the opted-in repo
-  enumeration, the per-repo drain, and the backlog tick are all injected and faked, so the
-  heartbeat runs with no real arq, Redis, gh, Docker, or wall-clock. The worker's `on_startup`
-  binds those four collaborators onto `ctx` under live GitHub-App auth (the real wall-clock, the
-  App's installed-and-opted-in repo enumeration, the *same* bound ad-hoc drain the webhook kick
-  fires, and a bound `run_cron_tick`); a bare/unauthed worker leaves them unset so the tick
-  no-ops.
-- `retinue.notify` — the reusable `Notifier`: fans one escalation out to a push
-  channel (ntfy / Pushover), an issue comment, and a label, through injected sinks.
-  Every escalation in the retinue routes through it.
-- `retinue.pr_opener` — `open_staging_pr`: once a PRD's ready set drains, prechecks
-  heimdall is installed and the staging branch exists, then brings `retinue/prd-<n>`
-  up to date with staging and opens exactly one PR into it; a failed precheck escalates
-  through `Notifier` and opens no PR. The gh operations are injected seams.
-- `retinue.slicer` — `slice_prd`: runs the headless Agent-SDK slicer over a PRD
-  body to produce vertical-slice issues labeled `ready-for-agent` + `prd-slice` +
-  `Part of #<prd>` with a resolved `## Blocked by` graph, reserving `hitl` for genuinely
-  human-only slices. A thin/malformed PRD escalates through `Notifier` instead of inventing
-  slices. The Agent-SDK call and the gh issue creation are injected seams.
-- `retinue.impl_retry` — `ImplRetryStore`, the SQLite-backed per-slice
-  implementer-attempt counter that persists the retry budget across worker restarts.
-- `retinue.triage` — `triage_implementer` / `decide_triage`: reasons about an
-  implementer failure or returned notes and decides retry / reslice / escalate,
-  bounded by the persisted retry count.
-- `retinue.reviewer` — `review_round`: the internal reviewer that runs after a PRD
-  round merges, reviews the round's diff for correctness/stale docs, and files
-  `review-fix` follow-up issues (`ready-for-agent` + `Part of #<prd>`) wired into
-  dependents' `## Blocked by`. It never edits code. The Agent-SDK review, the gh
-  issue creation (reused from the slicer), and the gh issue-body edit are injected.
-- `retinue.reconcile` — `reconcile_run` / `ResumePhase` / `RunStateStore`: on worker
-  restart, reconciles an in-flight PRD round against GitHub (the source of truth —
-  which slice issues are closed, which `issue-<N>` branches are merged, whether the
-  `retinue/prd-<n>` → staging PR exists) plus the SQLite run-state, and picks the phase
-  to resume at (`BUILD` finishes only the unfinished slices, `PR_OPEN`, `LOOPBACK`, or
-  `DONE`) so no duplicate issue, branch, or PR is produced. A slice is finished when
-  EITHER its issue is closed OR its branch is merged, so a crash between the two still
-  resumes correctly. The gh queries are injected seams; `RunStateStore` is the durable
-  secondary ledger (owned-slice set + PR↔PRD mapping), mirroring `PrdDedupeStore`.
+- `retinue.worker` — the `reap_pr_job` + `run_adhoc_drain_job` Arq tasks, the heartbeat, and
+  `WorkerSettings`. `on_startup` binds the real collaborators under live GitHub-App auth.
 
-A validly signed `prd`-labeled `issues` webhook (action opened/reopened/edited/labeled)
-returns 202 and enqueues exactly one PRD job; a `ready-for-agent` non-`prd` issue on those
-actions returns 202 and enqueues exactly one ad-hoc drain kick (`prd` wins when both labels
-are present), which the worker dequeues into `run_adhoc_drain_job` to fire that repo's
-drain. An invalid or missing signature returns 401 and enqueues nothing. A signed
-issues event with neither label (or any other action), a `pull_request_review` not from
-heimdall's bot, and any other off-target event are acked with 204 without enqueuing.
+A validly signed `ready-for-agent` `issues` webhook (action opened/reopened/edited/labeled)
+returns 202 and enqueues exactly one scheduler-drain kick, which the worker dequeues into
+`run_adhoc_drain_job`. An invalid or missing signature returns 401 and enqueues nothing. A
+signed issues event without the trigger label (or on any other action) and any other
+off-target event are acked 204 without enqueuing.
 
 ## Per-repo opt-in (`.github/retinue.yml`)
 
-The worker only acts on a PRD when the target repo opts in by committing a
-`.github/retinue.yml`. The gate in `process_prd` applies three checks in order:
-
-1. **Opt-in** — no file means the repo is not opted in and the PRD is skipped.
-2. **Validity** — a malformed file (bad YAML or a schema violation) is skipped and
-   logged; it never crashes the worker and never burns the dedupe slot, so a later
-   fixed config can still run.
-3. **Novelty** — the PRD is deduplicated by `owner/repo#issue` (SQLite-backed), so a
-   redelivered or repeated event is processed exactly once.
+The worker only acts on a repo that opts in by committing a `.github/retinue.yml`. Its
+presence is the opt-in signal: a repo with no file is skipped upstream, a repo whose file is
+malformed is skipped by `load_repo_config` (it returns `None` and logs — a single broken
+config never crashes the worker). Validation is strict (unknown keys are rejected), so a
+typo'd field is a skip, not a silent drop.
 
 Schema (all fields optional; defaults shown):
 
 ```yaml
-staging_branch: staging        # branch the retinue integrates onto
-retry_cap: 3                   # max retries per unit of work (>= 0)
-max_parallel: 4                # optional concurrency cap (> 0)
-cron: "0 */6 * * *"            # optional five-field cron cadence
-secrets:                       # optional inline secrets + external refs
+trigger_label: ready-for-agent   # the "build me" label an issue must wear to be scheduled
+target_branch: staging           # branch an issue-<N> build is cut from and PR'd against
+                                 #   (None → the repo's own default branch, resolved at build)
+severity_tiers: [critical, high, medium, low]   # ordered vocabulary, most-severe first
+priority_tiers: [critical, high]                # top prefix that routes to the priority queue
+retry_cap: 3                     # max retries per unit of work (>= 0)
+max_parallel: 4                  # optional concurrent-build cap (> 0); the reserved slot needs >= 2
+cron: "0 */6 * * *"              # optional five-field cron cadence for the safety-net sweep
+secrets:                         # optional inline secrets + external refs
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   refs:
     - vault://team/retinue/github-token
+routing:                         # optional per-issue model/effort routing table
+  default: standard
+  levels:
+    standard:
+      description: Ordinary work across a few files with tests.
+      roles:
+        reviewer: {model: claude-opus-4-8, effort: xhigh}
 ```
 
-Unknown top-level keys are rejected (a typo'd field is a skip, not a silent drop).
+An issue's queue tier is the `priority:<tier>` label whose `<tier>` names one of
+`severity_tiers`; an untiered issue ranks last. `priority_tiers` must be a (possibly empty)
+top prefix of `severity_tiers` — "which tiers are drop-everything" has to be the top of the
+order, or the reserved-slot ranking would contradict itself.
 
-> The worker's `fetch_config` seam reads `retinue.yml` over the GitHub contents API
-> (`github_config_fetcher`) once GitHub App auth is wired; absent that auth it falls back
-> to treating every repo as not opted in.
+## Scheduler drain
+
+`retinue.adhoc_drain.run_adhoc_drain` is the central mechanism — one drain per repo, under a
+single-run lock, in one stateless pass. Each entry recomputes readiness and ranking from
+GitHub truth rather than keeping a persistent queue store:
+
+1. **list** every open issue wearing `config.trigger_label` (number, labels, body),
+2. **admit** the ones the scheduler acts on — trigger label present, `hitl` absent (a
+   human-escalated issue stays out until the `hitl` label is removed, the human "resume"),
+3. **gate on readiness** — drop any issue with an open blocker (the union of body
+   `## Blocked by #N` refs and native GitHub relations, `retinue.readiness.resolve_ready`),
+4. **classify flight state** against GitHub truth (`FlightState`, fetched once per drain as a
+   whole-repo `FlightSnapshot`): an issue with an open PR is `IN_FLIGHT` (skip, no duplicate);
+   one with a pushed `issue-<N>` branch but no open PR is `STRANDED` (a prior green build
+   whose PR never opened — open its PR **without rebuilding**); the rest are buildable,
+5. **rank + select** the buildable set through the pure two-queue scheduler
+   (`retinue.scheduler.select_to_build`, `cap=config.max_parallel`): priority queue first,
+   the main queue held to at most `cap-1` slots (the reserved priority slot),
+6. **build** each selected issue in a disposable container, concurrently, each metered
+   against the one shared `BudgetGovernor`; a build that would cross the rolling-24h cap is
+   skipped, so the shared budget is never overshot.
+
+Every leaf I/O — the gh queries, the readiness lookups, the budget store, the downstream
+build — is injected and faked, so the whole drain runs with no real `gh`, no Docker, and no
+network.
+
+## Ad-hoc build + review gate
+
+`retinue.adhoc_build.build_adhoc_issue` builds one issue in **one disposable container**
+destroyed on every path. There is no integration branch and no merge — the issue is built
+directly on an `issue-<N>` branch cut off `config.require_target_branch()`:
+
+1. **clone + branch** — the container clones over the installation token and checks out a
+   fresh `issue-<N>` branch off the resolved target branch,
+2. **plan** — the read-only planner (Opus on the in-container CLI) maps the code with an
+   Explore subagent and emits a plan, captured from its output (it writes nothing),
+3. **materialize** — the captured plan is written byte-exact into `.retinue/plan.md`,
+4. **implement** — the same implementer, pointed at the plan file via its `plan_path`,
+   implements TDD-first and commits to `issue-<N>`; a run that lands **zero commits** fails
+   the build (the hollow-implement guard) instead of pushing an empty branch,
+5. **done-check** — the repo's done-check runs in the *same* container over the real changes,
+6. **push** — only on a green done-check is `issue-<N>` pushed; a red check pushes nothing,
+7. **review gate** — after the green push, the in-session gate (`_run_review_gate`) runs the
+   internal reviewer (Opus) over the `issue-<N>` diff. On a clean review it is a no-op. On
+   findings it runs **one critique-and-fix pass**: the same implementer fixes the flagged
+   findings in the same container, the done-check re-runs, and — only if it stays green — the
+   branch is re-pushed and the reviewer runs again over the fixed diff.
+
+The surviving findings are **partitioned by severity** into a `ReviewGateOutcome`:
+
+- **blocking** (severity at or above the threshold, default `Severity.HIGH`, or a fix-pass
+  regression) → the pipeline escalates the issue through one `Notifier` fan-out (push +
+  `hitl` comment + label) and opens **no PR**, leaving the green branch pushed for a human;
+- **backlog** (below the threshold) → the pipeline files each as a `backlog` +
+  `priority:<severity>` follow-up, then opens the PR.
+
+A fix pass that turns the done-check red is a **regression**: the gate flags it blocking and
+does **not** push the red fix, so the branch stays at its green pre-fix pushed state. Every
+side-effecting collaborator — the planner, implementer, reviewer, container, auth, secret
+resolver, report sink — is injected, so the whole flow is exercised with no Agent SDK, no
+Docker, no gh, and no network.
+
+## PR + merge reap
+
+After a green build (clean or backlog gate), `Pipeline.process_adhoc_pr` opens **exactly
+one** PR `issue-<N>` → `config.require_target_branch()` via `pr_opener.open_staging_pr`,
+behind one precheck (the target branch must exist; a missing one escalates and opens no PR). The
+PR↔issue mapping is recorded in `RunStateStore` keyed by the single issue, so the merge
+webhook resolves the PR back to its issue.
+
+When the human merges, `retinue.handoff.reap_merged_pr` reacts to the `pull_request`
+closed+merged signal and closes the issue(s) the PR owned. **The retinue never merges** — a
+human performs the merge, and the reap reacts to it.
+
+## Cron backlog trickle
+
+`retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
+loose `backlog` issues **one at a time**, alongside the scheduler drain. Each tick runs under
+its own single-run lock (`CronBusyError`), **gates** on the *same shared* service-level
+`BudgetGovernor` and defers when the budget is spent, then **picks** the next backlog issue
+by a weighted score (priority dominates, age breaks ties) — except on every Nth tick where a
+**quota floor** takes the oldest low-priority issue so the low items provably drain rather
+than starving behind a steady high-priority stream.
+
+WS1's backlog job is the **trickle promotion**: `GhCliBacklogPromoter` swaps `backlog` for
+the repo's `trigger_label` in one `gh issue edit --add-label <trigger> --remove-label
+backlog`, so the promoted nit re-enters the scheduler queue and the real build stays with the
+scheduler. The clock is injected and the tick counter is passed in, so nothing reads the wall
+clock; the gh query, the budget governor, the lock, and the downstream promoter are all
+injected and faked.
+
+## Runtime heartbeat
+
+`retinue.heartbeat.run_heartbeat` fires both lanes at runtime. Registered as the
+worker-global arq `cron_jobs` tick (`WorkerSettings.cron_jobs`, every Nth minute — the global
+tick), each heartbeat sweeps the opted-in repos: it fires the safety-net **scheduler drain**
+for each repo whose `repo_config.cron` cadence is due on this tick (`cron_due`, the per-repo
+"is this repo due?" filter), catching up issues labeled while the webhook was missed or the
+worker was down, and drives the **backlog cron lane** for every repo. A drain or tick that
+raises for one repo is logged and skipped so a single bad repo cannot starve the sweep.
+
+In production the worker's `on_startup` binds the collaborators under live GitHub-App auth —
+the real wall-clock, the App's installed-and-opted-in repo enumeration, the *same* bound
+scheduler drain the webhook kick fires, and a bound `run_cron_tick`. A bare/unauthed worker
+leaves them unset and the tick stays a no-op.
 
 ## Disposable-container done-check
 
-Once a PRD is accepted, the worker runs the repo's done-check in a fresh, throwaway
-container. `retinue.done_check.run_done_check` orchestrates, in order:
-
-1. **auth** — mint a GitHub App installation token (`retinue.github_app`),
-2. **clone** — clone the repo into the container over that token,
-3. **inject** — resolve the config's `secrets` block and place it in the container env;
-   a missing required secret escalates (an observable report) *before* any container
-   starts, so a doomed check never runs,
-4. **run** — run the done-check command read from the repo's `CLAUDE.md`,
-5. **report** — post the outcome to an observable sink (commit status / issue comment),
-6. **teardown** — destroy the container (guaranteed via `try/finally`, on every path).
-
-Auth, the container runtime, the secret resolver, and the report sink are all injected,
-so the orchestration is fully exercised without Docker or network; a real container is
-only touched in the manual smoke. The done-check command is parsed from the first fenced
-code block under a "Definition of done" heading in the repo's `CLAUDE.md`.
-
-## Single-slice orchestrator
-
-`retinue.orchestrator.build_slice` builds one ready slice end-to-end, in order:
-
-1. **spawn** — run one implementer subagent (the Agent SDK seam) in an isolated git
-   worktree inside the disposable container; it implements TDD-first and commits to the
-   slice's `issue-<N>` branch,
-2. **done-check** — run the repo's done-check via `run_done_check` (the gate),
-3. **merge** — only on a green done-check, ensure the integration branch
-   `retinue/prd-<n>` exists (created off the config's `staging_branch` when absent) and
-   merge `issue-<N>` into it. A red done-check **blocks** the merge: no failing slice is
-   ever integrated, and the integration branch is left untouched.
-
-The implementer spawn and the git operations (`GitOps`: ensure-branch + merge) are
-injected alongside the done-check seams, so the whole one-slice flow is exercised with
-no Agent SDK, no Docker, no gh, and no network.
-
-## Full-PRD orchestrator
-
-`retinue.orchestrator.build_prd` builds a whole PRD by wrapping the single-slice
-primitive, looping rounds until the ready set drains:
-
-1. **ready set** — pick every `PrdSlice` whose `blocked_by` refs are all merged this run
-   (or absent from the PRD's slice set, meaning already merged/closed before it began),
-2. **parallel fan-out** — spawn the round's implementers concurrently, bounded by the
-   config's `max_parallel` (unbounded when unset),
-3. **topological merge** — merge the green branches in dependency order under the
-   done-check; a red slice is **blocked**, a merge conflict is handed to the injected
-   `ConflictResolver` to resolve-and-retry or **escalate** (unresolvable, no resolver,
-   or a retry that still conflicts). A blocked or escalated slice is terminal, so its
-   dependents never become ready — that pruned subtree is reported as **skipped**, not
-   silently dropped,
-4. **loop** — repeat until no ready slice remains, then drain every still-pending slice
-   into `skipped`.
-
-The result is a `PrdBuildResult` that partitions every input slice into exactly one
-bucket — `merged`, `blocked`, `escalated`, or `skipped` — so no slice ever vanishes
-from the outcome.
-
-The run executes inside an injected single-run lock, so at most one orchestrator run is
-in flight at a time — a second entry raises `OrchestratorBusyError`. The lock, the
-conflict resolver, the implementer spawn, and the git operations are all injected
-alongside the done-check seams, so the whole parallel/topological flow is exercised with
-no Agent SDK, no Docker, no gh, no network, and no concurrency races.
-
-## Reasoning failure triage
-
-The implementer subagent does not always cleanly build a slice — it can fail (raise)
-or return *notes* explaining that it could not finish or that the slice is mis-scoped.
-`retinue.triage.triage_implementer` refuses to blind-loop on this: it reasons about the
-signal plus how many attempts it has already spent, then carries out one decision.
-
-1. **retry** — re-run the implementer while the *persisted* attempt count is below the
-   config's `retry_cap` (default `3`; `0` means no retries). The bound is persisted in
-   `retinue.impl_retry.ImplRetryStore` (a SQLite counter keyed by `owner/repo#issue`),
-   so a doomed slice cannot retry forever and a slice that already spent its budget in
-   an earlier run escalates without burning another attempt,
-2. **reslice** — when the notes say the slice is mis-scoped, file an adjusted slice
-   through the gh issue-creation seam (reusing the slicer's `create_issue`), carrying
-   the implementer's reasoning into the new issue body,
-3. **escalate** — hand the slice to a human by fanning a `Notification` out through the
-   shared `Notifier` (push + comment + the `hitl` label).
-
-The pure `decide_triage(failed, notes, attempts, cap)` returns the typed
-`RETRY` / `RESLICE` / `ESCALATE` decision; both the failure path and the returned-notes
-path reach it — notes are never silently dropped. The implementer, the notifier sinks,
-the gh issue creator, and the SQLite store are all injected, so the whole loop is
-exercised with no Agent SDK, no gh, no push service, and no network.
-
-## Internal reviewer
-
-After a PRD round merges (`build_prd`), `retinue.reviewer.review_round` reviews that
-round before the next one starts:
-
-1. **review** — run the headless Agent-SDK reviewer (the injected `generate` seam) over
-   the round's merged diff and merged issue numbers, surfacing correctness bugs and
-   stale docs as `ReviewFinding`s,
-2. **file** — for each finding, file a follow-up issue via the slicer's `create_issue`
-   seam, reusing the `ready-for-agent` + `Part of #<prd>` shape and adding a
-   `review-fix` label so the agent loop routes it as a fix,
-3. **wire** — append the new review-fix issue to the `## Blocked by` of each dependent
-   open issue it flags (the injected `edit_blocked_by` gh seam), so the fix builds in a
-   later round *before* the work layered on top of the defect.
-
-A clean review files nothing. The reviewer **never edits code** — it only files and
-wires issues. The Agent-SDK review, the gh issue creation, and the gh issue-body edit
-are all injected, so the flow is exercised with no Agent SDK, no gh, and no network.
-
-## Staging PR + heimdall precheck
-
-Once a PRD's ready set drains (the full-PRD build completes), `retinue.pr_opener.open_staging_pr`
-lands the work by opening a PR into `staging`, behind two prechecks applied in order:
-
-1. **heimdall installed** — the repo must have the heimdall check installed. A repo
-   without it escalates through the shared `Notifier` (push + comment + label) and opens
-   no PR — landing into `staging` without the gate is unsafe.
-2. **staging exists** — the target `staging` branch (`config.staging_branch`) must
-   exist. A missing one escalates on its own path and opens no PR.
-
-When both pass, the integration branch `retinue/prd-<n>` is brought up to date with the
-staging branch and **exactly one** PR `retinue/prd-<n>` -> `staging` is opened. The four
-gh operations — the heimdall precheck, the staging-branch existence check, the
-bring-up-to-date, and the open-PR — are a single injected `PrOps` seam, so the whole
-flow is exercised with no real `gh` and no network. The result is a `PrOpenResult`
-whose outcome is `OPENED` (with the created PR), `HEIMDALL_MISSING`, or
-`STAGING_MISSING`.
-
-## Heimdall verdict loopback
-
-Once the staging PR is open, heimdall posts a bot review on it.
-`retinue.loopback.process_review` reads that verdict and reasons about it plus a
-*persisted* per-PR rebuild-round count (`HeimdallRoundStore`, an aiosqlite counter in
-the `ImplRetryStore` style), via the pure `decide_verdict`:
-
-1. **rebuild** — heimdall raised **blocking** findings (severity at/above the `high`
-   threshold) and the round count is below `RepoConfig.retry_cap` (3). Each blocking
-   finding becomes a fix-issue (`ready-for-agent` + `Part of #<prd>`) that rebuilds onto
-   the **same** `retinue/prd-<n>` branch and re-triggers heimdall review; the round is
-   persisted so the loop survives a restart and is bounded at the cap.
-2. **converge** — heimdall raised **no** blocking findings. The flow proceeds to handoff.
-   Any non-blocking nits are filed as `backlog` issues carrying heimdall severity mapped
-   1:1 to a `priority:<severity>` label.
-3. **escalate** — the round budget is spent while still blocked. The flow stops: it
-   comments the PRD, applies `hitl`, and notifies through the shared `Notifier`, leaving
-   the PR open for a human.
-
-The heimdall verdict, the gh issue creator (reused from the slicer), the
-rebuild-onto-same-branch trigger, the handoff, and the notifier sinks are all injected,
-so the loop is exercised with no real `gh`, heimdall, or network.
-
-## Convergence handoff + merge reap
-
-On convergence the loopback calls its `Handoff` seam, which `retinue.handoff` implements
-as **`announce_handoff`**: a single "test & merge" notification through the shared
-`Notifier` — a push heads-up plus a PR comment (and a findable `test-and-merge` label)
-telling a human the PR is clean and ready. **The retinue never merges**: there is no
-merge collaborator on the handoff, and a human performs the merge.
-
-When the human merges, **`reap_merged_pr`** reacts to the `pull_request` closed+merged
-signal: it closes the PR's slice issues, then *reaps* the PRD — closing it IFF every
-non-`hitl` child (issues carrying `Part of #<prd>`) is closed. An open `hitl` child (a
-deliberately human-only slice) does not block the reap; an open non-`hitl` child does.
-The gh issue-close and child-enumeration are a single injected `Handoff` gh seam (no
-merge method), so both flows run with no real `gh`, push service, or network.
+Each build runs the repo's done-check in a fresh, throwaway container.
+`retinue.container_build.build_issue_in_container` orchestrates, in order: **auth** (mint a
+GitHub App installation token), **clone + branch**, **inject** (resolve the config's
+`secrets` block into the container env — a missing required secret escalates *before* any
+container starts, so a doomed check never runs), **implement**, **done-check** (the command
+read from the repo's `CLAUDE.md`), **push-on-green**, **report** (to an observable sink), and
+**teardown** (guaranteed via `try/finally`, on every path). Auth, the container runtime, the
+secret resolver, and the report sink are all injected, so the orchestration is fully
+exercised without Docker or network.
 
 ## Budget governor
 
 `retinue.budget` meters agent token spend against a **service-level** weekly budget (one
-ledger shared across the orchestrator and cron lanes) and enforces a per-rolling-24h-window
-ceiling — by default 12% of the weekly budget (`cap()`). The **`BudgetLedger`** is an
-aiosqlite spend ledger in the `PrdDedupeStore` style: `record_spend` appends a timestamped
-charge, `trailing_24h_spend` sums only the charges inside the trailing 24h read off an
-**injected `Clock`** (no wall-clock, so the window is deterministic in tests).
+ledger shared across the scheduler and cron lanes) and enforces a per-rolling-24h-window
+ceiling — by default 12% of the weekly budget (`cap()`). The `BudgetLedger` is an aiosqlite
+spend ledger: `record_spend` appends a timestamped charge, `trailing_24h_spend` sums only the
+charges inside the trailing 24h read off an **injected `Clock`** (no wall-clock, so the
+window is deterministic in tests).
 
-Metering is auth-aware: an API key meters **dollars** against a weekly-$ budget,
-subscription OAuth meters **tokens** against a weekly-token budget — same rolling math,
-different unit. **`BudgetGovernor`** enforces at two points: `gate` **defers** a run whose
-estimated charge would start it over the cap; `meter` **pauses + checkpoints** a run whose
-next charge would cross the cap. Because the two lanes meter against one shared ledger
-file, `meter` records through `try_record_if_within_cap`, which performs the cap check and
-the insert inside a single `BEGIN IMMEDIATE` transaction: a second concurrent lane
-serializes on the SQLite write lock, re-reads the updated trailing total, and pauses
-instead of recording — so two charges that would jointly cross the cap can never both
-land (no overshoot). The `defer_until` / `resume_at` is the instant the window
-frees enough room for that specific amount — `window_frees_at(amount)` walks the in-window
-charges oldest-first, accumulating freed spend, and returns the expiry of the charge that
-first brings the trailing spend back under the cap (not merely the oldest charge's expiry,
-which can be too early when the estimate exceeds the room it frees). `try_resume`
-re-verifies the cap before clearing the pause: past `resume_at` but still over cap, it
-returns `None` and leaves the run paused rather than resuming over-budget; once the window
-genuinely has room it reuses the reconcile machinery (`reconcile_run` over the checkpointed
-slice set), so only the unfinished slices rebuild — no duplicate issue, branch, or PR.
-
-## Lane classifier + cron backlog drainer
-
-`retinue.lane.classify` routes a GitHub issue to one of three lanes from its labels and
-body. `ready-for-agent` is the single "build me" trigger; the `Part of #<prd>` body link
-splits provenance from pickup: a `ready-for-agent` slice carrying a `Part of #<prd>` link
-goes to the **orchestrator** lane (built by `build_prd`); a `ready-for-agent` issue with
-**no** Part-of link goes to the **ad-hoc** lane (standalone work, not a slice of any PRD);
-a loose `backlog` issue goes to the **cron** lane. PRD work runs first by default, but a
-*standalone* `priority:critical` / `priority:high` issue **preempts** that ordering onto
-the orchestrator lane — a critical must not wait its turn in the slow backlog drain. The
-classifier is pure (labels + body only, no `gh`) and reuses the same `priority:<severity>`
-vocabulary loopback emits. The slicer additionally stamps `prd-slice` alongside
-`ready-for-agent` on every slice it files, so a slice is distinguishable from ad-hoc
-pickup at the label layer.
-
-`retinue.adhoc_build.build_adhoc_issue` is the ad-hoc lane's build primitive. In one
-disposable container it runs the read-only `planner` (Opus on the in-container CLI, which
-maps the code with an Explore subagent and emits a plan), **materializes** that plan into
-`.retinue/plan.md`, then runs the **same** implementer the PRD lane uses — pointed at
-`.retinue/plan.md` via its `plan_path` so it reads the plan first — to build and commit on
-an `issue-<N>` branch cut off `config.staging_branch`. The repo's done-check
-runs in the same container; a green check pushes the branch (for a human to open a PR
-from), a red check pushes nothing. On a green build only, the injected `AdhocReviewer`
-(`ContainerAdhocReviewer`) runs the third pass: it diffs the `issue-<N>` branch over the
-staging base in the same container, runs the internal reviewer (Opus/`max`) over that diff,
-and files each finding as a **flat** `review-fix` + `ready-for-agent` follow-up issue (no
-`Part of #` footer, no Blocked-by wiring — ad-hoc work has no parent PRD) that loops back as
-ordinary ad-hoc work. The review is **advisory**: it never blocks the build or the push, and
-any error it raises is swallowed. The review-fix **chain** is bounded by a **lineage marker**,
-not by the issue number: each filed fix carries a `Chain-depth: <n>` line in its body, and a
-build whose issue is already at depth `retry_cap` files no more fixes — so the chain
-`#29 -> #501 -> #503 -> ...` terminates after `retry_cap` hops even though each hop is a fresh
-GitHub issue number. The bound rides the issue body and touches no shared store, so it never
-collides with triage's build-retry budget. It stays live only because the ad-hoc lane rebuilds
-each fetched issue through `AdhocIssue.from_fetched_issue`, which parses that `Chain-depth:`
-marker back into the issue — constructing the issue by hand would default every hop to depth 0
-and make the bound inert. There is no integration branch and no merge — that
-is the orchestrator lane's job. Every collaborator (planner, implementer, reviewer,
-container, auth, secret resolver, report sink) is an injected seam, so the flow is tested
-with no Agent SDK, Docker, gh, or network.
-
-After a green ad-hoc build, `Pipeline.process_adhoc_pr` opens **exactly one** PR
-`issue-<N>` -> `staging` and wires it into the **shared** post-build pipeline unchanged. It
-reuses `pr_opener.open_staging_pr` behind the same heimdall/staging prechecks the PRD lane
-uses, passing the `issue-<N>` branch as the PR `head` so the PR opens straight into staging
-with **no** integration branch — the one ad-hoc difference at this seam. A red build pushed
-nothing, so no PR is opened. The PR<->issue mapping is recorded in the same `RunStateStore`
-keyed by the single ad-hoc issue (no PRD parent, no slice children), so the PR drives the
-existing `process_review` heimdall loopback and `test-and-merge` handoff, and on the human's
-merge the unchanged `reap_pr` reaps the single ad-hoc issue closed (there is no PRD to reap).
-"The retinue never merges" — only a human merges; the reap reacts to that merge.
-
-`retinue.adhoc_drain.run_adhoc_drain` ties the ad-hoc lane together — one drain per repo. It
-**lists** every open `ready-for-agent` issue via the gh seam (`GhCli`, which surfaces each
-issue's `body` alongside its labels), **filters** to the ad-hoc lane the same way
-`lane.classify` decides it — dropping any `prd`-labeled issue and any issue carrying a
-`Part of #<prd>` link, since those route to the orchestrator lane — and **ranks** the
-survivors by `priority:<sev>` with no-priority lowest. It then **drives** the
-`build_adhoc_issue` + `process_adhoc_pr` primitive (one injected callable) for each ranked
-issue, concurrently but capped at `config.max_parallel` live builds. Each issue is
-materialized through `AdhocIssue.from_fetched_issue` fed the **fetched body**, never the bare
-constructor, so the `Chain-depth:` lineage marker is read back into `chain_depth` and the
-review-fix chain bound stays live — building the issue by hand would default every hop to
-depth 0 and make the bound inert.
-
-The drain is hardened for production with four guards. **Dedup via GitHub truth**:
-`AdhocGh.in_flight` skips any issue whose `issue-<N>` branch or open PR already exists
-(mirroring `reconcile`'s source-of-truth approach), so no duplicate branch or PR is opened.
-**Single-run lock**: the whole drain runs under an injected lock so two drains for a repo
-never overlap (a second entry raises `AdhocDrainBusyError`); the lock is *separate* from the
-orchestrator's, so the drain still runs alongside a PRD build. **Shared budget governor**:
-every build meters against the *one* service-level `BudgetGovernor` the PRD lane uses
-(`meter_adhoc`, the same atomic check-and-record as the PRD meter), so a build that would
-cross the rolling-24h cap is skipped and the shared budget is never overshot. **PRD-first
-ordering with preemption**: when a PRD build is in flight, only a `priority:critical|high`
-issue (the rule `lane.preempts_prd_first` is the single source of truth for) builds —
-ordinary ad-hoc work waits for the PRD. The gh queries, the budget store, and the downstream
-build are all injected and faked, so the drain runs with no real `gh`, no Docker, and no
-network.
-
-`retinue.cron.run_cron_tick` is the cron lane's per-tick driver: a scheduled tick drains
-loose `backlog` issues **one at a time**. Each tick runs under an injected single-run
-**lock** (mirroring the orchestrator's `OrchestratorBusyError` guard, here `CronBusyError`)
-so at most one cron run executes alongside at most one orchestrator run. It then **gates**
-on the *same shared* service-level `BudgetGovernor` and **defers** (picking nothing,
-running nothing) when the budget is spent. Otherwise it **picks** the next backlog issue by
-a weighted score (priority dominates, age breaks ties within a priority), except on every
-Nth tick where a **quota floor** takes the oldest low-priority issue so the low items
-provably drain rather than starving behind a steady high-priority stream. The picked issue
-runs the same downstream the orchestrator drives (build -> PR -> heimdall loopback ->
-notify) via one injected build callable.
-
-The clock is injected (age-weighting) and the tick counter is passed in (the quota floor),
-so nothing reads the wall clock. The backlog `gh` query, the budget governor, the
-single-run lock, and the downstream build are all injected and faked, so a tick runs with
-no real `gh`, no Docker, and no network.
-
-`retinue.heartbeat.run_heartbeat` is what fires both lanes at runtime. Registered as the
-worker-global arq `cron_jobs` tick (`WorkerSettings.cron_jobs`, every 15th minute — the
-global tick), each heartbeat sweeps the opted-in repos: it fires the safety-net **ad-hoc
-drain** for each repo whose `repo_config.cron` cadence is due on this tick (`cron_due` is the
-per-repo "is this repo due?" filter under the global tick), catching up issues labeled while
-the webhook was missed or the worker was down, and drives the **backlog cron lane**
-(`run_cron_tick`) for every repo — the first runtime caller of the previously-dead lane. A
-drain or tick that raises for one repo is logged and skipped so a single bad repo cannot
-starve the sweep. The clock, the repo enumeration, the per-repo drain, and the backlog tick
-are all injected, so the heartbeat runs with no real arq, Redis, `gh`, Docker, or wall-clock.
-In production the worker's `on_startup` binds them under live GitHub-App auth — the real
-wall-clock `Clock`, an enumerator over the App's installed-and-opted-in repos (each as a
-`DueRepo` with its accepted `RepoConfig`), the *same* bound ad-hoc drain the webhook kick
-fires (so a kick and a sweep are one drain), and a bound `run_cron_tick` — so the registered
-tick actually sweeps; a bare/unauthed worker leaves them unset and the tick stays a no-op.
+Metering is auth-aware: an API key meters **dollars** against a weekly-$ budget, subscription
+OAuth meters **tokens** against a weekly-token budget — same rolling math, different unit.
+`BudgetGovernor` enforces at two points: `gate` **defers** a run whose estimated charge would
+start it over the cap; `meter` **pauses** a run whose next charge would cross it. Because the
+two lanes meter against one shared ledger file, `meter` records through
+`try_record_if_within_cap`, which performs the cap check and the insert inside a single
+`BEGIN IMMEDIATE` transaction: a second concurrent lane serializes on the SQLite write lock,
+re-reads the updated trailing total, and pauses instead of recording — so two charges that
+would jointly cross the cap can never both land.
 
 ## Configuration
 
@@ -507,14 +310,13 @@ Set via environment variables or a `.env` file:
 | ---------------------------- | -------- | ------------------------- | ---------------------------------------------------- |
 | `WEBHOOK_SECRET`             | yes      | —                         | GitHub webhook HMAC secret                           |
 | `REDIS_URL`                  | no       | `redis://localhost:6379`  | Redis connection URL                                 |
-| `DEDUPE_DB_PATH`             | no       | `retinue-dedupe.sqlite3`  | SQLite file backing PRD dedupe                       |
+| `DEDUPE_DB_PATH`             | no       | `retinue-dedupe.sqlite3`  | Locates the worker's durable-state directory (run-state / retry stores) |
 | `AUTH_MODE`                  | no       | `api_key`                 | Metering unit: `api_key` (dollars) or `subscription` (tokens) |
 | `WEEKLY_BUDGET`              | no       | `0`                       | Service-level weekly budget (dollars or tokens)      |
 | `BUDGET_DB_PATH`             | no       | `retinue-budget.sqlite3`  | SQLite file backing the rolling-24h spend ledger     |
 | `BUDGET_DAILY_CAP_FRACTION`  | no       | `0.12`                    | Fraction of the weekly budget spendable per 24h      |
 | `JOB_TIMEOUT_SECONDS`        | no       | `1800`                    | Arq worker-global job timeout; must outlast a full build |
 | `IMPLEMENT_MAX_TURNS`        | no       | `80`                      | Hard cap on the implementer's agent loop (`claude --max-turns`) |
-| `HEIMDALL_BOT_LOGIN`         | no       | `heimdall[bot]`           | Reviewer bot login the webhook filter and loopback listen for |
 | `GITHUB_APP_ID`              | no\*     | —                         | GitHub App numeric id (the JWT `iss` claim)          |
 | `GITHUB_APP_PRIVATE_KEY_PATH`| no\*     | —                         | Path to the App RSA private key (PEM) signing app JWTs |
 | `ANTHROPIC_API_KEY`          | no\*     | —                         | Anthropic API key — used in `api_key` auth mode      |
@@ -524,15 +326,15 @@ Set via environment variables or a `.env` file:
 | `PUSHOVER_TOKEN`             | no\*\*   | —                         | Pushover application API token (Pushover backend)    |
 | `PUSHOVER_USER`              | no\*\*   | —                         | Pushover user/group key (Pushover backend)           |
 
-\* Required once the worker drives the real pipeline: the GitHub App credentials mint
-the per-repo tokens the gh adapters use, and the Anthropic credential for the active
-`AUTH_MODE` (`ANTHROPIC_API_KEY` for `api_key`, `CLAUDE_CODE_OAUTH_TOKEN` for
-`subscription`) authenticates the Agent-SDK calls. Without GitHub App auth the worker
-falls back to the safe not-opted-in default and drives nothing.
+\* Required once the worker drives the real pipeline: the GitHub App credentials mint the
+per-repo tokens the gh adapters use, and the Anthropic credential for the active `AUTH_MODE`
+(`ANTHROPIC_API_KEY` for `api_key`, `CLAUDE_CODE_OAUTH_TOKEN` for `subscription`)
+authenticates the agent calls. Without GitHub App auth the worker falls back to the safe
+not-opted-in default and drives nothing.
 
-\*\* Push channel: configure **either** ntfy (`NTFY_TOPIC`) **or** Pushover
-(`PUSHOVER_TOKEN` + `PUSHOVER_USER`). With neither set the push heads-up is a logged
-no-op; the issue comment + label (the durable escalation record) still land.
+\*\* Push channel: configure **either** ntfy (`NTFY_TOPIC`) **or** Pushover (`PUSHOVER_TOKEN`
++ `PUSHOVER_USER`). With neither set the push heads-up is a logged no-op; the issue comment +
+label (the durable escalation record) still land.
 
 ## Running
 
