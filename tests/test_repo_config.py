@@ -13,7 +13,10 @@ import pytest
 from retinue.repo_config import RepoConfig, load_repo_config
 
 FULL_CONFIG = """
-staging_branch: integration
+trigger_label: build-me
+target_branch: integration
+severity_tiers: [urgent, normal, whenever]
+priority_tiers: [urgent]
 retry_cap: 5
 max_parallel: 4
 cron: "0 */6 * * *"
@@ -28,7 +31,10 @@ def test_full_config_parses_every_field() -> None:
     """A complete config exposes every documented field downstream."""
     config = load_repo_config(FULL_CONFIG)
     assert config is not None
-    assert config.staging_branch == "integration"
+    assert config.trigger_label == "build-me"
+    assert config.target_branch == "integration"
+    assert config.severity_tiers == ["urgent", "normal", "whenever"]
+    assert config.priority_tiers == ["urgent"]
     assert config.retry_cap == 5
     assert config.max_parallel == 4
     assert config.cron == "0 */6 * * *"
@@ -40,7 +46,10 @@ def test_minimal_config_applies_defaults() -> None:
     """An empty mapping is valid; documented defaults fill the gaps."""
     config = load_repo_config("{}")
     assert config is not None
-    assert config.staging_branch == "staging"
+    assert config.trigger_label == "ready-for-agent"
+    assert config.target_branch is None
+    assert config.severity_tiers == ["critical", "high", "medium", "low"]
+    assert config.priority_tiers == ["critical", "high"]
     assert config.retry_cap == 3
     assert config.max_parallel is None
     assert config.cron is None
@@ -52,12 +61,51 @@ def test_empty_file_applies_defaults() -> None:
     """An empty file parses to an all-defaults config rather than failing."""
     config = load_repo_config("")
     assert config is not None
-    assert config.staging_branch == "staging"
+    assert config.target_branch is None
 
 
-def test_validates_staging_branch_type() -> None:
-    """A non-string staging_branch is rejected (config skipped)."""
-    assert load_repo_config("staging_branch: 123\n") is None
+def test_validates_target_branch_type() -> None:
+    """A non-string target_branch is rejected (config skipped)."""
+    assert load_repo_config("target_branch: 123\n") is None
+
+
+def test_priority_tiers_must_be_a_top_prefix_of_severity_tiers() -> None:
+    """A priority range that isn't the top of the ordered tiers is rejected."""
+    # A non-prefix subset contradicts "priority queue drains the top tiers first".
+    assert load_repo_config(
+        "severity_tiers: [critical, high, low]\npriority_tiers: [low]\n"
+    ) is None
+    # A prefix is accepted; an empty range (no drop-everything tier) is valid too.
+    ok = load_repo_config(
+        "severity_tiers: [critical, high, low]\npriority_tiers: [critical]\n"
+    )
+    assert ok is not None and ok.priority_tiers == ["critical"]
+    empty = load_repo_config("priority_tiers: []\n")
+    assert empty is not None and empty.priority_tiers == []
+
+
+def test_rejects_empty_or_duplicate_severity_tiers() -> None:
+    """severity_tiers must be non-empty and unique."""
+    assert load_repo_config("severity_tiers: []\n") is None
+    assert load_repo_config("severity_tiers: [high, high]\n") is None
+
+
+def test_tier_helpers_rank_and_classify() -> None:
+    """tier_of / tier_rank / is_priority_tier read the priority:<tier> label."""
+    config = load_repo_config(
+        "severity_tiers: [critical, high, medium, low]\npriority_tiers: [critical, high]\n"
+    )
+    assert config is not None
+    assert config.tier_of(["priority:high", "other"]) == "high"
+    assert config.tier_of(["priority:bogus"]) is None
+    assert config.tier_of([]) is None
+    # Rank: earlier tier is more urgent; untiered ranks past the last tier.
+    assert config.tier_rank("critical") < config.tier_rank("low")
+    assert config.tier_rank(None) == len(config.severity_tiers)
+    assert config.tier_rank("bogus") == len(config.severity_tiers)
+    assert config.is_priority_tier("high") is True
+    assert config.is_priority_tier("medium") is False
+    assert config.is_priority_tier(None) is False
 
 
 def test_validates_retry_cap_is_non_negative_int() -> None:
@@ -111,7 +159,7 @@ def test_non_mapping_document_is_skipped() -> None:
 def test_repo_config_is_constructible_directly() -> None:
     """RepoConfig can be built in code with all defaults for downstream use."""
     config = RepoConfig()
-    assert config.staging_branch == "staging"
+    assert config.target_branch is None
     assert config.retry_cap == 3
 
 
@@ -171,7 +219,7 @@ def test_routing_block_parses_full_shape() -> None:
 
 def test_routing_absent_is_valid_and_reports_none() -> None:
     """A config with no routing: block validates, with routing simply off."""
-    config = load_repo_config("staging_branch: staging\n")
+    config = load_repo_config("target_branch: staging\n")
     assert config is not None
     assert config.routing is None
 
