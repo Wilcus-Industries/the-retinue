@@ -1,23 +1,16 @@
-"""Open the staging PR for a fully built PRD, behind a heimdall precheck.
+"""Open the ``issue-<N>`` -> target-branch PR for a green build.
 
-Once a PRD's ready set drains (the full-PRD build in :mod:`retinue.orchestrator`
-completes), the integration branch ``retinue/prd-<n>`` is ready to land. This module
-opens exactly one PR ``retinue/prd-<n>`` -> ``staging`` for it, gated by two prechecks
-applied in order:
+Once a build pushes a green ``issue-<N>`` branch, this module opens exactly one PR
+``issue-<N>`` -> ``config.require_target_branch()`` for it, gated by one precheck: the
+target branch must exist. A missing one escalates through
+:class:`retinue.notify.Notifier` (push + comment + label) and opens no PR.
 
-1. **heimdall installed** — the repo must have the heimdall check installed. A repo
-   without it escalates through :class:`retinue.notify.Notifier` (push + comment +
-   label) and opens no PR — landing into ``staging`` without the gate is unsafe.
-2. **staging exists** — the target ``staging`` branch (``config.staging_branch``) must
-   exist. A missing one escalates on its own path and opens no PR.
-
-When both pass, the integration branch is brought up to date with ``staging`` and
-exactly one PR is opened. Every gh-touching collaborator — the heimdall precheck, the
-staging-branch existence check, the bring-up-to-date, and the open-PR action — is an
-injected :class:`PrOps` seam, mirroring the gh-seam style of
-:mod:`retinue.github_app` / :mod:`retinue.orchestrator`. Tests inject a fake, so the
-whole flow runs with no real ``gh`` and no network. Escalations reuse the shared
-:class:`~retinue.notify.Notifier` fan-out rather than re-implementing notification.
+When the precheck passes, the head branch is brought up to date with the target branch and
+exactly one PR is opened. Every gh-touching collaborator — the target-branch existence
+check, the bring-up-to-date, and the open-PR action — is an injected :class:`PrOps` seam.
+Tests inject a fake, so the whole flow runs with no real ``gh`` and no network. Escalations
+reuse the shared :class:`~retinue.notify.Notifier` fan-out rather than re-implementing
+notification.
 """
 
 from __future__ import annotations
@@ -31,13 +24,12 @@ from typing import Protocol
 
 from retinue.gh import GhCommandError, GhResult, GhRunner, auth_env
 from retinue.notify import Notification, Notifier
-from retinue.orchestrator import integration_branch
 from retinue.repo_config import RepoConfig
 
 logger = logging.getLogger(__name__)
 
-# The label every PR-opener escalation carries: a human must intervene (install
-# heimdall, create the staging branch) before the PR can open.
+# The label every PR-opener escalation carries: a human must intervene (create the target
+# branch) before the PR can open.
 _ESCALATION_LABEL = "hitl"
 
 
@@ -47,8 +39,8 @@ class OpenPrRequest:
 
     Attributes:
         repo_full_name: The target repo, e.g. "owner/repo".
-        head: The source branch, ``retinue/prd-<n>``.
-        base: The target branch, ``config.staging_branch`` (default ``staging``).
+        head: The source branch, ``issue-<N>``.
+        base: The target branch, ``config.require_target_branch()``.
         title: The PR title.
         body: The PR body.
     """
@@ -74,18 +66,13 @@ class PullRequest:
 
 
 class PrOps(Protocol):
-    """The gh operations behind opening the staging PR. The PR-opener gh seam.
+    """The gh operations behind opening the PR. The PR-opener gh seam.
 
-    A production implementation runs ``gh`` against the target repo (the heimdall
-    check lookup, a branch-existence query, a fast-forward/merge of ``staging`` into
-    the integration branch, and ``gh pr create``); tests inject a fake that scripts
-    the prechecks and records the sync + open-PR calls. Modeled as one protocol so the
-    whole PR-opener flow injects through a single collaborator.
+    A production implementation runs ``gh`` against the target repo (a branch-existence
+    query, a merge of the target branch into the head, and ``gh pr create``); tests inject
+    a fake that scripts the precheck and records the sync + open-PR calls. Modeled as one
+    protocol so the whole PR-opener flow injects through a single collaborator.
     """
-
-    async def heimdall_installed(self, repo_full_name: str) -> bool:
-        """Return True when the heimdall check is installed on ``repo_full_name``."""
-        ...
 
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         """Return True when ``branch`` (the staging branch) exists on the repo."""
@@ -112,18 +99,17 @@ class PrOpenOutcome(enum.Enum):
     """Why the PR-opener opened a PR or escalated instead."""
 
     OPENED = "opened"
-    HEIMDALL_MISSING = "heimdall_missing"
     STAGING_MISSING = "staging_missing"
 
 
 @dataclass(frozen=True)
 class PrOpenResult:
-    """Outcome of attempting to open the staging PR for a built PRD.
+    """Outcome of attempting to open the ``issue-<N>`` -> target-branch PR.
 
     Attributes:
-        outcome: ``OPENED`` when exactly one PR was opened; ``HEIMDALL_MISSING`` or
-            ``STAGING_MISSING`` when a precheck failed and the run escalated.
-        integration_branch: The source branch the PR opens from, ``retinue/prd-<n>``.
+        outcome: ``OPENED`` when exactly one PR was opened; ``STAGING_MISSING`` when the
+            target-branch precheck failed and the run escalated.
+        integration_branch: The source branch the PR opens from, ``issue-<N>``.
         pull_request: The opened PR on ``OPENED``; ``None`` on an escalation.
     """
 
@@ -145,58 +131,38 @@ async def open_staging_pr(
     config: RepoConfig,
     ops: PrOps,
     notifier: Notifier,
-    head: str | None = None,
+    head: str,
 ) -> PrOpenResult:
-    """Open exactly one PR ``<head>`` -> ``staging`` behind a heimdall precheck.
+    """Open exactly one PR ``<head>`` -> target-branch behind a branch-existence precheck.
 
-    Applies two prechecks in order: heimdall must be installed on the repo, then the
-    staging branch must exist. A failed precheck escalates through ``notifier`` (push +
-    comment + label) and opens no PR. When both pass, the head branch is brought up to
-    date with the staging branch and exactly one PR is opened.
+    The target branch (``config.require_target_branch()``) must exist; a missing one
+    escalates through ``notifier`` (push + comment + label) and opens no PR. When the
+    precheck passes, the head branch is brought up to date with the target branch and
+    exactly one PR is opened.
 
-    The head defaults to the PRD lane's integration branch ``retinue/prd-<prd_number>``;
-    the ad-hoc lane passes its own ``issue-<N>`` branch as ``head`` so a standalone build
-    opens its PR straight into staging with **no** integration branch — the only ad-hoc
-    difference at this seam. Both lanes share every precheck, the bring-up-to-date, and
-    the single open-PR action.
+    The head is the built ``issue-<N>`` branch, so a standalone build opens its PR straight
+    into the target branch with no integration branch.
 
     Args:
         repo_full_name: The target repo, e.g. "owner/repo".
-        prd_number: The PRD (or ad-hoc issue) number; names the default integration head.
-        prd_issue_number: The tracking issue an escalation comments/labels (the PRD's, or
-            the ad-hoc issue itself).
-        config: The accepted repo config; ``staging_branch`` is the PR base and the
-            sync base.
-        ops: The injected gh seam (heimdall precheck, staging check, sync, open-PR).
-        notifier: The shared escalation fan-out used on either precheck-failure path.
-        head: The source branch to open from; defaults to ``retinue/prd-<prd_number>``.
-            The ad-hoc lane passes ``issue-<N>`` to open straight into staging.
+        prd_number: The issue number the PR maps to (recorded by the caller's mapping).
+        prd_issue_number: The tracking issue an escalation comments/labels.
+        config: The accepted repo config; ``require_target_branch()`` is the PR base and
+            the sync base.
+        ops: The injected gh seam (target-branch check, sync, open-PR).
+        notifier: The shared escalation fan-out used on the precheck-failure path.
+        head: The source ``issue-<N>`` branch to open from.
 
     Returns:
-        A :class:`PrOpenResult`: ``OPENED`` with the created PR, or an escalation
-        outcome (``HEIMDALL_MISSING`` / ``STAGING_MISSING``) with no PR.
+        A :class:`PrOpenResult`: ``OPENED`` with the created PR, or ``STAGING_MISSING``
+        with no PR.
 
     Raises:
         Whatever ``ops`` raises on a real gh failure, and whatever ``notifier`` raises
         when the durable comment/label record cannot be written.
     """
-    branch = head if head is not None else integration_branch(prd_number)
-    staging = config.staging_branch
-
-    if not await ops.heimdall_installed(repo_full_name):
-        return await _escalate(
-            repo_full_name=repo_full_name,
-            prd_issue_number=prd_issue_number,
-            branch=branch,
-            notifier=notifier,
-            outcome=PrOpenOutcome.HEIMDALL_MISSING,
-            title="Retinue cannot open the staging PR: heimdall not installed",
-            body=(
-                f"PRD #{prd_issue_number} built `{branch}`, but heimdall is not "
-                f"installed on `{repo_full_name}`. Install the heimdall check, then "
-                "the retinue can open the PR into staging. No PR was opened."
-            ),
-        )
+    branch = head
+    staging = config.require_target_branch()
 
     if not await ops.staging_exists(repo_full_name=repo_full_name, branch=staging):
         return await _escalate(
@@ -205,9 +171,9 @@ async def open_staging_pr(
             branch=branch,
             notifier=notifier,
             outcome=PrOpenOutcome.STAGING_MISSING,
-            title="Retinue cannot open the staging PR: staging branch missing",
+            title="Retinue cannot open the PR: target branch missing",
             body=(
-                f"PRD #{prd_issue_number} built `{branch}`, but the staging branch "
+                f"Issue #{prd_issue_number} built `{branch}`, but the target branch "
                 f"`{staging}` does not exist on `{repo_full_name}`. Create it, then "
                 "the retinue can open the PR. No PR was opened."
             ),
@@ -355,31 +321,22 @@ def _parse_pr(stdout: str) -> PullRequest:
 
 
 class GhCliPrOps:
-    """Production :class:`PrOps`: drives the staging PR through ``gh`` and ``git``.
+    """Production :class:`PrOps`: drives the PR through ``gh`` and ``git``.
 
-    Every gh-touching step the flow needs — the heimdall check lookup, the staging
-    branch-existence query, the bring-up-to-date, and ``gh pr create`` — is assembled
-    here and dispatched through the injected :class:`~retinue.gh.GhRunner`,
-    authenticated with a ``GH_TOKEN`` bearer (see :func:`retinue.gh.auth_env`). The
-    runner is the only side-effecting
-    seam, which keeps command assembly and payload parsing unit-testable.
+    Every gh-touching step the flow needs — the target-branch existence query, the
+    bring-up-to-date, and ``gh pr create`` — is assembled here and dispatched through the
+    injected :class:`~retinue.gh.GhRunner`, authenticated with a ``GH_TOKEN`` bearer (see
+    :func:`retinue.gh.auth_env`). The runner is the only side-effecting seam, which keeps
+    command assembly and payload parsing unit-testable.
 
     Args:
         runner: The process-spawn seam that runs each ``gh`` command.
         token: The installation/access token ``gh`` authenticates with.
-        heimdall_check_name: The check-run name that marks heimdall as installed.
     """
 
-    def __init__(
-        self,
-        runner: GhRunner,
-        *,
-        token: str,
-        heimdall_check_name: str = "heimdall",
-    ) -> None:
+    def __init__(self, runner: GhRunner, *, token: str) -> None:
         self._runner = runner
         self._token = token
-        self._heimdall_check_name = heimdall_check_name
 
     async def _gh(self, args: list[str]) -> GhResult:
         """Run one ``gh`` command authenticated with the token, raising on failure."""
@@ -387,50 +344,6 @@ class GhCliPrOps:
         if not result.ok:
             raise GhCommandError(args, result)
         return result
-
-    async def heimdall_installed(self, repo_full_name: str) -> bool:
-        """Return True when a check named ``heimdall`` is required by any repo ruleset.
-
-        The repo-rulesets *list* endpoint omits each ruleset's ``rules`` (it returns only
-        summaries: id, name, target, enforcement), so the required-check contexts must be
-        read from each ruleset's *detail* endpoint. List the ruleset ids, then membership-
-        test the heimdall context across each ruleset's rules, short-circuiting on the first
-        hit. (Querying ``.rules`` on the list response always yields nothing — the prior bug
-        that left ``heimdall_installed`` permanently False, so no PR ever opened.)
-
-        A 403 from the list endpoint ("Upgrade to GitHub Pro or make this repository
-        public to enable this feature.") means the repo has no rulesets feature at all —
-        a private repo on a free plan — so no ruleset can require the heimdall check:
-        that is a False answer (the HEIMDALL_MISSING escalation path), not a gh failure
-        to raise on. Any other non-zero exit (auth, network) still raises.
-        """
-        listed = await self._runner.run(
-            ["api", f"repos/{repo_full_name}/rulesets", "--jq", "[.[].id]"],
-            env=auth_env(self._token),
-        )
-        if not listed.ok:
-            if "HTTP 403" in listed.stderr:
-                logger.info(
-                    "Rulesets feature unavailable on %s (HTTP 403); reading "
-                    "heimdall as not installed",
-                    repo_full_name,
-                )
-                return False
-            raise GhCommandError(
-                ["api", f"repos/{repo_full_name}/rulesets", "--jq", "[.[].id]"], listed
-            )
-        for ruleset_id in json.loads(listed.stdout or "[]"):
-            detail = await self._gh(
-                [
-                    "api",
-                    f"repos/{repo_full_name}/rulesets/{ruleset_id}",
-                    "--jq",
-                    "[.rules[]?.parameters.required_status_checks[]?.context]",
-                ]
-            )
-            if self._heimdall_check_name in json.loads(detail.stdout or "[]"):
-                return True
-        return False
 
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         """Return True when ``branch`` resolves to a ref on ``repo_full_name``."""

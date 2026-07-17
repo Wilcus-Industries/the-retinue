@@ -1,14 +1,13 @@
 """Ad-hoc build primitive: plan -> materialize -> implement -> review, gated on done-check.
 
-The ad-hoc lane (:mod:`retinue.lane`) routes a standalone ``ready-for-agent`` issue — one
-with no ``Part of #<prd>`` link — here. Unlike a PRD slice there is no integration branch
-and no merge: the issue is built directly on an ``issue-<N>`` branch cut off the repo's
-``config.staging_branch``, and a green build pushes that branch for a human to open a PR
-from. The whole build runs in **one disposable container** that is destroyed on every path
-(:func:`build_adhoc_issue`):
+The scheduler drain routes a ``ready-for-agent`` issue here. There is no integration branch
+and no merge: the issue is built directly on an ``issue-<N>`` branch cut off the resolved
+target branch (``config.require_target_branch()``), and a green build pushes that branch for
+the PR-open step. The whole build runs in **one disposable container** that is destroyed on
+every path (:func:`build_adhoc_issue`):
 
 1. **clone + branch** — the container clones the repo over the installation token and
-   checks out a fresh ``issue-<N>`` branch off ``config.staging_branch``,
+   checks out a fresh ``issue-<N>`` branch off the resolved target branch,
 2. **plan** — the read-only planner (the :data:`~retinue.roles.Role.PLANNER` registry
    entry, Opus on the in-container CLI) maps the code with an Explore subagent and emits a
    plan, captured from its output (it writes nothing to the workspace),
@@ -307,9 +306,9 @@ def _issue_diff_command(branch: str, base: str) -> list[str]:
     :func:`retinue.container_build.clone_and_branch` runs ``git fetch origin <base>`` then
     ``git checkout -B issue-<N> origin/<base>``, so it creates the remote-tracking
     ``origin/<base>`` ref and the local ``issue-<N>`` branch but **no** bare local
-    ``<base>`` (that exists only when ``staging_branch`` happens to be the clone's default
+    ``<base>`` (that exists only when the target branch happens to be the clone's default
     HEAD). The base is therefore ``origin/<base>`` — mirroring the orchestrator's
-    :func:`~retinue.orchestrator._branch_diff_command`, whose base side is
+    the round-diff base, whose base side is
     also a resolvable ref — while the branch stays the *local* ``issue-<N>`` ref the build
     just committed to (no ``origin/`` prefix): the review runs in the same container that
     built it, so the local tip is the surface to review.
@@ -326,12 +325,12 @@ class ContainerAdhocReviewer:
     reviewer wholesale:
 
     1. diff the local ``issue-<N>`` branch over the remote-tracking
-       ``origin/<config.staging_branch>`` ref inside the build container (the same
+       ``origin/<target-branch>`` ref inside the build container (the same
        container that built it, so the local tip is reviewed against a ref it actually
        has); a failed diff raises rather than yielding an empty review surface,
     2. run the injected :class:`~retinue.reviewer.ReviewGenerator` (the headless Agent-SDK
        reviewer, Opus/max) over that diff, and
-    3. file each finding via the injected :class:`~retinue.slicer.IssueCreator` (gh) as a
+    3. file each finding via the injected :class:`~retinue.issues.IssueCreator` (gh) as a
        flat ``review-fix`` + ``ready-for-agent`` issue — no ``Part of #`` footer and no
        Blocked-by wiring, since ad-hoc work has no parent PRD; the fix loops back as
        ordinary ad-hoc work.
@@ -350,7 +349,7 @@ class ContainerAdhocReviewer:
 
     Attributes:
         repo_full_name: The target repo the review-fix issues are filed against.
-        config: The accepted repo config; ``staging_branch`` is the diff base and
+        config: The accepted repo config; the target branch is the diff base and
             ``retry_cap`` bounds the review-fix chain depth.
         generate: The headless Agent-SDK reviewer (the :class:`ReviewGenerator` seam).
         create_issue: The gh issue creator filing each flat review-fix issue (slicer's
@@ -419,7 +418,7 @@ class ContainerAdhocReviewer:
         unreviewed with no error surfaced. The advisory wrapper
         (:func:`_review_advisory`) still swallows the raised error, but logs it.
         """
-        command = _issue_diff_command(issue.branch, self.config.staging_branch)
+        command = _issue_diff_command(issue.branch, self.config.require_target_branch())
         result = await container.run_command(command)
         if not result.ok:
             raise GitOpsError(
@@ -473,7 +472,7 @@ async def build_adhoc_issue(
     Runs the shared per-issue lifecycle
     (:func:`retinue.container_build.build_issue_in_container`) in a single disposable
     container, destroyed on every path — parse the done-check, resolve the secrets, start
-    the container, clone and cut ``issue-<N>`` off ``config.staging_branch``, implement,
+    the container, clone and cut ``issue-<N>`` off the resolved target branch, implement,
     guard against a hollow implement (zero commits fails the build), done-check, push on
     green, report — with the ad-hoc lane's hooks threaded in:
 
@@ -491,7 +490,7 @@ async def build_adhoc_issue(
 
     Args:
         issue: The ad-hoc issue to build (repo, issue number).
-        config: The accepted repo config; its ``staging_branch`` is the issue-branch base
+        config: The accepted repo config; its target branch is the issue-branch base
             and its ``secrets`` are injected into the container.
         claude_md: The repo's ``CLAUDE.md`` text, carrying the done-check command.
         planner: Execs the read-only planner in the container (the planner seam).
@@ -533,7 +532,7 @@ async def build_adhoc_issue(
         _slice_for_issue(issue),
         config,
         claude_md,
-        base=config.staging_branch,
+        base=config.require_target_branch(),
         implementer=implementer,
         auth=auth,
         runtime=runtime,
@@ -578,7 +577,7 @@ async def _materialize_plan(container: Container, plan: str) -> None:
 
 
 def _slice_for_issue(issue: AdhocIssue) -> Slice:
-    """Adapt an :class:`AdhocIssue` to the :class:`~retinue.orchestrator.Slice` seam.
+    """Adapt an :class:`AdhocIssue` to the :class:`~retinue.container_build.Slice` seam.
 
     The implementer seam is shared with the PRD lane, whose contract is a ``Slice``. An
     ad-hoc issue has no parent PRD, so it stands on its own integration target: the

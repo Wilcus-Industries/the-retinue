@@ -7,10 +7,9 @@ it into the ``## Blocked by`` of the relevant dependent open issues so the fix b
 before the work layered on it. The reviewer never edits code.
 
 The three side-effecting seams are faked: the review generator (Agent SDK), the gh
-issue creator (reused from the slicer), and the gh issue-body editor (the Blocked-by
-wiring). A clean diff files nothing. A filed review-fix issue is also fed back into
-``build_prd`` to prove it is picked up and built in a subsequent round. No real Agent
-SDK, gh, or network is touched.
+issue creator (reused from the issues module), and the gh issue-body editor (the
+Blocked-by wiring). A clean diff files nothing. No real Agent SDK, gh, or network is
+touched.
 """
 
 from __future__ import annotations
@@ -18,9 +17,8 @@ from __future__ import annotations
 import pytest
 
 from retinue.gh import GhCommandError, GhResult
+from retinue.issues import CreatedIssue, IssueDraft
 from retinue.messages_api import HttpResponse
-from retinue.orchestrator import PrdBuildResult, PrdSlice, build_prd
-from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
     _REVIEW_SYSTEM,
     AgentSdkReviewGenerator,
@@ -35,17 +33,6 @@ from retinue.reviewer import (
     review_round,
 )
 from retinue.roles import CLAUDE_CODE_IDENTITY, EFFORT_MAX
-from retinue.slicer import CreatedIssue, IssueDraft
-from tests.fakes import (
-    CLAUDE_MD,
-    FakeAuth,
-    FakeGitOps,
-    FakeImplementer,
-    FakeRuntime,
-    OneAtATimeLock,
-    _resolver,
-    _sink,
-)
 
 PRD_NUMBER = 1
 REPO = "owner/repo"
@@ -172,49 +159,6 @@ async def test_finding_with_no_dependents_files_issue_without_wiring() -> None:
 
     assert len(result.filed_issues) == 1
     assert rec.edits == []
-
-
-@pytest.mark.asyncio
-async def test_review_fix_issue_is_built_in_a_subsequent_round() -> None:
-    """The filed review-fix issue is picked up and built by a later build_prd round."""
-    rec = _Recorder()
-
-    async def generate(review_input: ReviewInput) -> ReviewPlan:
-        return ReviewPlan(
-            findings=[
-                ReviewFinding(
-                    title="Fix off-by-one in total()",
-                    body="total() adds a stray +1.",
-                    blocks_issues=[3],
-                )
-            ]
-        )
-
-    review = await review_round(
-        _input(PLANTED_DEFECT_DIFF),
-        generate=generate,
-        create_issue=rec.create_issue,
-        edit_blocked_by=rec.edit_blocked_by,
-    )
-
-    # A subsequent orchestrator round picks up the filed review-fix issue as a slice.
-    fix_number = review.filed_issues[0]
-    git = FakeGitOps()
-    result: PrdBuildResult = await build_prd(
-        [PrdSlice(repo_full_name=REPO, issue_number=fix_number, prd_number=PRD_NUMBER)],
-        RepoConfig(),
-        CLAUDE_MD,
-        implementer=FakeImplementer(),
-        git=git,
-        auth=FakeAuth(),
-        runtime=FakeRuntime(),
-        resolve_secret=_resolver({}),
-        report=_sink([]),
-        lock=OneAtATimeLock(),
-    )
-
-    assert result.merged_issues == [fix_number]
-    assert (f"issue-{fix_number}", "retinue/prd-1") in git.merges
 
 
 # --- Real Agent-SDK ReviewGenerator: pure/parseable parts, no network ---

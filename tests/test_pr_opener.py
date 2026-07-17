@@ -1,18 +1,15 @@
-"""Tests for the staging PR opener with its heimdall precheck (issue #10).
+"""Tests for the ``issue-<N>`` -> target-branch PR opener (issue #10).
 
-Once a PRD's ready set drains, the orchestrator opens exactly one PR
-``retinue/prd-<n>`` -> ``staging`` — but only after two prechecks pass:
+Once a build pushes a green ``issue-<N>`` branch, the orchestrator opens exactly one
+PR ``issue-<N>`` -> ``config.require_target_branch()`` — but only after one precheck
+passes: the target branch must exist. A missing one escalates (notify + label) and
+opens no PR.
 
-1. **heimdall installed** — the repo must have the heimdall check installed; a repo
-   without it escalates (notify + label) and opens no PR,
-2. **staging exists** — the target ``staging`` branch must exist; a missing one
-   escalates on its own path and opens no PR.
-
-When both pass, the integration branch is brought up to date with ``staging`` and
-exactly one PR is opened. Every gh-touching collaborator — the heimdall precheck, the
-staging-branch check, the bring-up-to-date, and the open-PR action — is an injected
-seam faked here, so no real gh and no network are touched. Escalations reuse the
-``Notifier`` fan-out (push + comment + label).
+When the precheck passes, the head branch is brought up to date with the target branch
+and exactly one PR is opened. Every gh-touching collaborator — the target-branch check,
+the bring-up-to-date, and the open-PR action — is an injected seam faked here, so no
+real gh and no network are touched. Escalations reuse the ``Notifier`` fan-out (push +
+comment + label).
 """
 
 from __future__ import annotations
@@ -56,29 +53,24 @@ class _RecordingSinks:
 
 
 class FakePrOps:
-    """In-memory gh seams: heimdall precheck, staging check, sync, and open-PR.
+    """In-memory gh seams: target-branch check, sync, and open-PR.
 
-    ``heimdall_installed`` and ``staging_exists`` script the two prechecks.
-    ``synced`` records each bring-up-to-date call; ``opened`` records every PR opened
-    so a test can assert exactly one PR was opened (or none).
+    ``staging_exists`` scripts the one precheck. ``synced`` records each
+    bring-up-to-date call; ``opened`` records every PR opened so a test can assert
+    exactly one PR was opened (or none).
     """
 
     def __init__(
         self,
         *,
-        heimdall_installed: bool = True,
         staging_exists: bool = True,
         existing_pr: PullRequest | None = None,
     ) -> None:
-        self._heimdall_installed = heimdall_installed
         self._staging_exists = staging_exists
         self._existing_pr = existing_pr
         self.synced: list[tuple[str, str]] = []
         self.opened: list[OpenPrRequest] = []
         self.existing_queries: list[tuple[str, str]] = []
-
-    async def heimdall_installed(self, repo_full_name: str) -> bool:
-        return self._heimdall_installed
 
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         return self._staging_exists
@@ -103,6 +95,10 @@ def _notifier(sinks: _RecordingSinks) -> Notifier:
     return Notifier(push=sinks.push, comment=sinks.comment, label=sinks.label)
 
 
+def _config(target_branch: str = "staging") -> RepoConfig:
+    return RepoConfig(target_branch=target_branch)
+
+
 async def _open(
     *,
     ops: FakePrOps,
@@ -117,14 +113,14 @@ async def _open(
         repo_full_name=repo_full_name,
         prd_number=prd_number,
         prd_issue_number=issue_number,
-        config=config or RepoConfig(),
+        config=config or _config(),
         ops=ops,
         notifier=_notifier(sinks or _RecordingSinks()),
-        head=head,
+        head=head or f"retinue/prd-{prd_number}",
     )
 
 
-# --- happy path: heimdall installed + staging exists -> exactly one PR ------------
+# --- happy path: target branch exists -> exactly one PR ---------------------------
 
 
 @pytest.mark.asyncio
@@ -149,7 +145,7 @@ async def test_adhoc_head_opens_issue_branch_straight_into_staging() -> None:
 
     The ad-hoc lane has no integration branch: it passes its ``issue-<N>`` branch as the
     head, so the head is synced and opened with no ``retinue/prd-<n>`` branch involved,
-    while every shared precheck still runs.
+    while the precheck still runs.
     """
     ops = FakePrOps()
 
@@ -194,10 +190,10 @@ async def test_integration_branch_brought_up_to_date_before_pr() -> None:
 
 
 @pytest.mark.asyncio
-async def test_custom_staging_branch_is_the_pr_base() -> None:
-    """A repo's non-default staging branch is the sync base and the PR base."""
+async def test_custom_target_branch_is_the_pr_base() -> None:
+    """A repo's non-default target branch is the sync base and the PR base."""
     ops = FakePrOps()
-    config = RepoConfig(staging_branch="release")
+    config = _config(target_branch="release")
 
     result = await _open(ops=ops, config=config, prd_number=2)
 
@@ -218,47 +214,12 @@ async def test_happy_path_does_not_escalate() -> None:
     assert sinks.labels == []
 
 
-# --- precheck: heimdall not installed escalates, opens no PR ----------------------
+# --- precheck: missing target branch escalates on its own path --------------------
 
 
 @pytest.mark.asyncio
-async def test_missing_heimdall_escalates_and_opens_no_pr() -> None:
-    """A repo without heimdall installed escalates (notify + label), opens no PR."""
-    ops = FakePrOps(heimdall_installed=False)
-    sinks = _RecordingSinks()
-
-    result = await _open(ops=ops, sinks=sinks)
-
-    assert result.outcome is PrOpenOutcome.HEIMDALL_MISSING
-    assert result.pull_request is None
-    # No PR, and the branch is never even brought up to date.
-    assert ops.opened == []
-    assert ops.synced == []
-    # The escalation landed on the comment + label sinks.
-    assert len(sinks.comments) == 1
-    assert len(sinks.labels) == 1
-
-
-@pytest.mark.asyncio
-async def test_missing_heimdall_labels_hitl() -> None:
-    """The heimdall escalation applies the hitl label so a human can pick it up."""
-    ops = FakePrOps(heimdall_installed=False)
-    sinks = _RecordingSinks()
-
-    await _open(ops=ops, sinks=sinks, issue_number=42)
-
-    label = sinks.labels[0]
-    assert label.label == "hitl"
-    assert label.issue_number == 42
-    assert "heimdall" in sinks.comments[0].body.lower()
-
-
-# --- precheck: missing staging branch escalates on its own path -------------------
-
-
-@pytest.mark.asyncio
-async def test_missing_staging_escalates_and_opens_no_pr() -> None:
-    """A missing staging branch escalates on its own path and opens no PR."""
+async def test_missing_target_branch_escalates_and_opens_no_pr() -> None:
+    """A missing target branch escalates and opens no PR."""
     ops = FakePrOps(staging_exists=False)
     sinks = _RecordingSinks()
 
@@ -273,28 +234,19 @@ async def test_missing_staging_escalates_and_opens_no_pr() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_staging_names_the_branch_in_the_escalation() -> None:
-    """The staging escalation names the missing branch so the human knows what to fix."""
+async def test_missing_target_branch_names_the_branch_in_the_escalation() -> None:
+    """The escalation names the missing branch so the human knows what to fix."""
     ops = FakePrOps(staging_exists=False)
     sinks = _RecordingSinks()
-    config = RepoConfig(staging_branch="release")
+    config = _config(target_branch="release")
 
-    await _open(ops=ops, sinks=sinks, config=config)
+    await _open(ops=ops, sinks=sinks, config=config, issue_number=42)
 
     assert "release" in sinks.comments[0].body
-    assert sinks.labels[0].label == "hitl"
-
-
-@pytest.mark.asyncio
-async def test_heimdall_checked_before_staging() -> None:
-    """A repo missing both heimdall and staging escalates on the heimdall path first."""
-    ops = FakePrOps(heimdall_installed=False, staging_exists=False)
-    sinks = _RecordingSinks()
-
-    result = await _open(ops=ops, sinks=sinks)
-
-    assert result.outcome is PrOpenOutcome.HEIMDALL_MISSING
-    assert "heimdall" in sinks.comments[0].body.lower()
+    assert "does not exist" in sinks.comments[0].body
+    label = sinks.labels[0]
+    assert label.label == "hitl"
+    assert label.issue_number == 42
 
 
 # --- production gh-cli PrOps: command assembly + payload parsing -------------------
@@ -415,109 +367,6 @@ async def test_failed_gh_invocation_raises_with_stderr() -> None:
     with pytest.raises(GhCommandError) as excinfo:
         await _ops(runner).open_pr(request)
     assert "boom: not allowed" in str(excinfo.value)
-
-
-@pytest.mark.asyncio
-async def test_heimdall_installed_reads_each_rulesets_detail() -> None:
-    """heimdall_installed lists ruleset ids, then reads each ruleset's *detail* for the check.
-
-    The repo-rulesets *list* endpoint omits each ruleset's ``rules``, so the required-check
-    contexts must be read per-ruleset from the detail endpoint — querying ``.rules`` on the
-    list response always yields nothing (the prior bug that left no PR ever opened).
-    """
-    runner = _FakeGhRunner(
-        [
-            GhResult(exit_code=0, stdout="[7, 9]"),  # list: ruleset ids
-            GhResult(exit_code=0, stdout='["ci", "heimdall"]'),  # detail of 7: match
-        ]
-    )
-
-    assert await _ops(runner).heimdall_installed("owner/repo") is True
-    list_args, _ = runner.calls[0]
-    assert list_args[0] == "api"
-    assert list_args[1] == "repos/owner/repo/rulesets"
-    assert list_args[list_args.index("--jq") + 1] == "[.[].id]"
-    detail_args, _ = runner.calls[1]
-    assert detail_args[1] == "repos/owner/repo/rulesets/7"
-
-
-@pytest.mark.asyncio
-async def test_heimdall_installed_scans_every_ruleset_until_found() -> None:
-    """The check may live in a later ruleset; each ruleset's detail is scanned until matched."""
-    runner = _FakeGhRunner(
-        [
-            GhResult(exit_code=0, stdout="[7, 9]"),
-            GhResult(exit_code=0, stdout='["ci"]'),  # detail 7: no heimdall
-            GhResult(exit_code=0, stdout='["heimdall"]'),  # detail 9: match
-        ]
-    )
-
-    assert await _ops(runner).heimdall_installed("owner/repo") is True
-    assert [c[0][1] for c in runner.calls] == [
-        "repos/owner/repo/rulesets",
-        "repos/owner/repo/rulesets/7",
-        "repos/owner/repo/rulesets/9",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_heimdall_installed_false_when_no_ruleset_requires_it() -> None:
-    """Every ruleset read, none requiring the heimdall check, reads as not installed."""
-    runner = _FakeGhRunner(
-        [
-            GhResult(exit_code=0, stdout="[7]"),
-            GhResult(exit_code=0, stdout='["ci", "lint"]'),
-        ]
-    )
-
-    assert await _ops(runner).heimdall_installed("owner/repo") is False
-
-
-@pytest.mark.asyncio
-async def test_heimdall_installed_false_and_no_detail_call_when_no_rulesets() -> None:
-    """No rulesets at all reads as not installed, with no per-ruleset detail call made."""
-    runner = _FakeGhRunner([GhResult(exit_code=0, stdout="[]")])
-
-    assert await _ops(runner).heimdall_installed("owner/repo") is False
-    assert len(runner.calls) == 1  # only the list call
-
-
-@pytest.mark.asyncio
-async def test_heimdall_installed_false_when_rulesets_feature_unavailable() -> None:
-    """A 403 from the rulesets list reads as not installed, not a crash.
-
-    GitHub returns HTTP 403 ("Upgrade to GitHub Pro or make this repository public
-    to enable this feature.") for a private repo on a free plan — the rulesets
-    feature does not exist there, so no ruleset can require the heimdall check.
-    That is the HEIMDALL_MISSING escalation path, not a gh failure to raise on;
-    raising here crashed the PRD resume sweep after a green merged round.
-    """
-    runner = _FakeGhRunner(
-        [
-            GhResult(
-                exit_code=1,
-                stdout="",
-                stderr=(
-                    "gh: Upgrade to GitHub Pro or make this repository public to "
-                    "enable this feature. (HTTP 403)"
-                ),
-            )
-        ]
-    )
-
-    assert await _ops(runner).heimdall_installed("owner/repo") is False
-    assert len(runner.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_heimdall_installed_still_raises_on_other_gh_failures() -> None:
-    """A non-403 gh failure (auth, network) still raises rather than reading False."""
-    runner = _FakeGhRunner(
-        [GhResult(exit_code=1, stdout="", stderr="gh: Bad credentials (HTTP 401)")]
-    )
-
-    with pytest.raises(GhCommandError):
-        await _ops(runner).heimdall_installed("owner/repo")
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,9 @@
 """End-to-end enqueue -> dequeue round-trip over a faked Redis.
 
-Proves the transport spine: a job enqueued through :func:`enqueue_prd` is picked
-up by a real Arq worker running :func:`process_prd`, with the repo, issue number,
-and action carried across the queue intact. Redis is faked with ``fakeredis`` so
-the test is hermetic; Arq's enqueue, queue storage, dequeue, and deserialization
-are all exercised for real.
+Proves the transport spine: a kick enqueued through :func:`enqueue_adhoc_drain` is picked
+up by a real Arq worker running :func:`run_adhoc_drain_job`, with the repo carried across
+the queue intact. Redis is faked with ``fakeredis`` so the test is hermetic; Arq's enqueue,
+queue storage, dequeue, and deserialization are all exercised for real.
 """
 
 from __future__ import annotations
@@ -20,8 +19,8 @@ import pytest_asyncio
 from arq import ArqRedis
 from arq.worker import Worker
 
-from retinue.queue import PrdJob, enqueue_prd
-from retinue.worker import process_prd
+from retinue.queue import AdhocDrainJob, enqueue_adhoc_drain
+from retinue.worker import run_adhoc_drain_job
 
 
 @pytest_asyncio.fixture()
@@ -42,17 +41,18 @@ async def arq_pool() -> AsyncIterator[ArqRedis]:
 async def test_enqueue_dequeue_roundtrip(
     arq_pool: ArqRedis, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A job enqueued via enqueue_prd is dequeued and run by the real process_prd.
+    """A kick enqueued via enqueue_adhoc_drain is dequeued and run by run_adhoc_drain_job.
 
-    The real task logs the repo, issue number, and action; asserting on that log
-    line proves the enqueue -> dequeue round-trip carried the PRD fields intact.
+    With no drain wired into the bare worker ctx the task logs which repo it received;
+    asserting on that log line proves the enqueue -> dequeue round-trip carried the repo
+    intact.
     """
-    job = PrdJob(repo_full_name="owner/repo", issue_number=42, action="opened")
-    job_id = await enqueue_prd(arq_pool, job)
+    job = AdhocDrainJob(repo_full_name="owner/repo")
+    job_id = await enqueue_adhoc_drain(arq_pool, job)
     assert job_id  # a real job id was assigned
 
     worker = Worker(
-        functions=[process_prd],
+        functions=[run_adhoc_drain_job],
         redis_pool=arq_pool,
         burst=True,
         poll_delay=0.01,
@@ -70,5 +70,5 @@ async def test_enqueue_dequeue_roundtrip(
     # Exactly one job ran to completion over the round-trip.
     assert worker.jobs_complete == 1
     assert worker.jobs_failed == 0
-    # The dequeued task logged the repo, issue number, and action it received.
-    assert "Processing PRD for owner/repo#42 action=opened" in caplog.text
+    # The dequeued task logged the repo it received.
+    assert "No ad-hoc drain wired; dropping kick for owner/repo" in caplog.text

@@ -1,78 +1,49 @@
-"""Tests for retinue.routing: per-issue implementer-model routing in the PRD build lane.
+"""Tests for retinue.routing: per-issue implementer-model routing.
 
-Two layers are exercised, all offline (no gh, no network, no Docker):
+All layers run offline (no gh, no network, no Docker):
 
 * **Unit** — the ``gh issue view`` argv/parse helpers and :class:`GhCliIssueFacts`, plus
-  the four :class:`PerIssueImplementerRouter` paths (classify success, pre-existing-label
-  short-circuit, classification failure) against recording label/comment sinks, a fake
-  classifier, and a real :class:`BudgetGovernor` on a temp ledger.
-* **Integration** — :func:`retinue.wiring.bind_build_prd` driven with a real router over
-  the container-exec :class:`ContainerImplementer` and the in-memory runtime/git/auth
-  fakes, so the recording container runtime records the actual ``claude --model <...>``
-  exec each slice launched with. This layer also proves a loopback fix-issue (a
-  ``ready-for-agent`` + ``Part of #<prd>`` slice) classifies and routes through the same
-  seam, and — over the ad-hoc :func:`retinue.adhoc_build.build_adhoc_issue` harness — that
-  the ad-hoc planner/implementer/reviewer all launch at the issue's resolved level.
+  the :class:`PerIssueImplementerRouter` paths (classify success, pre-existing-label
+  short-circuit, classification failure, best-effort fallbacks) against recording
+  label/comment sinks, a fake classifier, and a real :class:`BudgetGovernor` on a temp
+  ledger. The shared :func:`retinue.routing.resolve_issue_level` hop is unit-tested
+  directly against the same recording fakes.
+* **Ad-hoc lane** — the :func:`retinue.pipeline._resolve_adhoc_level` best-effort resolver
+  is unit-tested against the same fakes, and :func:`retinue.pipeline.bind_adhoc_build`'s
+  per-issue closure is driven through the real ``_resolve_adhoc_level`` ->
+  :func:`resolve_issue_level` classify chain over faked boundary seams, proving each role
+  is constructed at the resolved level.
 
-The shared :func:`retinue.routing.resolve_issue_level` hop and the ad-hoc
-:func:`retinue.pipeline._resolve_adhoc_level` best-effort resolver are unit-tested directly
-against the same recording fakes.
-
-Reuses ``FakeRuntime``/``FakeAuth``/``CLAUDE_MD``/``_resolver``/``_sink`` from
-``tests/test_done_check.py``, ``FakeGitOps`` from ``tests/test_orchestrator.py``, and
-``FakeClock`` from ``tests/test_budget.py``.
+Reuses ``FakeAuth``/``CLAUDE_MD``/``FakeClock`` from ``tests/fakes.py``.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
 
-from retinue.adhoc_build import (
-    AdhocBuildResult,
-    AdhocIssue,
-    ContainerAdhocReviewer,
-    ContainerPlanner,
-    build_adhoc_issue,
-)
+from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
 from retinue.budget import CLASSIFIER_ESTIMATED_AMOUNT, AuthMode, BudgetGovernor, BudgetLedger
-from retinue.classifier import ClassifyInput, ClassifyResult, ClaudeIssueClassifier
-from retinue.container_build import Slice
+from retinue.classifier import ClassifyInput, ClassifyResult
+from retinue.container_build import ContainerImplementer, Slice
 from retinue.messages_api import HttpResponse
-from retinue.notify import (
-    CommentRequest,
-    CommentSink,
-    LabelRequest,
-    LabelSink,
-    Notifier,
-    PushRequest,
-)
-from retinue.orchestrator import ContainerImplementer, PrdSlice
+from retinue.notify import CommentRequest, LabelRequest
 from retinue.pipeline import _resolve_adhoc_level
 from retinue.repo_config import RepoConfig, RoutingConfig, RoutingLevel
-from retinue.reviewer import AgentSdkReviewGenerator
-from retinue.roles import Role, resolve_effort, resolve_model
 from retinue.routing import (
     _FAILURE_COMMENT,
     GhCliIssueFacts,
-    PerIssueImplementer,
     PerIssueImplementerRouter,
     _issue_facts_argv,
     _parse_issue_facts,
     resolve_issue_level,
 )
-from retinue.wiring import BoundBuildResult, bind_build_prd
 from tests.fakes import (
     CLAUDE_MD,
     FakeAuth,
     FakeClock,
-    FakeGitOps,
-    FakeRuntime,
-    _resolver,
-    _sink,
 )
 
 pytestmark = pytest.mark.filterwarnings(
@@ -101,7 +72,7 @@ def _routing() -> RoutingConfig:
 
 
 def _config() -> RepoConfig:
-    return RepoConfig(staging_branch="staging", max_parallel=1, routing=_routing())
+    return RepoConfig(target_branch="staging", max_parallel=1, routing=_routing())
 
 
 class _RecordingLabels:
@@ -432,7 +403,7 @@ async def test_router_misuse_without_a_routing_table_fails_loudly(
     """
     router = PerIssueImplementerRouter(
         base_implementer=ContainerImplementer(credential="k", model="base-model"),
-        config=RepoConfig(staging_branch="staging"),  # no routing table
+        config=RepoConfig(target_branch="staging"),  # no routing table
         classify=_UnusedClassifier(),
         label_sink=_RecordingLabels(),
         comment_sink=_RecordingComments(),
@@ -470,7 +441,7 @@ async def test_router_failure_comment_post_failure_falls_back_to_base(
     assert implementer is base
 
 
-# --- integration: bind_build_prd driving a real router --------------------------
+# --- shared fakes/helpers for the ad-hoc integration tests -----------------------
 
 
 class _TitleRoutingTransport:
@@ -505,268 +476,6 @@ class _TitleRoutingTransport:
             status_code=200,
             body={"content": [{"type": "text", "text": _json.dumps({"level": level})}]},
         )
-
-
-async def _noop_push(request: PushRequest) -> None:
-    return None
-
-
-async def _noop_comment(request: CommentRequest) -> None:
-    return None
-
-
-async def _noop_label(request: LabelRequest) -> None:
-    return None
-
-
-def _quiet_notifier() -> Notifier:
-    return Notifier(push=_noop_push, comment=_noop_comment, label=_noop_label)
-
-
-async def _no_create(draft: object) -> object:
-    raise AssertionError("create_issue must not be called on a clean build")
-
-
-def _prd_slice(issue_number: int) -> PrdSlice:
-    return PrdSlice(
-        repo_full_name="owner/repo", issue_number=issue_number, prd_number=7
-    )
-
-
-def _build_router(
-    *,
-    config: RepoConfig,
-    transport: _TitleRoutingTransport,
-    facts: _FactsFor,
-    comments: CommentSink,
-    governor: BudgetGovernor,
-    labels: LabelSink = _noop_label,
-) -> PerIssueImplementerRouter:
-    assert config.routing is not None
-    return PerIssueImplementerRouter(
-        base_implementer=ContainerImplementer(
-            credential="sk-ant-api03-k",
-            model=resolve_model(Role.IMPLEMENTER, config),
-        ),
-        config=config,
-        classify=ClaudeIssueClassifier(
-            credential="sk-ant-api03-k",
-            transport=transport,
-            routing=config.routing,
-        ),
-        label_sink=labels,
-        comment_sink=comments,
-        issue_facts=facts,
-        governor=governor,
-        classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
-    )
-
-
-def _bind(
-    *,
-    tmp_path: Path,
-    governor: BudgetGovernor,
-    runtime: FakeRuntime,
-    resolve_implementer: PerIssueImplementer | None,
-    base: ContainerImplementer,
-    estimated_amount: float = 1.0,
-) -> Callable[..., Awaitable[BoundBuildResult]]:
-    return bind_build_prd(
-        implementer=base,
-        governor=governor,
-        notifier=_quiet_notifier(),
-        create_issue=_no_create,  # type: ignore[arg-type]
-        retry_store_path=tmp_path / "retries.sqlite3",
-        estimated_amount=estimated_amount,
-        git=FakeGitOps(),
-        auth=FakeAuth(),
-        runtime=runtime,
-        resolve_secret=_resolver({}),
-        report=_sink([]),
-        resolve_implementer=resolve_implementer,
-    )
-
-
-def _launched_models(runtime: FakeRuntime) -> list[str]:
-    """The ``--model`` value of every ``claude`` exec the runtime recorded, in order."""
-    models: list[str] = []
-    for event in runtime.log:
-        if not event.startswith("run:claude"):
-            continue
-        parts = event.split()
-        idx = parts.index("--model")
-        models.append(parts[idx + 1])
-    return models
-
-
-@pytest.mark.asyncio
-async def test_two_slices_launch_on_their_levels_models(tmp_path: Path) -> None:
-    """AC-1: two slices classifying to different levels each exec their level's model."""
-    config = _config()
-    governor = _governor(tmp_path)
-    runtime = FakeRuntime()
-    transport = _TitleRoutingTransport()
-    facts = _FactsFor(
-        {
-            1: ClassifyInput(title="PICKTRIVIAL doc fix", body="b", labels=[]),
-            2: ClassifyInput(title="a normal feature", body="b", labels=[]),
-        }
-    )
-    base = ContainerImplementer(
-        credential="sk-ant-api03-k", model=resolve_model(Role.IMPLEMENTER, config)
-    )
-    router = _build_router(
-        config=config,
-        transport=transport,
-        facts=facts,
-        comments=_RecordingComments(),
-        governor=governor,
-    )
-    build_prd = _bind(
-        tmp_path=tmp_path,
-        governor=governor,
-        runtime=runtime,
-        resolve_implementer=router,
-        base=base,
-    )
-
-    result = await build_prd(
-        repo_full_name="owner/repo",
-        prd_number=7,
-        slices=[_prd_slice(1), _prd_slice(2)],
-        config=config,
-        claude_md=CLAUDE_MD,
-    )
-
-    assert result.prd_build is not None
-    assert result.prd_build.merged_issues == [1, 2]
-    models = _launched_models(runtime)
-    assert "implementer-trivial" in models
-    assert "implementer-standard" in models
-
-
-@pytest.mark.asyncio
-async def test_classification_failure_builds_default_and_comments(
-    tmp_path: Path,
-) -> None:
-    """AC-2: a classifier failure builds at the default level and posts an explanation."""
-    config = _config()
-    governor = _governor(tmp_path)
-    runtime = FakeRuntime()
-    transport = _TitleRoutingTransport(non_200=True)  # both attempts fail
-    facts = _FactsFor({1: ClassifyInput(title="x", body="b", labels=[])})
-    comments = _RecordingComments()
-    base = ContainerImplementer(
-        credential="sk-ant-api03-k", model=resolve_model(Role.IMPLEMENTER, config)
-    )
-    router = _build_router(
-        config=config,
-        transport=transport,
-        facts=facts,
-        comments=comments,
-        governor=governor,
-    )
-    build_prd = _bind(
-        tmp_path=tmp_path,
-        governor=governor,
-        runtime=runtime,
-        resolve_implementer=router,
-        base=base,
-    )
-
-    result = await build_prd(
-        repo_full_name="owner/repo",
-        prd_number=7,
-        slices=[_prd_slice(1)],
-        config=config,
-        claude_md=CLAUDE_MD,
-    )
-
-    assert result.prd_build is not None
-    assert result.prd_build.merged_issues == [1]
-    assert _launched_models(runtime) == ["implementer-standard"]
-    assert len(comments.calls) == 1
-    assert comments.calls[0].body == _FAILURE_COMMENT.format(level="standard")
-
-
-@pytest.mark.asyncio
-async def test_classifier_charge_lands_and_gate_estimate_unchanged(
-    tmp_path: Path,
-) -> None:
-    """AC-3: one classifying slice charges the gate estimate plus one classifier charge."""
-    config = _config()
-    governor = _governor(tmp_path)
-    runtime = FakeRuntime()
-    transport = _TitleRoutingTransport()
-    facts = _FactsFor({1: ClassifyInput(title="PICKTRIVIAL fix", body="b", labels=[])})
-    base = ContainerImplementer(
-        credential="sk-ant-api03-k", model=resolve_model(Role.IMPLEMENTER, config)
-    )
-    router = _build_router(
-        config=config,
-        transport=transport,
-        facts=facts,
-        comments=_RecordingComments(),
-        governor=governor,
-    )
-    build_prd = _bind(
-        tmp_path=tmp_path,
-        governor=governor,
-        runtime=runtime,
-        resolve_implementer=router,
-        base=base,
-        estimated_amount=1.0,
-    )
-
-    await build_prd(
-        repo_full_name="owner/repo",
-        prd_number=7,
-        slices=[_prd_slice(1)],
-        config=config,
-        claude_md=CLAUDE_MD,
-    )
-
-    assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        1.0 + CLASSIFIER_ESTIMATED_AMOUNT
-    )
-
-
-@pytest.mark.asyncio
-async def test_table_less_repo_uses_registry_default_and_no_classifier(
-    tmp_path: Path,
-) -> None:
-    """AC-4: with no routing table the build uses the plain default and never classifies."""
-    config = RepoConfig(staging_branch="staging", max_parallel=1)  # no routing
-    governor = _governor(tmp_path)
-    runtime = FakeRuntime()
-    transport = _TitleRoutingTransport()
-    facts = _FactsFor({1: ClassifyInput(title="x", body="b", labels=[])})
-    base = ContainerImplementer(
-        credential="sk-ant-api03-k", model=resolve_model(Role.IMPLEMENTER, config)
-    )
-    build_prd = _bind(
-        tmp_path=tmp_path,
-        governor=governor,
-        runtime=runtime,
-        resolve_implementer=None,  # production passes None for a table-less repo
-        base=base,
-    )
-
-    result = await build_prd(
-        repo_full_name="owner/repo",
-        prd_number=7,
-        slices=[_prd_slice(1)],
-        config=config,
-        claude_md=CLAUDE_MD,
-    )
-
-    assert result.prd_build is not None
-    assert result.prd_build.merged_issues == [1]
-    assert _launched_models(runtime) == [resolve_model(Role.IMPLEMENTER, RepoConfig())]
-    assert _launched_models(runtime) == ["claude-sonnet-4-6"]
-    # The classifier transport and issue-facts fetch were never touched.
-    assert transport.calls == []
-    assert facts.calls == []
 
 
 # --- resolve_issue_level: the shared classify-one-issue hop -----------------------
@@ -859,128 +568,6 @@ async def test_resolve_issue_level_failure_defaults_and_comments(
     )
 
 
-# --- loopback fix-issues route through the identical seam -------------------------
-
-
-def _fix_issue_facts(issue_number: int, *, title: str) -> ClassifyInput:
-    """Facts shaped like a loopback fix-issue: ``ready-for-agent`` + ``Part of #<prd>``.
-
-    A loopback fix-issue (``retinue.loopback._file_fix_issue``) is an ordinary
-    orchestrator-lane slice — no ``level:`` label — so it must classify and route through
-    the same :class:`PerIssueImplementerRouter` seam as any PRD slice.
-    """
-    return ClassifyInput(
-        title=title,
-        body="A heimdall blocking finding to fix.\n\nPart of #7",
-        labels=["ready-for-agent"],
-    )
-
-
-@pytest.mark.asyncio
-async def test_loopback_fix_issue_classifies_labels_and_routes(tmp_path: Path) -> None:
-    """A fix-issue-shaped slice classifies once, gets its label, meters, and routes."""
-    config = _config()
-    governor = _governor(tmp_path)
-    runtime = FakeRuntime()
-    transport = _TitleRoutingTransport()
-    labels = _RecordingLabels()
-    facts = _FactsFor(
-        {1: _fix_issue_facts(1, title="Heimdall fix: PICKTRIVIAL correct the typo")}
-    )
-    base = ContainerImplementer(
-        credential="sk-ant-api03-k", model=resolve_model(Role.IMPLEMENTER, config)
-    )
-    router = _build_router(
-        config=config,
-        transport=transport,
-        facts=facts,
-        comments=_RecordingComments(),
-        governor=governor,
-        labels=labels,
-    )
-    build_prd = _bind(
-        tmp_path=tmp_path,
-        governor=governor,
-        runtime=runtime,
-        resolve_implementer=router,
-        base=base,
-    )
-
-    result = await build_prd(
-        repo_full_name="owner/repo",
-        prd_number=7,
-        slices=[_prd_slice(1)],
-        config=config,
-        claude_md=CLAUDE_MD,
-    )
-
-    assert result.prd_build is not None
-    assert result.prd_build.merged_issues == [1]
-    # The classifier ran exactly once for the one fix-issue.
-    assert len(transport.calls) == 1
-    # Its resolved level label was applied.
-    assert [r.label for r in labels.calls] == ["level:trivial"]
-    # It launched on the resolved level's implementer model.
-    assert _launched_models(runtime) == ["implementer-trivial"]
-    # The classifier charge was metered on top of the build gate estimate.
-    assert await governor._ledger.trailing_24h_spend() == pytest.approx(
-        1.0 + CLASSIFIER_ESTIMATED_AMOUNT
-    )
-
-
-@pytest.mark.asyncio
-async def test_two_loopback_fix_issues_each_classified_individually(
-    tmp_path: Path,
-) -> None:
-    """Two fix-issues classifying to different levels each exec their own level's model."""
-    config = _config()
-    governor = _governor(tmp_path)
-    runtime = FakeRuntime()
-    transport = _TitleRoutingTransport()
-    labels = _RecordingLabels()
-    facts = _FactsFor(
-        {
-            1: _fix_issue_facts(1, title="Heimdall fix: PICKTRIVIAL a one-line typo"),
-            2: _fix_issue_facts(2, title="Heimdall fix: a substantive refactor"),
-        }
-    )
-    base = ContainerImplementer(
-        credential="sk-ant-api03-k", model=resolve_model(Role.IMPLEMENTER, config)
-    )
-    router = _build_router(
-        config=config,
-        transport=transport,
-        facts=facts,
-        comments=_RecordingComments(),
-        governor=governor,
-        labels=labels,
-    )
-    build_prd = _bind(
-        tmp_path=tmp_path,
-        governor=governor,
-        runtime=runtime,
-        resolve_implementer=router,
-        base=base,
-    )
-
-    result = await build_prd(
-        repo_full_name="owner/repo",
-        prd_number=7,
-        slices=[_prd_slice(1), _prd_slice(2)],
-        config=config,
-        claude_md=CLAUDE_MD,
-    )
-
-    assert result.prd_build is not None
-    assert result.prd_build.merged_issues == [1, 2]
-    # Each fix-issue was classified on its own facts.
-    assert len(transport.calls) == 2
-    models = _launched_models(runtime)
-    assert "implementer-trivial" in models
-    assert "implementer-standard" in models
-    assert sorted(r.label for r in labels.calls) == ["level:standard", "level:trivial"]
-
-
 # --- ad-hoc lane: _resolve_adhoc_level (unit) ------------------------------------
 
 
@@ -998,7 +585,7 @@ async def test_resolve_adhoc_level_table_less_returns_none_without_classifying(
 
     level = await _resolve_adhoc_level(
         _adhoc_issue(),
-        RepoConfig(staging_branch="staging"),  # no routing table
+        RepoConfig(target_branch="staging"),  # no routing table
         classify=_UnusedClassifier(),  # type: ignore[arg-type]
         label_sink=_RecordingLabels(),  # type: ignore[arg-type]
         comment_sink=_RecordingComments(),  # type: ignore[arg-type]
@@ -1108,7 +695,7 @@ async def test_resolve_adhoc_level_facts_flake_falls_back_without_propagating(
     assert level == "standard"  # config.routing.default
 
 
-# --- ad-hoc lane: all three roles launch at the resolved level (integration) ------
+# --- ad-hoc lane: the bound build routes through the real classify hop -------------
 
 
 def _adhoc_routing() -> RoutingConfig:
@@ -1135,62 +722,6 @@ def _adhoc_routing() -> RoutingConfig:
         },
     )
 
-
-@pytest.mark.asyncio
-async def test_adhoc_roles_all_launch_at_the_resolved_level(tmp_path: Path) -> None:
-    """AC-1: the ad-hoc planner + implementer exec the level's models; the reviewer too.
-
-    Mirrors the reworked ``bind_adhoc_build`` closure: construct the three per-issue roles
-    at the resolved level and drive ``build_adhoc_issue`` over a fake runtime. The planner
-    and implementer exec ``claude --model <level's model>`` in-container; the reviewer's
-    generator carries the level's model and effort (it reviews over HTTP, not in-container).
-    """
-    config = RepoConfig(staging_branch="staging", routing=_adhoc_routing())
-    level = "trivial"
-    runtime = FakeRuntime()
-
-    planner = ContainerPlanner(
-        credential="sk-ant-api03-k",
-        auth_mode="api_key",
-        model=resolve_model(Role.PLANNER, config, level=level),
-    )
-    implementer = ContainerImplementer(
-        credential="sk-ant-api03-k",
-        auth_mode="api_key",
-        model=resolve_model(Role.IMPLEMENTER, config, level=level),
-    )
-    review_generate = AgentSdkReviewGenerator(
-        credential="sk-ant-api03-k",
-        transport=_TitleRoutingTransport(),
-        model=resolve_model(Role.REVIEWER, config, level=level),
-        effort=resolve_effort(Role.REVIEWER, config, level=level),
-    )
-    reviewer = ContainerAdhocReviewer(
-        repo_full_name="owner/repo",
-        config=config,
-        generate=review_generate,
-        create_issue=_no_create,  # type: ignore[arg-type]
-    )
-
-    result = await build_adhoc_issue(
-        _adhoc_issue(29),
-        config,
-        CLAUDE_MD,
-        planner=planner,
-        implementer=implementer,
-        auth=FakeAuth(),
-        runtime=runtime,
-        resolve_secret=_resolver({}),
-        report=_sink([]),
-        reviewer=None,  # the reviewer's routing is asserted on the generator directly
-    )
-
-    assert result.passed is True
-    assert _launched_models(runtime) == ["planner-trivial", "implementer-trivial"]
-    assert review_generate.model == "reviewer-trivial"
-    assert reviewer.generate is review_generate
-    assert review_generate.effort == resolve_effort(Role.REVIEWER, config, level=level)
-    assert review_generate.effort == "low"
 
 @pytest.mark.asyncio
 async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
@@ -1241,7 +772,7 @@ async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
         pipeline_mod, "build_adhoc_issue", _fake_build_adhoc_issue(captured, green)
     )
 
-    config = RepoConfig(staging_branch="staging", routing=_adhoc_routing())
+    config = RepoConfig(target_branch="staging", routing=_adhoc_routing())
     governor = _governor(tmp_path)
     pipeline = _RecordingAdhocPipeline(governor=governor)
     settings = _settings(tmp_path, anthropic_credential="sk-ant-api03-k")

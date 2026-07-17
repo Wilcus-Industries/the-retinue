@@ -36,13 +36,14 @@ from dataclasses import dataclass, replace
 
 from retinue.budget import BudgetGovernor
 from retinue.classifier import ClassifyInput
-from retinue.container_build import Implementer, Slice
+from retinue.container_build import (
+    ContainerImplementer,
+    Implementer,
+    IssueFactsSource,
+    Slice,
+)
 from retinue.level import Classifier, resolve_level
 from retinue.notify import CommentRequest, CommentSink, LabelSink
-from retinue.orchestrator import (
-    ContainerImplementer,
-    IssueFactsSource,
-)
 from retinue.reconcile import GhRunner
 from retinue.repo_config import RepoConfig
 from retinue.roles import Role, resolve_model

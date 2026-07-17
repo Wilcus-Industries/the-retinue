@@ -1,10 +1,9 @@
 """Shared retinue vocabulary: labels, severities, and branch naming.
 
-The bottom layer of the package — every lane and workflow module (slicer, loopback,
-lane, cron, ad-hoc drain, handoff, webhook) speaks this vocabulary, so it lives here
-rather than in any one of them. This module imports nothing from the rest of
-:mod:`retinue`; anything here must stay importable by every other module without
-creating a cycle.
+The bottom layer of the package — every lane and workflow module (cron, scheduler drain,
+handoff, webhook) speaks this vocabulary, so it lives here rather than in any one of them.
+This module imports nothing from the rest of :mod:`retinue`; anything here must stay
+importable by every other module without creating a cycle.
 """
 
 from __future__ import annotations
@@ -17,24 +16,8 @@ READY_LABEL = "ready-for-agent"
 # Human-in-the-loop escalation: the retinue stops and leaves the issue for a human.
 HITL_LABEL = "hitl"
 
-# Provenance marker: a slice the slicer filed off a PRD. Stamped alongside
-# ``ready-for-agent`` so a PRD slice is distinguishable from ad-hoc ``ready-for-agent``
-# work at the label layer (the lane router reads the ``Part of #<prd>`` link, not this
-# label, but downstream tooling and humans can tell a slice apart from pickup). See
-# :mod:`retinue.lane`.
-PRD_SLICE_LABEL = "prd-slice"
-
-# A PRD tracking issue — the retinue's slicing entry point (:mod:`retinue.webhook`
-# gates on it; the ad-hoc drain excludes it).
-PRD_LABEL = "prd"
-
-# A loose backlog nit (the non-blocking heimdall findings :mod:`retinue.loopback`
-# files), drained by the cron lane.
+# A loose backlog nit, swept by the cron lane.
 BACKLOG_LABEL = "backlog"
-
-# The "test & merge" handoff is a heads-up for a human, not an escalation. It carries a
-# findable label so the converged-but-unmerged PRs are routable, but it never merges.
-TEST_AND_MERGE_LABEL = "test-and-merge"
 
 # A backlog nit (or any preempting standalone) carries its severity as the
 # ``priority:<severity>`` label :func:`priority_label` emits; :func:`parse_priority`

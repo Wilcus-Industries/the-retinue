@@ -38,10 +38,15 @@ from retinue.adhoc_build import (
     render_chain_depth,
 )
 from retinue.container import Container, RunResult
-from retinue.container_build import GitOpsError, Implementer, ImplementError, Slice
+from retinue.container_build import (
+    GitOpsError,
+    Implementer,
+    ImplementError,
+    Slice,
+    _implement_prompt,
+)
 from retinue.done_check import DoneCheckReport
 from retinue.impl_retry import ImplRetryStore, impl_retry_key
-from retinue.orchestrator import _implement_prompt
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
     REVIEW_FIX_LABEL,
@@ -114,7 +119,7 @@ async def _build(
 ) -> AdhocBuildResult:
     return await build_adhoc_issue(
         issue or _issue(),
-        config or RepoConfig(),
+        config or RepoConfig(target_branch="staging"),
         CLAUDE_MD,
         planner=planner or FakePlanner(),
         implementer=implementer or FakeImplementer(),
@@ -223,7 +228,7 @@ def test_implement_prompt_with_plan_path_instructs_reading_the_plan() -> None:
 async def test_issue_branch_is_cut_off_the_staging_branch() -> None:
     """The implementer's ``issue-<N>`` branch is created off ``config.staging_branch``."""
     runtime = FakeRuntime()
-    config = RepoConfig(staging_branch="trunk")
+    config = RepoConfig(target_branch="trunk")
 
     await _build(runtime=runtime, config=config)
 
@@ -595,7 +600,7 @@ def _reviewer(
 ) -> ContainerAdhocReviewer:
     return ContainerAdhocReviewer(
         repo_full_name="owner/repo",
-        config=config or RepoConfig(),
+        config=config or RepoConfig(target_branch="staging"),
         generate=generate,
         create_issue=create_issue,
     )
@@ -710,7 +715,7 @@ async def test_round_trip_through_the_constructor_terminates_at_the_cap() -> Non
     generate, _ = _finding_generator(
         ReviewFinding(title="Another fix", body="more to fix")
     )
-    config = RepoConfig(retry_cap=2)
+    config = RepoConfig(target_branch="staging", retry_cap=2)
     reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
 
     # First hop: an issue one below the cap files exactly one review-fix.
@@ -745,7 +750,7 @@ async def test_review_fix_chain_terminates_within_the_cap() -> None:
     generate, _ = _finding_generator(
         ReviewFinding(title="Another fix", body="more to fix")
     )
-    config = RepoConfig(retry_cap=2)
+    config = RepoConfig(target_branch="staging", retry_cap=2)
     reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
 
     # Walk the chain: each hop is a *new* issue number carrying the prior hop's depth + 1.
@@ -786,7 +791,7 @@ async def test_review_budget_does_not_share_a_key_with_triage(tmp_path: Path) ->
     generate, _ = _finding_generator(
         ReviewFinding(title="A fix", body="fix this")
     )
-    config = RepoConfig(retry_cap=2)
+    config = RepoConfig(target_branch="staging", retry_cap=2)
     reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
 
     # Triage has already spent this issue's *build*-retry budget on the shared store.
@@ -811,7 +816,7 @@ async def test_reviewer_credential_rides_the_auth_env() -> None:
     generate, _ = _finding_generator()
     reviewer = ContainerAdhocReviewer(
         repo_full_name="owner/repo",
-        config=RepoConfig(),
+        config=RepoConfig(target_branch="staging"),
         generate=generate,
         create_issue=rec.create_issue,
         credential="tok",
@@ -833,7 +838,7 @@ async def test_review_diffs_a_non_default_staging_branch(tmp_path: Path) -> None
     generate, captured = _finding_generator(
         ReviewFinding(title="Fix off-by-one", body="total() adds a stray +1.")
     )
-    config = RepoConfig(staging_branch="release")
+    config = RepoConfig(target_branch="release")
     reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
     # The build container only has the remote-tracking ref, not a bare local ``release``.
     container = _RefAwareDiffContainer(DEFECT_DIFF, known_refs={"origin/release"})

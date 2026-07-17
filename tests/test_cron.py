@@ -25,23 +25,18 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
-from retinue.container_build import Slice
 from retinue.cron import (
     BacklogIssue,
     CronBusyError,
     CronOutcome,
     CronTickResult,
     GhCli,
-    SliceBuilder,
     run_cron_tick,
 )
-from retinue.orchestrator import BuildOutcome, BuildResult, integration_branch
-from retinue.repo_config import RepoConfig
 from retinue.vocab import Severity
 from tests.fakes import CLOCK_DEFAULT, FakeClock
 
@@ -476,101 +471,3 @@ async def test_ghcli_rejects_a_malformed_issue_entry() -> None:
 
     with pytest.raises(ValueError):
         await gh.list_backlog(repo_full_name="owner/repo")
-
-
-# --- real SliceBuilder (CronBuild): slice assembly + downstream wiring -------------
-#
-# The production CronBuild assembles the standalone Slice for the picked backlog nit and
-# drives the orchestrator's build_slice downstream. These exercise that assembly + the
-# decision (which integration target a loose nit drains onto) through an injected slice
-# runner — no Agent SDK, Docker, gh, or network. The runner captures the assembled Slice
-# and returns a canned BuildResult, so the slice it builds is asserted directly.
-
-
-class CapturingSliceRunner:
-    """Records the assembled Slice it was handed and returns a canned BuildResult."""
-
-    def __init__(self, result: BuildResult | None = None) -> None:
-        self._result = result or BuildResult(
-            outcome=BuildOutcome.MERGED, integration_branch="retinue/prd-0"
-        )
-        self.slices: list[Slice] = []
-
-    async def __call__(self, slice_: Slice) -> BuildResult:
-        self.slices.append(slice_)
-        return self._result
-
-
-def _slice_builder(runner: CapturingSliceRunner) -> SliceBuilder:
-    """A SliceBuilder whose downstream is the injected runner.
-
-    The orchestrator collaborators are inert sentinels: with ``runner`` injected the real
-    ``build_slice`` edge is never touched, so the test stays free of the Agent SDK,
-    Docker, gh, and network.
-    """
-    sentinel = cast(Any, object())
-    return SliceBuilder(
-        config=RepoConfig(),
-        claude_md="# CLAUDE.md",
-        implementer=sentinel,
-        git=sentinel,
-        auth=sentinel,
-        runtime=sentinel,
-        resolve_secret=sentinel,
-        report=sentinel,
-        runner=runner,
-    )
-
-
-@pytest.mark.asyncio
-async def test_slice_builder_assembles_a_slice_for_the_backlog_issue() -> None:
-    """The builder turns the picked backlog issue into a Slice for that repo + issue."""
-    runner = CapturingSliceRunner()
-    build = _slice_builder(runner)
-
-    await build(repo_full_name="owner/repo", issue_number=42)
-
-    assert len(runner.slices) == 1
-    built = runner.slices[0]
-    assert built.repo_full_name == "owner/repo"
-    assert built.issue_number == 42
-
-
-@pytest.mark.asyncio
-async def test_slice_builder_drains_a_loose_nit_onto_its_own_integration_branch() -> None:
-    """A loose nit has no parent PRD, so it drains onto ``retinue/prd-<issue>``."""
-    runner = CapturingSliceRunner()
-    build = _slice_builder(runner)
-
-    await build(repo_full_name="owner/repo", issue_number=42)
-
-    built = runner.slices[0]
-    # The per-issue PRD number is the issue number, giving a dedicated integration target.
-    assert built.prd_number == 42
-    assert integration_branch(built.prd_number) == "retinue/prd-42"
-    # The implementer commits to the issue-<N> branch derived from the issue number.
-    assert built.branch == "issue-42"
-
-
-@pytest.mark.asyncio
-async def test_slice_builder_satisfies_the_cron_build_protocol(tmp_path: Path) -> None:
-    """The builder is a drop-in CronBuild: run_cron_tick drives it end to end."""
-    runner = CapturingSliceRunner()
-    build = _slice_builder(runner)
-    clock = FakeClock()
-
-    result = await run_cron_tick(
-        repo_full_name="owner/repo",
-        gh=FakeCronGh([_issue(7, priority="high", age_days=1)]),
-        governor=_governor(tmp_path, clock),
-        clock=clock,
-        build=build,
-        tick_number=1,
-        estimated_amount=1.0,
-        lock=OneAtATimeLock(),
-    )
-
-    assert result.outcome is CronOutcome.RAN
-    assert result.issue_number == 7
-    # The tick drove the real builder, which assembled and ran the slice for issue 7.
-    assert [s.issue_number for s in runner.slices] == [7]

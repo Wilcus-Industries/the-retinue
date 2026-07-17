@@ -27,6 +27,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from retinue.gh import GhCommandError, GhResult, GhRunner, auth_env
+from retinue.issues import (
+    CreatedIssue,
+    IssueCreator,
+    IssueDraft,
+)
 from retinue.messages_api import (
     MESSAGES_URL,
     HttpTransport,
@@ -40,11 +45,6 @@ from retinue.roles import (
     resolve_effort,
     resolve_model,
     structured_output_config,
-)
-from retinue.slicer import (
-    CreatedIssue,
-    IssueCreator,
-    IssueDraft,
 )
 from retinue.vocab import READY_LABEL
 
