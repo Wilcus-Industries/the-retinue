@@ -75,14 +75,15 @@ def _governor(tmp_path: Path, clock: _Clock, *, weekly: float = 1000.0) -> Budge
 
 
 @pytest.mark.asyncio
-async def test_cron_tick_lists_and_locks_when_in_budget(
+async def test_cron_tick_lists_picks_and_promotes_when_in_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bound cron tick mints a per-repo token and picks one backlog issue.
+    """The bound cron tick mints a token, picks one backlog issue, and promotes it.
 
-    The production bind constructs the backlog gh seam itself (the WS1 downstream is a
-    no-op trickle placeholder), so the test patches the module seam with a scripted backlog
-    and asserts the bound callable threads it: the listed issue is picked.
+    The production bind constructs the backlog gh seam and the trickle promoter itself, so
+    the test patches the module seams (a scripted backlog, a recording promoter) and asserts
+    the bound callable threads them: the listed issue is picked and promoted via label
+    surgery onto the repo's configured trigger label.
     """
     import retinue.cron as cron_mod
     from retinue.cron import BacklogIssue
@@ -92,6 +93,7 @@ async def test_cron_tick_lists_and_locks_when_in_budget(
     issue = BacklogIssue(
         number=42, labels=["backlog", "priority:low"], created_at=clock.now()
     )
+    promotions: list[tuple[str, int, str]] = []
 
     class _FakeCronGhCli:
         def __init__(self, *, token: str) -> None:
@@ -100,7 +102,16 @@ async def test_cron_tick_lists_and_locks_when_in_budget(
         async def list_backlog(self, *, repo_full_name: str) -> list[BacklogIssue]:
             return [issue]
 
+    class _FakePromoter:
+        def __init__(self, *, trigger_label: str, token: str) -> None:
+            self.trigger_label = trigger_label
+            self.token = token
+
+        async def promote(self, *, repo_full_name: str, issue_number: int) -> None:
+            promotions.append((repo_full_name, issue_number, self.trigger_label))
+
     monkeypatch.setattr(cron_mod, "GhCli", _FakeCronGhCli)
+    monkeypatch.setattr(cron_mod, "GhCliBacklogPromoter", _FakePromoter)
 
     tick = bind_cron_tick(
         cast(Settings, object()),
@@ -108,8 +119,14 @@ async def test_cron_tick_lists_and_locks_when_in_budget(
         governor=governor,
         fetch_claude_md=_canned_claude_md,
     )
-    result = await tick(repo_full_name="owner/repo", tick_number=1)
+    result = await tick(
+        repo_full_name="owner/repo",
+        tick_number=1,
+        config=RepoConfig(trigger_label="ready-for-agent"),
+    )
     assert result.issue_number == 42
+    # The picked issue was promoted via label surgery onto the repo's trigger label.
+    assert promotions == [("owner/repo", 42, "ready-for-agent")]
 
 
 # --- bind_adhoc_drain ------------------------------------------------------------

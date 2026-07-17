@@ -96,49 +96,46 @@ def bind_cron_tick(
     lane meters, so the budget is one rolling-24h window; a per-repo single-run lock
     registry lets two repos tick concurrently while a repo's own ticks serialize.
 
-    The backlog cron lane's new job is a label-surgery *trickle* promotion (promote a
-    backlog nit to the scheduler's trigger label), which a later WS implements; for now the
-    downstream build is a no-op so the tick still lists and locks without a build path.
+    The backlog cron lane's job is a label-surgery *trickle* promotion: the picked backlog
+    nit is promoted into the scheduler queue by swapping ``backlog`` for the repo's
+    ``config.trigger_label`` in one ``gh issue edit`` (:class:`retinue.cron.GhCliBacklogPromoter`),
+    so the real build stays with the unified scheduler and the promotion leaves a GitHub
+    audit trail. The repo's config rides each tick so the promotion applies that repo's own
+    trigger label.
 
     Args:
         settings: The runtime settings carrying the Anthropic config.
         auth: The GitHub App installation auth used to mint per-repo tokens.
         governor: The shared service-level budget governor.
         fetch_claude_md: Reads each repo's ``CLAUDE.md`` (kept for parity with the drain
-            bind; the trickle promotion will consume it).
+            bind; the trickle promotion does not build, so it is unused here).
         quota_every: Take the oldest low-priority issue on every Nth tick.
 
     Returns:
-        The bound cron tick — an async ``(*, repo_full_name, tick_number) -> CronTickResult``.
+        The bound cron tick — an async
+        ``(*, repo_full_name, tick_number, config) -> CronTickResult``.
     """
     # Deferred: retinue.pipeline imports this module, so a module-level import of the cron
-    # gh seam would risk a cycle; resolving GhCli at bind time also keeps it a
-    # monkeypatchable module attribute (tests patch retinue.cron.GhCli before startup).
-    from retinue.cron import GhCli
+    # gh seams would risk a cycle; resolving them at bind time also keeps them
+    # monkeypatchable module attributes (tests patch retinue.cron.GhCli before startup).
+    from retinue.cron import GhCli, GhCliBacklogPromoter
 
     locks: dict[str, AbstractAsyncContextManager[object]] = {}
 
-    async def _noop_build(*, repo_full_name: str, issue_number: int) -> None:
-        # TODO(#80 trickle): promote the picked backlog nit to the scheduler's trigger
-        # label (label surgery) rather than building it here — the cron lane no longer
-        # owns a container build path.
-        logger.info(
-            "Cron picked backlog issue #%d (%s); trickle promotion not yet wired",
-            issue_number,
-            repo_full_name,
-        )
-
     async def cron_tick(
-        *, repo_full_name: str, tick_number: int
+        *, repo_full_name: str, tick_number: int, config: RepoConfig
     ) -> CronTickResult:
         token = (await auth.installation_token(repo_full_name)).token
         gh = GhCli(token=token)
+        promoter = GhCliBacklogPromoter(
+            trigger_label=config.trigger_label, token=token
+        )
         return await run_cron_tick(
             repo_full_name=repo_full_name,
             gh=gh,
             governor=governor,
             clock=SystemClock(),
-            build=_noop_build,
+            build=promoter.promote,
             tick_number=tick_number,
             estimated_amount=ADHOC_DRAIN_ESTIMATED_AMOUNT,
             lock=locks.setdefault(repo_full_name, CronLock()),

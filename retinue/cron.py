@@ -15,8 +15,9 @@ Each :func:`run_cron_tick`:
 3. **picks** the next backlog issue by a weighted score (priority + age), except on every
    ``quota_every``-th tick where a **quota floor** takes the oldest low-priority issue so
    the low items provably drain rather than starving behind a steady high-priority stream;
-4. runs its downstream via a single injected :data:`CronBuild` callable (WS1's backlog job
-   is a trickle promotion, wired by a later WS).
+4. runs its downstream via a single injected :data:`CronBuild` callable — WS1's backlog job
+   is the *trickle promotion*: :class:`GhCliBacklogPromoter` swaps ``backlog`` for the
+   repo's trigger label in one ``gh issue edit`` so the nit re-enters the scheduler queue.
 
 The clock is injected (:class:`retinue.budget.Clock`) for age-weighting and the tick
 counter is passed in, so nothing reads the wall clock. The gh backlog query, the budget
@@ -219,10 +220,86 @@ def _parse_timestamp(raw: str) -> datetime:
 
 
 # The downstream a cron tick drives for the picked issue, behind one injected callable so
-# the tick is exercised without gh or network. WS1's backlog cron job is a trickle
-# promotion (label surgery), wired by a later WS; the production bind currently passes a
-# no-op here (see :func:`retinue.wiring.bind_cron_tick`).
+# the tick is exercised without gh or network. WS1's backlog cron job is the *trickle
+# promotion*: a single ``gh issue edit`` that swaps ``backlog`` for the repo's trigger label
+# so the promoted nit re-enters the scheduler queue as ordinary trigger-labeled work. The
+# production bind wires :class:`GhCliBacklogPromoter` here (see
+# :func:`retinue.wiring.bind_cron_tick`).
 CronBuild = Callable[..., Awaitable[None]]
+
+
+def _promote_argv(
+    repo_full_name: str, issue_number: int, *, trigger_label: str
+) -> list[str]:
+    """Assemble the ``gh issue edit`` argv that promotes a backlog issue in one edit.
+
+    Adds the repo's ``trigger_label`` and removes :data:`~retinue.vocab.BACKLOG_LABEL` on
+    the same edit, so the promotion is one atomic GitHub mutation (with an audit trail on
+    the issue's event log) that hands the nit to the scheduler drain as trigger-labeled work.
+    """
+    return [
+        "gh",
+        "issue",
+        "edit",
+        str(issue_number),
+        "--repo",
+        repo_full_name,
+        "--add-label",
+        trigger_label,
+        "--remove-label",
+        BACKLOG_LABEL,
+    ]
+
+
+class GhCliBacklogPromoter:
+    """The production :data:`CronBuild`: trickle-promote a backlog issue via label surgery.
+
+    A cron tick picks the top-severity backlog issue and hands it here; :meth:`promote`
+    swaps ``backlog`` for the repo's ``trigger_label`` in a single ``gh issue edit`` so the
+    promoted issue re-enters the scheduler drain's queue as ordinary trigger-labeled work
+    (the next heartbeat sweep, or a webhook kick on the label event, picks it up). No
+    container build runs in the cron lane — the promotion is pure label surgery, leaving the
+    real build to the unified scheduler.
+
+    The subprocess spawn is the one impure edge, factored behind the injected ``runner`` so
+    the argv assembly and auth env are unit-testable without a real ``gh``, Docker, or
+    network. Production leaves ``runner`` defaulted to :func:`retinue.gh.run_gh_subprocess`.
+
+    Args:
+        trigger_label: The repo's "build me" trigger label (``config.trigger_label``) the
+            promotion applies.
+        token: The GitHub token ``gh`` authenticates with, placed in the child env as
+            ``GH_TOKEN`` (``None`` runs ``gh`` with ambient auth).
+        runner: The injected argv runner; defaults to the real subprocess spawn.
+    """
+
+    def __init__(
+        self,
+        *,
+        trigger_label: str,
+        token: str | None = None,
+        runner: GhBytesRunner | None = None,
+    ) -> None:
+        self._trigger_label = trigger_label
+        self._token = token
+        self._runner = runner or run_gh_subprocess
+
+    async def promote(self, *, repo_full_name: str, issue_number: int) -> None:
+        """Promote ``issue_number`` into the scheduler queue via one ``gh issue edit``.
+
+        Raises:
+            GhCliError: ``gh`` exited non-zero (propagated from the runner).
+        """
+        argv = _promote_argv(
+            repo_full_name, issue_number, trigger_label=self._trigger_label
+        )
+        await self._runner(argv, auth_env(self._token))
+        logger.info(
+            "Cron promoted backlog issue #%d (%s) to %r",
+            issue_number,
+            repo_full_name,
+            self._trigger_label,
+        )
 
 
 class CronOutcome(enum.Enum):

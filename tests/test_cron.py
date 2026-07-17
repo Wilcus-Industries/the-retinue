@@ -35,6 +35,7 @@ from retinue.cron import (
     CronOutcome,
     CronTickResult,
     GhCli,
+    GhCliBacklogPromoter,
     run_cron_tick,
 )
 from retinue.vocab import Severity
@@ -471,3 +472,78 @@ async def test_ghcli_rejects_a_malformed_issue_entry() -> None:
 
     with pytest.raises(ValueError):
         await gh.list_backlog(repo_full_name="owner/repo")
+
+
+# --- GhCliBacklogPromoter: the trickle promotion (label surgery) -------------------
+
+
+@pytest.mark.asyncio
+async def test_promoter_swaps_backlog_for_the_trigger_label_in_one_edit() -> None:
+    """The promotion adds the trigger label and removes ``backlog`` in one gh issue edit."""
+    runner = CapturingGhRunner()
+    promoter = GhCliBacklogPromoter(trigger_label="ready-for-agent", token="t0ken", runner=runner)
+
+    await promoter.promote(repo_full_name="owner/repo", issue_number=42)
+
+    argv = list(runner.argv or [])
+    assert argv[:3] == ["gh", "issue", "edit"]
+    assert argv[3] == "42"
+    assert "--repo" in argv and argv[argv.index("--repo") + 1] == "owner/repo"
+    assert argv[argv.index("--add-label") + 1] == "ready-for-agent"
+    assert argv[argv.index("--remove-label") + 1] == "backlog"
+
+
+@pytest.mark.asyncio
+async def test_promoter_applies_a_repos_custom_trigger_label() -> None:
+    """A repo that overrides ``trigger_label`` promotes onto that label, not the default."""
+    runner = CapturingGhRunner()
+    promoter = GhCliBacklogPromoter(trigger_label="build-me", token="t", runner=runner)
+
+    await promoter.promote(repo_full_name="owner/repo", issue_number=7)
+
+    argv = list(runner.argv or [])
+    assert argv[argv.index("--add-label") + 1] == "build-me"
+
+
+@pytest.mark.asyncio
+async def test_promoter_puts_the_token_in_the_env_not_the_argv() -> None:
+    """The token authenticates via GH_TOKEN in the child env, never on the command line."""
+    runner = CapturingGhRunner()
+    promoter = GhCliBacklogPromoter(trigger_label="ready-for-agent", token="s3cret", runner=runner)
+
+    await promoter.promote(repo_full_name="owner/repo", issue_number=42)
+
+    assert (runner.env or {}).get("GH_TOKEN") == "s3cret"
+    assert "s3cret" not in list(runner.argv or [])
+
+
+@pytest.mark.asyncio
+async def test_cron_tick_promotes_the_picked_issue_through_the_promoter(
+    tmp_path: Path,
+) -> None:
+    """End to end: an admitted tick hands the picked issue to the promoter downstream.
+
+    Wiring the real :class:`GhCliBacklogPromoter` (over a capturing runner) as the tick's
+    downstream ``build`` proves the picked backlog issue is promoted via label surgery —
+    the cron lane's whole job under the severity pivot.
+    """
+    clock = FakeClock()
+    runner = CapturingGhRunner()
+    promoter = GhCliBacklogPromoter(trigger_label="ready-for-agent", token="t", runner=runner)
+    issue = BacklogIssue(
+        number=88, labels=["backlog", "priority:high"], created_at=CLOCK_DEFAULT
+    )
+
+    result = await _tick(
+        gh=FakeCronGh([issue]),
+        governor=_governor(tmp_path, clock),
+        clock=clock,
+        build=promoter.promote,  # type: ignore[arg-type]  # structural CronBuild
+    )
+
+    assert result.outcome is CronOutcome.RAN
+    assert result.issue_number == 88
+    # The picked issue was promoted via a single gh issue edit.
+    argv = list(runner.argv or [])
+    assert argv[:4] == ["gh", "issue", "edit", "88"]
+    assert argv[argv.index("--add-label") + 1] == "ready-for-agent"
