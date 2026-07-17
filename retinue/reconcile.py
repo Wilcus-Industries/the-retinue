@@ -4,7 +4,7 @@ The scheduler drain is stateless per pass, but the ad-hoc PR flow still needs a 
 ledger: when a build opens an ``issue-<N>`` -> target-branch PR, the PR number is recorded
 here keyed by the issue, so a later merge webhook can resolve the PR back to the issue it
 closes (:meth:`RunStateStore.round_for_pr`). The store mirrors the durable-SQLite style of
-:class:`retinue.dedupe.PrdDedupeStore` / :class:`retinue.impl_retry.ImplRetryStore`.
+:class:`retinue.impl_retry.ImplRetryStore`.
 
 The gh seam (:class:`GhRunner` / :class:`ReconcileGhRunner`) runs one ``gh`` argv and
 returns its stdout; it is the generic subprocess seam the issue-facts fetch and the
@@ -55,7 +55,7 @@ class RunStateStore:
 
     One row per build, keyed by repo + number, holding the owned issue numbers and the
     PR number (recorded once a PR opens). Mirrors the durable-SQLite style of
-    :class:`retinue.dedupe.PrdDedupeStore`.
+    :class:`retinue.impl_retry.ImplRetryStore`.
 
     Args:
         db_path: Path to the SQLite database file. Created on first use; parent

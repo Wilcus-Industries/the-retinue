@@ -4,7 +4,7 @@ The retinue meters agent token spend against a service-level weekly budget and e
 a per-rolling-24h-window ceiling (``cap`` = a fraction, by default 12%, of the weekly
 budget). The budget is shared across all lanes — the orchestrator's :func:`build_prd`
 run, the ad-hoc lane, and the cron lane — so the ledger is a single service-level SQLite
-store, mirroring the durable-SQLite style of :class:`retinue.dedupe.PrdDedupeStore` and
+store, mirroring the durable-SQLite style of
 :class:`retinue.impl_retry.ImplRetryStore`.
 
 Enforcement happens at admission (:meth:`BudgetGovernor.gate` for PRD/cron runs,

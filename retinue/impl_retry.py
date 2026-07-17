@@ -6,7 +6,7 @@ bounded by a cap — or to give up and reslice/escalate. That bound must be a
 reset just by re-running the orchestrator, otherwise a doomed slice could retry
 forever. :class:`ImplRetryStore` records one attempt counter per slice, keyed by
 repo + issue, mirroring the durable-SQLite style of
-:class:`retinue.dedupe.PrdDedupeStore`.
+:class:`retinue.reconcile.RunStateStore`.
 """
 
 from __future__ import annotations
