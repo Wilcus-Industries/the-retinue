@@ -800,8 +800,8 @@ async def test_bind_adhoc_build_routes_through_the_real_classify_hop(
     assert isinstance(kwargs, dict)
     assert kwargs["planner"].model == "planner-trivial"
     assert kwargs["implementer"].model == "implementer-trivial"
-    assert kwargs["reviewer"].generate.model == "reviewer-trivial"
-    assert kwargs["reviewer"].generate.effort == "low"
+    assert kwargs["review_generate"].model == "reviewer-trivial"
+    assert kwargs["review_generate"].effort == "low"
     # The classifier charge landed on the pipeline's own governor's ledger.
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(
         CLASSIFIER_ESTIMATED_AMOUNT

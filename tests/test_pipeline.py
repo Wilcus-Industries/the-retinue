@@ -104,6 +104,111 @@ async def test_red_adhoc_build_opens_no_pr(tmp_path: Path) -> None:
     assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
 
 
+# --- review gate consumption -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gate_blocking_findings_escalate_and_open_no_pr(tmp_path: Path) -> None:
+    """A blocking review gate escalates a hitl notification and opens no PR.
+
+    The green branch stays pushed for a human; the single notification fans out to
+    push + comment + label, so the blocking findings land as a ``hitl`` escalation.
+    """
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.notify import Notification
+    from retinue.reviewer import ReviewFinding
+    from retinue.vocab import HITL_LABEL, Severity
+
+    notifier = _RecordingNotifier()
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, notifier=notifier, pr_ops=pr_ops)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    gate = ReviewGateOutcome(
+        blocking=[ReviewFinding("Still broken", "the bug survives", Severity.HIGH)],
+        backlog=[],
+    )
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True, gate=gate)
+    )
+
+    assert result is None  # no PR opened
+    assert pr_ops.opened == []
+    assert len(notifier.notes) == 1
+    note = notifier.notes[0]
+    assert isinstance(note, Notification)
+    assert note.repo_full_name == "owner/repo"
+    assert note.issue_number == 31
+    assert note.label == HITL_LABEL
+    assert "Still broken" in note.body
+    # No mapping recorded — the PR never opened.
+    assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
+
+
+@pytest.mark.asyncio
+async def test_gate_backlog_findings_are_filed_then_the_pr_opens(tmp_path: Path) -> None:
+    """Sub-threshold gate findings become ``priority:<severity>`` backlog nits, PR opens."""
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.issues import CreatedIssue, IssueDraft
+    from retinue.reviewer import ReviewFinding
+    from retinue.vocab import BACKLOG_LABEL, Severity
+
+    filed: list[IssueDraft] = []
+
+    async def recording_create(draft: IssueDraft) -> CreatedIssue:
+        filed.append(draft)
+        return CreatedIssue(issue_number=1000 + len(filed))
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, pr_ops=pr_ops, create_issue=recording_create)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    gate = ReviewGateOutcome(
+        blocking=[],
+        backlog=[
+            ReviewFinding("Rename var", "cosmetic", Severity.LOW),
+            ReviewFinding("Tidy helper", "minor", Severity.MEDIUM),
+        ],
+    )
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True, gate=gate)
+    )
+
+    # The PR opened (backlog does not block).
+    assert result is not None and result.opened is True
+    assert len(pr_ops.opened) == 1
+    # Each backlog finding filed a backlog + priority:<severity> nit.
+    assert len(filed) == 2
+    assert filed[0].labels == [BACKLOG_LABEL, "priority:low"]
+    assert filed[1].labels == [BACKLOG_LABEL, "priority:medium"]
+    assert {d.title for d in filed} == {"Rename var", "Tidy helper"}
+
+
+@pytest.mark.asyncio
+async def test_clean_gate_opens_the_pr_without_filing_anything(tmp_path: Path) -> None:
+    """A clean gate (no findings) opens the PR and files no backlog nits."""
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.issues import CreatedIssue, IssueDraft
+
+    filed: list[IssueDraft] = []
+
+    async def recording_create(draft: IssueDraft) -> CreatedIssue:
+        filed.append(draft)
+        return CreatedIssue(issue_number=1)
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, pr_ops=pr_ops, create_issue=recording_create)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    gate = ReviewGateOutcome(blocking=[], backlog=[])
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True, gate=gate)
+    )
+
+    assert result is not None and result.opened is True
+    assert filed == []
+
+
 # --- reap ------------------------------------------------------------------------
 
 

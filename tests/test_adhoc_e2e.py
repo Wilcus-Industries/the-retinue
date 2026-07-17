@@ -35,7 +35,12 @@ import pytest_asyncio
 from arq import ArqRedis
 from arq.worker import Worker
 
-from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, render_chain_depth
+from retinue.adhoc_build import (
+    AdhocBuildResult,
+    AdhocIssue,
+    ReviewGateOutcome,
+    render_chain_depth,
+)
 from retinue.adhoc_drain import AdhocDrainLock, ReadyIssue, run_adhoc_drain
 from retinue.handoff import MergedPullRequest, ReapOutcome
 from retinue.pipeline import Pipeline, bind_adhoc_pr_open
@@ -102,7 +107,14 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
         # lives in tests/test_adhoc_build.py) followed by the *real* pipeline PR step, exactly
         # what ``bind_adhoc_build`` chains but with the leaf build injected.
         built_issues.append(issue)
-        result = AdhocBuildResult(branch=issue.branch, passed=True)
+        # A green build carries a review-gate outcome (clean here), exactly as production
+        # does; the pipeline consumes it and — nothing blocking, nothing backlog — opens
+        # the PR. The gate's own build-time coverage lives in tests/test_adhoc_build.py.
+        result = AdhocBuildResult(
+            branch=issue.branch,
+            passed=True,
+            gate=ReviewGateOutcome(blocking=[], backlog=[]),
+        )
         await pipeline.process_adhoc_pr(issue, result)
 
     # A ``Chain-depth: 1`` marker in the body proves the drain materializes the issue through

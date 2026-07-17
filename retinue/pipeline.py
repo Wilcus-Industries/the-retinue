@@ -31,8 +31,8 @@ from typing import TYPE_CHECKING
 from retinue.adhoc_build import (
     AdhocBuildResult,
     AdhocIssue,
-    ContainerAdhocReviewer,
     ContainerPlanner,
+    ReviewGateOutcome,
     build_adhoc_issue,
 )
 from retinue.budget import (
@@ -56,20 +56,22 @@ from retinue.handoff import (
     ReapResult,
     reap_merged_pr,
 )
-from retinue.issues import GhCliIssueCreator, IssueCreator
+from retinue.issues import GhCliIssueCreator, IssueCreator, IssueDraft
 from retinue.messages_api import HttpxTransport
 from retinue.notify import (
     GhCommentSink,
     GhLabelSink,
+    Notification,
     Notifier,
     build_push_sink,
 )
 from retinue.pr_opener import GhCliPrOps, PrOpenResult, PrOps, open_staging_pr
 from retinue.reconcile import ReconcileGhRunner, RunStateStore
 from retinue.repo_config import RepoConfig
-from retinue.reviewer import AgentSdkReviewGenerator
+from retinue.reviewer import AgentSdkReviewGenerator, ReviewFinding
 from retinue.roles import Role, resolve_effort, resolve_model
 from retinue.routing import GhCliIssueFacts, resolve_issue_level
+from retinue.vocab import BACKLOG_LABEL, HITL_LABEL, priority_label
 
 if TYPE_CHECKING:
     from retinue.config import Settings
@@ -116,30 +118,89 @@ class Pipeline:
     async def process_adhoc_pr(
         self, issue: AdhocIssue, build: AdhocBuildResult
     ) -> PrOpenResult | None:
-        """Open the PR for a green ad-hoc build and record the PR<->issue mapping.
+        """Consume the review gate, then open the PR for a green ad-hoc build.
 
-        After a green build, open exactly one PR ``issue-<N>`` -> target-branch — the head
-        is the ``issue-<N>`` branch itself, so **no integration branch** is created. The
-        PR<->issue mapping is recorded in the run-state store keyed by the single issue, so
-        a human merge reaps that one issue through :meth:`reap_pr`.
+        After a green build, the in-session review gate's outcome routes the issue:
+
+        * **blocking findings** (severity at or above the threshold, or a fix-pass
+          regression): the issue is escalated — one :class:`~retinue.notify.Notification`
+          fans a ``hitl``-labeled comment + push out — and **no PR opens**. The green
+          branch stays pushed for a human to pick up.
+        * **backlog findings**: each is filed as a ``backlog`` + ``priority:<severity>``
+          follow-up issue, then the PR opens normally.
+        * **clean gate** (or no gate, e.g. stranded recovery): the PR opens straight.
+
+        The PR ``issue-<N>`` -> target-branch is opened with the ``issue-<N>`` branch as
+        its head (no integration branch), and the PR<->issue mapping is recorded keyed by
+        the single issue so a human merge reaps it through :meth:`reap_pr`.
 
         A red build pushed nothing, so there is no head to open a PR from: the step is
         skipped and ``None`` is returned.
 
         Args:
             issue: The ad-hoc issue that was built (carries the ``issue-<N>`` branch).
-            build: The build outcome; only a ``passed`` build opens a PR.
+            build: The build outcome; only a ``passed`` build opens a PR, and its ``gate``
+                carries the review findings to escalate or file.
 
         Returns:
-            The :class:`PrOpenResult` when the PR step ran, or ``None`` when the red build
-            skipped it.
+            The :class:`PrOpenResult` when the PR step ran, or ``None`` when the red build,
+            or a blocking review gate, skipped it.
         """
         if not build.passed:
             logger.info("Ad-hoc build for %s failed; opening no PR", issue.branch)
             return None
+        gate = build.gate
+        if gate is not None and gate.blocking:
+            await self._escalate_blocking(issue, gate)
+            return None
+        if gate is not None:
+            await self._file_backlog(issue, gate.backlog)
         return await self._open_pr(
             issue.repo_full_name, issue.issue_number, head=build.branch
         )
+
+    async def _escalate_blocking(
+        self, issue: AdhocIssue, gate: ReviewGateOutcome
+    ) -> None:
+        """Escalate a blocked ad-hoc issue: one hitl notification, no PR.
+
+        The single :meth:`Notifier.notify` fans out to push + comment + label, so the
+        blocking findings land as a durable ``hitl`` comment on the issue and a push
+        heads-up. The green branch is left pushed for the human to take over.
+        """
+        logger.info(
+            "Ad-hoc review gate for %s blocked the PR (%d finding(s)); escalating",
+            issue.branch,
+            len(gate.blocking),
+        )
+        await self.notifier.notify(
+            Notification(
+                repo_full_name=issue.repo_full_name,
+                issue_number=issue.issue_number,
+                title=f"Review gate blocked issue #{issue.issue_number}",
+                body=_render_blocking_body(issue, gate),
+                label=HITL_LABEL,
+            )
+        )
+
+    async def _file_backlog(
+        self, issue: AdhocIssue, backlog: list[ReviewFinding]
+    ) -> None:
+        """File each sub-threshold gate finding as a ``priority:<severity>`` backlog nit."""
+        for finding in backlog:
+            await self.create_issue(
+                IssueDraft(
+                    title=finding.title,
+                    body=finding.body,
+                    labels=[BACKLOG_LABEL, priority_label(finding.severity)],
+                )
+            )
+        if backlog:
+            logger.info(
+                "Ad-hoc review gate for %s filed %d backlog nit(s)",
+                issue.branch,
+                len(backlog),
+            )
 
     async def reap_pr(self, merged: MergedPullRequest) -> ReapResult:
         """React to a human-merged PR: close its issue(s), then reap the parent.
@@ -186,6 +247,25 @@ class Pipeline:
                 pr_number=result.pull_request.number,
             )
         return result
+
+
+def _render_blocking_body(issue: AdhocIssue, gate: ReviewGateOutcome) -> str:
+    """Render the hitl escalation comment body listing a gate's blocking findings.
+
+    Leads with why the PR was held, then one bullet per blocking finding (title +
+    severity + body). A fix-pass regression reads the same way — its single synthetic
+    finding explains the done-check turned red and the fix was not pushed.
+    """
+    lead = (
+        f"The in-session review gate blocked issue #{issue.issue_number} from opening a "
+        f"PR: the reviewer found {len(gate.blocking)} blocking finding(s) it still saw "
+        "after one fix pass. The green branch is pushed and left for a human.\n"
+    )
+    bullets = "\n".join(
+        f"- **{f.title}** ({f.severity.name.lower()})\n\n  {f.body.rstrip()}"
+        for f in gate.blocking
+    )
+    return f"{lead}\n{bullets}"
 
 
 # --- production wiring: build the real pipeline from Settings ----------------------
@@ -362,10 +442,11 @@ def bind_adhoc_build(
     Returns an async ``(issue, *, repo_full_name) -> None`` — the
     :data:`retinue.adhoc_drain.AdhocBuild` shape — that drives one ad-hoc issue end to end:
     :func:`retinue.adhoc_build.build_adhoc_issue` (plan -> implement -> done-check -> push,
-    then the advisory review pass) in a fresh disposable container, then the *already
-    constructed* repo :class:`Pipeline`'s :meth:`~Pipeline.process_adhoc_pr` to open the
-    ``issue-<N>`` -> target-branch PR on a green build. A red build pushes nothing and opens
-    no PR (``process_adhoc_pr`` skips it).
+    then the in-session review gate) in a fresh disposable container, then the *already
+    constructed* repo :class:`Pipeline`'s :meth:`~Pipeline.process_adhoc_pr`, which consumes
+    the gate outcome: it escalates blocking findings (no PR), files backlog nits, and opens
+    the ``issue-<N>`` -> target-branch PR on a clean-or-backlog gate. A red build pushes
+    nothing and opens no PR (``process_adhoc_pr`` skips it).
 
     Each ad-hoc issue is **classified once** at build start via
     :func:`_resolve_adhoc_level`, and its planner, implementer, and reviewer are then
@@ -376,8 +457,9 @@ def bind_adhoc_build(
     Args:
         settings: Carries the Anthropic credential/auth mode.
         auth: Mints the installation token the build clones over.
-        pipeline: The repo's constructed pipeline; its ``process_adhoc_pr`` opens the PR and
-            records the mapping, and its ``create_issue`` files the review-fix issues.
+        pipeline: The repo's constructed pipeline; its ``process_adhoc_pr`` consumes the
+            review gate, opens the PR and records the mapping, and its ``create_issue``
+            files the gate's backlog nits.
         repo_full_name: The target repo the build runs against.
         token: The minted installation token the gh report sink files under.
         config: The repo's validated config (resolved target branch, secrets, overrides).
@@ -438,14 +520,6 @@ def bind_adhoc_build(
             model=resolve_model(Role.REVIEWER, config, level=level),
             effort=resolve_effort(Role.REVIEWER, config, level=level),
         )
-        reviewer = ContainerAdhocReviewer(
-            repo_full_name=repo_full_name,
-            config=config,
-            generate=review_generate,
-            create_issue=pipeline.create_issue,
-            credential=settings.anthropic_credential,
-            auth_mode=settings.auth_mode,
-        )
         result = await build_adhoc_issue(
             issue,
             config,
@@ -456,7 +530,7 @@ def bind_adhoc_build(
             runtime=runtime,
             resolve_secret=resolve_secret,
             report=report,
-            reviewer=reviewer,
+            review_generate=review_generate,
         )
         await pipeline.process_adhoc_pr(issue, result)
 
