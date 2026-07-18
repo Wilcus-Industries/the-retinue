@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 from retinue.adhoc_drain import AdhocDrainLock, run_adhoc_drain
 from retinue.budget import (
     ADHOC_DRAIN_ESTIMATED_AMOUNT,
+    CRON_PROMOTION_ESTIMATED_AMOUNT,
     BudgetGovernor,
     SystemClock,
 )
@@ -92,9 +93,12 @@ def bind_cron_tick(
     :data:`retinue.heartbeat.HeartbeatCronTick` shape — that drives one repo's backlog
     lane through :func:`retinue.cron.run_cron_tick`: gate on the shared ``governor``, pick
     the next backlog issue by weighted score (or the quota floor on every Nth tick), and
-    run its downstream build. The governor is the *same* service-level governor the ad-hoc
-    lane meters, so the budget is one rolling-24h window; a per-repo single-run lock
-    registry lets two repos tick concurrently while a repo's own ticks serialize.
+    run its downstream build. The tick's own work is label surgery with no model spend, so
+    it gates at :data:`retinue.budget.CRON_PROMOTION_ESTIMATED_AMOUNT` (zero) — the
+    governor is the *same* service-level governor the ad-hoc lane meters for the real
+    build, so the budget is one rolling-24h window charged exactly once per promoted
+    issue; a per-repo single-run lock registry lets two repos tick concurrently while a
+    repo's own ticks serialize.
 
     The backlog cron lane's job is a label-surgery *trickle* promotion: the picked backlog
     nit is promoted into the scheduler queue by swapping ``backlog`` for the repo's
@@ -137,7 +141,7 @@ def bind_cron_tick(
             clock=SystemClock(),
             build=promoter.promote,
             tick_number=tick_number,
-            estimated_amount=ADHOC_DRAIN_ESTIMATED_AMOUNT,
+            estimated_amount=CRON_PROMOTION_ESTIMATED_AMOUNT,
             lock=locks.setdefault(repo_full_name, CronLock()),
             quota_every=quota_every,
         )

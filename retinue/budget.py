@@ -451,3 +451,11 @@ CLASSIFIER_ESTIMATED_AMOUNT = 0.01
 # build that would cross the cap is skipped so the one shared budget is never overshot.
 ADHOC_DRAIN_ESTIMATED_AMOUNT = 1.0
 
+# The cron backlog tick's estimated charge, gated against the rolling-24h budget cap. The
+# tick's own work is pure label surgery (swapping ``backlog`` for the trigger label) with
+# no model spend, so it charges nothing here; the scheduler drain meters the *real* build
+# charge (:data:`ADHOC_DRAIN_ESTIMATED_AMOUNT`) separately once it later drains the
+# promoted issue. Charging a nonzero amount here would double-bill every promoted issue
+# and prematurely trip the rolling-24h defer on phantom spend.
+CRON_PROMOTION_ESTIMATED_AMOUNT = 0.0
+

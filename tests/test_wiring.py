@@ -127,6 +127,10 @@ async def test_cron_tick_lists_picks_and_promotes_when_in_budget(
     assert result.issue_number == 42
     # The picked issue was promoted via label surgery onto the repo's trigger label.
     assert promotions == [("owner/repo", 42, "ready-for-agent")]
+    # The promotion is pure label surgery with no model spend; the scheduler drain
+    # separately meters the real build when it later drains the promoted issue, so the
+    # cron tick itself must charge nothing against the shared rolling-24h ledger.
+    assert await governor._ledger.trailing_24h_spend() == 0.0
 
 
 # --- bind_adhoc_drain ------------------------------------------------------------
