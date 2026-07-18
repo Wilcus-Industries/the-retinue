@@ -642,7 +642,7 @@ async def run_adhoc_drain(
     governor: BudgetGovernor,
     estimated_amount: float,
     lock: AbstractAsyncContextManager[object],
-    guard: AdhocBuildGuard | None = None,
+    guard: AdhocBuildGuard,
     prd_in_flight: bool = False,
 ) -> list[AdhocIssue]:
     """Drain the repo's ad-hoc work, hardened for production: list, filter, classify, act.
@@ -697,8 +697,9 @@ async def run_adhoc_drain(
             around that section, not the builds. Separate from the PRD build's lock.
         guard: The per-repo in-flight :class:`AdhocBuildGuard`, reserved under the lock and
             released when the builds finish, so an overlapping drain does not double-build an
-            issue. Defaults to a fresh per-call guard (no cross-drain dedup) when omitted; the
-            worker passes the shared per-repo instance.
+            issue. Required (no unsafe default): the worker passes the shared per-repo
+            instance, so a missing wiring fails loudly rather than silently running without
+            cross-drain double-build dedup (#83). A single-drain caller passes a fresh guard.
         prd_in_flight: Whether a PRD build is currently running for this repo. When True,
             PRD-first ordering holds and only preempting (``critical``/``high``) issues
             build; when False, every ranked ad-hoc issue builds.
@@ -713,7 +714,6 @@ async def run_adhoc_drain(
         AdhocDrainBusyError: Another drain for this repo holds the list/classify/reserve
             critical section (from the lock).
     """
-    guard = guard if guard is not None else AdhocBuildGuard()
     async with lock:
         listed = await gh.list_ready(repo_full_name=repo_full_name)
         candidates = _select_candidates(repo_full_name, prd_in_flight, listed)

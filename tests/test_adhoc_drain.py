@@ -149,7 +149,7 @@ async def _drain(
             governor=governor,
             estimated_amount=estimated_amount,
             lock=lock or _nolock(),
-            guard=guard,
+            guard=guard if guard is not None else AdhocBuildGuard(),
             prd_in_flight=prd_in_flight,
         )
     finally:
@@ -690,6 +690,19 @@ async def test_the_guard_is_released_even_when_a_build_raises(tmp_path: Path) ->
         )
 
     assert 7 not in guard  # released despite the failure
+
+
+def test_run_adhoc_drain_requires_an_explicit_guard() -> None:
+    """The drain has no unsafe default guard: a caller must pass one (#83).
+
+    A ``None``/absent default would silently run the drain without cross-drain
+    double-build dedup, masking a missing wiring at the call site. Making ``guard``
+    required means an unwired caller fails loudly instead of building an issue twice.
+    """
+    import inspect
+
+    param = inspect.signature(run_adhoc_drain).parameters["guard"]
+    assert param.default is inspect.Parameter.empty
 
 
 @pytest.mark.asyncio
