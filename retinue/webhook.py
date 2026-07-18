@@ -1,12 +1,11 @@
 """FastAPI webhook router: signature verification and event dispatch.
 
 Verifies the HMAC-SHA256 signature on every incoming webhook, then routes two event types
-to work: an ``issues`` event carrying the ``ready-for-agent`` trigger label (on an action
-that can newly add the label or change the issue) kicks a single scheduler drain — the
-low-latency admission of ready work — and a ``pull_request`` closed+merged event enqueues a
-merge reap. Everything else is acked 204 and enqueues nothing. The enqueue is awaited
-inline before the ack so a failed enqueue surfaces as a 5xx (GitHub redelivers) rather than
-vanishing after a 202.
+to work: an ``issues`` event on a relevant action (one that can newly ready the issue or
+change it) kicks a single scheduler drain — the low-latency admission of ready work — and a
+``pull_request`` closed+merged event enqueues a merge reap. Everything else is acked 204 and
+enqueues nothing. The enqueue is awaited inline before the ack so a failed enqueue surfaces
+as a 5xx (GitHub redelivers) rather than vanishing after a 202.
 """
 
 from __future__ import annotations
@@ -24,20 +23,13 @@ from retinue.queue import (
     enqueue_adhoc_drain,
     enqueue_merged_pr,
 )
-from retinue.vocab import READY_LABEL
 
 logger = logging.getLogger(__name__)
 
-# The relevant issue actions: only the ones that can newly add the trigger label or change
+# The relevant issue actions: only the ones that can newly add a trigger label or change
 # the issue drive a drain kick. Any other action (closed, assigned, unlabeled, …) is acked
 # 204 and enqueues nothing.
 _ISSUE_ACTIONS = frozenset({"opened", "reopened", "edited", "labeled"})
-
-
-def _issue_label_names(body: dict[str, Any]) -> list[str]:
-    """The label names on an ``issues`` payload (empty when none / malformed)."""
-    labels = body.get("issue", {}).get("labels", [])
-    return [label.get("name") for label in labels]
 
 
 def _is_relevant_issue_action(body: dict[str, Any]) -> bool:
@@ -48,13 +40,14 @@ def _is_relevant_issue_action(body: dict[str, Any]) -> bool:
 def _is_adhoc_issue_event(body: dict[str, Any]) -> bool:
     """Whether an ``issues`` payload should kick a scheduler drain.
 
-    True when the issue carries the ``ready-for-agent`` trigger label and the action is one
-    the gate accepts. The drain re-lists and re-filters the repo's ready issues itself, so
-    this is only a kick, not a per-issue task.
+    True whenever the action is one the gate accepts (see :data:`_ISSUE_ACTIONS`) — the
+    kick is only a per-repo "drain this repo" signal, not a per-issue task, so it does not
+    gate on any specific label. The drain re-lists and re-filters the repo's ready issues by
+    its own configured ``trigger_label`` (which varies per repo, e.g. a BYOK repo's custom
+    label), so hardcoding a label here would silently starve repos that don't use the
+    default ``ready-for-agent``.
     """
-    if not _is_relevant_issue_action(body):
-        return False
-    return READY_LABEL in _issue_label_names(body)
+    return _is_relevant_issue_action(body)
 
 
 def compute_signature(payload: bytes, secret: str) -> str:
@@ -149,9 +142,10 @@ def make_webhook_router(*, webhook_secret: str) -> APIRouter:
     async def _dispatch_issue(request: Request) -> Response:
         """Route an ``issues`` event: scheduler-drain kick, or ack-and-drop.
 
-        A ``ready-for-agent`` issue on a relevant action kicks a single scheduler drain (the
-        low-latency admission). An issue with no trigger label (or a non-relevant action) is
-        acked 204 and enqueues nothing.
+        A relevant action (see :data:`_ISSUE_ACTIONS`) kicks a single scheduler drain (the
+        low-latency admission), regardless of the issue's labels — the drain re-filters by
+        the repo's own configured trigger label. A non-relevant action is acked 204 and
+        enqueues nothing.
         """
         body: dict[str, Any] = await request.json()
         if _is_adhoc_issue_event(body):

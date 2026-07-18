@@ -34,11 +34,13 @@ class MergedPrJob:
 class AdhocDrainJob:
     """A low-latency kick that runs one ad-hoc drain for a repo.
 
-    The webhook enqueues this when a ``ready-for-agent`` (non-``prd``) issue event
-    arrives, so the repo's ad-hoc backlog is drained without waiting for the cron tick.
-    The job carries only the repo because :func:`retinue.adhoc_drain.run_adhoc_drain`
-    re-lists the repo's ready-for-agent issues itself — the event is a *kick*, not a
-    per-issue task, so a burst of events for one repo collapses to a single drain.
+    The webhook enqueues this when a relevant issue event arrives (see
+    :data:`retinue.webhook._ISSUE_ACTIONS`), so the repo's ad-hoc backlog is drained
+    without waiting for the cron tick. The kick does not gate on any specific label — the
+    job carries only the repo because :func:`retinue.adhoc_drain.run_adhoc_drain` re-lists
+    and re-filters the repo's ready issues by its own configured trigger label itself — the
+    event is a *kick*, not a per-issue task, so a burst of events for one repo collapses to
+    a single drain.
 
     Attributes:
         repo_full_name: e.g. "owner/repo".

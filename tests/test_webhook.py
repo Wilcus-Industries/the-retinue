@@ -135,26 +135,26 @@ def test_ready_for_agent_issue_enqueues_one_adhoc_drain(
     enqueue_merged.assert_not_called()
 
 
-def test_unlabeled_issue_acks_204_and_enqueues_nothing(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock],
+@pytest.mark.parametrize(
+    "labels", [[], ["bug", "backlog"], ["custom-trigger"]], ids=["none", "other", "custom"]
+)
+def test_relevant_action_kicks_a_drain_regardless_of_label(
+    dispatch_client: tuple[TestClient, MagicMock, MagicMock], labels: list[str]
 ) -> None:
-    """An issue without the trigger label is acked 204 and enqueues nothing."""
-    client, enqueue_adhoc, _merged = dispatch_client
-    response = _post(client, "issues", _issues_payload(action="opened", labels=[]))
-    assert response.status_code == 204
-    enqueue_adhoc.assert_not_called()
+    """A relevant issue action kicks a drain no matter what labels the issue carries.
 
-
-def test_non_trigger_label_acks_204_and_enqueues_nothing(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock],
-) -> None:
-    """An issue labeled with something other than the trigger enqueues nothing."""
-    client, enqueue_adhoc, _merged = dispatch_client
-    response = _post(
-        client, "issues", _issues_payload(action="opened", labels=["bug", "backlog"])
-    )
-    assert response.status_code == 204
-    enqueue_adhoc.assert_not_called()
+    The kick is only a per-repo "drain this repo" signal; the drain itself re-lists and
+    re-filters the repo's ready issues by its own configured ``trigger_label``. Gating the
+    kick on the hardcoded ``ready-for-agent`` label would starve a BYOK repo that
+    configures a custom trigger label (or hasn't been labeled yet) of any webhook-driven
+    drain.
+    """
+    client, enqueue_adhoc, enqueue_merged = dispatch_client
+    response = _post(client, "issues", _issues_payload(action="opened", labels=labels))
+    assert response.status_code == 202
+    enqueue_adhoc.assert_awaited_once()
+    assert enqueue_adhoc.call_args[0][1] == AdhocDrainJob(repo_full_name="owner/repo")
+    enqueue_merged.assert_not_called()
 
 
 @pytest.mark.parametrize("action", ["closed", "assigned", "deleted", "unlabeled"])
