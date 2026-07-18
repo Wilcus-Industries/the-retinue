@@ -286,7 +286,7 @@ class GhReportSink:
     The subprocess spawn is the one impure edge, factored behind the injected ``runner``
     so command assembly, the auth env, and body rendering are unit-testable without a
     real ``gh``, Docker, or network — mirroring :class:`retinue.cron.GhCli`. The instance
-    is callable, so it drops into the orchestrator's build flow wherever the fake did.
+    is callable, so it drops into the build lane's build flow wherever the fake did.
 
     Args:
         token: The GitHub token ``gh`` authenticates with, placed in the child env as
@@ -390,7 +390,7 @@ async def run_done_check_commands(
 ) -> tuple[bool, str]:
     """Run each done-check command in order in ``container``; stop at the first failure.
 
-    The container is owned by the caller (the orchestrator's per-slice build container,
+    The container is owned by the caller (the build container,
     which has already cloned the repo and let the implementer commit the slice), so the
     commands run over the *real* changes rather than a pristine clone. Each command runs
     with the Anthropic auth credential blanked in its environment (it is the implementer's,

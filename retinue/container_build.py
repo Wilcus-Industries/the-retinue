@@ -1,37 +1,35 @@
-"""The per-issue container-build lifecycle shared by the PRD and ad-hoc lanes.
+"""The per-issue container-build lifecycle the scheduler build lane runs.
 
-Both build lanes run one issue's whole build inside **one disposable container** that is
+The build lane runs one issue's whole build inside **one disposable container** that is
 destroyed on every path: parse the done-check, resolve the config's secrets, start the
 container (secrets + git committer identity + the in-container agents' credentials all in
-its env), clone the repo and check out a fresh ``issue-<N>`` branch off the lane's base,
+its env), clone the repo and check out a fresh ``issue-<N>`` branch off the target base,
 exec the implementer, guard against a hollow implement (zero commits landed), run the
 repo's done-check over the real changes, push the branch only on green, and post the
 outcome to the report sink. :func:`build_issue_in_container` owns that lifecycle; the
-lanes own only what genuinely differs, passed as hooks:
-
-- the **PRD lane** (:func:`retinue.orchestrator.build_slice` / ``build_prd``) branches off
-  the integration branch ``retinue/prd-<n>`` and passes no hooks,
-- the **ad-hoc lane** (:func:`retinue.adhoc_build.build_adhoc_issue`) branches off the
-  repo's staging branch, runs a read-only planner before the implement
-  (``pre_implement``), points the implementer at the materialized plan (``plan_path``),
-  and runs an advisory review after a green check (``on_green``).
+caller — the **ad-hoc lane** (:func:`retinue.adhoc_build.build_adhoc_issue`), which
+branches off the repo's target branch — owns only what genuinely differs, passed as hooks:
+a read-only planner before the implement (``pre_implement``), the materialized plan the
+implementer reads (``plan_path``), and the in-session review gate after a green check
+(``on_green``).
 
 The building blocks the lifecycle drives — the :class:`Slice` unit, the
 :class:`Implementer` seam, the git command builders, and the in-container git helpers —
-live here too, so both lanes (and the orchestrator's merge seam) share one public set
-instead of reaching into each other's privates. Every side-effecting collaborator is
-injected, so the whole flow is exercised in tests with no Agent SDK, no Docker, no gh,
-and no network.
+live here too, so the lane draws on one public set instead of reaching into private
+internals. Every side-effecting collaborator is injected, so the whole flow is exercised
+in tests with no Agent SDK, no Docker, no gh, and no network.
 """
 
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
+from retinue.classifier import ClassifyInput
 from retinue.container import Container, ContainerRuntime
 from retinue.done_check import (
     DoneCheckReport,
@@ -43,6 +41,7 @@ from retinue.done_check import (
 )
 from retinue.github_app import InstallationAuth
 from retinue.repo_config import RepoConfig
+from retinue.roles import Role, resolve_model
 from retinue.vocab import issue_branch
 
 logger = logging.getLogger(__name__)
@@ -88,9 +87,9 @@ class Implementer(Protocol):
         """Build ``slice_`` in ``container``, committing to its ``issue-<N>`` branch.
 
         ``plan_path`` is the in-container path of a materialized implementation plan the
-        subagent must read before building. The PRD lane passes nothing (``None``), so its
-        prompt is unchanged; the ad-hoc lane passes its ``PLAN_FILE`` so the subagent is
-        pointed at the plan the planner wrote.
+        subagent must read before building. A caller that materializes no plan passes
+        nothing (``None``), leaving the prompt unchanged; the ad-hoc lane passes its
+        ``PLAN_FILE`` so the subagent is pointed at the plan the planner wrote.
         """
         ...
 
@@ -117,12 +116,10 @@ class ImplementError(RuntimeError):
 
 
 class GitOpsError(RuntimeError):
-    """A ``git`` command failed for a reason other than a recoverable merge conflict.
+    """A ``git`` command failed with a hard error.
 
-    Distinct from :class:`retinue.orchestrator.MergeConflict`: a conflict is handed to
-    the resolver, but a hard error (unknown ref, not a repository, checkout failure)
-    means the branch could not be advanced at all, so it propagates rather than
-    masquerading as a conflict the resolver could fix.
+    A hard error (unknown ref, not a repository, checkout failure) means the branch could
+    not be advanced at all, so it propagates and fails the build rather than being swallowed.
     """
 
 
@@ -323,8 +320,8 @@ async def build_issue_in_container(
         if pre_implement is not None:
             await pre_implement(container)
         if plan_path is None:
-            # The bare call shape is kept for the PRD lane so an injected implementer
-            # that predates the plan_path parameter still satisfies the seam.
+            # The bare call shape (no plan_path) is kept so an injected implementer that
+            # predates the plan_path parameter still satisfies the seam.
             await implementer.implement(slice_, container=container)
         else:
             await implementer.implement(
@@ -359,3 +356,251 @@ async def build_issue_in_container(
         # including when clone, a hook, implement, the done-check, the push, or report
         # raises.
         await container.destroy()
+
+
+# --- real container-exec implementer (production adapter behind the Implementer seam) ---
+#
+# The production :class:`Implementer` execs the headless ``claude`` CLI *inside the
+# disposable build container* the lifecycle owns — the "shell out to claude" discipline the
+# PRD cites. The repo is already cloned and the ``issue-<N>`` branch checked out in that
+# container, so the agent edits files and commits over the real tree the done-check then
+# runs against. Confining the autonomous AI step to a throwaway container keeps it off the
+# worker host and its mounted ``docker.sock``. The one side effect is the exec, taken behind
+# the injected :class:`~retinue.container.Container`, so the flow is exercisable without a
+# live model, the CLI, Docker, gh, or network. The bug-prone pure parts — prompt assembly,
+# argv construction, the api_key-vs-subscription env auth routing, and reading the CLI result
+# — are factored into the free functions below so they are unit-tested in isolation.
+#
+# Auth mirrors :class:`retinue.config.Settings`: ``auth_mode="api_key"`` threads the
+# credential to the CLI as ``ANTHROPIC_API_KEY``; ``auth_mode="subscription"`` threads it as
+# ``CLAUDE_CODE_OAUTH_TOKEN`` (the subscription OAuth env var). The credential rides the
+# container env (fixed at ``start``), so the implementer exposes it via :meth:`auth_env` for
+# the lifecycle to merge in, rather than passing it per-exec. The contract is the commit on
+# ``slice.branch``; the lifecycle gates on the done-check that follows, so a run the CLI
+# finishes "successfully" but that fails to satisfy the repo is still caught downstream.
+# A non-zero CLI exit (or a json result flagged ``is_error``) raises :class:`ImplementError`.
+#
+# The implementing model and effort tier come from the :data:`~retinue.roles.Role.IMPLEMENTER`
+# registry entry (Sonnet 4.6 at the ``high`` tier by default), resolved at construction time
+# so a repo's routing level can swap the model at the wiring site. The in-container
+# ``claude`` CLI carries no effort flag today, so the ``high`` tier is registry metadata that
+# records the PRD's intent without changing the wire.
+
+# The implementer's brief, appended to the CLI's system prompt. Frozen (no per-slice
+# interpolation) so the prefix is stable; the slice specifics ride in the per-slice prompt.
+_IMPLEMENT_SYSTEM = (
+    "You are an autonomous implementer. Build the requested GitHub issue inside the "
+    "repository you are running in. Default to test-driven development: when the change "
+    "has testable behavior, write or update a failing test first, then write code until "
+    "it passes. A documentation- or config-only change has nothing to test — make the "
+    "change directly rather than inventing a test for it. Either way, ensure the repo's "
+    "own checks pass before you commit. Make the smallest change that satisfies the "
+    "issue; do not refactor unrelated code. When the work is complete and committed to "
+    "the issue's branch, stop."
+)
+
+# Hard cap on the implementer's agent loop. Without it the headless ``claude`` run is
+# bounded only by the arq job_timeout, which cancels the *whole* job (container and all)
+# mid-implement — so a thrashing run (e.g. a doc task re-running the full check suite each
+# turn) is killed before the done-check ever runs. The cap makes the agent stop and lets
+# the done-check report on whatever was committed. Tunable via ``implement_max_turns``.
+_DEFAULT_IMPLEMENT_MAX_TURNS = 80
+
+
+# Fetch one issue's facts (title/body/labels) — the seam the implementer bakes the issue
+# content into its prompt through. Defined here (with the implementer that carries it) so
+# :class:`ContainerImplementer` can carry it without an import cycle.
+IssueFactsSource = Callable[[str, int], Awaitable[ClassifyInput]]
+
+
+def _implement_prompt(
+    slice_: Slice, *, plan_path: str | None = None, facts: ClassifyInput | None = None
+) -> str:
+    """Assemble the per-slice prompt: which issue to build, on which branch.
+
+    Names the target repo, the issue number to implement, and the ``issue-<N>`` branch the
+    work must be committed to, so the spawned subagent commits where the lifecycle expects
+    to find it. When ``plan_path`` is given (the ad-hoc lane), the prompt leads with an
+    instruction to read that materialized plan first; with no ``plan_path`` the prompt is
+    the bare form.
+
+    When ``facts`` is given, the issue's title and body are appended as the authoritative
+    spec. This is load-bearing: the build container has no ``gh`` and no GitHub token in
+    its env (the installation token only rides the clone URL), so the agent cannot read
+    the issue itself — without the baked content it no-ops and the slice builds hollow.
+    """
+    plan_preamble = (
+        f"Read the implementation plan at '{plan_path}' first, then implement it. "
+        if plan_path is not None
+        else ""
+    )
+    facts_section = (
+        ""
+        if facts is None
+        else (
+            "\n\nThe issue's title and body follow; they are the authoritative "
+            "specification for this change. This container cannot reach GitHub, so "
+            "work from them rather than trying to fetch the issue.\n\n"
+            f"Issue title: {facts.title}\n\n"
+            f"Issue body:\n{facts.body}"
+        )
+    )
+    return (
+        f"{plan_preamble}"
+        f"Implement issue #{slice_.issue_number} of {slice_.repo_full_name}. "
+        f"Commit your work to the '{slice_.branch}' branch (already checked out). "
+        "Implement it test-driven when the change has testable behavior; a documentation- "
+        "or config-only change needs no test. Ensure the repo's checks pass before "
+        f"committing.{facts_section}"
+    )
+
+
+def _claude_argv(*, prompt: str, model: str, max_turns: int) -> list[str]:
+    """Assemble the headless ``claude`` CLI argv for one in-container implement run.
+
+    Runs non-interactively (``-p`` print mode), pins the implementing ``model``, and runs
+    with ``--permission-mode bypassPermissions``: ``acceptEdits`` only auto-accepts *file
+    edits*, leaving every Bash call — ``git commit``, the repo's checks — blocked pending
+    an approval a headless run can never give, so the agent edits its whole run and exits
+    0 with zero commits (a hollow-implement cause, seen live). The container is
+    disposable and isolated, so bypassing permissions is the intended trade. Caps the
+    agent loop at ``max_turns`` so a runaway/thrashing run stops instead of being killed
+    mid-implement by the arq job_timeout, appends the frozen implementer brief to the
+    system prompt, and emits a machine-readable json result so the exit can be
+    cross-checked. The CLI runs in the container's working dir (the cloned repo), so no
+    cwd flag is needed.
+    """
+    return [
+        "claude",
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--permission-mode",
+        "bypassPermissions",
+        "--max-turns",
+        str(max_turns),
+        "--append-system-prompt",
+        _IMPLEMENT_SYSTEM,
+        "--output-format",
+        "json",
+    ]
+
+
+def _claude_result_is_error(stdout: str) -> bool:
+    """Whether the CLI's ``--output-format json`` result flags the run as errored.
+
+    The headless CLI emits a json object carrying an ``is_error`` boolean. A non-json or
+    empty stdout is not treated as an error here — the exit code is the primary signal —
+    so this only catches a run that exited 0 yet reported an internal error. An
+    unparseable or empty stdout is unexpected given ``--output-format json`` was
+    requested, so it is logged as a warning (the exit code still decides) rather than
+    silently passing.
+    """
+    try:
+        result = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning(
+            "Implementer CLI stdout was not parseable JSON despite --output-format "
+            "json (exit code stays authoritative): %r",
+            stdout,
+        )
+        return False
+    return bool(isinstance(result, dict) and result.get("is_error"))
+
+
+# The result text can carry the agent's whole closing message; the log keeps enough to
+# diagnose a wrong-but-clean run without flooding the line.
+_RESULT_SNIPPET_CHARS = 500
+
+
+def _claude_result_summary(stdout: str) -> str:
+    """A log-ready summary of the CLI's json result: turn count + result snippet.
+
+    Returns an empty string when the stdout is not the expected json object, so the
+    completion log line degrades gracefully rather than raising over telemetry.
+    """
+    try:
+        result = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(result, dict):
+        return ""
+    turns = result.get("num_turns")
+    text = str(result.get("result", ""))[:_RESULT_SNIPPET_CHARS]
+    return f" ({turns} turns): {text}"
+
+
+@dataclass(frozen=True)
+class ContainerImplementer:
+    """Real :class:`Implementer`: build a slice by exec-ing ``claude`` in the build container.
+
+    Satisfies the implementer protocol ``implement(slice_, *, container) -> None`` so it
+    drops in where the fake implementer sits in tests and at the wiring site. It execs the
+    headless ``claude`` CLI inside the already-cloned, branch-checked-out container, hands it
+    the per-slice prompt, and lets it implement TDD-first and commit to ``slice.branch``. The
+    lifecycle gates on the done-check that follows, so the contract here is only that the
+    exec ran and committed; a non-zero exit (or an ``is_error`` json result) raises
+    :class:`ImplementError`.
+
+    Attributes:
+        credential: The Anthropic credential (API key or subscription OAuth token).
+        auth_mode: ``"api_key"`` (credential rides ``ANTHROPIC_API_KEY``) or
+            ``"subscription"`` (credential rides ``CLAUDE_CODE_OAUTH_TOKEN``).
+        model: The implementing model id; defaults to the
+            :data:`~retinue.roles.Role.IMPLEMENTER` registry entry (Sonnet 4.6), which a
+            repo's routing level can replace at the wiring site.
+        max_turns: Hard cap on the agent loop, threaded to ``claude --max-turns`` so a
+            runaway implement stops itself rather than being killed (with its done-check)
+            by the arq job_timeout. The wiring site passes ``settings.implement_max_turns``.
+        issue_facts: Fetches the issue's title/body on the worker (which has ``gh`` and
+            the installation token) so they are baked into the prompt — the container
+            cannot reach GitHub itself. ``None`` keeps the bare prompt.
+    """
+
+    credential: str
+    auth_mode: str = "api_key"
+    model: str = field(default_factory=lambda: resolve_model(Role.IMPLEMENTER))
+    max_turns: int = _DEFAULT_IMPLEMENT_MAX_TURNS
+    issue_facts: IssueFactsSource | None = None
+
+    async def implement(
+        self, slice_: Slice, *, container: Container, plan_path: str | None = None
+    ) -> None:
+        """Exec ``claude`` in ``container`` to build ``slice_``; raise on an errored run.
+
+        ``plan_path``, when given, names a materialized plan the per-slice prompt instructs
+        the subagent to read before building (the ad-hoc lane); the bare call passes nothing.
+        """
+        facts: ClassifyInput | None = None
+        if self.issue_facts is not None:
+            facts = await self.issue_facts(
+                slice_.repo_full_name, slice_.issue_number
+            )
+        prompt = _implement_prompt(slice_, plan_path=plan_path, facts=facts)
+        argv = _claude_argv(prompt=prompt, model=self.model, max_turns=self.max_turns)
+        # The runner container execs as root, and the CLI refuses bypassPermissions
+        # under root unless IS_SANDBOX=1 marks the env as a disposable sandbox —
+        # which this container is.
+        result = await container.run_command(argv, env={"IS_SANDBOX": "1"})
+        if not result.ok:
+            raise ImplementError(
+                f"implementer for {slice_.branch} exited {result.exit_code}: "
+                f"{result.stderr}"
+            )
+        if _claude_result_is_error(result.stdout):
+            raise ImplementError(
+                f"implementer for {slice_.branch} reported an error: {result.stdout}"
+            )
+        # The CLI's stdout is consumed here and the container is destroyed after the
+        # build, so this line is the only forensic trace of what the agent reported —
+        # without it a clean-but-wrong run (e.g. "I could not commit") is invisible.
+        logger.info(
+            "Implementer for %s completed in-container%s",
+            slice_.branch,
+            _claude_result_summary(result.stdout),
+        )
+
+    def auth_env(self) -> dict[str, str]:
+        """The credential env the lifecycle merges into the build container at start."""
+        return implement_env(self.credential, self.auth_mode)

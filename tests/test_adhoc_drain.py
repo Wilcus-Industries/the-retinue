@@ -1,22 +1,21 @@
-"""Tests for the ad-hoc drain (issue #32).
+"""Tests for the scheduler drain (PRD #80).
 
-The ad-hoc drain lists every open ``ready-for-agent`` non-PRD issue via the gh seam,
-ranks them by ``priority:<severity>`` (no-priority lowest), and drives the ad-hoc
-build+PR primitive for each up to the concurrency cap (``max_parallel``):
+The drain lists every open trigger-labeled issue via the gh seam, admits the ones the
+scheduler acts on (trigger label present, ``hitl`` absent), gates them on blocked-by
+readiness, classifies flight state, and drives the build+PR primitive for the selected
+issues through the pure two-queue scheduler (priority queue first, reserved priority slot):
 
-1. **list** — pull the repo's open ``ready-for-agent`` issues (number, labels, body),
-2. **filter** — keep only the ad-hoc lane via ``ReadyIssue.is_adhoc``, which mirrors
-   :func:`retinue.lane.classify`'s ad-hoc decision but does **not** call it: drop any
-   PRD-labeled issue and any issue carrying a ``Part of #<prd>`` link, since those route
-   to the orchestrator lane,
-3. **rank** — order by ``priority:<severity>`` with no-priority lowest,
-4. **drive** — materialize each ranked issue into an :class:`AdhocIssue` through
-   :meth:`AdhocIssue.from_fetched_issue` (fed the fetched body, so the ``Chain-depth:``
-   lineage marker is read back and the #39/#40 review-fix chain bound stays live) and
-   run the injected ad-hoc build callable, bounded by ``max_parallel``.
+1. **list** — pull the repo's open trigger-labeled issues (number, labels, body),
+2. **admit** — keep trigger-labeled, non-``hitl`` issues,
+3. **readiness** — drop any issue with an open blocker (union of body ``## Blocked by #N``
+   refs and native GitHub relations),
+4. **classify** — partition by flight state (absent / stranded / in-flight),
+5. **rank + select** — two-queue tier ranking with the reserved priority slot,
+6. **drive** — materialize each selected issue via :meth:`AdhocIssue.from_fetched_issue`
+   and run the injected build, metered against the shared budget.
 
-Every collaborator — the gh issue query and the downstream build — is injected and
-faked, so the whole drain runs with no real ``gh``, no Docker, and no network.
+Every collaborator — the gh issue query, the readiness lookups, and the downstream build —
+is injected and faked, so the whole drain runs with no real ``gh``, no Docker, no network.
 """
 
 from __future__ import annotations
@@ -44,15 +43,15 @@ from retinue.adhoc_drain import (
     run_adhoc_drain,
 )
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
+from retinue.readiness import ReadinessGh
 from retinue.repo_config import RepoConfig
-from retinue.vocab import Severity
 from tests.fakes import FakeAdhocGh, FakeClock
 
 
 def _ready(
     number: int, *, labels: list[str] | None = None, body: str = ""
 ) -> ReadyIssue:
-    """A ``ready-for-agent`` issue as the gh seam reports it (number, labels, body)."""
+    """A trigger-labeled issue as the gh seam reports it (number, labels, body)."""
     return ReadyIssue(
         number=number,
         labels=["ready-for-agent", *(labels or [])],
@@ -101,12 +100,7 @@ def _nolock() -> AbstractAsyncContextManager[object]:
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
-    """Yield the event loop until ``predicate()`` is truthy (bounded so a test fails fast).
-
-    The drain awaits real SQLite I/O (the budget meter, on an aiosqlite executor thread)
-    before each build, so a concurrency assertion can't rely on a fixed number of
-    ``sleep(0)`` turns; this polls with a short real sleep so the executor threads progress.
-    """
+    """Yield the event loop until ``predicate()`` is truthy (bounded so a test fails fast)."""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if predicate():
@@ -119,46 +113,46 @@ async def _drain(
     *,
     gh: AdhocGh,
     build: AdhocBuild,
+    readiness_gh: ReadinessGh | None = None,
     open_pr: AdhocPrOpen | None = None,
     config: RepoConfig | None = None,
     governor: BudgetGovernor | None = None,
     tmp_path: Path | None = None,
     lock: AbstractAsyncContextManager[object] | None = None,
-    prd_in_flight: bool = False,
     estimated_amount: float = 1.0,
 ) -> list[AdhocIssue]:
     """Invoke the drain with sensible defaults so each test sets only what it exercises.
 
-    Exactly one of ``governor`` or ``tmp_path`` must be given: ``tmp_path`` builds a
-    default generous-budget governor over a temp ledger when the test doesn't pin one.
+    Exactly one of ``governor`` or ``tmp_path`` must be given. When ``readiness_gh`` is not
+    pinned, the same fake gh answers readiness (its default: no blockers, so all ready).
     """
     if governor is None:
         assert tmp_path is not None, "pass a governor or a tmp_path for a default one"
         governor = _governor(tmp_path)
+    if readiness_gh is None:
+        assert isinstance(gh, ReadinessGh), "gh must answer readiness or pass readiness_gh"
+        readiness_gh = gh
     try:
         return await run_adhoc_drain(
             repo_full_name="owner/repo",
             gh=gh,
+            readiness_gh=readiness_gh,
             build=build,
             open_pr=open_pr or RecordingPrOpen(),
             config=config or RepoConfig(),
             governor=governor,
             estimated_amount=estimated_amount,
             lock=lock or _nolock(),
-            prd_in_flight=prd_in_flight,
         )
     finally:
-        # Release the governor's SQLite connection on this test's own event loop; a
-        # leaked one is torn down at GC against whatever loop is current then. close()
-        # reconnects lazily, so tests that meter the governor afterwards still work.
         await governor.close()
 
 
 class _FlightStateOnlyGh:
     """A seam offering only per-issue ``flight_state`` (no whole-repo snapshot).
 
-    Exercises the drain's fallback: a gh seam that does not implement
-    :class:`SupportsFlightSnapshot` is classified one issue at a time via ``flight_state``.
+    Exercises the drain's fallback and answers readiness (no blockers) so it can double as
+    the readiness seam.
     """
 
     def __init__(
@@ -173,7 +167,9 @@ class _FlightStateOnlyGh:
         self._stranded = stranded_numbers or set()
         self.flight_state_calls: list[int] = []
 
-    async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
+    async def list_ready(
+        self, *, repo_full_name: str, label: str
+    ) -> list[ReadyIssue]:
         return list(self._issues)
 
     async def flight_state(
@@ -186,13 +182,17 @@ class _FlightStateOnlyGh:
             return FlightState.STRANDED
         return FlightState.ABSENT
 
+    async def native_blockers(
+        self, *, repo_full_name: str, issue_number: int
+    ) -> list[int]:
+        return []
+
+    async def is_closed(self, *, repo_full_name: str, issue_number: int) -> bool:
+        return False
+
 
 class RecordingPrOpen:
-    """Records each AdhocIssue whose stranded PR the drain opened (the PR-open-only seam).
-
-    The drain drives this instead of the build for a :attr:`FlightState.STRANDED` issue —
-    a green branch pushed by a prior build but never PR'd — so the PR opens with no rebuild.
-    """
+    """Records each AdhocIssue whose stranded PR the drain opened (the PR-open-only seam)."""
 
     def __init__(self) -> None:
         self.opened: list[AdhocIssue] = []
@@ -204,10 +204,8 @@ class RecordingPrOpen:
 class RecordingAdhocBuild:
     """Records each AdhocIssue handed to the downstream build (the mocked build+PR).
 
-    ``invoked`` is the order builds were *started* in (rank order, recorded before any
-    await); ``built`` is completion order. The drain meters each build against a real
-    SQLite-backed budget before calling here, so completion order can interleave — rank
-    assertions read ``invoked``, concurrency assertions read ``built``.
+    ``invoked`` is start order (rank order, recorded before any await); ``built`` is
+    completion order. ``max_in_flight`` records peak concurrency.
     """
 
     def __init__(self, *, gate: asyncio.Event | None = None) -> None:
@@ -229,12 +227,12 @@ class RecordingAdhocBuild:
             self.in_flight -= 1
 
 
-# --- listing + filtering: only open ready-for-agent non-PRD issues ----------------
+# --- admission: trigger-labeled, hitl absent --------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_drain_drives_the_build_for_each_ready_adhoc_issue(tmp_path: Path) -> None:
-    """AC1/AC3: the drain drives the ad-hoc build primitive for each ready issue."""
+async def test_drain_drives_the_build_for_each_ready_issue(tmp_path: Path) -> None:
+    """The drain drives the build primitive for each admitted, ready issue."""
     gh = FakeAdhocGh([_ready(7), _ready(9)])
     build = RecordingAdhocBuild()
 
@@ -242,12 +240,25 @@ async def test_drain_drives_the_build_for_each_ready_adhoc_issue(tmp_path: Path)
 
     assert {issue.issue_number for issue in build.built} == {7, 9}
     assert gh.calls == ["owner/repo"]
+    assert gh.list_labels == ["ready-for-agent"]
 
 
 @pytest.mark.asyncio
-async def test_prd_labeled_issues_are_excluded(tmp_path: Path) -> None:
-    """AC4: a PRD-labeled (``prd``) issue is not an ad-hoc issue, so it is dropped."""
-    gh = FakeAdhocGh([_ready(7), _ready(8, labels=["prd"])])
+async def test_the_list_query_uses_the_configured_trigger_label(tmp_path: Path) -> None:
+    """A repo that renames its trigger label lists on that label, not the default."""
+    gh = FakeAdhocGh([_ready(7)])
+    build = RecordingAdhocBuild()
+    config = RepoConfig(trigger_label="build-me")
+
+    await _drain(gh=gh, build=build, config=config, tmp_path=tmp_path)
+
+    assert gh.list_labels == ["build-me"]
+
+
+@pytest.mark.asyncio
+async def test_a_hitl_issue_is_excluded(tmp_path: Path) -> None:
+    """A ``hitl``-labeled issue is escalated to a human, so the scheduler skips it."""
+    gh = FakeAdhocGh([_ready(7), _ready(8, labels=["hitl"])])
     build = RecordingAdhocBuild()
 
     await _drain(gh=gh, build=build, tmp_path=tmp_path)
@@ -255,11 +266,49 @@ async def test_prd_labeled_issues_are_excluded(tmp_path: Path) -> None:
     assert [issue.issue_number for issue in build.built] == [7]
 
 
+# --- readiness: blocked issues invisible until blockers close ----------------------
+
+
 @pytest.mark.asyncio
-async def test_part_of_prd_issues_are_excluded(tmp_path: Path) -> None:
-    """AC1/AC4: a ``Part of #<prd>`` issue routes to the orchestrator lane, not ad-hoc."""
+async def test_a_body_blocked_issue_is_invisible_until_its_blocker_closes(
+    tmp_path: Path,
+) -> None:
+    """An issue with an open ``## Blocked by #N`` blocker is not scheduled."""
     gh = FakeAdhocGh(
-        [_ready(7), _ready(8, body="Implements the thing.\n\nPart of #42")]
+        [_ready(7), _ready(8, body="Do the thing.\n\n## Blocked by\n\n- #7")],
+    )
+    build = RecordingAdhocBuild()
+
+    await _drain(gh=gh, build=build, tmp_path=tmp_path)
+
+    # #7 is open, so #8 is blocked; only #7 builds.
+    assert [issue.issue_number for issue in build.built] == [7]
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_issue_becomes_ready_when_its_blocker_closes(
+    tmp_path: Path,
+) -> None:
+    """Once every blocker is closed, the dependent is admitted and built."""
+    gh = FakeAdhocGh(
+        [_ready(8, body="Do the thing.\n\n## Blocked by\n\n- #7")],
+        closed_numbers={7},
+    )
+    build = RecordingAdhocBuild()
+
+    await _drain(gh=gh, build=build, tmp_path=tmp_path)
+
+    assert [issue.issue_number for issue in build.built] == [8]
+
+
+@pytest.mark.asyncio
+async def test_a_native_blocked_issue_is_invisible_until_its_blocker_closes(
+    tmp_path: Path,
+) -> None:
+    """GitHub's native ``blocked_by`` relation gates readiness too (union source)."""
+    gh = FakeAdhocGh(
+        [_ready(7), _ready(8)],
+        native_blockers={8: [7]},
     )
     build = RecordingAdhocBuild()
 
@@ -268,18 +317,18 @@ async def test_part_of_prd_issues_are_excluded(tmp_path: Path) -> None:
     assert [issue.issue_number for issue in build.built] == [7]
 
 
-# --- ranking: priority:<sev>, no-priority lowest ----------------------------------
+# --- ranking: two queues, tier-ordered, untiered last -----------------------------
 
 
 @pytest.mark.asyncio
-async def test_issues_are_ranked_by_priority_no_priority_lowest(tmp_path: Path) -> None:
-    """AC2: issues are built highest-priority first; a no-priority issue ranks lowest."""
+async def test_issues_are_ranked_priority_queue_first(tmp_path: Path) -> None:
+    """Ready issues drain priority-queue-first, tier-ordered, untiered last."""
     gh = FakeAdhocGh(
         [
-            _ready(1),  # no priority -> lowest
-            _ready(2, labels=["priority:high"]),
-            _ready(3, labels=["priority:critical"]),
-            _ready(4, labels=["priority:low"]),
+            _ready(1),  # untiered -> lowest
+            _ready(2, labels=["priority:high"]),  # priority queue
+            _ready(3, labels=["priority:critical"]),  # priority queue, top
+            _ready(4, labels=["priority:low"]),  # main queue
         ]
     )
     build = RecordingAdhocBuild()
@@ -292,7 +341,7 @@ async def test_issues_are_ranked_by_priority_no_priority_lowest(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_an_unknown_priority_label_ranks_lowest(tmp_path: Path) -> None:
-    """A stray ``priority:*`` value is treated as no priority (lowest), never raises."""
+    """A stray ``priority:*`` value is treated as untiered (lowest), never raises."""
     gh = FakeAdhocGh(
         [_ready(1, labels=["priority:bogus"]), _ready(2, labels=["priority:high"])]
     )
@@ -303,33 +352,63 @@ async def test_an_unknown_priority_label_ranks_lowest(tmp_path: Path) -> None:
     assert [issue.issue_number for issue in drained] == [2, 1]
 
 
-# --- concurrency: bounded by max_parallel -----------------------------------------
+# --- reserved priority slot -------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_the_drain_is_bounded_by_max_parallel(tmp_path: Path) -> None:
-    """AC3: at most ``max_parallel`` ad-hoc builds run concurrently."""
-    gate = asyncio.Event()
-    gh = FakeAdhocGh([_ready(n) for n in range(10)])
-    build = RecordingAdhocBuild(gate=gate)
+async def test_the_main_queue_holds_at_most_cap_minus_one_slots(tmp_path: Path) -> None:
+    """With cap N and no priority work, the main queue fills at most N-1 slots this pass."""
+    gh = FakeAdhocGh([_ready(n) for n in range(5)])  # all untiered -> main queue
+    build = RecordingAdhocBuild()
 
-    config = RepoConfig(max_parallel=3)
-    drain = asyncio.create_task(
-        _drain(gh=gh, build=build, config=config, tmp_path=tmp_path)
+    drained = await _drain(
+        gh=gh, build=build, config=RepoConfig(max_parallel=3), tmp_path=tmp_path
     )
-    # Each build first meters against the (real, SQLite-backed) shared budget, so wait for
-    # the semaphore to fill rather than pumping a fixed number of event-loop turns.
-    await _wait_until(lambda: build.in_flight >= 3)
-    gate.set()
-    await drain
 
-    assert build.max_in_flight == 3
-    assert len(build.built) == 10
+    # 3-1 = 2 main slots; the 3rd is reserved for priority work that isn't here.
+    assert len(drained) == 2
+    assert [issue.issue_number for issue in drained] == [0, 1]
 
 
 @pytest.mark.asyncio
-async def test_an_unset_max_parallel_builds_all_visible_issues(tmp_path: Path) -> None:
-    """An unset ``max_parallel`` does not block: every ready issue is still built."""
+async def test_a_priority_arrival_takes_the_reserved_slot(tmp_path: Path) -> None:
+    """A priority issue fills the reserved slot alongside cap-1 main issues."""
+    gh = FakeAdhocGh(
+        [
+            _ready(1, labels=["priority:critical"]),
+            _ready(2),
+            _ready(3),
+            _ready(4),
+        ]
+    )
+    build = RecordingAdhocBuild()
+
+    drained = await _drain(
+        gh=gh, build=build, config=RepoConfig(max_parallel=3), tmp_path=tmp_path
+    )
+
+    # cap 3: the critical takes the reserved slot, then two main issues fill the rest.
+    assert [issue.issue_number for issue in drained] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_cap_one_is_strict_priority_first(tmp_path: Path) -> None:
+    """At cap 1 there is no slot to reserve: the single build is strict priority-first."""
+    gh = FakeAdhocGh(
+        [_ready(1), _ready(2, labels=["priority:critical"])]
+    )
+    build = RecordingAdhocBuild()
+
+    drained = await _drain(
+        gh=gh, build=build, config=RepoConfig(max_parallel=1), tmp_path=tmp_path
+    )
+
+    assert [issue.issue_number for issue in drained] == [2]
+
+
+@pytest.mark.asyncio
+async def test_an_unset_max_parallel_builds_every_ready_issue(tmp_path: Path) -> None:
+    """An unset ``max_parallel`` reserves no slot: every ready issue builds this pass."""
     gh = FakeAdhocGh([_ready(n) for n in range(5)])
     build = RecordingAdhocBuild()
 
@@ -349,12 +428,35 @@ async def test_an_empty_ready_set_drives_no_build(tmp_path: Path) -> None:
     assert build.built == []
 
 
-# --- AC1 dedup: an in-flight issue (branch AND open PR) is not rebuilt --------------
+# --- concurrency: bounded by max_parallel -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_selected_builds_run_concurrently_up_to_the_cap(tmp_path: Path) -> None:
+    """The selected builds run concurrently, peaking at the cap."""
+    gate = asyncio.Event()
+    # Three priority-tier issues fill all cap slots (no reserved slot left free).
+    gh = FakeAdhocGh([_ready(n, labels=["priority:critical"]) for n in range(3)])
+    build = RecordingAdhocBuild(gate=gate)
+
+    config = RepoConfig(max_parallel=3)
+    drain = asyncio.create_task(
+        _drain(gh=gh, build=build, config=config, tmp_path=tmp_path)
+    )
+    await _wait_until(lambda: build.in_flight >= 3)
+    gate.set()
+    await drain
+
+    assert build.max_in_flight == 3
+    assert len(build.built) == 3
+
+
+# --- dedup: an in-flight issue (branch AND open PR) is not rebuilt -----------------
 
 
 @pytest.mark.asyncio
 async def test_an_in_flight_issue_is_not_rebuilt(tmp_path: Path) -> None:
-    """AC1: an issue whose branch AND open PR exist is skipped — no rebuild, no PR."""
+    """An issue whose branch AND open PR exist is skipped — no rebuild, no PR."""
     gh = FakeAdhocGh([_ready(7), _ready(9)], in_flight_numbers={9})
     build = RecordingAdhocBuild()
     open_pr = RecordingPrOpen()
@@ -362,9 +464,7 @@ async def test_an_in_flight_issue_is_not_rebuilt(tmp_path: Path) -> None:
     await _drain(gh=gh, build=build, open_pr=open_pr, tmp_path=tmp_path)
 
     assert [issue.issue_number for issue in build.built] == [7]
-    # A truly in-flight issue gets neither a rebuild nor a (duplicate) PR open.
     assert open_pr.opened == []
-    # The flight-state truth was read once for the whole repo, not per issue.
     assert gh.snapshot_calls == ["owner/repo"]
     assert gh.flight_state_calls == []
 
@@ -373,11 +473,7 @@ async def test_an_in_flight_issue_is_not_rebuilt(tmp_path: Path) -> None:
 async def test_flight_state_is_classified_with_one_whole_repo_query(
     tmp_path: Path,
 ) -> None:
-    """The drain reads flight-state truth once for the whole repo — not a query per issue.
-
-    The N+1 regression target: classification must be a single ``flight_snapshot`` call and
-    then in-memory classification, not an ``flight_state`` spawn per candidate.
-    """
+    """The drain reads flight-state truth once for the whole repo — not a query per issue."""
     gh = FakeAdhocGh(
         [_ready(7), _ready(8), _ready(9)],
         stranded_numbers={8},
@@ -396,11 +492,7 @@ async def test_flight_state_is_classified_with_one_whole_repo_query(
 
 @pytest.mark.asyncio
 async def test_drain_falls_back_to_per_issue_flight_state(tmp_path: Path) -> None:
-    """A seam without a whole-repo snapshot is classified per issue via ``flight_state``.
-
-    Keeps the drain working with a minimal gh seam (e.g. the wiring test's fake) that only
-    implements the per-issue ``flight_state`` — the fallback preserves the same semantics.
-    """
+    """A seam without a whole-repo snapshot is classified per issue via ``flight_state``."""
     gh = _FlightStateOnlyGh([_ready(7), _ready(8)], stranded_numbers={8})
     build = RecordingAdhocBuild()
     open_pr = RecordingPrOpen()
@@ -414,7 +506,7 @@ async def test_drain_falls_back_to_per_issue_flight_state(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_all_in_flight_drives_no_build(tmp_path: Path) -> None:
-    """AC1: when every candidate is already in flight, the drain builds nothing."""
+    """When every candidate is already in flight, the drain builds nothing."""
     gh = FakeAdhocGh([_ready(7), _ready(9)], in_flight_numbers={7, 9})
     build = RecordingAdhocBuild()
 
@@ -428,13 +520,7 @@ async def test_all_in_flight_drives_no_build(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_a_stranded_branch_opens_its_pr_without_rebuilding(tmp_path: Path) -> None:
-    """A pushed (green) ``issue-<N>`` branch with no open PR gets its PR opened, no rebuild.
-
-    The regression target: a green build that pushed its branch but never opened a PR
-    (e.g. the PR-open precheck failed) must not be wrongly treated as "in flight" and
-    dropped forever. The drain recognizes the stranded branch and opens its PR through the
-    PR-open-only seam — skipping the (wasteful, and budget-spending) rebuild.
-    """
+    """A pushed (green) ``issue-<N>`` branch with no open PR gets its PR opened, no rebuild."""
     gh = FakeAdhocGh([_ready(48)], stranded_numbers={48})
     build = RecordingAdhocBuild()
     open_pr = RecordingPrOpen()
@@ -447,12 +533,7 @@ async def test_a_stranded_branch_opens_its_pr_without_rebuilding(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_stranded_pr_open_is_not_budget_metered(tmp_path: Path) -> None:
-    """Opening a stranded branch's PR does no model work, so it spends no shared budget.
-
-    A spent (zero-headroom) governor would decline any *build*, but opening the PR for an
-    already-green branch is a free gh call — so it still happens even when the budget is
-    exhausted.
-    """
+    """Opening a stranded branch's PR does no model work, so it spends no shared budget."""
     governor = _governor(tmp_path, weekly=0.0)  # cap 0 -> any build is declined
     gh = FakeAdhocGh([_ready(48)], stranded_numbers={48})
     build = RecordingAdhocBuild()
@@ -481,16 +562,11 @@ async def test_absent_stranded_and_in_flight_are_handled_independently(
 
     assert [issue.issue_number for issue in build.built] == [7]  # absent -> build
     assert [issue.issue_number for issue in open_pr.opened] == [8]  # stranded -> open PR
-    # #9 (in flight) is neither built nor PR'd.
 
 
 @pytest.mark.asyncio
 async def test_only_stranded_issues_still_open_their_prs(tmp_path: Path) -> None:
-    """With no buildable issue, the drain still opens every stranded branch's PR.
-
-    Guards the early-exit: a drain whose only ready issues are stranded must not return
-    empty-handed before recovering them — their PRs still open.
-    """
+    """With no buildable issue, the drain still opens every stranded branch's PR."""
     gh = FakeAdhocGh([_ready(48), _ready(49)], stranded_numbers={48, 49})
     build = RecordingAdhocBuild()
     open_pr = RecordingPrOpen()
@@ -503,12 +579,7 @@ async def test_only_stranded_issues_still_open_their_prs(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_a_stranded_pr_is_opened_through_from_fetched_issue(tmp_path: Path) -> None:
-    """A stranded issue is materialized via ``from_fetched_issue`` (chain depth stays live).
-
-    The recovery path must build its :class:`AdhocIssue` the same way the build path does,
-    so a recovered review-fix issue keeps its ``Chain-depth:`` lineage rather than
-    defaulting to a chain origin.
-    """
+    """A stranded issue is materialized via ``from_fetched_issue`` (chain depth stays live)."""
     body = f"a review-fix to apply.\n\n{render_chain_depth(2)}"
     gh = FakeAdhocGh([_ready(503, body=body)], stranded_numbers={503})
     build = RecordingAdhocBuild()
@@ -521,14 +592,14 @@ async def test_a_stranded_pr_is_opened_through_from_fetched_issue(tmp_path: Path
     ]
 
 
-# --- AC2 single-run lock: two concurrent drains never overlap ---------------------
+# --- single-run lock: two concurrent drains never overlap -------------------------
 
 
 @pytest.mark.asyncio
 async def test_a_second_concurrent_drain_is_rejected_by_the_lock(
     tmp_path: Path,
 ) -> None:
-    """AC2: a second drain entered while one holds the lock raises (never overlaps)."""
+    """A second drain entered while one holds the lock raises (never overlaps)."""
     gate = asyncio.Event()
     gh = FakeAdhocGh([_ready(7)])
     build = RecordingAdhocBuild(gate=gate)
@@ -540,7 +611,6 @@ async def test_a_second_concurrent_drain_is_rejected_by_the_lock(
     for _ in range(50):
         await asyncio.sleep(0)
 
-    # The first drain holds the lock; a second entry is rejected, not queued.
     with pytest.raises(AdhocDrainBusyError):
         await _drain(gh=gh, build=build, tmp_path=tmp_path, lock=lock)
 
@@ -551,57 +621,43 @@ async def test_a_second_concurrent_drain_is_rejected_by_the_lock(
 
 @pytest.mark.asyncio
 async def test_adhoc_drain_lock_rejects_a_second_holder_then_reenters() -> None:
-    """The production lock rejects a concurrent second holder, then frees on exit.
-
-    :class:`AdhocDrainLock` is the production single-run guard the worker binds per repo:
-    the first holder enters; a second concurrent ``__aenter__`` raises (never blocks); and
-    once the first exits the lock is free to be entered again (a later kick is not poisoned).
-    """
+    """The production lock rejects a concurrent second holder, then frees on exit."""
     lock = AdhocDrainLock()
     async with lock:
         with pytest.raises(AdhocDrainBusyError):
             async with lock:
                 pass
-    # Freed on exit: a subsequent drain can take it again.
     async with lock:
         pass
 
 
-# --- AC3 shared budget governor: each build meters the one shared budget -----------
+# --- shared budget governor: each build meters the one shared budget --------------
 
 
 @pytest.mark.asyncio
 async def test_each_build_meters_the_shared_budget(tmp_path: Path) -> None:
-    """AC3: every ad-hoc build charges the shared governor; an over-budget build stops.
+    """Every build charges the shared governor; an over-budget build stops.
 
-    cap = 12 (12% of weekly 100). Two builds at 5.0 each fit (10.0 <= 12); a third
-    would cross the cap, so it is not built. The shared budget is the one the PRD lane
-    meters too.
+    cap = 12 (12% of weekly 100). Two builds at 5.0 each fit (10.0 <= 12); a third would
+    cross the cap, so it is not built. All three are priority-tier so all are selected.
     """
     governor = _governor(tmp_path, weekly=100.0)
-    gh = FakeAdhocGh([_ready(1), _ready(2), _ready(3)])
+    gh = FakeAdhocGh([_ready(n, labels=["priority:critical"]) for n in (1, 2, 3)])
     build = RecordingAdhocBuild()
 
-    await _drain(
-        gh=gh, build=build, governor=governor, estimated_amount=5.0
-    )
+    await _drain(gh=gh, build=build, governor=governor, estimated_amount=5.0)
 
     assert len(build.built) == 2
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(10.0)
 
 
 @pytest.mark.asyncio
-async def test_a_prd_charge_already_on_the_ledger_starves_the_drain(
+async def test_a_prior_charge_on_the_ledger_starves_the_drain(
     tmp_path: Path,
 ) -> None:
-    """AC3: a PRD build and an ad-hoc drain share the budget — a PRD charge crowds out.
-
-    The PRD lane has already metered 11.0 of the 12.0 cap on the *shared* ledger. The
-    ad-hoc drain's 2.0 build can't fit, so it is not built — the two lanes run at once but
-    share one budget governor.
-    """
+    """A charge already on the shared ledger crowds out a drain build."""
     governor = _governor(tmp_path, weekly=100.0)
-    await governor._ledger.record_spend(amount=11.0)  # the PRD lane's prior charge
+    await governor._ledger.record_spend(amount=11.0)  # a prior charge
     gh = FakeAdhocGh([_ready(1)])
     build = RecordingAdhocBuild()
 
@@ -610,68 +666,12 @@ async def test_a_prd_charge_already_on_the_ledger_starves_the_drain(
     assert build.built == []
 
 
-# --- AC4 PRD-first ordering with priority:critical|high preemption -----------------
-
-
-@pytest.mark.asyncio
-async def test_prd_first_defers_ordinary_adhoc_when_a_prd_is_in_flight(
-    tmp_path: Path,
-) -> None:
-    """AC4: with a PRD in flight, an ordinary (non-preempting) ad-hoc issue waits."""
-    gh = FakeAdhocGh([_ready(1, labels=["priority:low"]), _ready(2)])
-    build = RecordingAdhocBuild()
-
-    await _drain(gh=gh, build=build, tmp_path=tmp_path, prd_in_flight=True)
-
-    assert build.built == []
-
-
-@pytest.mark.asyncio
-async def test_a_critical_or_high_adhoc_preempts_prd_first_ordering(
-    tmp_path: Path,
-) -> None:
-    """AC4: a ``priority:critical``/``high`` ad-hoc issue preempts a PRD in flight."""
-    gh = FakeAdhocGh(
-        [
-            _ready(1, labels=["priority:low"]),  # ordinary -> waits behind the PRD
-            _ready(2, labels=["priority:high"]),  # preempts
-            _ready(3, labels=["priority:critical"]),  # preempts
-        ]
-    )
-    build = RecordingAdhocBuild()
-
-    drained = await _drain(gh=gh, build=build, tmp_path=tmp_path, prd_in_flight=True)
-
-    # Only the preempting issues build, in rank order (critical before high).
-    assert [issue.issue_number for issue in drained] == [3, 2]
-    assert {issue.issue_number for issue in build.built} == {2, 3}
-
-
-@pytest.mark.asyncio
-async def test_no_prd_in_flight_builds_every_ranked_adhoc_issue(
-    tmp_path: Path,
-) -> None:
-    """AC4: with no PRD in flight, PRD-first does not apply — every issue builds."""
-    gh = FakeAdhocGh([_ready(1, labels=["priority:low"]), _ready(2)])
-    build = RecordingAdhocBuild()
-
-    await _drain(gh=gh, build=build, tmp_path=tmp_path, prd_in_flight=False)
-
-    assert {issue.issue_number for issue in build.built} == {1, 2}
-
-
-# --- chain-depth: built through from_fetched_issue (the #39/#40 bound stays live) --
+# --- chain-depth: built through from_fetched_issue (the review-fix bound stays live) --
 
 
 @pytest.mark.asyncio
 async def test_each_issue_is_built_through_from_fetched_issue(tmp_path: Path) -> None:
-    """AC5: a fetched body carrying ``Chain-depth: <n>`` yields ``chain_depth == n``.
-
-    The drain MUST materialize each issue via
-    :meth:`AdhocIssue.from_fetched_issue` fed the fetched body — not the bare
-    constructor — so the lineage marker is read back and the #39/#40 review-fix chain
-    bound stays live.
-    """
+    """A fetched body carrying ``Chain-depth: <n>`` yields ``chain_depth == n``."""
     body = f"a review-fix to apply.\n\n{render_chain_depth(2)}"
     gh = FakeAdhocGh([_ready(503, body=body)])
     build = RecordingAdhocBuild()
@@ -713,11 +713,11 @@ class CapturingGhRunner:
 
 @pytest.mark.asyncio
 async def test_ghcli_assembles_the_ready_list_command() -> None:
-    """GhCli runs ``gh issue list`` scoped to the repo's open ``ready-for-agent`` issues."""
+    """GhCli runs ``gh issue list`` scoped to the repo's open trigger-labeled issues."""
     runner = CapturingGhRunner()
     gh = GhCli(token="t0ken", runner=runner, list_limit=50)
 
-    await gh.list_ready(repo_full_name="owner/repo")
+    await gh.list_ready(repo_full_name="owner/repo", label="ready-for-agent")
 
     argv = list(runner.argv or [])
     assert argv[:3] == ["gh", "issue", "list"]
@@ -725,8 +725,19 @@ async def test_ghcli_assembles_the_ready_list_command() -> None:
     assert "--label" in argv and argv[argv.index("--label") + 1] == "ready-for-agent"
     assert "--state" in argv and argv[argv.index("--state") + 1] == "open"
     assert "--limit" in argv and argv[argv.index("--limit") + 1] == "50"
-    # The body must be surfaced so the drain can feed from_fetched_issue.
     assert argv[argv.index("--json") + 1] == "number,labels,body"
+
+
+@pytest.mark.asyncio
+async def test_ghcli_lists_on_the_passed_label() -> None:
+    """The trigger label is threaded from config into the list command."""
+    runner = CapturingGhRunner()
+    gh = GhCli(runner=runner)
+
+    await gh.list_ready(repo_full_name="owner/repo", label="build-me")
+
+    argv = list(runner.argv or [])
+    assert argv[argv.index("--label") + 1] == "build-me"
 
 
 @pytest.mark.asyncio
@@ -735,7 +746,7 @@ async def test_ghcli_puts_the_token_in_the_env_not_the_argv() -> None:
     runner = CapturingGhRunner()
     gh = GhCli(token="s3cret", runner=runner)
 
-    await gh.list_ready(repo_full_name="owner/repo")
+    await gh.list_ready(repo_full_name="owner/repo", label="ready-for-agent")
 
     assert (runner.env or {}).get("GH_TOKEN") == "s3cret"
     assert "s3cret" not in list(runner.argv or [])
@@ -747,7 +758,7 @@ async def test_ghcli_omits_the_auth_env_when_no_token() -> None:
     runner = CapturingGhRunner()
     gh = GhCli(token=None, runner=runner)
 
-    await gh.list_ready(repo_full_name="owner/repo")
+    await gh.list_ready(repo_full_name="owner/repo", label="ready-for-agent")
 
     assert "GH_TOKEN" not in (runner.env or {})
 
@@ -771,13 +782,11 @@ async def test_ghcli_parses_the_gh_json_payload() -> None:
     ).encode()
     gh = GhCli(runner=CapturingGhRunner(stdout=payload))
 
-    issues = await gh.list_ready(repo_full_name="owner/repo")
+    issues = await gh.list_ready(repo_full_name="owner/repo", label="ready-for-agent")
 
     assert [issue.number for issue in issues] == [7, 9]
     assert issues[0].labels == ["ready-for-agent", "priority:high"]
     assert issues[0].body == f"a fix.\n\n{render_chain_depth(1)}"
-    assert issues[0].severity() is Severity.HIGH
-    assert issues[1].severity() is None
 
 
 @pytest.mark.asyncio
@@ -786,18 +795,14 @@ async def test_ghcli_rejects_a_non_array_payload() -> None:
     gh = GhCli(runner=CapturingGhRunner(stdout=b'{"number": 7}'))
 
     with pytest.raises(ValueError):
-        await gh.list_ready(repo_full_name="owner/repo")
+        await gh.list_ready(repo_full_name="owner/repo", label="ready-for-agent")
 
 
 # --- real GhCli flight state: branch + open-PR truth via gh ------------------------
 
 
 class SequencedGhRunner:
-    """Returns a queued stdout per call, recording each argv it was handed.
-
-    The flight-state check fans out to up to two gh calls (branch-existence, then open-PR);
-    a queue of canned payloads lets a test script each leg's answer independently.
-    """
+    """Returns a queued stdout per call, recording each argv it was handed."""
 
     def __init__(self, stdouts: list[bytes]) -> None:
         self._stdouts = list(stdouts)
@@ -821,7 +826,6 @@ async def test_ghcli_flight_state_in_flight_when_branch_and_open_pr() -> None:
         is FlightState.IN_FLIGHT
     )
 
-    # Both legs ran: the branch ref lookup, then the open-PR list for its head.
     assert len(runner.argvs) == 2
     branch_argv = list(runner.argvs[0])
     assert branch_argv[0] == "gh" and branch_argv[1] == "api"
@@ -847,11 +851,7 @@ async def test_ghcli_flight_state_stranded_when_branch_but_no_open_pr() -> None:
 
 @pytest.mark.asyncio
 async def test_ghcli_flight_state_absent_when_no_branch() -> None:
-    """No ``issue-<N>`` branch -> ABSENT, and the open-PR leg is skipped.
-
-    An open PR keeps its head branch alive, so a missing branch proves no open PR exists:
-    the adapter short-circuits to ABSENT without the second gh call.
-    """
+    """No ``issue-<N>`` branch -> ABSENT, and the open-PR leg is skipped."""
     runner = _RunnerWithBranchMiss(open_pr_payload=b"[]")
     gh = GhCli(runner=runner)
 
@@ -859,16 +859,11 @@ async def test_ghcli_flight_state_absent_when_no_branch() -> None:
         await gh.flight_state(repo_full_name="owner/repo", issue_number=7)
         is FlightState.ABSENT
     )
-    # The branch miss short-circuits: the open-PR leg was never queried.
     assert runner.pr_argv is None
 
 
 class _RunnerWithBranchMiss:
-    """A runner whose branch-ref leg always 404s, then answers the PR leg from a payload.
-
-    The branch-existence leg raises :class:`GhCliError` (a missing ref is a 404 / non-zero
-    exit), which the adapter reads as "no branch"; the PR leg returns the scripted payload.
-    """
+    """A runner whose branch-ref leg always 404s, then answers the PR leg from a payload."""
 
     def __init__(self, *, open_pr_payload: bytes) -> None:
         self._open_pr_payload = open_pr_payload
@@ -905,11 +900,7 @@ def test_flight_snapshot_classifies_each_state() -> None:
 
 @pytest.mark.asyncio
 async def test_ghcli_flight_snapshot_uses_two_whole_repo_queries() -> None:
-    """One ``gh pr list`` for open-PR heads + one ``gh api`` matching-refs enumeration.
-
-    Replaces the per-issue branch-ref + open-PR spawns with two repo-wide queries, then
-    classifies in memory — the same FlightState verdicts, without the N+1 spawn fan-out.
-    """
+    """One ``gh pr list`` for open-PR heads + one ``gh api`` matching-refs enumeration."""
     open_prs = json.dumps([{"headRefName": "issue-7"}]).encode()
     refs = json.dumps(
         [{"ref": "refs/heads/issue-7"}, {"ref": "refs/heads/issue-48"}]
@@ -919,7 +910,6 @@ async def test_ghcli_flight_snapshot_uses_two_whole_repo_queries() -> None:
 
     snapshot = await gh.flight_snapshot(repo_full_name="owner/repo")
 
-    # Exactly two whole-repo queries, no per-issue calls.
     assert len(runner.argvs) == 2
     pr_argv = list(runner.argvs[0])
     assert pr_argv[:3] == ["gh", "pr", "list"]
@@ -929,7 +919,6 @@ async def test_ghcli_flight_snapshot_uses_two_whole_repo_queries() -> None:
     refs_argv = list(runner.argvs[1])
     assert refs_argv[:2] == ["gh", "api"]
     assert any("git/matching-refs/heads/issue-" in part for part in refs_argv)
-    # And the parsed snapshot classifies each candidate with the preserved semantics.
     assert snapshot.state_for(7) is FlightState.IN_FLIGHT
     assert snapshot.state_for(48) is FlightState.STRANDED
     assert snapshot.state_for(99) is FlightState.ABSENT

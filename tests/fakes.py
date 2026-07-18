@@ -23,10 +23,8 @@ from retinue.container_build import Slice
 from retinue.done_check import DoneCheckReport, ReportSink, SecretResolver
 from retinue.github_app import InstallationToken
 from retinue.handoff import ChildIssue
-from retinue.orchestrator import MergeConflict
+from retinue.issues import CreatedIssue, IssueDraft
 from retinue.pr_opener import OpenPrRequest, PullRequest
-from retinue.reconcile import PrState
-from retinue.slicer import CreatedIssue, IssueDraft
 
 CLAUDE_MD = """# CLAUDE.md
 
@@ -151,49 +149,6 @@ class FakeImplementer:
         return {}
 
 
-class MergeConflictError(MergeConflict):
-    """A merge could not complete because of a conflict (a typed ``MergeConflict``)."""
-
-
-class FakeGitOps:
-    """In-memory git: records branch creation and merges, scripts existence/conflicts.
-
-    ``existing`` is the set of branches that already exist on the remote. ``conflicts``
-    is the set of source branches whose merge should raise (a conflict the orchestrator
-    surfaces). ``log`` records each ensure/merge event in order.
-    """
-
-    def __init__(
-        self,
-        existing: set[str] | None = None,
-        conflicts: set[str] | None = None,
-        timeline: list[str] | None = None,
-    ) -> None:
-        self.existing = set(existing or set())
-        self._conflicts = set(conflicts or set())
-        self.log: list[str] = []
-        self.merges: list[tuple[str, str]] = []
-        # Optional shared event list, written to by both this seam and the runtime, so a
-        # test can assert ordering *across* the git and container seams.
-        self._timeline = timeline
-
-    async def ensure_integration_branch(self, *, branch: str, base: str) -> None:
-        if branch in self.existing:
-            self.log.append(f"exists:{branch}")
-            return
-        event = f"create:{branch}<-{base}"
-        self.log.append(event)
-        if self._timeline is not None:
-            self._timeline.append(event)
-        self.existing.add(branch)
-
-    async def merge(self, *, source: str, into: str) -> None:
-        self.log.append(f"merge:{source}->{into}")
-        if source in self._conflicts:
-            raise MergeConflictError(source, into)
-        self.merges.append((source, into))
-
-
 CLOCK_DEFAULT = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
 
 
@@ -262,17 +217,33 @@ class FakeAdhocGh:
         *,
         in_flight_numbers: set[int] | None = None,
         stranded_numbers: set[int] | None = None,
+        closed_numbers: set[int] | None = None,
+        native_blockers: dict[int, list[int]] | None = None,
     ) -> None:
         self._issues = issues
         self._in_flight = in_flight_numbers or set()
         self._stranded = stranded_numbers or set()
+        self._closed = closed_numbers or set()
+        self._native_blockers = native_blockers or {}
         self.calls: list[str] = []
+        self.list_labels: list[str] = []
         self.snapshot_calls: list[str] = []
         self.flight_state_calls: list[int] = []
 
-    async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
+    async def list_ready(
+        self, *, repo_full_name: str, label: str
+    ) -> list[ReadyIssue]:
         self.calls.append(repo_full_name)
+        self.list_labels.append(label)
         return list(self._issues)
+
+    async def native_blockers(
+        self, *, repo_full_name: str, issue_number: int
+    ) -> list[int]:
+        return list(self._native_blockers.get(issue_number, []))
+
+    async def is_closed(self, *, repo_full_name: str, issue_number: int) -> bool:
+        return issue_number in self._closed
 
     async def flight_snapshot(self, *, repo_full_name: str) -> FlightSnapshot:
         self.snapshot_calls.append(repo_full_name)
@@ -294,48 +265,6 @@ class FakeAdhocGh:
         return FlightState.ABSENT
 
 
-class FakeReconcileGh:
-    """In-memory gh truth: which slice issues are closed, which branches merged, PR.
-
-    ``closed_issues`` and ``merged_branches`` script the GitHub truth a restart reads;
-    ``pr`` is the staging PR number once one exists (``None`` when no PR is open). Every
-    query records its argument so a test can assert exactly which questions were asked.
-    """
-
-    def __init__(
-        self,
-        *,
-        closed_issues: set[int] | None = None,
-        merged_branches: set[str] | None = None,
-        pr: int | None = None,
-        pr_states: dict[int, PrState] | None = None,
-    ) -> None:
-        self._closed_issues = closed_issues or set()
-        self._merged_branches = merged_branches or set()
-        self._pr = pr
-        self._pr_states = pr_states or {}
-        self.issue_queries: list[int] = []
-        self.branch_queries: list[str] = []
-        self.pr_queries: list[int] = []
-
-    async def issue_closed(self, *, repo_full_name: str, issue_number: int) -> bool:
-        self.issue_queries.append(issue_number)
-        return issue_number in self._closed_issues
-
-    async def branch_merged(
-        self, *, repo_full_name: str, branch: str, prd_number: int
-    ) -> bool:
-        self.branch_queries.append(branch)
-        return branch in self._merged_branches
-
-    async def staging_pr(self, *, repo_full_name: str, prd_number: int) -> int | None:
-        self.pr_queries.append(prd_number)
-        return self._pr
-
-    async def pr_state(self, *, repo_full_name: str, pr_number: int) -> PrState:
-        return self._pr_states.get(pr_number, PrState.OPEN)
-
-
 class _FixedClock:
     def now(self) -> datetime:
         return datetime(2026, 6, 22, tzinfo=UTC)
@@ -351,12 +280,8 @@ class _RecordingNotifier:
 
 @dataclass
 class _FakePrOps:
-    heimdall: bool = True
     staging: bool = True
     opened: list[OpenPrRequest] = field(default_factory=list)
-
-    async def heimdall_installed(self, repo_full_name: str) -> bool:
-        return self.heimdall
 
     async def staging_exists(self, *, repo_full_name: str, branch: str) -> bool:
         return self.staging

@@ -1,24 +1,13 @@
-"""Convergence handoff + merge reap (issue #12): notify, then reap on the human merge.
+"""Merge reap (issue #12): on the human's merge, close the issue(s) and reap the parent.
 
-This module owns the two ends of the retinue's "the retinue never merges" contract:
+Subscribing to a ``pull_request`` closed+merged signal, on the human's merge the retinue
+closes the PR's owned issues and then *reaps* the parent: it closes the parent IFF every
+non-``hitl`` child issue is closed. An open ``hitl`` child (a deliberately human-only
+issue) does not block the reap; an open non-``hitl`` child does.
 
-1. **convergence handoff** (:func:`announce_handoff`) — when heimdall converges on the
-   staging PR (:mod:`retinue.loopback` reaches ``CONVERGED`` and calls its ``Handoff``
-   seam), the retinue fires a single "test & merge" notification: a push (the
-   out-of-band heads-up) plus a PR comment (the durable, in-repo record) telling a human
-   to test and merge. There is **no** merge collaborator — the retinue hands off and a
-   human merges. The signature is the loopback ``Handoff`` shape (``repo_full_name=`` +
-   ``pr_number=``) so it wires straight in.
-2. **merge reap** (:func:`reap_merged_pr`) — subscribing to a ``pull_request``
-   closed+merged signal, on the human's merge the retinue closes the PR's slice issues
-   and then *reaps* the PRD: it closes the PRD IFF every non-``hitl`` child issue is
-   closed. An open ``hitl`` child (a deliberately human-only slice) does not block the
-   reap; an open non-``hitl`` child does.
-
-The push + PR comment reuse the shared :class:`retinue.notify.Notifier` fan-out. The
-gh issue-close and PRD child-enumeration are an injected :class:`Handoff` gh seam,
-mirroring the gh-seam style of :mod:`retinue.pr_opener` / :mod:`retinue.orchestrator`,
-so both flows run with no real ``gh``, push service, or network in a unit test.
+The gh issue-close and child-enumeration are an injected :class:`Handoff` gh seam,
+mirroring the gh-seam style of :mod:`retinue.pr_opener`, so the flow runs with no real
+``gh`` or network in a unit test.
 """
 
 from __future__ import annotations
@@ -32,55 +21,9 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from retinue.gh import GhTextRunner, run_gh
-from retinue.notify import Notification, Notifier
-from retinue.vocab import HITL_LABEL, TEST_AND_MERGE_LABEL
+from retinue.vocab import HITL_LABEL
 
 logger = logging.getLogger(__name__)
-
-
-async def announce_handoff(
-    *,
-    repo_full_name: str,
-    pr_number: int,
-    notifier: Notifier,
-) -> None:
-    """Announce a converged PR for a human to test & merge — the retinue never merges.
-
-    Fires one notification through the shared :class:`~retinue.notify.Notifier`: a push
-    heads-up plus a PR comment (and a findable label) telling a human the PR is clean and
-    ready to test and merge. No merge happens here and no merge seam is accepted — the
-    human merges, and :func:`reap_merged_pr` then reacts to that merge.
-
-    The keyword signature matches the loopback ``Handoff`` seam
-    (:data:`retinue.loopback.Handoff`), so the converge path wires this in directly.
-
-    Args:
-        repo_full_name: e.g. "owner/repo"; targets the PR comment and label.
-        pr_number: The converged staging PR to hand off; the comment lands on it.
-        notifier: The shared push + comment + label fan-out.
-
-    Raises:
-        Whatever ``notifier`` raises when the durable comment/label record cannot be
-        written (a push-sink failure is logged and swallowed by the notifier).
-    """
-    logger.info(
-        "Handing off converged PR #%d (%s) for a human to test & merge",
-        pr_number,
-        repo_full_name,
-    )
-    await notifier.notify(
-        Notification(
-            repo_full_name=repo_full_name,
-            issue_number=pr_number,
-            title=f"Retinue: test & merge PR #{pr_number}",
-            body=(
-                f"Heimdall converged on PR #{pr_number}: it is clean and ready. "
-                "Please test and merge it — the retinue does not merge. Once you merge, "
-                "the retinue will close the slice issues and reap the PRD."
-            ),
-            label=TEST_AND_MERGE_LABEL,
-        )
-    )
 
 
 @dataclass(frozen=True)

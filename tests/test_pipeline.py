@@ -1,49 +1,31 @@
-"""Tests for the PRD pipeline orchestration (retinue.pipeline).
+"""Tests for the ad-hoc pipeline orchestration (retinue.pipeline).
 
-The pipeline ties the real adapters together: budget gate -> slice -> build_prd ->
-open staging PR -> reconcile on resume, with triage on an implementer failure and the
-heimdall loopback / reap on the webhook-driven events. Every collaborator is injected,
-so these tests drive the orchestration with fakes — no Docker, gh, Agent SDK, or network.
+The slimmed pipeline ties the real adapters together for two responsibilities: open the
+ad-hoc ``issue-<N>`` -> target-branch PR after a green build (recording the PR<->issue
+mapping), and reap that issue on the human's merge. Every collaborator is injected, so
+these tests drive the orchestration with fakes — no Docker, gh, Agent SDK, or network.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from retinue.handoff import MergedPullRequest, ReapOutcome
-from retinue.loopback import (
-    HeimdallFinding,
-    HeimdallReview,
-    ReviewState,
-    VerdictOutcome,
-)
-from retinue.orchestrator import PrdBuildResult, PrdSlice
 from retinue.pipeline import Pipeline
-from retinue.reconcile import PrState, ResumePhase, RunStateStore
 from retinue.repo_config import (
     ModelEffort,
     RepoConfig,
     RoutingConfig,
     RoutingLevel,
 )
-from retinue.slicer import (
-    CreatedIssue,
-    IssueDraft,
-    SlicePlan,
-)
-from retinue.vocab import Severity
 from tests.fakes import (
-    FakeReconcileGh,
     _created,
     _fake_build_adhoc_issue,
     _FakePrOps,
     _FakeReapGh,
     _governor,
-    _noop_rebuild,
     _RecordingAdhocPipeline,
     _RecordingNotifier,
     _settings,
@@ -51,11 +33,11 @@ from tests.fakes import (
 
 
 def _config() -> RepoConfig:
-    return RepoConfig(staging_branch="staging", retry_cap=2)
+    return RepoConfig(target_branch="staging", retry_cap=2)
 
 
 def _pipeline(tmp_path: Path, **overrides: object) -> Pipeline:
-    """Build a Pipeline whose collaborators default to harmless recording fakes."""
+    """Build a slimmed Pipeline whose collaborators default to harmless recording fakes."""
     notifier = _RecordingNotifier()
     base: dict[str, object] = dict(
         config=_config(),
@@ -63,543 +45,25 @@ def _pipeline(tmp_path: Path, **overrides: object) -> Pipeline:
         governor=_governor(tmp_path),
         notifier=notifier,
         create_issue=_created,
-        slice_generate=lambda body: _empty_plan(),
         pr_ops=_FakePrOps(),
         reap_gh=_FakeReapGh(),
-        round_store_path=tmp_path / "rounds.sqlite3",
         retry_store_path=tmp_path / "retries.sqlite3",
         run_state_path=tmp_path / "runstate.sqlite3",
-        rebuild=_noop_rebuild,
     )
     base.update(overrides)
     return Pipeline(**base)  # type: ignore[arg-type]
 
 
-async def _empty_plan() -> SlicePlan:
-    return SlicePlan(slices=[])
-
-
-# --- slicing ---------------------------------------------------------------------
+# --- ad-hoc PR open --------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_thin_prd_escalates_and_builds_nothing(tmp_path: Path) -> None:
-    """A thin PRD escalates through the notifier and never reaches build/PR."""
-    notifier = _RecordingNotifier()
-    built: list[object] = []
-
-    async def build_prd(*args: object, **kwargs: object) -> PrdBuildResult:
-        built.append(kwargs)
-        return PrdBuildResult("retinue/prd-7", [], [], [], [])
-
-    pipeline = _pipeline(tmp_path, notifier=notifier, build_prd=build_prd)
-    result = await pipeline.process_prd_job(
-        repo_full_name="owner/repo", prd_number=7, prd_body="too short"
-    )
-
-    assert result.sliced is False
-    assert built == []
-    assert notifier.notes  # escalated
-
-
-@pytest.mark.asyncio
-async def test_substantive_prd_slices_then_builds_and_opens_pr(tmp_path: Path) -> None:
-    """A real PRD slices, builds the slices, then opens the staging PR."""
-    created_numbers: list[int] = []
-
-    async def create_issue(draft: IssueDraft) -> CreatedIssue:
-        number = 100 + len(created_numbers)
-        created_numbers.append(number)
-        return CreatedIssue(issue_number=number)
-
-    async def generate(body: str) -> SlicePlan:
-        return SlicePlan(slices=[IssueDraft(title="s1", body="build the thing")])
-
-    pr_ops = _FakePrOps()
-
-    async def build_prd(**kwargs: object) -> PrdBuildResult:
-        return PrdBuildResult("retinue/prd-7", merged_issues=[100], blocked_issues=[],
-                              escalated_issues=[], skipped_issues=[])
-
-    pipeline = _pipeline(
-        tmp_path,
-        create_issue=create_issue,
-        slice_generate=generate,
-        pr_ops=pr_ops,
-        build_prd=build_prd,
-    )
-    body = "Implement a real feature with enough detail to slice responsibly here."
-    result = await pipeline.process_prd_job(
-        repo_full_name="owner/repo", prd_number=7, prd_body=body
-    )
-
-    assert result.sliced is True
-    assert result.pr_opened is True
-    assert pr_ops.opened  # the staging PR was opened
-
-
-@pytest.mark.asyncio
-async def test_no_done_check_gate_escalates_and_skips_build(tmp_path: Path) -> None:
-    """A repo with no parseable done-check escalates and skips the build, never raising.
-
-    An opted-in repo whose CLAUDE.md carries no "Definition of done" block would make the
-    build's ``parse_done_check`` raise ``DoneCheckError``, crash-looping the Arq job.
-    Instead the pipeline must detect the missing gate, escalate through the notifier, and
-    return a clean terminal result so the job succeeds with no build and no PR attempted.
-    """
-    notifier = _RecordingNotifier()
-    built: list[object] = []
-
-    async def build_prd(**kwargs: object) -> PrdBuildResult:
-        built.append(kwargs)
-        return PrdBuildResult("retinue/prd-7", [], [], [], [])
-
-    async def generate(body: str) -> SlicePlan:
-        return SlicePlan(slices=[IssueDraft(title="s1", body="build the thing")])
-
-    pr_ops = _FakePrOps()
-    pipeline = _pipeline(
-        tmp_path,
-        claude_md="# CLAUDE.md\n\nNo definition-of-done block here.\n",
-        notifier=notifier,
-        slice_generate=generate,
-        pr_ops=pr_ops,
-        build_prd=build_prd,
-    )
-    body = "Implement a real feature with enough detail to slice responsibly here."
-    result = await pipeline.process_prd_job(
-        repo_full_name="owner/repo", prd_number=7, prd_body=body
-    )
-
-    assert result.sliced is True
-    assert result.done_check_missing is True
-    assert result.pr_opened is False
-    assert built == []  # the build was skipped
-    assert pr_ops.opened == []  # no PR attempted
-    assert notifier.notes  # the missing-gate escalation landed
-
-
-@pytest.mark.asyncio
-async def test_deferred_build_skips_pr_and_surfaces_deferral(tmp_path: Path) -> None:
-    """A build that merged nothing (budget-deferred / all-blocked) opens no PR.
-
-    ``_open_pr`` opens/syncs a PR for the ``retinue/prd-<n>`` head; a deferred or
-    all-blocked build never pushed that branch, so opening a PR would 404. The pipeline
-    must skip the PR step when no slices merged and still surface the no-op cleanly.
-    """
-
-    async def generate(body: str) -> SlicePlan:
-        return SlicePlan(slices=[IssueDraft(title="s1", body="build the thing")])
-
-    pr_ops = _FakePrOps()
-
-    async def build_prd(**kwargs: object) -> PrdBuildResult:
-        # No merged_issues: the budget gate deferred (or every slice was blocked).
-        return PrdBuildResult("retinue/prd-7", merged_issues=[], blocked_issues=[101],
-                              escalated_issues=[], skipped_issues=[])
-
-    pipeline = _pipeline(
-        tmp_path, slice_generate=generate, pr_ops=pr_ops, build_prd=build_prd
-    )
-    body = "Implement a real feature with enough detail to slice responsibly here."
-    result = await pipeline.process_prd_job(
-        repo_full_name="owner/repo", prd_number=7, prd_body=body
-    )
-
-    assert result.sliced is True
-    assert result.pr_opened is False
-    assert result.pr_open is None  # the PR step was never reached
-    assert result.prd_build is not None
-    assert result.prd_build.merged_issues == []  # the deferral is visible to the caller
-    assert pr_ops.opened == []  # no PR open/sync attempted
-
-
-@pytest.mark.asyncio
-async def test_deferred_build_rides_the_job_result(tmp_path: Path) -> None:
-    """A budget-deferred build's flag and window ride the PrdJobResult.
-
-    The worker re-enqueues a deferred PRD's resume for when the window frees; without
-    ``deferred``/``defer_until`` on the job result the gate's deferral is discarded and
-    the PRD sits until a worker restart happens to sweep it.
-    """
-    when = datetime(2026, 6, 23, tzinfo=UTC)
-
-    async def generate(body: str) -> SlicePlan:
-        return SlicePlan(slices=[IssueDraft(title="s1", body="build the thing")])
-
-    async def build_prd(**kwargs: object) -> PrdBuildResult:
-        return PrdBuildResult("retinue/prd-7", [], [], [], [],
-                              deferred=True, defer_until=when)
-
-    pipeline = _pipeline(tmp_path, slice_generate=generate, build_prd=build_prd)
-    body = "Implement a real feature with enough detail to slice responsibly here."
-    result = await pipeline.process_prd_job(
-        repo_full_name="owner/repo", prd_number=7, prd_body=body
-    )
-
-    assert result.deferred is True
-    assert result.defer_until == when
-    assert result.pr_opened is False
-
-
-def test_prd_build_from_bound_threads_the_deferral() -> None:
-    """The bound-build adapter carries the gate's deferral onto the PrdBuildResult."""
-    from retinue.pipeline import _prd_build_from_bound
-    from retinue.wiring import BoundBuildResult
-
-    when = datetime(2026, 6, 23, tzinfo=UTC)
-    build = _prd_build_from_bound(
-        BoundBuildResult(deferred=True, defer_until=when), prd_number=7
-    )
-
-    assert build.deferred is True
-    assert build.defer_until == when
-    assert build.merged_issues == []
-    assert build.integration_branch == "retinue/prd-7"
-
-
-# --- review loopback -------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_process_review_job_converges_and_hands_off(tmp_path: Path) -> None:
-    """A clean heimdall review converges: the loopback runs and hands off."""
-    handed_off: list[int] = []
-
-    async def handoff(*, repo_full_name: str, pr_number: int) -> None:
-        handed_off.append(pr_number)
-
-    pipeline = _pipeline(tmp_path, handoff=handoff)
-    review = HeimdallReview(
-        repo_full_name="owner/repo",
-        pr_number=99,
-        prd_number=7,
-        prd_issue_number=7,
-        integration_branch="retinue/prd-7",
-        state=ReviewState.APPROVED,
-        findings=[],
-    )
-    result = await pipeline.process_review(review)
-
-    assert result.outcome is VerdictOutcome.CONVERGED
-    assert handed_off == [99]
-
-
-@pytest.mark.asyncio
-async def test_process_review_job_rebuilds_on_blocking(tmp_path: Path) -> None:
-    """A blocking heimdall finding files a fix-issue and rebuilds onto the same branch."""
-    rebuilt: list[object] = []
-
-    async def rebuild(request: object) -> None:
-        rebuilt.append(request)
-
-    pipeline = _pipeline(tmp_path, rebuild=rebuild)
-    review = HeimdallReview(
-        repo_full_name="owner/repo",
-        pr_number=99,
-        prd_number=7,
-        prd_issue_number=7,
-        integration_branch="retinue/prd-7",
-        state=ReviewState.REQUEST_CHANGES,
-        findings=[HeimdallFinding(summary="boom", severity=Severity.HIGH)],
-    )
-    result = await pipeline.process_review(review)
-
-    assert result.outcome is VerdictOutcome.REBUILT
-    assert rebuilt  # the rebuild seam fired
-
-
-# --- reap ------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_reap_pr_job_closes_slices_and_reaps_prd(tmp_path: Path) -> None:
-    """The reap closes slice issues and reaps the PRD when no non-hitl child is open."""
-    reap_gh = _FakeReapGh(children=[])
-    pipeline = _pipeline(tmp_path, reap_gh=reap_gh)
-    merged = MergedPullRequest(
-        repo_full_name="owner/repo",
-        pr_number=99,
-        prd_number=7,
-        slice_issues=[100, 101],
-    )
-    result = await pipeline.reap_pr(merged)
-
-    assert result.outcome is ReapOutcome.REAPED
-    assert 100 in reap_gh.closed and 101 in reap_gh.closed
-    assert 7 in reap_gh.closed  # the PRD itself
-
-
-# --- crash-resume: resume_round routes a persisted round to its phase ------------
-
-
-def _run_state(tmp_path: Path) -> RunStateStore:
-    """The same run-state file the ``_pipeline`` helper binds, for seeding rounds."""
-    return RunStateStore(tmp_path / "runstate.sqlite3")
-
-
-@pytest.mark.asyncio
-async def test_resume_round_mid_build_rebuilds_only_unfinished_slices(
-    tmp_path: Path,
-) -> None:
-    """A BUILD-phase resume rebuilds only the unfinished slices, then opens the PR.
-
-    The store persists only slice numbers, so the rebuilt slices carry an empty
-    ``blocked_by`` graph (the sanctioned cross-restart fallback). Slice 100 already
-    landed on GitHub; only 101 reaches the build, and the merged build opens the PR.
-    """
-    built: list[dict[str, Any]] = []
-
-    async def build_prd(**kwargs: Any) -> PrdBuildResult:
-        built.append(kwargs)
-        return PrdBuildResult("retinue/prd-7", merged_issues=[101], blocked_issues=[],
-                              escalated_issues=[], skipped_issues=[])
-
-    gh = FakeReconcileGh(closed_issues={100}, pr=None)
-    pr_ops = _FakePrOps()
-    pipeline = _pipeline(tmp_path, build_prd=build_prd, reconcile_gh=gh, pr_ops=pr_ops)
-    await _run_state(tmp_path).record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
-    )
-
-    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
-
-    assert result.reconcile.phase is ResumePhase.BUILD
-    assert len(built) == 1
-    resumed: list[PrdSlice] = built[0]["slices"]
-    assert [s.issue_number for s in resumed] == [101]
-    assert all(s.blocked_by == [] for s in resumed)
-    assert pr_ops.opened  # the merged resume-build opened the staging PR
-
-
-@pytest.mark.asyncio
-async def test_resume_round_at_pr_open_opens_the_pr_and_records_it(
-    tmp_path: Path,
-) -> None:
-    """A PR_OPEN-phase resume opens the staging PR without rebuilding anything."""
-    built: list[object] = []
-
-    async def build_prd(**kwargs: object) -> PrdBuildResult:
-        built.append(kwargs)
-        return PrdBuildResult("retinue/prd-7", [], [], [], [])
-
-    gh = FakeReconcileGh(closed_issues={100, 101}, pr=None)
-    pr_ops = _FakePrOps()
-    pipeline = _pipeline(tmp_path, build_prd=build_prd, reconcile_gh=gh, pr_ops=pr_ops)
-    await _run_state(tmp_path).record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
-    )
-
-    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
-
-    assert result.reconcile.phase is ResumePhase.PR_OPEN
-    assert built == []  # the landed round is never rebuilt
-    assert len(pr_ops.opened) == 1
-    assert pr_ops.opened[0].head == "retinue/prd-7"
-    # The opened PR's mapping is recorded so the loopback/reap can resolve it.
-    assert await pipeline.round_for_pr(
-        repo_full_name="owner/repo", pr_number=99
-    ) == (7, [100, 101])
-
-
-@pytest.mark.asyncio
-async def test_resume_round_at_loopback_awaits_the_verdict(tmp_path: Path) -> None:
-    """A LOOPBACK-phase resume re-records the PR mapping and drives nothing else.
-
-    Heimdall verdicts arrive by webhook, so nothing is actively re-driven — but the
-    PR<->PRD mapping is re-recorded (self-healing a crash between the PR open and its
-    record) so the arriving verdict resolves back to the PRD.
-    """
-    built: list[object] = []
-
-    async def build_prd(**kwargs: object) -> PrdBuildResult:
-        built.append(kwargs)
-        return PrdBuildResult("retinue/prd-7", [], [], [], [])
-
-    gh = FakeReconcileGh(pr=55)
-    pr_ops = _FakePrOps()
-    pipeline = _pipeline(tmp_path, build_prd=build_prd, reconcile_gh=gh, pr_ops=pr_ops)
-    # The crash hit between the PR open and record_pr: only the slices are persisted.
-    await _run_state(tmp_path).record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
-    )
-
-    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
-
-    assert result.reconcile.phase is ResumePhase.LOOPBACK
-    assert built == []
-    assert pr_ops.opened == []  # the PR already exists; nothing is re-opened
-    # The mapping self-healed: the webhook's verdict for PR #55 now resolves.
-    assert await pipeline.round_for_pr(
-        repo_full_name="owner/repo", pr_number=55
-    ) == (7, [100, 101])
-
-
-@pytest.mark.asyncio
-async def test_resume_round_done_cleans_up_the_run_state_row(tmp_path: Path) -> None:
-    """A DONE-phase resume deletes the round's row so no sweep re-reconciles it."""
-    gh = FakeReconcileGh(pr=None)
-    pipeline = _pipeline(tmp_path, reconcile_gh=gh)
-    store = _run_state(tmp_path)
-    await store.record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[]
-    )
-
-    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
-
-    assert result.reconcile.phase is ResumePhase.DONE
-    assert await store.all_rounds() == []
-
-
-@pytest.mark.asyncio
-async def test_resume_round_surfaces_a_deferred_rebuild(tmp_path: Path) -> None:
-    """A BUILD-phase resume whose re-gated build was deferred surfaces the deferral.
-
-    The resume's BUILD path re-gates through the same bound build; the caller (the
-    worker's resume task) needs the deferral to re-enqueue itself, so the outcome must
-    carry it rather than reading as a silently finished resume.
-    """
-    when = datetime(2026, 6, 23, tzinfo=UTC)
-
-    async def build_prd(**kwargs: Any) -> PrdBuildResult:
-        return PrdBuildResult("retinue/prd-7", [], [], [], [],
-                              deferred=True, defer_until=when)
-
-    gh = FakeReconcileGh(closed_issues={100}, pr=None)
-    pr_ops = _FakePrOps()
-    pipeline = _pipeline(tmp_path, build_prd=build_prd, reconcile_gh=gh, pr_ops=pr_ops)
-    await _run_state(tmp_path).record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
-    )
-
-    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
-
-    assert result.reconcile.phase is ResumePhase.BUILD
-    assert result.deferred is True
-    assert result.defer_until == when
-    assert pr_ops.opened == []  # nothing merged, so no PR
-
-
-@pytest.mark.asyncio
-async def test_resume_round_reaps_a_recorded_pr_github_shows_merged(
-    tmp_path: Path,
-) -> None:
-    """A recorded PR GitHub shows MERGED is reaped on resume (the missed-webhook reap).
-
-    The merge webhook can be lost (worker down, tunnel rotated); without this routing
-    the resume re-reconciles a landed round — all slices closed, no *open* PR — and
-    tries to re-open a PR for finished work on every restart.
-    """
-    reap_gh = _FakeReapGh(children=[])
-    gh = FakeReconcileGh(pr_states={99: PrState.MERGED})
-    pipeline = _pipeline(tmp_path, reconcile_gh=gh, reap_gh=reap_gh)
-    store = _run_state(tmp_path)
-    await store.record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
-    )
-    await store.record_pr(repo_full_name="owner/repo", prd_number=7, pr_number=99)
-
-    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
-
-    assert result.reconcile.phase is ResumePhase.DONE
-    assert {100, 101, 7} <= set(reap_gh.closed)  # slices + the PRD reaped
-    assert await store.all_rounds() == []  # the round's terminal event
-    assert gh.pr_queries == []  # short-circuited before the staging-PR reconcile
-
-
-@pytest.mark.asyncio
-async def test_resume_round_drops_a_recorded_pr_a_human_closed(tmp_path: Path) -> None:
-    """A recorded PR GitHub shows CLOSED (rejected, unmerged) ends the round quietly.
-
-    A human closing the staging PR is a rejection; the resume must not reap the slices
-    as done, and must not re-open a PR for the rejected work on every restart — the
-    zombie-PR loop. The round's row is deleted so no later sweep resurrects it.
-    """
-    reap_gh = _FakeReapGh(children=[])
-    gh = FakeReconcileGh(pr_states={99: PrState.CLOSED})
-    pipeline = _pipeline(tmp_path, reconcile_gh=gh, reap_gh=reap_gh)
-    store = _run_state(tmp_path)
-    await store.record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
-    )
-    await store.record_pr(repo_full_name="owner/repo", prd_number=7, pr_number=99)
-
-    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
-
-    assert result.reconcile.phase is ResumePhase.DONE
-    assert reap_gh.closed == []  # rejected work is never closed as done
-    assert await store.all_rounds() == []  # no sweep re-opens a PR for it
-
-
-@pytest.mark.asyncio
-async def test_resume_round_with_an_open_recorded_pr_proceeds(tmp_path: Path) -> None:
-    """A recorded PR still OPEN routes through the normal reconcile (loopback)."""
-    gh = FakeReconcileGh(pr=99, pr_states={99: PrState.OPEN})
-    pipeline = _pipeline(tmp_path, reconcile_gh=gh)
-    store = _run_state(tmp_path)
-    await store.record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
-    )
-    await store.record_pr(repo_full_name="owner/repo", prd_number=7, pr_number=99)
-
-    result = await pipeline.resume_round(repo_full_name="owner/repo", prd_number=7)
-
-    assert result.reconcile.phase is ResumePhase.LOOPBACK
-    assert result.reconcile.pr_number == 99
-    assert await store.all_rounds() != []  # the round still awaits its verdict
-
-
-@pytest.mark.asyncio
-async def test_has_round_reflects_persisted_slices(tmp_path: Path) -> None:
-    """has_round is True exactly when the round persisted its slice set."""
-    pipeline = _pipeline(tmp_path)
-
-    assert await pipeline.has_round(repo_full_name="owner/repo", prd_number=7) is False
-
-    await _run_state(tmp_path).record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100]
-    )
-    assert await pipeline.has_round(repo_full_name="owner/repo", prd_number=7) is True
-
-
-@pytest.mark.asyncio
-async def test_reap_pr_deletes_the_round_run_state(tmp_path: Path) -> None:
-    """The merge reap deletes the round's run-state row (the round's terminal event).
-
-    Without this, every startup sweep would re-reconcile the landed round — all slices
-    closed, no open PR — and try to re-open a PR for finished work.
-    """
-    reap_gh = _FakeReapGh(children=[])
-    pipeline = _pipeline(tmp_path, reap_gh=reap_gh)
-    store = _run_state(tmp_path)
-    await store.record_slices(
-        repo_full_name="owner/repo", prd_number=7, issue_numbers=[100, 101]
-    )
-    await store.record_pr(repo_full_name="owner/repo", prd_number=7, pr_number=99)
-
-    merged = MergedPullRequest(
-        repo_full_name="owner/repo",
-        pr_number=99,
-        prd_number=7,
-        slice_issues=[100, 101],
-    )
-    result = await pipeline.reap_pr(merged)
-
-    assert result.outcome is ReapOutcome.REAPED
-    assert await store.all_rounds() == []
-    assert await store.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
-
-
-# --- ad-hoc PR into the shared pipeline ------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_green_adhoc_build_opens_one_pr_into_staging(tmp_path: Path) -> None:
-    """A green ad-hoc build opens exactly one PR ``issue-<N>`` -> staging, no integration.
+async def test_green_adhoc_build_opens_one_pr_into_target_branch(tmp_path: Path) -> None:
+    """A green ad-hoc build opens exactly one PR ``issue-<N>`` -> target branch.
 
     The ad-hoc PR head is the ``issue-<N>`` branch itself — there is no integration
     branch — and it reuses the shared PR-opener prechecks. The PR<->issue mapping is
-    recorded so the loopback and reap can resolve the PR back to the single ad-hoc issue.
+    recorded so the reap can resolve the PR back to the single ad-hoc issue.
     """
     from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
 
@@ -640,55 +104,150 @@ async def test_red_adhoc_build_opens_no_pr(tmp_path: Path) -> None:
     assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
 
 
-@pytest.mark.asyncio
-async def test_adhoc_pr_drives_loopback_handoff_and_reap(tmp_path: Path) -> None:
-    """The ad-hoc PR enters the shared loopback/handoff, and a merge reaps its issue.
+# --- review gate consumption -----------------------------------------------------
 
-    After the green build opens the PR, a clean heimdall review converges through the
-    *same* loopback and fires the test-and-merge handoff; the simulated human merge reaps
-    the single ad-hoc issue closed — no PRD parent to reap.
+
+@pytest.mark.asyncio
+async def test_gate_blocking_findings_escalate_and_open_no_pr(tmp_path: Path) -> None:
+    """A blocking review gate escalates a hitl notification and opens no PR.
+
+    The green branch stays pushed for a human; the single notification fans out to
+    push + comment + label, so the blocking findings land as a ``hitl`` escalation.
+    """
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.notify import Notification
+    from retinue.reviewer import ReviewFinding
+    from retinue.vocab import HITL_LABEL, Severity
+
+    notifier = _RecordingNotifier()
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, notifier=notifier, pr_ops=pr_ops)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    gate = ReviewGateOutcome(
+        blocking=[ReviewFinding("Still broken", "the bug survives", Severity.HIGH)],
+        backlog=[],
+    )
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True, gate=gate)
+    )
+
+    assert result is None  # no PR opened
+    assert pr_ops.opened == []
+    assert len(notifier.notes) == 1
+    note = notifier.notes[0]
+    assert isinstance(note, Notification)
+    assert note.repo_full_name == "owner/repo"
+    assert note.issue_number == 31
+    assert note.label == HITL_LABEL
+    assert "Still broken" in note.body
+    # No mapping recorded — the PR never opened.
+    assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
+
+
+@pytest.mark.asyncio
+async def test_gate_backlog_findings_are_filed_then_the_pr_opens(tmp_path: Path) -> None:
+    """Sub-threshold gate findings become ``priority:<severity>`` backlog nits, PR opens."""
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.issues import CreatedIssue, IssueDraft
+    from retinue.reviewer import ReviewFinding
+    from retinue.vocab import BACKLOG_LABEL, Severity
+
+    filed: list[IssueDraft] = []
+
+    async def recording_create(draft: IssueDraft) -> CreatedIssue:
+        filed.append(draft)
+        return CreatedIssue(issue_number=1000 + len(filed))
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, pr_ops=pr_ops, create_issue=recording_create)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    gate = ReviewGateOutcome(
+        blocking=[],
+        backlog=[
+            ReviewFinding("Rename var", "cosmetic", Severity.LOW),
+            ReviewFinding("Tidy helper", "minor", Severity.MEDIUM),
+        ],
+    )
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True, gate=gate)
+    )
+
+    # The PR opened (backlog does not block).
+    assert result is not None and result.opened is True
+    assert len(pr_ops.opened) == 1
+    # Each backlog finding filed a backlog + priority:<severity> nit.
+    assert len(filed) == 2
+    assert filed[0].labels == [BACKLOG_LABEL, "priority:low"]
+    assert filed[1].labels == [BACKLOG_LABEL, "priority:medium"]
+    assert {d.title for d in filed} == {"Rename var", "Tidy helper"}
+
+
+@pytest.mark.asyncio
+async def test_clean_gate_opens_the_pr_without_filing_anything(tmp_path: Path) -> None:
+    """A clean gate (no findings) opens the PR and files no backlog nits."""
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.issues import CreatedIssue, IssueDraft
+
+    filed: list[IssueDraft] = []
+
+    async def recording_create(draft: IssueDraft) -> CreatedIssue:
+        filed.append(draft)
+        return CreatedIssue(issue_number=1)
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(tmp_path, pr_ops=pr_ops, create_issue=recording_create)
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
+    gate = ReviewGateOutcome(blocking=[], backlog=[])
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True, gate=gate)
+    )
+
+    assert result is not None and result.opened is True
+    assert filed == []
+
+
+# --- reap ------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reap_pr_closes_the_issue_and_deletes_the_run_state(tmp_path: Path) -> None:
+    """The merge reap closes the ad-hoc issue and deletes the round's run-state row.
+
+    The green build records the PR<->issue mapping; the human merge then reaps the single
+    ad-hoc issue and deletes the row (the round's terminal event) so ``round_for_pr``
+    resolves to ``None`` — no later sweep re-reconciles a finished PR.
     """
     from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
 
-    handed_off: list[int] = []
-
-    async def handoff(*, repo_full_name: str, pr_number: int) -> None:
-        handed_off.append(pr_number)
-
     reap_gh = _FakeReapGh(children=[])  # no Part-of children: ad-hoc has no PRD parent
-    pipeline = _pipeline(tmp_path, handoff=handoff, reap_gh=reap_gh)
+    pipeline = _pipeline(tmp_path, reap_gh=reap_gh)
     issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)
     await pipeline.process_adhoc_pr(
         issue, AdhocBuildResult(branch="issue-31", passed=True)
     )
 
-    # The PR drives the shared loopback -> handoff on a clean heimdall review.
-    review = HeimdallReview(
-        repo_full_name="owner/repo",
-        pr_number=99,
-        prd_number=31,
-        prd_issue_number=31,
-        integration_branch="issue-31",
-        state=ReviewState.APPROVED,
-        findings=[],
-    )
-    verdict = await pipeline.process_review(review)
-    assert verdict.outcome is VerdictOutcome.CONVERGED
-    assert handed_off == [99]
-
-    # The simulated human merge reaps the single ad-hoc issue closed.
+    # The recorded mapping resolves the PR back to the single ad-hoc issue.
     mapping = await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99)
+    assert mapping == (31, [])
     assert mapping is not None
-    prd_number, slice_numbers = mapping
+    prd_number: int = mapping[0]
+    slice_numbers: list[int] = mapping[1]
+
     merged = MergedPullRequest(
         repo_full_name="owner/repo",
         pr_number=99,
         prd_number=prd_number,
         slice_issues=slice_numbers,
     )
-    reap = await pipeline.reap_pr(merged)
-    assert reap.outcome is ReapOutcome.REAPED
+    result = await pipeline.reap_pr(merged)
+
+    assert result.outcome is ReapOutcome.REAPED
     assert reap_gh.closed == [31]  # the single ad-hoc issue, closed exactly once
+    # The round's row was deleted, so the merged PR no longer resolves.
+    assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
 
 
 # --- production factory wiring ---------------------------------------------------
@@ -703,11 +262,11 @@ class _FakeAuth:
 
 @pytest.mark.asyncio
 async def test_build_pipeline_factory_wires_a_pipeline(tmp_path: Path) -> None:
-    """The production factory mints a token and builds a fully-wired Pipeline.
+    """The production factory mints a token and builds a wired Pipeline.
 
-    The build lane is now bound by default: the factory binds the real
-    budget-gated/triaged ``build_prd`` (over the Agent-SDK implementer + container/git/
-    secret/report adapters) per repo, so the produced pipeline has a live build seam.
+    The slimmed pipeline's surviving seams — the accepted repo config (its target branch
+    is the PR base), the PR-opener gh ops, and the reap gh seam — are all set on the
+    pipeline the factory returns.
     """
     from retinue.pipeline import build_pipeline_factory
 
@@ -719,10 +278,10 @@ async def test_build_pipeline_factory_wires_a_pipeline(tmp_path: Path) -> None:
     )
     pipeline = await factory("owner/repo", _config())
 
-    assert pipeline.rebuild is not None
-    assert pipeline.reconcile_gh is not None
-    # The build lane is wired: an accepted PRD reaches a real, budget-gated build.
-    assert pipeline.build_prd is not None
+    assert isinstance(pipeline, Pipeline)
+    assert pipeline.config.target_branch == "staging"  # the PR base is wired
+    assert pipeline.pr_ops is not None  # the PR-opener gh seam is wired
+    assert pipeline.reap_gh is not None  # the reap gh seam is wired
 
 
 @pytest.mark.asyncio
@@ -749,68 +308,6 @@ async def test_build_pipeline_factory_sources_claude_md(tmp_path: Path) -> None:
     assert "uv run pytest" in pipeline.claude_md
 
 
-@pytest.mark.asyncio
-async def test_build_pipeline_factory_applies_routing_default_to_slicer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A routing-default slicer override sets the constructed slicer's model + effort.
-
-    Drives the real production slicer construction (:class:`ClaudeSliceGenerator`), so a
-    routing table's ``default:`` level override for :data:`Role.SLICER` flows end-to-end
-    from the repo config through the role registry into the wired generator — proving
-    both model *and* effort thread through, not just the model (the bug #63 fixes).
-    """
-    import retinue.pipeline as pipeline_mod
-    from retinue.pipeline import build_pipeline_factory
-    from retinue.roles import ROLE_REGISTRY, Role
-    from retinue.slicer import ClaudeSliceGenerator
-
-    captured: dict[str, object] = {}
-
-    def _record(*args: object, **kwargs: object) -> ClaudeSliceGenerator:
-        captured["model"] = kwargs.get("model")
-        captured["effort"] = kwargs.get("effort")
-        return ClaudeSliceGenerator(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(pipeline_mod, "ClaudeSliceGenerator", _record)
-
-    config = RepoConfig(
-        staging_branch="staging",
-        retry_cap=2,
-        routing=RoutingConfig(
-            default="standard",
-            levels={
-                "standard": RoutingLevel(
-                    description="Ordinary work.",
-                    roles={
-                        Role.SLICER.value: ModelEffort(
-                            model="slicer-custom", effort="low"
-                        )
-                    },
-                )
-            },
-        ),
-    )
-    settings = _settings(tmp_path, ntfy_topic="alerts")
-    factory = build_pipeline_factory(
-        settings,  # type: ignore[arg-type]
-        _FakeAuth(),  # type: ignore[arg-type]
-        governor=_governor(tmp_path),
-    )
-    await factory("owner/repo", config)
-
-    assert captured["model"] == "slicer-custom"
-    assert captured["effort"] == "low"
-
-    # A table-less repo config (no ``routing:`` block at all) resolves both model and
-    # effort to the plain registry defaults, unaffected by the routed override above.
-    captured.clear()
-    await factory("owner/repo", _config())
-
-    assert captured["model"] == ROLE_REGISTRY[Role.SLICER].model
-    assert captured["effort"] == ROLE_REGISTRY[Role.SLICER].effort
-
-
 def test_build_push_sink_picks_pushover_when_no_ntfy(tmp_path: Path) -> None:
     """With only Pushover configured, the push sink is the Pushover backend."""
     from retinue.notify import PushoverPushSink, build_push_sink
@@ -818,145 +315,6 @@ def test_build_push_sink_picks_pushover_when_no_ntfy(tmp_path: Path) -> None:
     settings = _settings(tmp_path, pushover_token="pk", pushover_user="uk")
     sink = build_push_sink(settings)  # type: ignore[arg-type]
     assert isinstance(sink, PushoverPushSink)
-
-
-@pytest.mark.asyncio
-async def test_review_reviewer_factory_diffs_round_over_integration_branch(
-    tmp_path: Path,
-) -> None:
-    """The factory's reviewer pulls the round diff over the PRD's integration branch.
-
-    Proves the production reviewer-wiring path without a network call: ``generate`` is
-    injected as a fake, the diff source records the diff request, and a clean review files
-    and enqueues nothing. The base is the PRD's integration branch (``retinue/prd-7``).
-    """
-    from retinue.pipeline import _build_review_reviewer_factory
-    from retinue.reviewer import ReviewInput, ReviewPlan
-
-    diffed: list[tuple[list[str], str]] = []
-
-    class _DiffSource:
-        async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
-            diffed.append((list(merged_branches), base))
-            return "diff-body"
-
-    reviewed: list[ReviewInput] = []
-
-    async def generate(review_input: ReviewInput) -> ReviewPlan:
-        reviewed.append(review_input)
-        return ReviewPlan(findings=[])  # clean review
-
-    settings = _settings(tmp_path, anthropic_credential="k")
-    factory = _build_review_reviewer_factory(
-        settings,  # type: ignore[arg-type]
-        repo_full_name="owner/repo",
-        token="ghs_x",
-        create_issue=_created,
-        diff_source=_DiffSource(),
-        config=_config(),
-        generate=generate,
-    )
-    reviewer = factory("owner/repo", 7)
-
-    fixes = await reviewer.review(merged_issues=[2, 3])
-
-    assert diffed == [(["issue-2", "issue-3"], "retinue/prd-7")]
-    assert reviewed[0].diff == "diff-body"
-    assert fixes == []  # a clean review files and enqueues nothing
-
-
-def test_review_factory_applies_repo_config_model_override(tmp_path: Path) -> None:
-    """A routing-default reviewer override sets the review generator's model.
-
-    Drives the real production review-generator construction (no ``generate`` override),
-    so the override flows end-to-end from the repo config's routing default level through
-    the role registry into the live :class:`~retinue.reviewer.AgentSdkReviewGenerator`.
-    """
-    from retinue.pipeline import _build_review_reviewer_factory
-    from retinue.reviewer import AgentSdkReviewGenerator
-    from retinue.roles import Role
-    from retinue.wiring import _BoundRoundReviewer
-
-    class _DiffSource:
-        async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
-            return "diff-body"
-
-    settings = _settings(tmp_path, anthropic_credential="k")
-    config = RepoConfig(
-        routing=RoutingConfig(
-            default="standard",
-            levels={
-                "standard": RoutingLevel(
-                    description="Ordinary work.",
-                    roles={
-                        Role.REVIEWER.value: ModelEffort(model="claude-opus-4-8-custom")
-                    },
-                )
-            },
-        )
-    )
-    factory = _build_review_reviewer_factory(
-        settings,  # type: ignore[arg-type]
-        repo_full_name="owner/repo",
-        token="ghs_x",
-        create_issue=_created,
-        diff_source=_DiffSource(),
-        config=config,
-    )
-    reviewer = factory("owner/repo", 7)
-
-    assert isinstance(reviewer, _BoundRoundReviewer)
-    assert isinstance(reviewer.generate, AgentSdkReviewGenerator)
-    assert reviewer.generate.model == "claude-opus-4-8-custom"
-
-
-def test_review_factory_applies_repo_config_effort_override(tmp_path: Path) -> None:
-    """A routing-default reviewer override sets the review generator's effort tier.
-
-    Mirrors ``test_review_factory_applies_repo_config_model_override``: drives the real
-    production review-generator construction so a routing-table ``effort:`` override
-    flows end-to-end into the live :class:`~retinue.reviewer.AgentSdkReviewGenerator`
-    (the bug #63 fixes — previously only the model threaded through).
-    """
-    from retinue.pipeline import _build_review_reviewer_factory
-    from retinue.reviewer import AgentSdkReviewGenerator
-    from retinue.roles import Role
-    from retinue.wiring import _BoundRoundReviewer
-
-    class _DiffSource:
-        async def round_diff(self, *, merged_branches: list[str], base: str) -> str:
-            return "diff-body"
-
-    settings = _settings(tmp_path, anthropic_credential="k")
-    config = RepoConfig(
-        routing=RoutingConfig(
-            default="standard",
-            levels={
-                "standard": RoutingLevel(
-                    description="Ordinary work.",
-                    roles={
-                        Role.REVIEWER.value: ModelEffort(
-                            model="claude-opus-4-8-custom", effort="low"
-                        )
-                    },
-                )
-            },
-        )
-    )
-    factory = _build_review_reviewer_factory(
-        settings,  # type: ignore[arg-type]
-        repo_full_name="owner/repo",
-        token="ghs_x",
-        create_issue=_created,
-        diff_source=_DiffSource(),
-        config=config,
-    )
-    reviewer = factory("owner/repo", 7)
-
-    assert isinstance(reviewer, _BoundRoundReviewer)
-    assert isinstance(reviewer.generate, AgentSdkReviewGenerator)
-    assert reviewer.generate.model == "claude-opus-4-8-custom"
-    assert reviewer.generate.effort == "low"
 
 
 def test_httpx_transport_is_the_default_review_transport() -> None:
@@ -977,8 +335,8 @@ async def test_bind_adhoc_build_chains_process_adhoc_pr_on_a_green_build(
 
     The load-bearing chain: :func:`bind_adhoc_build`'s callable runs the ad-hoc build and
     **then** hands the green :class:`AdhocBuildResult` to the pipeline's
-    ``process_adhoc_pr`` (which opens the ``issue-<N>`` -> staging PR). The build is faked
-    so no container spawns; the recording pipeline proves the result threads through.
+    ``process_adhoc_pr`` (which opens the ``issue-<N>`` -> target-branch PR). The build is
+    faked so no container spawns; the recording pipeline proves the result threads through.
     """
     import retinue.pipeline as pipeline_mod
     from retinue.adhoc_build import AdhocBuildResult, AdhocIssue
@@ -1069,7 +427,7 @@ async def test_bind_adhoc_build_resolves_each_role_model_at_the_issue_level(
     """
     import retinue.pipeline as pipeline_mod
     from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ContainerPlanner
-    from retinue.orchestrator import ContainerImplementer
+    from retinue.container_build import ContainerImplementer
     from retinue.pipeline import bind_adhoc_build
     from retinue.reviewer import AgentSdkReviewGenerator
     from retinue.roles import EFFORT_MAX, Role
@@ -1119,7 +477,7 @@ async def test_bind_adhoc_build_resolves_each_role_model_at_the_issue_level(
     # resolved at ``level=None``, every model below would come out ``*-default``, so the
     # ``*-complex`` asserts pin the resolved level flowing through the construction.
     config = RepoConfig(
-        staging_branch="staging",
+        target_branch="staging",
         retry_cap=2,
         routing=RoutingConfig(
             default="standard",

@@ -120,15 +120,17 @@ class RecordingDrain:
 
 
 class RecordingCronTick:
-    """Records every repo the backlog cron tick was driven for, and the tick number."""
+    """Records every repo the backlog cron tick was driven for, the tick number, config."""
 
     def __init__(self) -> None:
         self.ticked: list[tuple[str, int]] = []
+        self.configs: list[RepoConfig] = []
 
     async def __call__(
-        self, *, repo_full_name: str, tick_number: int
+        self, *, repo_full_name: str, tick_number: int, config: RepoConfig
     ) -> CronTickResult:
         self.ticked.append((repo_full_name, tick_number))
+        self.configs.append(config)
         return CronTickResult(outcome=CronOutcome.IDLE)
 
 
@@ -196,6 +198,9 @@ async def test_heartbeat_drives_the_backlog_cron_lane_for_every_repo() -> None:
 
     assert drain.drained == []  # 07:00 is not a */6 boundary
     assert cron_tick.ticked == [("owner/a", 4), ("owner/b", 4)]
+    # Each repo's own config rides its tick so the trickle promotion uses that repo's
+    # trigger label.
+    assert [c.cron for c in cron_tick.configs] == ["0 */6 * * *", None]
 
 
 @pytest.mark.asyncio

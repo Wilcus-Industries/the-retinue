@@ -271,9 +271,17 @@ async def _safe_drain(repo: DueRepo, drain: HeartbeatDrain) -> bool:
 async def _safe_cron_tick(
     repo: DueRepo, cron_tick: HeartbeatCronTick, tick_number: int
 ) -> bool:
-    """Drive the backlog cron lane for ``repo``; log and swallow a per-repo failure."""
+    """Drive the backlog cron lane for ``repo``; log and swallow a per-repo failure.
+
+    The repo's ``config`` rides the call so the tick's trickle promotion can apply the
+    repo's own ``trigger_label`` (label surgery: ``backlog`` -> ``trigger_label``).
+    """
     try:
-        await cron_tick(repo_full_name=repo.repo_full_name, tick_number=tick_number)
+        await cron_tick(
+            repo_full_name=repo.repo_full_name,
+            tick_number=tick_number,
+            config=repo.config,
+        )
     except Exception:
         logger.exception("Heartbeat backlog tick failed for %s", repo.repo_full_name)
         return False

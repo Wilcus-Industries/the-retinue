@@ -152,21 +152,6 @@ def test_adapter_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.pushover_user == ""
 
 
-def test_heimdall_bot_login_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The heimdall bot login defaults to ``heimdall[bot]`` (the inbound review filter)."""
-    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
-    assert settings.heimdall_bot_login == "heimdall[bot]"
-
-
-def test_heimdall_bot_login_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The heimdall bot login is overridable from the environment."""
-    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
-    monkeypatch.setenv("HEIMDALL_BOT_LOGIN", "watcher[bot]")
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
-    assert settings.heimdall_bot_login == "watcher[bot]"
-
-
 def test_adapter_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """GitHub App, Anthropic, and push channel settings load from the environment."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")

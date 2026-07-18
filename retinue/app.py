@@ -58,10 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # run (e.g. in tests that patch enqueue_prd and never need the real pool).
     app.state.arq_pool = None
 
-    webhook_router = make_webhook_router(
-        webhook_secret=settings.webhook_secret,
-        heimdall_bot_login=settings.heimdall_bot_login,
-    )
+    webhook_router = make_webhook_router(webhook_secret=settings.webhook_secret)
     app.include_router(webhook_router)
 
     return app

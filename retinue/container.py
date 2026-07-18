@@ -2,14 +2,14 @@
 
 The done-check executes untrusted repo code, so it runs in a fresh, throwaway
 container that is always destroyed afterward. The real Docker calls live behind the
-:class:`ContainerRuntime` / :class:`Container` protocols so the orchestrator can be
+:class:`ContainerRuntime` / :class:`Container` protocols so the build lane can be
 tested with the container faked — no Docker daemon, no network. The contract the
-orchestrator relies on:
+build lane relies on:
 
 - :meth:`ContainerRuntime.start` returns a started :class:`Container`, with the
   configured secrets already present in its environment.
 - :meth:`Container.run_command` runs a command inside and returns a :class:`RunResult`.
-- :meth:`Container.destroy` tears it down; the orchestrator calls it in a ``finally``
+- :meth:`Container.destroy` tears it down; the caller calls it in a ``finally``
   so a container is never leaked, even when a step raises.
 """
 
@@ -49,7 +49,7 @@ class RunResult:
 
 
 class Container(Protocol):
-    """A running disposable container the orchestrator drives then destroys."""
+    """A running disposable container the build lane drives then destroys."""
 
     async def run_command(
         self, command: list[str], *, env: Mapping[str, str] | None = None
@@ -330,7 +330,7 @@ class DockerRuntime:
 
 
 class DockerContainer:
-    """A running Docker container the orchestrator execs into, then destroys."""
+    """A running Docker container the build lane execs into, then destroys."""
 
     def __init__(self, container_id: str, runtime: DockerRuntime) -> None:
         self._id = container_id

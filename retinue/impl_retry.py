@@ -1,12 +1,12 @@
-"""SQLite-backed implementer-retry counter for the triage loop.
+"""SQLite-backed implementer-retry counter for the retry loop.
 
-When an implementer fails, the orchestrator's triage decides whether to retry —
+When an implementer fails, the retry driver decides whether to retry —
 bounded by a cap — or to give up and reslice/escalate. That bound must be a
 *persisted* count: a retry budget has to survive a worker restart and must not be
-reset just by re-running the orchestrator, otherwise a doomed slice could retry
+reset just by re-running the worker, otherwise a doomed slice could retry
 forever. :class:`ImplRetryStore` records one attempt counter per slice, keyed by
 repo + issue, mirroring the durable-SQLite style of
-:class:`retinue.dedupe.PrdDedupeStore`.
+:class:`retinue.reconcile.RunStateStore`.
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ class ImplRetryStore:
     async def record_attempt(self, key: str) -> int:
         """Atomically increment ``key``'s attempt count and return the new value.
 
-        The upsert is atomic on the primary key, so concurrent orchestrator runs
+        The upsert is atomic on the primary key, so concurrent worker runs
         cannot lose an increment.
 
         Args:

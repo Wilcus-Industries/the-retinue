@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
-from pathlib import Path
 
 import pytest
 
@@ -24,35 +23,36 @@ from retinue.adhoc_build import (
     PLAN_FILE,
     AdhocBuildResult,
     AdhocIssue,
-    AdhocReviewer,
-    ContainerAdhocReviewer,
     ContainerPlanner,
     PlanError,
     Planner,
+    ReviewGateOutcome,
     _issue_diff_command,
     _materialize_plan_command,
+    _partition_findings,
     _plan_prompt,
+    _run_review_gate,
     _slice_for_issue,
     build_adhoc_issue,
     parse_chain_depth,
     render_chain_depth,
 )
 from retinue.container import Container, RunResult
-from retinue.container_build import GitOpsError, Implementer, ImplementError, Slice
+from retinue.container_build import (
+    Implementer,
+    ImplementError,
+    Slice,
+    _implement_prompt,
+)
 from retinue.done_check import DoneCheckReport
-from retinue.impl_retry import ImplRetryStore, impl_retry_key
-from retinue.orchestrator import _implement_prompt
 from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
-    REVIEW_FIX_LABEL,
-    CreatedIssue,
-    IssueDraft,
     ReviewFinding,
     ReviewInput,
     ReviewPlan,
 )
 from retinue.roles import Role, planner_cli_argv, resolve_model
-from retinue.vocab import READY_LABEL
+from retinue.vocab import Severity
 from tests.fakes import (
     CLAUDE_MD,
     FakeAuth,
@@ -110,11 +110,11 @@ async def _build(
     config: RepoConfig | None = None,
     captured: list[DoneCheckReport] | None = None,
     issue: AdhocIssue | None = None,
-    reviewer: AdhocReviewer | None = None,
+    review_generate=None,
 ) -> AdhocBuildResult:
     return await build_adhoc_issue(
         issue or _issue(),
-        config or RepoConfig(),
+        config or RepoConfig(target_branch="staging"),
         CLAUDE_MD,
         planner=planner or FakePlanner(),
         implementer=implementer or FakeImplementer(),
@@ -122,7 +122,7 @@ async def _build(
         runtime=runtime,
         resolve_secret=_resolver({}),
         report=_sink(captured if captured is not None else []),
-        reviewer=reviewer,
+        review_generate=review_generate,
     )
 
 
@@ -223,7 +223,7 @@ def test_implement_prompt_with_plan_path_instructs_reading_the_plan() -> None:
 async def test_issue_branch_is_cut_off_the_staging_branch() -> None:
     """The implementer's ``issue-<N>`` branch is created off ``config.staging_branch``."""
     runtime = FakeRuntime()
-    config = RepoConfig(staging_branch="trunk")
+    config = RepoConfig(target_branch="trunk")
 
     await _build(runtime=runtime, config=config)
 
@@ -403,171 +403,7 @@ def test_container_planner_routes_subscription_credential() -> None:
     assert planner.auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
 
 
-# --- the third pass: the internal reviewer reviews the issue-N diff ----------------
-
-
-class _ReviewRecorder:
-    """Records the reviewer's calls and the issues it filed for assertions."""
-
-    def __init__(self) -> None:
-        self.reviewed: list[AdhocIssue] = []
-        self.created: list[IssueDraft] = []
-        self.last_number = 500  # the most recent fresh GitHub number handed out
-
-    async def review(self, issue: AdhocIssue, *, container: Container) -> None:
-        self.reviewed.append(issue)
-        await container.run_command(["review", issue.branch])
-
-    def auth_env(self) -> dict[str, str]:
-        return {}
-
-    async def create_issue(self, draft: IssueDraft) -> CreatedIssue:
-        self.last_number += 1
-        self.created.append(draft)
-        return CreatedIssue(issue_number=self.last_number)
-
-
-@pytest.mark.asyncio
-async def test_reviewer_runs_after_a_green_build() -> None:
-    """AC1: after a green build, the reviewer reviews the issue-N diff in-container."""
-    reviewer = _ReviewRecorder()
-    runtime = FakeRuntime()
-
-    await _build(runtime=runtime, reviewer=reviewer)
-
-    assert reviewer.reviewed == [_issue()]
-    # The review runs after the implementer and after the green push.
-    impl_idx = runtime.log.index("run:implement issue-29")
-    push_idx = runtime.log.index("run:git push origin issue-29")
-    review_idx = runtime.log.index("run:review issue-29")
-    assert impl_idx < review_idx
-    assert push_idx < review_idx
-
-
-@pytest.mark.asyncio
-async def test_reviewer_does_not_run_on_a_red_build() -> None:
-    """A red done-check skips the reviewer — there is no build to review."""
-    reviewer = _ReviewRecorder()
-    runtime = FakeRuntime(results={"uv": RunResult(exit_code=1, stderr="boom")})
-
-    result = await _build(runtime=runtime, reviewer=reviewer)
-
-    assert result.passed is False
-    assert reviewer.reviewed == []
-
-
-@pytest.mark.asyncio
-async def test_review_never_blocks_the_build_or_push() -> None:
-    """AC3: a reviewer that raises does not undo the green build or its push."""
-
-    class ExplodingReviewer:
-        async def review(self, issue: AdhocIssue, *, container: Container) -> None:
-            raise RuntimeError("reviewer blew up")
-
-        def auth_env(self) -> dict[str, str]:
-            return {}
-
-    runtime = FakeRuntime()
-    captured: list[DoneCheckReport] = []
-
-    result = await _build(
-        runtime=runtime, reviewer=ExplodingReviewer(), captured=captured
-    )
-
-    # The build still passed and the branch was still pushed — review is advisory.
-    assert result.passed is True
-    assert "run:git push origin issue-29" in runtime.log
-    assert [r.passed for r in captured] == [True]
-    # The container is still torn down on the swallowed-error path.
-    assert runtime.container is not None
-    assert runtime.container.destroyed is True
-
-
-@pytest.mark.asyncio
-async def test_reviewer_credential_is_not_injected_into_the_container() -> None:
-    """The reviewer runs over HTTP, so its credential must NOT ride the build container.
-
-    Unlike the planner and implementer (which exec *inside* the container), the reviewer's
-    model call goes out over HTTP from the generator, so placing its credential in the
-    container's start env is dead weight (and needless secret exposure). It must not appear
-    in the container env.
-    """
-
-    class CredReviewer(_ReviewRecorder):
-        def auth_env(self) -> dict[str, str]:
-            return {"REVIEWER_TOKEN": "r"}
-
-    runtime = FakeRuntime()
-    await _build(runtime=runtime, reviewer=CredReviewer())
-
-    assert runtime.started_env is not None
-    assert "REVIEWER_TOKEN" not in runtime.started_env
-
-
-@pytest.mark.asyncio
-async def test_no_reviewer_runs_no_review_pass() -> None:
-    """An absent reviewer seam leaves the two-pass build unchanged (no review pass)."""
-    runtime = FakeRuntime()
-
-    result = await _build(runtime=runtime, reviewer=None)
-
-    assert result.passed is True
-    assert not any(event.startswith("run:review") for event in runtime.log)
-
-
-# --- ContainerAdhocReviewer: the real reviewer adapter ----------------------------
-
-
-class _DiffContainer:
-    """A container that scripts the diff stdout and records every command."""
-
-    def __init__(self, diff: str) -> None:
-        self._diff = diff
-        self.commands: list[list[str]] = []
-
-    async def run_command(
-        self, command: list[str], *, env: Mapping[str, str] | None = None
-    ) -> RunResult:
-        self.commands.append(command)
-        if command[:2] == ["git", "diff"]:
-            return RunResult(exit_code=0, stdout=self._diff)
-        return RunResult(exit_code=0)
-
-    async def destroy(self) -> None:  # pragma: no cover - unused here
-        pass
-
-
-class _RefAwareDiffContainer:
-    """A container that resolves a diff only when its base ref actually exists.
-
-    Models the refs ``clone_and_branch`` leaves in the build container: the
-    remote-tracking ``origin/<base>`` and the local ``issue-<N>`` branch, but **no** bare
-    local ``<base>`` unless it is the clone's default HEAD. A ``git diff`` whose base side
-    names an unknown revision exits non-zero (mirroring git's "unknown revision" 404),
-    just as the live container would, so the previous bare-``staging`` form is caught.
-    """
-
-    def __init__(self, diff: str, *, known_refs: set[str]) -> None:
-        self._diff = diff
-        self._known_refs = known_refs
-        self.commands: list[list[str]] = []
-
-    async def run_command(
-        self, command: list[str], *, env: Mapping[str, str] | None = None
-    ) -> RunResult:
-        self.commands.append(command)
-        if command[:2] == ["git", "diff"]:
-            base = command[2].split("...", 1)[0]
-            if base not in self._known_refs:
-                return RunResult(
-                    exit_code=128,
-                    stderr=f"fatal: ambiguous argument '{base}': unknown revision",
-                )
-            return RunResult(exit_code=0, stdout=self._diff)
-        return RunResult(exit_code=0)
-
-    async def destroy(self) -> None:  # pragma: no cover - unused here
-        pass
+# --- the review gate: diff -> review -> fix pass -> re-review -> partition ----------
 
 
 DEFECT_DIFF = """\
@@ -577,86 +413,352 @@ diff --git a/retinue/widget.py b/retinue/widget.py
 """
 
 
-def _finding_generator(*findings: ReviewFinding):
+def _finding(title: str, severity: Severity, body: str = "the finding body") -> ReviewFinding:
+    return ReviewFinding(title=title, body=body, severity=severity)
+
+
+def _scripted_generator(*plans: ReviewPlan):
+    """A review generator that returns the given plans in order (review1, review2, ...)."""
     captured: list[ReviewInput] = []
+    queue = list(plans)
 
     async def generate(review_input: ReviewInput) -> ReviewPlan:
         captured.append(review_input)
-        return ReviewPlan(findings=list(findings))
+        return queue.pop(0)
 
     return generate, captured
 
 
-def _reviewer(
-    *,
+class _GateContainer:
+    """Scripts the gate's git diff / done-check / push commands and records them.
+
+    ``diffs`` is the queue of stdout returned for each ``git diff`` (review1 then review2);
+    ``fix_passes`` is whether the fix-pass done-check rerun (every ``uv run`` command)
+    goes green. Everything else — the plan-file writes, the implement marker, the push —
+    succeeds.
+    """
+
+    def __init__(self, *, diffs: list[str], fix_passes: bool = True) -> None:
+        self._diffs = list(diffs)
+        self._fix_passes = fix_passes
+        self.commands: list[list[str]] = []
+
+    async def run_command(
+        self, command: list[str], *, env: Mapping[str, str] | None = None
+    ) -> RunResult:
+        self.commands.append(command)
+        if command[:2] == ["git", "diff"]:
+            return RunResult(exit_code=0, stdout=self._diffs.pop(0))
+        if command[:2] == ["uv", "run"]:
+            return RunResult(exit_code=0 if self._fix_passes else 1, stderr="boom")
+        return RunResult(exit_code=0)
+
+    async def destroy(self) -> None:  # pragma: no cover - unused here
+        pass
+
+
+async def _gate(
+    container: _GateContainer,
     generate,
-    create_issue,
+    *,
     config: RepoConfig | None = None,
-) -> ContainerAdhocReviewer:
-    return ContainerAdhocReviewer(
-        repo_full_name="owner/repo",
-        config=config or RepoConfig(),
-        generate=generate,
-        create_issue=create_issue,
+    implementer: FakeImplementer | None = None,
+) -> ReviewGateOutcome:
+    return await _run_review_gate(
+        _issue(29),
+        config or RepoConfig(target_branch="staging"),
+        CLAUDE_MD,
+        container=container,
+        review_generate=generate,
+        implementer=implementer or FakeImplementer(),
     )
 
 
 def test_issue_diff_command_bases_on_the_remote_tracking_staging_ref() -> None:
-    """AC1: the diff base is ``origin/<base>``, a ref the build container actually has.
+    """The gate diff base is ``origin/<base>``, a ref the build container actually has.
 
     ``clone_and_branch`` only ever creates ``origin/<base>`` (the remote-tracking ref)
     and the local ``issue-<N>`` branch; a bare local ``staging`` exists only when it is
     the clone's default HEAD. Basing on ``origin/<base>`` resolves in every case, while
-    the local issue tip stays on the right since the review runs in the build container.
+    the local issue tip stays on the right since the gate runs in the build container.
     """
-    command = _issue_diff_command("issue-29", "staging")
-    assert command == ["git", "diff", "origin/staging...issue-29"]
+    assert _issue_diff_command("issue-29", "staging") == [
+        "git",
+        "diff",
+        "origin/staging...issue-29",
+    ]
+
+
+def test_partition_findings_splits_at_high() -> None:
+    """Findings at or above HIGH are blocking; below HIGH are backlog."""
+    findings = [
+        _finding("crit", Severity.CRITICAL),
+        _finding("high", Severity.HIGH),
+        _finding("med", Severity.MEDIUM),
+        _finding("low", Severity.LOW),
+    ]
+    blocking, backlog = _partition_findings(findings)
+    assert [f.title for f in blocking] == ["crit", "high"]
+    assert [f.title for f in backlog] == ["med", "low"]
 
 
 @pytest.mark.asyncio
-async def test_reviewer_files_each_finding_as_a_flat_review_fix_issue() -> None:
-    """AC2: each finding is filed as a flat ``review-fix`` + ``ready-for-agent`` issue.
+async def test_clean_review_gate_runs_no_fix_pass() -> None:
+    """A clean review₁ short-circuits: no fix pass, no re-push, empty outcome."""
+    generate, captured = _scripted_generator(ReviewPlan(findings=[]))
+    container = _GateContainer(diffs=[DEFECT_DIFF])
+    implementer = FakeImplementer()
 
-    Flat = no ``Part of #`` footer (ad-hoc work has no parent PRD) and no Blocked-by
-    wiring; the fix loops back as ordinary ad-hoc work.
+    outcome = await _gate(container, generate, implementer=implementer)
+
+    assert outcome == ReviewGateOutcome(blocking=[], backlog=[])
+    # Only review₁ ran; the fix implementer never ran and nothing was re-pushed.
+    assert len(captured) == 1
+    assert implementer.built == []
+    assert not any(c[:2] == ["git", "push"] for c in container.commands)
+
+
+@pytest.mark.asyncio
+async def test_fix_pass_repushes_and_partitions_surviving_findings() -> None:
+    """Findings trigger a fix pass; a green rerun re-pushes and partitions review₂.
+
+    review₁ finds a high + a low, the implementer fixes them, the done-check reruns
+    green, the branch is re-pushed, and review₂'s surviving findings — a lone low — are
+    partitioned into backlog (nothing blocking).
     """
-    rec = _ReviewRecorder()
-    generate, captured = _finding_generator(
-        ReviewFinding(title="Fix off-by-one", body="total() adds a stray +1."),
-        ReviewFinding(title="Stale doc", body="README still claims X."),
+    generate, captured = _scripted_generator(
+        ReviewPlan(findings=[_finding("bug", Severity.HIGH), _finding("nit", Severity.LOW)]),
+        ReviewPlan(findings=[_finding("leftover nit", Severity.LOW)]),
     )
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue)
-    container = _DiffContainer(DEFECT_DIFF)
+    container = _GateContainer(diffs=[DEFECT_DIFF, "second diff"], fix_passes=True)
+    implementer = FakeImplementer()
 
-    await reviewer.review(_issue(29), container=container)
+    outcome = await _gate(container, generate, implementer=implementer)
 
-    # The reviewer reviewed the issue-29 diff over the remote-tracking staging ref.
-    assert ["git", "diff", "origin/staging...issue-29"] in container.commands
-    assert captured[0].diff == DEFECT_DIFF
-    # Two findings -> two flat review-fix issues.
-    assert len(rec.created) == 2
-    for draft in rec.created:
-        assert REVIEW_FIX_LABEL in draft.labels
-        assert READY_LABEL in draft.labels
-        # Flat: no PRD back-link footer on an ad-hoc review-fix.
-        assert "Part of #" not in draft.body
-        # The chain-depth marker is stamped so the next hop inherits the budget.
-        assert parse_chain_depth(draft.body) == 1
+    assert outcome.regressed is False
+    assert outcome.blocking == []
+    assert [f.title for f in outcome.backlog] == ["leftover nit"]
+    # The fix pass ran the implementer over the plan file, then re-pushed the branch.
+    assert implementer.built == [_slice_for_issue(_issue(29))]
+    assert ["git", "push", "origin", "issue-29"] in container.commands
+    # Both review passes ran, over the two successive diffs.
+    assert [rv.diff for rv in captured] == [DEFECT_DIFF, "second diff"]
 
 
 @pytest.mark.asyncio
-async def test_clean_review_files_nothing() -> None:
-    """A clean review (no findings) files nothing and does not extend the chain."""
-    rec = _ReviewRecorder()
-    generate, _ = _finding_generator()  # no findings
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue)
+async def test_surviving_high_finding_is_blocking() -> None:
+    """A finding review₂ still sees at HIGH lands in the blocking bucket."""
+    generate, _ = _scripted_generator(
+        ReviewPlan(findings=[_finding("bug", Severity.HIGH)]),
+        ReviewPlan(findings=[_finding("still broken", Severity.HIGH)]),
+    )
+    container = _GateContainer(diffs=[DEFECT_DIFF, "second diff"], fix_passes=True)
 
-    await reviewer.review(_issue(29), container=_DiffContainer(""))
+    outcome = await _gate(container, generate)
 
-    assert rec.created == []
+    assert outcome.regressed is False
+    assert [f.title for f in outcome.blocking] == ["still broken"]
+    assert outcome.backlog == []
 
 
-# --- chain-depth marker: render / parse round-trip --------------------------------
+@pytest.mark.asyncio
+async def test_fix_pass_regression_blocks_and_does_not_push() -> None:
+    """A fix pass that turns the done-check red is a regression: blocking, no re-push.
+
+    The red fix must not be pushed — the branch stays at its green pre-fix pushed state —
+    and the outcome carries a single synthetic blocking finding so a regression escalates
+    like any other block. review₂ never runs (there is nothing green to re-review).
+    """
+    generate, captured = _scripted_generator(
+        ReviewPlan(findings=[_finding("bug", Severity.HIGH)]),
+    )
+    container = _GateContainer(diffs=[DEFECT_DIFF], fix_passes=False)
+
+    outcome = await _gate(container, generate)
+
+    assert outcome.regressed is True
+    assert len(outcome.blocking) == 1
+    assert outcome.blocking[0].severity >= Severity.HIGH
+    assert outcome.backlog == []
+    # No re-push of the red fix, and review₂ never ran.
+    assert not any(c[:2] == ["git", "push"] for c in container.commands)
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_nit_only_review_skips_the_fix_pass_and_files_backlog() -> None:
+    """review₁ with only sub-threshold findings files them as backlog, runs no fix pass.
+
+    The build is already green and pushed, so a fix pass over purely cosmetic nits risks
+    regressing the done-check and false-escalating a shippable build to a human. Nit-only
+    findings therefore skip the fix pass entirely — filed as backlog, PR opens from the
+    green pre-fix branch — so the implementer never runs, nothing is re-pushed, and review₂
+    never runs.
+    """
+    generate, captured = _scripted_generator(
+        ReviewPlan(
+            findings=[_finding("nit", Severity.LOW), _finding("med", Severity.MEDIUM)]
+        ),
+    )
+    container = _GateContainer(diffs=[DEFECT_DIFF])
+    implementer = FakeImplementer()
+
+    outcome = await _gate(container, generate, implementer=implementer)
+
+    assert outcome.regressed is False
+    assert outcome.blocking == []
+    assert [f.title for f in outcome.backlog] == ["nit", "med"]
+    assert implementer.built == []
+    assert not any(c[:2] == ["git", "push"] for c in container.commands)
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_nit_only_review_never_regresses_even_if_a_fix_would_break_the_check() -> None:
+    """A nit-only review can't regress: it runs no fix pass, so it never escalates.
+
+    Even with the container scripted so a fix-pass done-check *would* go red
+    (``fix_passes=False``), a nit-only review₁ still returns a clean backlog outcome — the
+    fix pass that could turn it red never runs. This is the false-escalation the skip
+    prevents: a green, shippable build held on a human because fixing a cosmetic nit broke
+    the check.
+    """
+    generate, _ = _scripted_generator(
+        ReviewPlan(findings=[_finding("nit", Severity.LOW)]),
+    )
+    container = _GateContainer(diffs=[DEFECT_DIFF], fix_passes=False)
+
+    outcome = await _gate(container, generate)
+
+    assert outcome.regressed is False
+    assert outcome.blocking == []
+    assert [f.title for f in outcome.backlog] == ["nit"]
+
+
+@pytest.mark.asyncio
+async def test_gate_error_is_fail_closed_blocking() -> None:
+    """A gate that raises mid-run blocks the PR instead of propagating.
+
+    The branch is already pushed green when the gate starts, so a raised gate — an LLM
+    5xx/429 from the reviewer, a failed fix pass, an unresolvable diff — must not escape
+    :func:`_run_review_gate`: escaping would skip ``process_adhoc_pr``, leave no ``hitl``,
+    and let the next drain's stranded recovery open the PR gate-bypassed. Instead the gate
+    swallows the error into a single synthetic blocking finding so the pipeline escalates.
+    """
+
+    async def boom(_: ReviewInput) -> ReviewPlan:
+        raise RuntimeError("reviewer 503")
+
+    container = _GateContainer(diffs=[DEFECT_DIFF])
+
+    outcome = await _gate(container, boom)
+
+    assert outcome.regressed is False
+    assert len(outcome.blocking) == 1
+    assert outcome.blocking[0].severity >= Severity.HIGH
+    assert outcome.backlog == []
+
+
+# --- build_adhoc_issue integration: the gate rides the on_green hook ---------------
+
+
+@pytest.mark.asyncio
+async def test_gate_runs_after_a_green_build_and_is_captured_on_the_result() -> None:
+    """A clean gate rides on_green after the green push and is captured on the result."""
+    generate, captured = _scripted_generator(ReviewPlan(findings=[]))
+    runtime = FakeRuntime()
+
+    result = await _build(runtime=runtime, review_generate=generate)
+
+    assert result.passed is True
+    assert result.gate == ReviewGateOutcome(blocking=[], backlog=[])
+    # The review ran after the implementer and after the green push.
+    impl_idx = runtime.log.index("run:implement issue-29")
+    push_idx = runtime.log.index("run:git push origin issue-29")
+    diff_idx = next(i for i, e in enumerate(runtime.log) if "git diff origin" in e)
+    assert impl_idx < diff_idx
+    assert push_idx < diff_idx
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_gate_does_not_run_on_a_red_build() -> None:
+    """A red done-check skips the gate — there is no built work to review."""
+    generate, captured = _scripted_generator(ReviewPlan(findings=[]))
+    runtime = FakeRuntime(results={"uv": RunResult(exit_code=1, stderr="boom")})
+
+    result = await _build(runtime=runtime, review_generate=generate)
+
+    assert result.passed is False
+    assert result.gate is None
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_gate_error_blocks_the_pr_without_stranding_the_branch() -> None:
+    """A gate error on a green build yields a blocking result, never a raised build.
+
+    ``build_adhoc_issue`` pushes the branch before the gate runs, so a gate that raised
+    out of ``on_green`` would leave the branch pushed with no PR and — because the raise
+    skips ``process_adhoc_pr`` — no ``hitl`` escalation, which the next drain would
+    "recover" into a gate-bypassed PR. The build must instead return ``passed=True`` with a
+    blocking gate so the pipeline escalates the issue to a human.
+    """
+
+    async def boom(_: ReviewInput) -> ReviewPlan:
+        raise RuntimeError("reviewer 503")
+
+    runtime = FakeRuntime()
+
+    result = await _build(runtime=runtime, review_generate=boom)
+
+    assert result.passed is True
+    assert result.gate is not None
+    assert len(result.gate.blocking) == 1
+    assert result.gate.blocking[0].severity >= Severity.HIGH
+
+
+@pytest.mark.asyncio
+async def test_no_review_generate_leaves_the_gate_unset() -> None:
+    """An absent reviewer seam leaves the two-pass build unchanged (gate is None)."""
+    runtime = FakeRuntime()
+
+    result = await _build(runtime=runtime, review_generate=None)
+
+    assert result.passed is True
+    assert result.gate is None
+    assert not any("git diff origin" in e for e in runtime.log)
+
+
+@pytest.mark.asyncio
+async def test_gate_findings_trigger_a_second_push_via_the_fix_pass() -> None:
+    """Blocking gate findings drive a fix pass whose green rerun re-pushes the branch.
+
+    Through the real ``build_adhoc_issue`` container lifecycle, a review₁ carrying a
+    *blocking* finding makes the gate run the implementer a second time and re-push, so the
+    branch is pushed twice (the initial green push plus the post-fix re-push). (A nit-only
+    review₁ skips the fix pass — see ``test_nit_only_review_skips_the_fix_pass_and_files_backlog``.)
+    """
+    generate, _ = _scripted_generator(
+        ReviewPlan(findings=[_finding("bug", Severity.HIGH)]),
+        ReviewPlan(findings=[]),
+    )
+    runtime = FakeRuntime()
+    implementer = FakeImplementer()
+
+    result = await _build(
+        runtime=runtime, review_generate=generate, implementer=implementer
+    )
+
+    assert result.passed is True
+    assert result.gate == ReviewGateOutcome(blocking=[], backlog=[])
+    # Two pushes: the initial green push and the gate's post-fix re-push.
+    assert sum(1 for e in runtime.log if e == "run:git push origin issue-29") == 2
+    # The implementer ran twice: the build, then the fix pass.
+    assert implementer.built == [_slice_for_issue(_issue(29))] * 2
+
+
+# --- chain-depth marker: render / parse round-trip (kept; drain reads it back) -----
 
 
 def test_chain_depth_marker_round_trips() -> None:
@@ -670,15 +772,11 @@ def test_a_body_without_a_marker_is_chain_origin_depth_zero() -> None:
     assert parse_chain_depth("just a plain issue body, no lineage marker") == 0
 
 
-# --- from_fetched_issue: the canonical constructor seam ---------------------------
-
-
 def test_from_fetched_issue_reads_chain_depth_from_the_body() -> None:
-    """AC2: a fetched body carrying ``Chain-depth: <n>`` yields ``chain_depth == n``.
+    """A fetched body carrying ``Chain-depth: <n>`` yields ``chain_depth == n``.
 
-    This is the seam the ad-hoc drain (#32) must call instead of building ``AdhocIssue``
-    by hand: it parses the lineage marker the prior hop stamped, so the #39 chain bound
-    is read back and stops being inert.
+    The seam the ad-hoc drain calls instead of building ``AdhocIssue`` by hand: it parses
+    the lineage marker so the drain reconstructs the depth off the fetched body.
     """
     body = f"a review-fix to apply.\n\n{render_chain_depth(2)}"
     issue = AdhocIssue.from_fetched_issue("owner/repo", 503, body)
@@ -689,181 +787,10 @@ def test_from_fetched_issue_reads_chain_depth_from_the_body() -> None:
 
 
 def test_from_fetched_issue_defaults_a_marker_less_body_to_depth_zero() -> None:
-    """AC2: a marker-less fetched body is a chain origin, so ``chain_depth == 0``."""
+    """A marker-less fetched body is a chain origin, so ``chain_depth == 0``."""
     issue = AdhocIssue.from_fetched_issue("owner/repo", 29, "a hand-filed nit, no marker")
 
     assert issue.chain_depth == 0
     assert issue == AdhocIssue(repo_full_name="owner/repo", issue_number=29)
 
 
-@pytest.mark.asyncio
-async def test_round_trip_through_the_constructor_terminates_at_the_cap() -> None:
-    """AC3: file -> re-fetch -> rebuild round-trip terminates the chain at the cap.
-
-    A review-fix filed at depth ``retry_cap - 1`` is captured from its stamped body,
-    fed back through :meth:`AdhocIssue.from_fetched_issue` exactly as the drain would
-    rebuild it from the re-fetched issue, and rebuilt: the reviewer files no further
-    review-fix. This proves the bound holds across the lane round-trip — not just within
-    one reviewer call — because the next hop is reconstructed through the real seam.
-    """
-    rec = _ReviewRecorder()
-    generate, _ = _finding_generator(
-        ReviewFinding(title="Another fix", body="more to fix")
-    )
-    config = RepoConfig(retry_cap=2)
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
-
-    # First hop: an issue one below the cap files exactly one review-fix.
-    first_body = f"the originating defect.\n\n{render_chain_depth(config.retry_cap - 1)}"
-    first = AdhocIssue.from_fetched_issue("owner/repo", 501, first_body)
-    assert first.chain_depth == config.retry_cap - 1
-
-    await reviewer.review(first, container=_DiffContainer(DEFECT_DIFF))
-    assert len(rec.created) == 1  # the fix was filed at depth retry_cap - 1
-
-    # Re-fetch the just-filed fix: rebuild the next hop through the real constructor
-    # seam from the body it was filed with (fresh GitHub number, carried depth).
-    next_body = rec.created[-1].body
-    next_hop = AdhocIssue.from_fetched_issue("owner/repo", rec.last_number, next_body)
-    assert next_hop.chain_depth == config.retry_cap  # at the cap now
-
-    # Rebuild: the next hop is at the cap, so it files no further review-fix.
-    await reviewer.review(next_hop, container=_DiffContainer(DEFECT_DIFF))
-    assert len(rec.created) == 1  # the chain terminated; nothing new filed
-
-
-@pytest.mark.asyncio
-async def test_review_fix_chain_terminates_within_the_cap() -> None:
-    """AC1: a chain with a *fresh issue number per hop* terminates within the cap.
-
-    Production files each review-fix under a brand-new GitHub number, so a key on the
-    issue number never bounds the chain. Here each hop is a distinct ``AdhocIssue`` whose
-    ``chain_depth`` is read from the prior hop's filed body — exactly how the lane would
-    rebuild it — and the loop terminates after ``retry_cap`` hops regardless of number.
-    """
-    rec = _ReviewRecorder()
-    generate, _ = _finding_generator(
-        ReviewFinding(title="Another fix", body="more to fix")
-    )
-    config = RepoConfig(retry_cap=2)
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
-
-    # Walk the chain: each hop is a *new* issue number carrying the prior hop's depth + 1.
-    issue = _issue(29)  # depth 0, the chain origin
-    passes = 0
-    seen_numbers = {issue.issue_number}
-    for _ in range(10):  # generous ceiling; the bound must stop us well before this
-        before = len(rec.created)
-        await reviewer.review(issue, container=_DiffContainer(DEFECT_DIFF))
-        if len(rec.created) == before:
-            break  # the chain terminated: this hop filed no further fixes
-        passes += 1
-        # The just-filed review-fix loops back as a fresh-numbered ad-hoc issue.
-        filed = rec.created[-1]
-        next_number = rec.last_number
-        assert next_number not in seen_numbers  # production: a new number every hop
-        seen_numbers.add(next_number)
-        issue = AdhocIssue(
-            repo_full_name="owner/repo",
-            issue_number=next_number,
-            chain_depth=parse_chain_depth(filed.body),
-        )
-
-    # The chain filed at most ``retry_cap`` review passes and then stopped — bounded.
-    assert passes == config.retry_cap
-
-
-@pytest.mark.asyncio
-async def test_review_budget_does_not_share_a_key_with_triage(tmp_path: Path) -> None:
-    """AC2: build retries and review passes draw on disjoint budgets, not one counter.
-
-    The review pass bounds on the issue's own ``chain_depth`` and never touches the
-    ``ImplRetryStore`` triage uses, so an issue whose build-retry counter is already at
-    or over the cap still gets a full review (no silent skip), and a review pass spends
-    no unit triage later reads as a build attempt.
-    """
-    rec = _ReviewRecorder()
-    generate, _ = _finding_generator(
-        ReviewFinding(title="A fix", body="fix this")
-    )
-    config = RepoConfig(retry_cap=2)
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
-
-    # Triage has already spent this issue's *build*-retry budget on the shared store.
-    triage_store = ImplRetryStore(tmp_path / "retries.sqlite3")
-    key = impl_retry_key(_slice_for_issue(_issue(29)))
-    await triage_store.record_attempt(key)
-    await triage_store.record_attempt(key)
-    assert await triage_store.count(key) >= config.retry_cap
-
-    # The review of that same issue is NOT skipped — its budget is its chain depth (0).
-    await reviewer.review(_issue(29), container=_DiffContainer(DEFECT_DIFF))
-    assert len(rec.created) == 1  # the review filed its fix despite triage's spent budget
-
-    # And the review pass consumed nothing from triage's build-retry counter.
-    assert await triage_store.count(key) == config.retry_cap
-
-
-@pytest.mark.asyncio
-async def test_reviewer_credential_rides_the_auth_env() -> None:
-    """The reviewer's credential is threaded as the container's auth env."""
-    rec = _ReviewRecorder()
-    generate, _ = _finding_generator()
-    reviewer = ContainerAdhocReviewer(
-        repo_full_name="owner/repo",
-        config=RepoConfig(),
-        generate=generate,
-        create_issue=rec.create_issue,
-        credential="tok",
-        auth_mode="subscription",
-    )
-    assert reviewer.auth_env() == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
-
-
-@pytest.mark.asyncio
-async def test_review_diffs_a_non_default_staging_branch(tmp_path: Path) -> None:
-    """AC2: a non-default staging branch still yields the issue branch's real diff.
-
-    When ``staging_branch`` is not the clone's default HEAD, no bare local ``<base>``
-    ref exists — only ``origin/<base>``. The previous ``<base>...issue-<N>`` form would
-    name an unknown revision and 404; basing on ``origin/<base>`` resolves, so the
-    reviewer feeds the generator the branch's actual diff and files the finding.
-    """
-    rec = _ReviewRecorder()
-    generate, captured = _finding_generator(
-        ReviewFinding(title="Fix off-by-one", body="total() adds a stray +1.")
-    )
-    config = RepoConfig(staging_branch="release")
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue, config=config)
-    # The build container only has the remote-tracking ref, not a bare local ``release``.
-    container = _RefAwareDiffContainer(DEFECT_DIFF, known_refs={"origin/release"})
-
-    await reviewer.review(_issue(29), container=container)
-
-    # The diff resolved against ``origin/release`` and the real diff reached the generator.
-    assert ["git", "diff", "origin/release...issue-29"] in container.commands
-    assert captured[0].diff == DEFECT_DIFF
-    assert len(rec.created) == 1
-
-
-@pytest.mark.asyncio
-async def test_review_raises_on_a_failed_diff_rather_than_treating_it_as_empty() -> None:
-    """AC3: a failed diff command surfaces as an error, not a silent empty review.
-
-    If the diff exits non-zero (e.g. an unresolvable base ref), ``_issue_diff`` must
-    raise so the advisory wrapper can log it — feeding the generator an empty diff would
-    leave the branch unreviewed with no error surfaced. Here the base ref is unknown, so
-    the diff fails and ``review`` propagates the error (the build's wrapper swallows it).
-    """
-    rec = _ReviewRecorder()
-    generate, captured = _finding_generator()
-    reviewer = _reviewer(generate=generate, create_issue=rec.create_issue)
-    # No known refs: every ``git diff`` 404s, so the diff command fails.
-    container = _RefAwareDiffContainer("", known_refs=set())
-
-    with pytest.raises(GitOpsError):
-        await reviewer.review(_issue(29), container=container)
-
-    # The generator never ran on a garbage/empty diff, and nothing was filed.
-    assert captured == []
-    assert rec.created == []

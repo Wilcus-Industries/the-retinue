@@ -4,7 +4,7 @@ The worker authenticates as the GitHub App *installation* (not a user) to mint a
 short-lived token, then clones the target repo over HTTPS with that token. The real
 JWT-signing + ``POST /app/installations/{id}/access_tokens`` exchange talks to GitHub,
 so it lives behind the :class:`InstallationAuth` protocol: production wires a concrete
-client, tests inject a fake. The orchestrator depends only on the protocol, which keeps
+client, tests inject a fake. The build lane depends only on the protocol, which keeps
 the auth->clone step exercisable without network.
 
 The production adapter is :class:`GitHubInstallationAuth`. It signs a short-lived app

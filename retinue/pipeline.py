@@ -1,33 +1,22 @@
-"""The PRD pipeline: tie the real adapters together behind one orchestration object.
+"""The ad-hoc pipeline: tie the real adapters together behind one orchestration object.
 
-Once :func:`retinue.worker.gate_prd` ACCEPTS a PRD, the worker drives the real
-pipeline through a :class:`Pipeline`. The pipeline is the single seam the worker
-injects (mirroring how ``fetch_config`` / ``dedupe`` are injected onto the Arq
-context): production builds one from :class:`retinue.config.Settings` via
-:func:`build_pipeline_factory`, wiring each step to its real adapter; tests inject a fake
-``Pipeline`` (or a real one over recording-fake collaborators).
+The scheduler drain drives the real pipeline through a :class:`Pipeline`. The pipeline is
+the single seam the worker injects: production builds one from
+:class:`retinue.config.Settings` via :func:`build_pipeline_factory`, wiring each step to
+its real adapter; tests inject a fake ``Pipeline`` (or a real one over recording-fake
+collaborators).
 
-The PRD path, in order, mirrors the build pipeline the rest of the modules document:
+The pipeline owns two responsibilities:
 
-1. **slice** (:func:`retinue.slicer.slice_prd`) — turn the PRD body into labeled,
-   dependency-ordered slices, or escalate a thin/malformed PRD,
-2. **build** (the injected ``build_prd`` seam over :func:`retinue.orchestrator.build_prd`)
-   — fan the slices out to implementers and merge the green ones onto ``retinue/prd-<n>``,
-3. **open the staging PR** (:func:`retinue.pr_opener.open_staging_pr`) — behind the
-   heimdall precheck, record the PR<->PRD mapping for a later resume.
+1. **open the ad-hoc PR** (:meth:`Pipeline.process_adhoc_pr`) — after a green build, open
+   exactly one ``issue-<N>`` -> target-branch PR and record the PR<->issue mapping so a
+   later merge webhook can reap it.
+2. **reap a merged PR** (:meth:`Pipeline.reap_pr`) — on the human's merge, close the PR's
+   issue(s) and reap the parent through :func:`retinue.handoff.reap_merged_pr`.
 
-The webhook-driven events route to their own entry points: a ``pull_request_review``
-to :meth:`Pipeline.process_review` (:func:`retinue.loopback.process_review`) and a
-merged ``pull_request`` to :meth:`Pipeline.reap_pr` (:func:`retinue.handoff.reap_merged_pr`).
-A worker restart resumes through :meth:`Pipeline.resume_round` — the startup sweep
-(:func:`retinue.worker.resume_rounds_job`) enumerates the persisted rounds and each one
-reconciles against GitHub truth (:func:`reconcile_run`), then re-drives its phase.
-
-The orchestrator ``build_prd`` call is an injected seam (so a fake drops in for tests),
-but production now binds it to the real, budget-gated, triaged build over the
-:class:`~retinue.orchestrator.ContainerImplementer` per repo inside
-:func:`build_pipeline_factory` — every side-effecting collaborator, the build lane
-included, is a real adapter wired there.
+The build+PR primitive the scheduler drain drives per issue, and the PR-open-only stranded
+recovery, are bound here too (:func:`bind_adhoc_build` / :func:`bind_adhoc_pr_open`) so the
+drain runs the production lane.
 """
 
 from __future__ import annotations
@@ -36,32 +25,28 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from retinue.adhoc_build import (
     AdhocBuildResult,
     AdhocIssue,
-    ContainerAdhocReviewer,
     ContainerPlanner,
+    ReviewGateOutcome,
     build_adhoc_issue,
 )
 from retinue.budget import (
-    BUILD_ESTIMATED_AMOUNT,
     CLASSIFIER_ESTIMATED_AMOUNT,
     BudgetGovernor,
 )
 from retinue.classifier import ClaudeIssueClassifier
 from retinue.container import DockerRuntime
-from retinue.cron import CronBuild, SliceBuilder
+from retinue.container_build import ContainerImplementer
 from retinue.done_check import (
-    DoneCheckError,
     EnvSecretResolver,
     GhReportSink,
     ReportSink,
     SecretResolver,
-    parse_done_check,
 )
 from retinue.gh import SubprocessGhRunner
 from retinue.handoff import (
@@ -69,17 +54,9 @@ from retinue.handoff import (
     HandoffGh,
     MergedPullRequest,
     ReapResult,
-    announce_handoff,
     reap_merged_pr,
 )
-from retinue.loopback import (
-    GhCliRebuilder,
-    HeimdallReview,
-    HeimdallRoundStore,
-    Rebuilder,
-    VerdictResult,
-    process_review,
-)
+from retinue.issues import GhCliIssueCreator, IssueCreator, IssueDraft
 from retinue.messages_api import HttpxTransport
 from retinue.notify import (
     GhCommentSink,
@@ -88,54 +65,13 @@ from retinue.notify import (
     Notifier,
     build_push_sink,
 )
-from retinue.orchestrator import (
-    ContainerImplementer,
-    MergeContainerGitOps,
-    PrdBuildResult,
-    PrdSlice,
-    RoundReviewer,
-    integration_branch,
-)
 from retinue.pr_opener import GhCliPrOps, PrOpenResult, PrOps, open_staging_pr
-from retinue.reconcile import (
-    GhCliReconcile,
-    PrState,
-    ReconcileGh,
-    ReconcileGhRunner,
-    ReconcileResult,
-    ResumePhase,
-    RunStateStore,
-    reconcile_run,
-)
+from retinue.reconcile import ReconcileGhRunner, RunStateStore
 from retinue.repo_config import RepoConfig
-from retinue.reviewer import (
-    AgentSdkReviewGenerator,
-    GhCliBlockedByEditor,
-    ReviewGenerator,
-)
+from retinue.reviewer import AgentSdkReviewGenerator, ReviewFinding
 from retinue.roles import Role, resolve_effort, resolve_model
-from retinue.routing import (
-    GhCliIssueFacts,
-    PerIssueImplementer,
-    PerIssueImplementerRouter,
-    resolve_issue_level,
-)
-from retinue.slicer import (
-    ClaudeSliceGenerator,
-    GhCliIssueCreator,
-    IssueCreator,
-    SliceGenerator,
-    SliceOutcome,
-    slice_prd,
-)
-from retinue.vocab import HITL_LABEL
-from retinue.wiring import (
-    BoundBuildResult,
-    ReviewerFactory,
-    RoundDiffSource,
-    bind_build_prd,
-    bind_round_reviewer,
-)
+from retinue.routing import GhCliIssueFacts, resolve_issue_level
+from retinue.vocab import BACKLOG_LABEL, HITL_LABEL, priority_label
 
 if TYPE_CHECKING:
     from retinue.config import Settings
@@ -143,83 +79,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The orchestrator build seam. Bound to the real budget-gated build over
-# :func:`retinue.orchestrator.build_prd` in production (per repo in the factory); injected
-# as a fake in tests. Returns the per-slice build outcome the PR-opener gates on.
-BuildPrd = Callable[..., Awaitable[PrdBuildResult]]
-
-# The handoff seam invoked when heimdall converges (the loopback's Handoff shape). Bound
-# to :func:`retinue.handoff.announce_handoff` in production.
-HandoffSeam = Callable[..., Awaitable[None]]
-
-
-@dataclass(frozen=True)
-class PrdJobResult:
-    """Outcome of driving one accepted PRD through the pipeline.
-
-    Attributes:
-        sliced: True when the PRD was sliced into issues (False when it escalated thin).
-        pr_opened: True when the staging PR opened after the build.
-        prd_build: The full-PRD build result, or ``None`` when the PRD never built.
-        pr_open: The PR-open result, or ``None`` when the PR step was not reached.
-        done_check_missing: True when the repo had no parseable done-check gate, so the
-            build was escalated and skipped (a clean terminal skip, not a crash).
-        deferred: True when the budget gate deferred the build — the worker re-enqueues
-            the round's resume for when the window frees instead of losing the PRD.
-        defer_until: When the budget window frees on a deferred build; ``None`` otherwise.
-    """
-
-    sliced: bool
-    pr_opened: bool
-    prd_build: PrdBuildResult | None = None
-    pr_open: PrOpenResult | None = None
-    done_check_missing: bool = False
-    deferred: bool = False
-    defer_until: datetime | None = None
-
-
-@dataclass(frozen=True)
-class ResumeRoundOutcome:
-    """Outcome of resuming one persisted PRD round.
-
-    Attributes:
-        reconcile: The reconcile result the round was routed on.
-        deferred: True when the resume's BUILD phase was budget-deferred (nothing ran);
-            the caller re-schedules the resume for when the window frees.
-        defer_until: When the budget window frees on a deferred resume; ``None`` otherwise.
-    """
-
-    reconcile: ReconcileResult
-    deferred: bool = False
-    defer_until: datetime | None = None
-
 
 @dataclass
 class Pipeline:
-    """Ties the real adapters into the PRD pipeline and the webhook event handlers.
+    """Ties the real adapters into the ad-hoc PR open + merge-reap flow.
 
-    The collaborators are the already-built real adapters (or recording fakes in a
-    test); the SQLite-backed stores are constructed lazily from their paths so one
-    pipeline owns one durable file per concern. The orchestrator build and the handoff
-    are injected seams (``build_prd`` / ``handoff``) so a fake drops in for tests; the
-    factory binds ``build_prd`` to the real budget-gated build in production.
+    The collaborators are the already-built real adapters (or recording fakes in a test);
+    the SQLite-backed run-state store is constructed lazily from its path so one pipeline
+    owns one durable file.
 
     Attributes:
-        config: The accepted repo config gating every step (staging branch, retry cap).
+        config: The accepted repo config (its resolved ``target_branch`` is the PR base).
         claude_md: The repo's ``CLAUDE.md`` text carrying the done-check command.
         governor: The shared service-level budget governor.
         notifier: The shared escalation fan-out (push + comment + label).
-        create_issue: The gh issue creator (slicer's seam) reused across slice/loopback.
-        slice_generate: The headless Agent-SDK slicer producing a SlicePlan.
-        pr_ops: The PR-opener gh seam (heimdall precheck, staging check, sync, open).
-        reap_gh: The reap gh seam (issue close + PRD child enumeration).
-        round_store_path: SQLite file backing the per-PR heimdall round counter.
-        retry_store_path: SQLite file backing the per-slice implementer-retry counter.
-        run_state_path: SQLite file backing the per-PRD run-state (slices + PR mapping).
-        build_prd: The orchestrator build seam (injected; bound to the real build_prd).
-        handoff: The convergence handoff seam (bound to announce_handoff).
-        rebuild: The heimdall rebuild seam (re-file fix-issues + re-trigger review).
-        reconcile_gh: The reconcile gh seam GitHub truth is read through on resume.
+        create_issue: The gh issue creator reused across the advisory review filing.
+        pr_ops: The PR-opener gh seam (target-branch check, sync, open).
+        reap_gh: The reap gh seam (issue close + child enumeration).
+        retry_store_path: SQLite file backing the per-issue implementer-retry counter.
+        run_state_path: SQLite file backing the per-issue run-state (PR mapping).
     """
 
     config: RepoConfig
@@ -227,192 +105,108 @@ class Pipeline:
     governor: BudgetGovernor
     notifier: Notifier
     create_issue: IssueCreator
-    slice_generate: SliceGenerator
     pr_ops: PrOps
     reap_gh: Handoff
-    round_store_path: Path
     retry_store_path: Path
     run_state_path: Path
-    build_prd: BuildPrd | None = None
-    handoff: HandoffSeam | None = None
-    rebuild: Rebuilder | None = None
-    reconcile_gh: ReconcileGh | None = None
 
-    _round_store: HeimdallRoundStore = field(init=False, repr=False)
     _run_state: RunStateStore = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._round_store = HeimdallRoundStore(self.round_store_path)
         self._run_state = RunStateStore(self.run_state_path)
-
-    async def process_prd_job(
-        self, *, repo_full_name: str, prd_number: int, prd_body: str
-    ) -> PrdJobResult:
-        """Drive an accepted PRD: slice -> build -> open the staging PR.
-
-        Slices the PRD (escalating a thin one and stopping); on a real slice it records
-        the owned slice set, runs the full-PRD build, then opens the staging PR behind
-        the heimdall precheck and records the PR<->PRD mapping for a later resume.
-
-        Two guards keep a misconfigured or no-op build from crashing the job. A repo with
-        no parseable done-check gate is escalated and skipped (a clean terminal result, so
-        the Arq job succeeds instead of crash-looping on the build's ``DoneCheckError``).
-        A build that merged no slices (budget-deferred or all-blocked) never pushed an
-        integration branch, so the staging-PR step is skipped — opening a PR for a head
-        that doesn't exist would 404.
-
-        Args:
-            repo_full_name: The target repo, e.g. "owner/repo".
-            prd_number: The PRD's tracking issue number.
-            prd_body: The PRD issue body to slice.
-
-        Returns:
-            A :class:`PrdJobResult` recording whether the PRD sliced, built, and opened.
-        """
-        slice_result = await slice_prd(
-            repo_full_name=repo_full_name,
-            prd_number=prd_number,
-            prd_body=prd_body,
-            generate=self.slice_generate,
-            create_issue=self.create_issue,
-            notifier=self.notifier,
-        )
-        if slice_result.outcome is not SliceOutcome.SLICED:
-            return PrdJobResult(sliced=False, pr_opened=False)
-
-        slices = _slices_from_numbers(
-            repo_full_name, prd_number, slice_result.created_numbers
-        )
-        await self._run_state.record_slices(
-            repo_full_name=repo_full_name,
-            prd_number=prd_number,
-            issue_numbers=slice_result.created_numbers,
-        )
-        if not await self._has_done_check_gate(repo_full_name, prd_number):
-            return PrdJobResult(sliced=True, pr_opened=False, done_check_missing=True)
-
-        build = await self._build(repo_full_name, prd_number, slices)
-        if not build.merged_issues:
-            # Budget-deferred or all-blocked: no integration branch was pushed, so there
-            # is no head to open a PR from. Surface the build — and the deferral, so the
-            # worker can re-enqueue the round — without attempting the doomed PR open.
-            return PrdJobResult(
-                sliced=True,
-                pr_opened=False,
-                prd_build=build,
-                deferred=build.deferred,
-                defer_until=build.defer_until,
-            )
-
-        pr_open = await self._open_pr(repo_full_name, prd_number)
-        return PrdJobResult(
-            sliced=True,
-            pr_opened=pr_open.opened,
-            prd_build=build,
-            pr_open=pr_open,
-        )
-
-    async def _has_done_check_gate(
-        self, repo_full_name: str, prd_number: int
-    ) -> bool:
-        """True when the repo's CLAUDE.md carries a parseable done-check gate.
-
-        An opted-in repo whose CLAUDE.md has no "Definition of done" block would make the
-        build's :func:`retinue.done_check.parse_done_check` raise, failing the Arq task
-        into an infinite retry. Detecting it here lets the pipeline escalate the
-        misconfiguration through the notifier (push + comment + label, matching the slicer
-        and PR-opener escalations) and skip the build cleanly — never running a phantom
-        gate, never crash-looping. Returns False after escalating; True when the gate
-        parses.
-        """
-        try:
-            parse_done_check(self.claude_md)
-        except DoneCheckError as exc:
-            await self.notifier.notify(
-                Notification(
-                    repo_full_name=repo_full_name,
-                    issue_number=prd_number,
-                    title=f"Retinue can't build PRD #{prd_number}: no done-check gate",
-                    body=(
-                        "skipped: no done-check gate. The repo's CLAUDE.md has no "
-                        f"parseable 'Definition of done' block ({exc}). Add one so the "
-                        "build has a gate to run, then re-trigger the PRD."
-                    ),
-                    label=HITL_LABEL,
-                )
-            )
-            logger.warning(
-                "Skipping build for %s PRD #%d: no done-check gate (%s)",
-                repo_full_name,
-                prd_number,
-                exc,
-            )
-            return False
-        return True
 
     async def process_adhoc_pr(
         self, issue: AdhocIssue, build: AdhocBuildResult
     ) -> PrOpenResult | None:
-        """Open the PR for a green ad-hoc build and wire it into the shared pipeline.
+        """Consume the review gate, then open the PR for a green ad-hoc build.
 
-        After a green ad-hoc build, open exactly one PR ``issue-<N>`` -> staging — the head
-        is the ``issue-<N>`` branch itself, so **no integration branch** is created — behind
-        the *same* heimdall/staging prechecks the PRD lane uses. The PR<->issue mapping is
-        recorded in the run-state store keyed by the single ad-hoc issue (with no PRD parent
-        and no slice children), so the PR drives the existing :meth:`process_review` loopback
-        / test-and-merge handoff and a human merge reaps that one issue through the unchanged
-        :meth:`reap_pr`.
+        After a green build, the in-session review gate's outcome routes the issue:
+
+        * **blocking findings** (severity at or above the threshold, or a fix-pass
+          regression): the issue is escalated — one :class:`~retinue.notify.Notification`
+          fans a ``hitl``-labeled comment + push out — and **no PR opens**. The green
+          branch stays pushed for a human to pick up.
+        * **backlog findings**: each is filed as a ``backlog`` + ``priority:<severity>``
+          follow-up issue, then the PR opens normally.
+        * **clean gate** (or no gate, e.g. stranded recovery): the PR opens straight.
+
+        The PR ``issue-<N>`` -> target-branch is opened with the ``issue-<N>`` branch as
+        its head (no integration branch), and the PR<->issue mapping is recorded keyed by
+        the single issue so a human merge reaps it through :meth:`reap_pr`.
 
         A red build pushed nothing, so there is no head to open a PR from: the step is
-        skipped and ``None`` is returned (mirroring how a build that merged no slices skips
-        the PRD staging-PR step).
+        skipped and ``None`` is returned.
 
         Args:
             issue: The ad-hoc issue that was built (carries the ``issue-<N>`` branch).
-            build: The build outcome; only a ``passed`` build opens a PR.
+            build: The build outcome; only a ``passed`` build opens a PR, and its ``gate``
+                carries the review findings to escalate or file.
 
         Returns:
-            The :class:`PrOpenResult` when the PR step ran, or ``None`` when the red build
-            skipped it.
+            The :class:`PrOpenResult` when the PR step ran, or ``None`` when the red build,
+            or a blocking review gate, skipped it.
         """
         if not build.passed:
-            logger.info(
-                "Ad-hoc build for %s failed; opening no PR", issue.branch
-            )
+            logger.info("Ad-hoc build for %s failed; opening no PR", issue.branch)
             return None
+        gate = build.gate
+        if gate is not None and gate.blocking:
+            await self._escalate_blocking(issue, gate)
+            return None
+        if gate is not None:
+            await self._file_backlog(issue, gate.backlog)
         return await self._open_pr(
             issue.repo_full_name, issue.issue_number, head=build.branch
         )
 
-    async def process_review(self, review: HeimdallReview) -> VerdictResult:
-        """Run the heimdall loopback for one review: rebuild / converge / escalate.
+    async def _escalate_blocking(
+        self, issue: AdhocIssue, gate: ReviewGateOutcome
+    ) -> None:
+        """Escalate a blocked ad-hoc issue: one hitl notification, no PR.
 
-        Drives :func:`retinue.loopback.process_review` with the pipeline's persisted
-        round store, issue creator, rebuild seam, handoff, and notifier — the converge
-        path hands off through :func:`retinue.handoff.announce_handoff`.
-
-        Args:
-            review: The parsed heimdall bot review.
-
-        Returns:
-            The :class:`retinue.loopback.VerdictResult` for the review.
+        The single :meth:`Notifier.notify` fans out to push + comment + label, so the
+        blocking findings land as a durable ``hitl`` comment on the issue and a push
+        heads-up. The green branch is left pushed for the human to take over.
         """
-        return await process_review(
-            review,
-            self.config,
-            round_store=self._round_store,
-            create_issue=self.create_issue,
-            rebuild=self._require_rebuild(),
-            handoff=self._handoff_seam(),
-            notifier=self.notifier,
+        logger.info(
+            "Ad-hoc review gate for %s blocked the PR (%d finding(s)); escalating",
+            issue.branch,
+            len(gate.blocking),
+        )
+        await self.notifier.notify(
+            Notification(
+                repo_full_name=issue.repo_full_name,
+                issue_number=issue.issue_number,
+                title=f"Review gate blocked issue #{issue.issue_number}",
+                body=_render_blocking_body(issue, gate),
+                label=HITL_LABEL,
+            )
         )
 
-    async def reap_pr(self, merged: MergedPullRequest) -> ReapResult:
-        """React to a human-merged PR: close its slice issues, then reap the PRD.
+    async def _file_backlog(
+        self, issue: AdhocIssue, backlog: list[ReviewFinding]
+    ) -> None:
+        """File each sub-threshold gate finding as a ``priority:<severity>`` backlog nit."""
+        for finding in backlog:
+            await self.create_issue(
+                IssueDraft(
+                    title=finding.title,
+                    body=finding.body,
+                    labels=[BACKLOG_LABEL, priority_label(finding.severity)],
+                )
+            )
+        if backlog:
+            logger.info(
+                "Ad-hoc review gate for %s filed %d backlog nit(s)",
+                issue.branch,
+                len(backlog),
+            )
 
-        The merge is the round's terminal event, so its run-state row is deleted —
-        otherwise every startup sweep would re-reconcile the landed round (all slices
-        closed, no open PR) and try to re-open a PR for finished work.
+    async def reap_pr(self, merged: MergedPullRequest) -> ReapResult:
+        """React to a human-merged PR: close its issue(s), then reap the parent.
+
+        The merge is the terminal event, so its run-state row is deleted — otherwise a
+        stale mapping would linger for a finished PR.
         """
         result = await reap_merged_pr(merged, gh=self.reap_gh)
         await self._run_state.delete_round(
@@ -423,199 +217,20 @@ class Pipeline:
     async def round_for_pr(
         self, *, repo_full_name: str, pr_number: int
     ) -> tuple[int, list[int]] | None:
-        """Resolve a PR to its ``(prd_number, slice_numbers)`` from the run-state store.
+        """Resolve a PR to its ``(issue_number, owned_issues)`` from the run-state store.
 
-        The webhook routes review/merge events by PR number, but the loopback and reap
-        need the parent PRD and its owned slice set; the PR<->PRD mapping recorded when
-        the staging PR opened (:meth:`_open_pr`) is the source. Returns ``None`` for a PR
-        the retinue never opened (so the worker can skip a foreign PR's event).
+        The webhook routes merge events by PR number, but the reap needs the issue the PR
+        maps to; the mapping recorded when the PR opened (:meth:`_open_pr`) is the source.
+        Returns ``None`` for a PR the retinue never opened.
         """
         return await self._run_state.round_for_pr(
             repo_full_name=repo_full_name, pr_number=pr_number
         )
 
-    async def has_round(self, *, repo_full_name: str, prd_number: int) -> bool:
-        """True when the PRD's round persisted its slice set (durable state exists).
-
-        The worker's failure path routes on this: a crash *before* any slice persisted
-        releases the PRD's dedupe claim (nothing durable exists, so a redelivery must
-        get through), while a crash after leaves the claim in place for the resume
-        sweep to pick the round up.
-        """
-        return bool(
-            await self._run_state.slices_of(
-                repo_full_name=repo_full_name, prd_number=prd_number
-            )
-        )
-
-    async def reconcile(
-        self, *, repo_full_name: str, prd_number: int, slices: list[PrdSlice]
-    ) -> ReconcileResult:
-        """Reconcile an in-flight PRD round against GitHub truth on worker restart."""
-        return await reconcile_run(
-            repo_full_name=repo_full_name,
-            prd_number=prd_number,
-            slices=slices,
-            gh=self._require_reconcile_gh(),
-        )
-
-    async def resume_round(
-        self, *, repo_full_name: str, prd_number: int
-    ) -> ResumeRoundOutcome:
-        """Resume one persisted PRD round after a restart: reconcile, then re-drive it.
-
-        A round with a *recorded* PR is first routed on that PR's lifecycle state
-        (:meth:`_route_recorded_pr`): a MERGED PR is reaped (the missed-webhook reap)
-        and a CLOSED one ends the round quietly — a human rejected the work, so the
-        resume must not re-open a PR for it on every restart. Only an OPEN (or
-        unrecorded) PR falls through to the reconcile below.
-
-        The round's slices are rebuilt from the numbers the run-state store persisted —
-        with an empty ``blocked_by`` graph, the sanctioned cross-restart fallback (the
-        slicer resolved the real edges into the issue bodies; see
-        :func:`_slices_from_numbers`) — then :meth:`reconcile` picks the phase from
-        GitHub truth and this method routes into it:
-
-        - ``BUILD``: rebuild only the unfinished slices, then open the staging PR when
-          the resumed build merged anything (mirroring :meth:`process_prd_job`). A
-          budget-deferred rebuild is surfaced on the outcome so the caller can
-          re-schedule the resume.
-        - ``PR_OPEN``: every slice landed but no PR exists — open it.
-        - ``LOOPBACK``: the PR is open and heimdall's verdict arrives by webhook, so
-          nothing is re-driven; the PR<->PRD mapping is re-recorded (self-healing a
-          crash between the PR open and its record) so the verdict resolves.
-        - ``DONE``: nothing to resume — the round's row is deleted so no later sweep
-          re-reconciles it.
-
-        Args:
-            repo_full_name: The round's repo, e.g. "owner/repo".
-            prd_number: The PRD's tracking issue number.
-
-        Returns:
-            The :class:`ResumeRoundOutcome` — the reconcile the round was routed on,
-            plus the deferral when the resumed build was budget-gated away.
-        """
-        recorded_pr = await self._run_state.pr_of(
-            repo_full_name=repo_full_name, prd_number=prd_number
-        )
-        if recorded_pr is not None:
-            terminal = await self._route_recorded_pr(
-                repo_full_name=repo_full_name,
-                prd_number=prd_number,
-                pr_number=recorded_pr,
-            )
-            if terminal is not None:
-                return terminal
-
-        slice_numbers = await self._run_state.slices_of(
-            repo_full_name=repo_full_name, prd_number=prd_number
-        )
-        slices = _slices_from_numbers(repo_full_name, prd_number, slice_numbers)
-        result = await self.reconcile(
-            repo_full_name=repo_full_name, prd_number=prd_number, slices=slices
-        )
-        deferred = False
-        defer_until: datetime | None = None
-        if result.phase is ResumePhase.BUILD:
-            build = await self._build(
-                repo_full_name, prd_number, result.unfinished_slices
-            )
-            deferred, defer_until = build.deferred, build.defer_until
-            if build.merged_issues:
-                await self._open_pr(repo_full_name, prd_number)
-        elif result.phase is ResumePhase.PR_OPEN:
-            await self._open_pr(repo_full_name, prd_number)
-        elif result.phase is ResumePhase.LOOPBACK and result.pr_number is not None:
-            await self._run_state.record_pr(
-                repo_full_name=repo_full_name,
-                prd_number=prd_number,
-                pr_number=result.pr_number,
-            )
-        elif result.phase is ResumePhase.DONE:
-            await self._run_state.delete_round(
-                repo_full_name=repo_full_name, prd_number=prd_number
-            )
-        return ResumeRoundOutcome(
-            reconcile=result, deferred=deferred, defer_until=defer_until
-        )
-
-    async def _route_recorded_pr(
-        self, *, repo_full_name: str, prd_number: int, pr_number: int
-    ) -> ResumeRoundOutcome | None:
-        """Terminal routing for a round whose recorded PR left the OPEN state.
-
-        The reconcile's ``staging_pr`` query only sees *open* PRs, so without this a
-        merged-but-webhook-missed round reads as "all slices landed, no PR" and re-opens
-        a PR for finished work, and a human-rejected (closed) round is re-opened on
-        every restart — the zombie-PR loop. Routes on GitHub's lifecycle state for the
-        recorded PR: MERGED drives the same reap the merge webhook would have
-        (:meth:`reap_pr` closes the slices and deletes the row); CLOSED logs and deletes
-        the round's row without reaping (rejected work is not done work); OPEN returns
-        ``None`` so the caller proceeds with the normal reconcile.
-        """
-        state = await self._require_reconcile_gh().pr_state(
-            repo_full_name=repo_full_name, pr_number=pr_number
-        )
-        if state is PrState.OPEN:
-            return None
-        if state is PrState.MERGED:
-            logger.info(
-                "Resume of %s PRD #%d: recorded PR #%d is merged; reaping",
-                repo_full_name,
-                prd_number,
-                pr_number,
-            )
-            slice_issues = await self._run_state.slices_of(
-                repo_full_name=repo_full_name, prd_number=prd_number
-            )
-            await self.reap_pr(
-                MergedPullRequest(
-                    repo_full_name=repo_full_name,
-                    pr_number=pr_number,
-                    prd_number=prd_number,
-                    slice_issues=slice_issues,
-                )
-            )
-        else:
-            logger.info(
-                "Resume of %s PRD #%d: recorded PR #%d was closed unmerged "
-                "(human rejected); dropping the round",
-                repo_full_name,
-                prd_number,
-                pr_number,
-            )
-            await self._run_state.delete_round(
-                repo_full_name=repo_full_name, prd_number=prd_number
-            )
-        return ResumeRoundOutcome(
-            reconcile=ReconcileResult(
-                phase=ResumePhase.DONE,
-                integration_branch=integration_branch(prd_number),
-            )
-        )
-
-    async def _build(
-        self, repo_full_name: str, prd_number: int, slices: list[PrdSlice]
-    ) -> PrdBuildResult:
-        """Run the full-PRD build through the injected orchestrator seam."""
-        return await self._require_build_prd()(
-            repo_full_name=repo_full_name,
-            prd_number=prd_number,
-            slices=slices,
-            config=self.config,
-            claude_md=self.claude_md,
-        )
-
     async def _open_pr(
-        self, repo_full_name: str, prd_number: int, *, head: str | None = None
+        self, repo_full_name: str, prd_number: int, *, head: str
     ) -> PrOpenResult:
-        """Open the staging PR for a built round and record the PR<->round mapping.
-
-        Shared by both lanes: the PRD lane opens ``retinue/prd-<n>`` (``head`` defaults to
-        it) keyed by the PRD number, while the ad-hoc lane passes its ``issue-<N>`` branch
-        as ``head`` keyed by the single ad-hoc issue number — so both record the PR mapping
-        the loopback and reap resolve through, with no integration branch for ad-hoc work.
-        """
+        """Open the ``issue-<N>`` -> target-branch PR and record the PR<->issue mapping."""
         result = await open_staging_pr(
             repo_full_name=repo_full_name,
             prd_number=prd_number,
@@ -633,66 +248,24 @@ class Pipeline:
             )
         return result
 
-    def _handoff_seam(self) -> HandoffSeam:
-        """The handoff invoked on convergence: the injected one, else announce_handoff."""
-        if self.handoff is not None:
-            return self.handoff
 
-        async def _announce(*, repo_full_name: str, pr_number: int) -> None:
-            await announce_handoff(
-                repo_full_name=repo_full_name,
-                pr_number=pr_number,
-                notifier=self.notifier,
-            )
+def _render_blocking_body(issue: AdhocIssue, gate: ReviewGateOutcome) -> str:
+    """Render the hitl escalation comment body listing a gate's blocking findings.
 
-        return _announce
-
-    def _require_build_prd(self) -> BuildPrd:
-        if self.build_prd is None:
-            raise PipelineNotWiredError("build_prd")
-        return self.build_prd
-
-    def _require_rebuild(self) -> Rebuilder:
-        if self.rebuild is None:
-            raise PipelineNotWiredError("rebuild")
-        return self.rebuild
-
-    def _require_reconcile_gh(self) -> ReconcileGh:
-        if self.reconcile_gh is None:
-            raise PipelineNotWiredError("reconcile_gh")
-        return self.reconcile_gh
-
-
-class PipelineNotWiredError(RuntimeError):
-    """A pipeline step was reached without its collaborator wired in.
-
-    Raised rather than silently no-oping so a pipeline reached through a step whose
-    optional seam was never injected (e.g. a fake pipeline with no ``rebuild`` or
-    ``reconcile_gh``) fails loudly at first use instead of misbehaving silently.
+    Leads with why the PR was held, then one bullet per blocking finding (title +
+    severity + body). A fix-pass regression reads the same way — its single synthetic
+    finding explains the done-check turned red and the fix was not pushed.
     """
-
-    def __init__(self, seam: str) -> None:
-        super().__init__(f"pipeline collaborator not wired: {seam}")
-        self.seam = seam
-
-
-def _slices_from_numbers(
-    repo_full_name: str, prd_number: int, issue_numbers: list[int]
-) -> list[PrdSlice]:
-    """Build :class:`PrdSlice` objects for freshly-sliced issue numbers (no edges yet).
-
-    The slicer resolves intra-PRD ``blocked_by`` into the rendered issue bodies and gh's
-    native links; the build's dependency order is re-derived there, so the in-process
-    slice objects carry no edges — every slice is independently ready for the first round.
-    """
-    return [
-        PrdSlice(
-            repo_full_name=repo_full_name,
-            issue_number=number,
-            prd_number=prd_number,
-        )
-        for number in issue_numbers
-    ]
+    lead = (
+        f"The in-session review gate blocked issue #{issue.issue_number} from opening a "
+        f"PR: the reviewer found {len(gate.blocking)} blocking finding(s) it still saw "
+        "after one fix pass. The green branch is pushed and left for a human.\n"
+    )
+    bullets = "\n".join(
+        f"- **{f.title}** ({f.severity.name.lower()})\n\n  {f.body.rstrip()}"
+        for f in gate.blocking
+    )
+    return f"{lead}\n{bullets}"
 
 
 # --- production wiring: build the real pipeline from Settings ----------------------
@@ -701,17 +274,14 @@ def _slices_from_numbers(
 def _state_dir(settings: Settings) -> Path:
     """The directory the pipeline's durable SQLite stores live in.
 
-    Co-locates the run-state/round/retry stores next to the dedupe DB so a single mounted
-    volume holds all of the worker's durable state.
+    Co-locates the run-state/retry stores next to the dedupe DB so a single mounted volume
+    holds all of the worker's durable state.
     """
     return Path(settings.dedupe_db_path).resolve().parent
 
 
 def run_state_store_path(settings: Settings) -> Path:
-    """The run-state SQLite file the factory's pipelines and the startup sweep share.
-
-    The sweep (:func:`retinue.worker.resume_rounds_job`) enumerates the same store every
-    factory-built :class:`Pipeline` records into, so the path is derived in one place.
+    """The run-state SQLite file the factory's pipelines record into.
 
     Args:
         settings: The runtime settings locating the worker's durable state directory.
@@ -722,10 +292,10 @@ def run_state_store_path(settings: Settings) -> Path:
     return _state_dir(settings) / "run-state.sqlite3"
 
 
-# Builds a :class:`Pipeline` for an accepted repo. Async so the production factory can
-# mint a per-repo installation token before constructing the gh adapters. Injected onto
-# the Arq context by :func:`retinue.worker.on_startup` so the worker tasks stay testable
-# with a fake factory; production binds it to :func:`build_pipeline_factory`'s factory.
+# Builds a :class:`Pipeline` for an accepted repo. Async so the production factory can mint
+# a per-repo installation token before constructing the gh adapters. Injected onto the Arq
+# context by :func:`retinue.worker.on_startup` so the worker tasks stay testable with a
+# fake factory; production binds it to :func:`build_pipeline_factory`'s factory.
 PipelineFactory = Callable[[str, RepoConfig], Awaitable[Pipeline]]
 
 
@@ -734,33 +304,21 @@ def build_pipeline_factory(
     auth: InstallationAuth,
     *,
     governor: BudgetGovernor,
-    build_prd: BuildPrd | None = None,
     fetch_claude_md: ClaudeMdFetcher | None = None,
 ) -> PipelineFactory:
     """Build the production pipeline factory over the real adapters.
 
     Returns an async ``(repo_full_name, config) -> Pipeline`` that mints a per-repo
-    installation token, then constructs every gh/Anthropic/push/build adapter against it:
-    the slicer's gh issue creator and Agent-SDK generator, the PR-opener gh ops, the reap
-    and reconcile gh seams, the heimdall rebuilder, the shared notifier (push + comment +
-    label), and the orchestrator build lane.
-
-    The orchestrator ``build_prd`` seam defaults to the real budget-gated, triaged build
-    bound per repo via :func:`retinue.wiring.bind_build_prd` over the real
-    :class:`~retinue.orchestrator.ContainerImplementer`, container/git/secret/report
-    adapters — so a constructed :class:`Pipeline` has a live build lane. A caller may pass
-    a ``build_prd`` to override it (a fake in tests); passing one skips the per-repo bind.
+    installation token, then constructs every gh/push adapter against it: the gh issue
+    creator, the PR-opener gh ops, the reap gh seam, and the shared notifier (push +
+    comment + label).
 
     Args:
         settings: The runtime settings carrying budget, Anthropic, and push config.
         auth: The GitHub App installation auth used to mint per-repo tokens.
-        governor: The one service-level budget governor (constructed by the worker's
-            startup and shared with the ad-hoc and cron lanes, so every lane meters the
-            same rolling-24h window).
-        build_prd: An explicit build seam overriding the real per-repo bind (e.g. a fake).
-        fetch_claude_md: Reads the target repo's ``CLAUDE.md`` text (the done-check
-            command source); ``None`` falls back to empty text, which the done-check
-            reads as no recognisable command. Production injects the contents-API fetcher.
+        governor: The one service-level budget governor, shared across the lanes.
+        fetch_claude_md: Reads the target repo's ``CLAUDE.md`` text (the done-check command
+            source); ``None`` falls back to empty text.
 
     Returns:
         An async pipeline factory keyed by repo and config.
@@ -768,8 +326,6 @@ def build_pipeline_factory(
     push = build_push_sink(settings)
     state_dir = _state_dir(settings)
     retry_store_path = state_dir / "impl-retries.sqlite3"
-    # One stateless subprocess runner satisfies every ``run(args, *, env)`` gh seam
-    # (slicer / PR-opener / loopback) — the shape now lives in :mod:`retinue.gh`.
     gh_runner = SubprocessGhRunner()
 
     async def factory(repo_full_name: str, config: RepoConfig) -> Pipeline:
@@ -782,56 +338,26 @@ def build_pipeline_factory(
         create_issue = GhCliIssueCreator(
             gh_runner, token=token, repo_full_name=repo_full_name
         )
-        slice_generate = ClaudeSliceGenerator(
-            token=settings.anthropic_credential,
-            auth_mode=settings.auth_mode,
-            model=resolve_model(Role.SLICER, config),
-            effort=resolve_effort(Role.SLICER, config),
-        ).generate
         pr_ops = GhCliPrOps(gh_runner, token=token)
         reap_gh = HandoffGh(token=token)
-        rebuild = GhCliRebuilder(
-            gh_runner,
-            token=token,
-            reviewer_login=settings.heimdall_bot_login,
-        )
-        reconcile_gh = GhCliReconcile(
-            ReconcileGhRunner(token), merge_base=config.staging_branch
-        )
-        bound_build_prd = build_prd or _bind_build_prd_for_repo(
-            settings,
-            auth,
-            repo_full_name=repo_full_name,
-            token=token,
-            governor=governor,
-            notifier=notifier,
-            create_issue=create_issue,
-            retry_store_path=retry_store_path,
-            config=config,
-        )
         return Pipeline(
             config=config,
             claude_md=await _fetch_claude_md(fetch_claude_md, repo_full_name),
             governor=governor,
             notifier=notifier,
             create_issue=create_issue,
-            slice_generate=slice_generate,
             pr_ops=pr_ops,
             reap_gh=reap_gh,
-            round_store_path=state_dir / "heimdall-rounds.sqlite3",
             retry_store_path=retry_store_path,
             run_state_path=run_state_store_path(settings),
-            build_prd=bound_build_prd,
-            rebuild=rebuild,
-            reconcile_gh=reconcile_gh,
         )
 
     return factory
 
 
-# Reads the target repo's ``CLAUDE.md`` text given its full name. Injected (over the
-# GitHub contents API in production) so the build's done-check command is parsed from the
-# real repo text rather than an empty string; absent, the factory falls back to "".
+# Reads the target repo's ``CLAUDE.md`` text given its full name. Injected (over the GitHub
+# contents API in production) so the build's done-check command is parsed from the real
+# repo text rather than an empty string; absent, the factory falls back to "".
 ClaudeMdFetcher = Callable[[str], Awaitable[str]]
 
 
@@ -842,174 +368,6 @@ async def _fetch_claude_md(
     if fetch_claude_md is None:
         return ""
     return await fetch_claude_md(repo_full_name)
-
-
-def _bind_build_prd_for_repo(
-    settings: Settings,
-    auth: InstallationAuth,
-    *,
-    repo_full_name: str,
-    token: str,
-    governor: BudgetGovernor,
-    notifier: Notifier,
-    create_issue: IssueCreator,
-    retry_store_path: Path,
-    config: RepoConfig,
-) -> BuildPrd:
-    """Bind the real budget-gated, triaged orchestrator build for one repo.
-
-    Constructs the build lane's real adapters — the container-exec implementer, the Docker
-    runtime, the lazy merge-container git ops, the env secret resolver, and the gh report
-    sink — then binds them through :func:`retinue.wiring.bind_build_prd`. The merge
-    container the lazy git ops starts is destroyed after each build in a ``finally``, so a
-    long-lived worker never leaks a container across PRD runs.
-
-    Args:
-        settings: Carries the Anthropic credential/auth mode and budget config.
-        auth: Mints the installation token the clone authenticates with (the done-check
-            clones over its URL); also passed through to the orchestrator build.
-        repo_full_name: The target repo the build runs against.
-        token: The minted installation token the gh report sink authenticates with.
-        governor: The shared service-level budget governor (gate + meter).
-        notifier: The escalation fan-out used by triage's escalate path.
-        create_issue: The gh issue creator used by triage's reslice path.
-        retry_store_path: SQLite file backing the persisted per-slice retry counter.
-        config: The repo's validated config; its ``routing:`` table overrides the
-            implementer's and reviewer's model per the role registry.
-
-    Returns:
-        The bound ``build_prd`` seam the pipeline drives.
-    """
-    runtime = DockerRuntime()
-    git = MergeContainerGitOps(
-        repo_full_name=repo_full_name, auth=auth, runtime=runtime
-    )
-    issue_facts = GhCliIssueFacts(ReconcileGhRunner(token))
-    implementer = ContainerImplementer(
-        credential=settings.anthropic_credential,
-        auth_mode=settings.auth_mode,
-        model=resolve_model(Role.IMPLEMENTER, config),
-        max_turns=settings.implement_max_turns,
-        issue_facts=issue_facts,
-    )
-    resolve_secret: SecretResolver = EnvSecretResolver()
-    report: ReportSink = GhReportSink(token=token)
-    review_reviewer = _build_review_reviewer_factory(
-        settings,
-        repo_full_name=repo_full_name,
-        token=token,
-        create_issue=create_issue,
-        diff_source=git,
-        config=config,
-    )
-    # The classifier (and its HTTP transport) is constructed only when the repo declares a
-    # routing table, so a table-less repo makes zero classifier calls and no issue-facts
-    # fetch — invocations identical to pre-routing. This is load-bearing; do not hoist it.
-    resolve_implementer: PerIssueImplementer | None = None
-    if config.routing is not None:
-        classifier = ClaudeIssueClassifier(
-            credential=settings.anthropic_credential,
-            transport=HttpxTransport(),
-            routing=config.routing,
-        )
-        resolve_implementer = PerIssueImplementerRouter(
-            base_implementer=implementer,
-            config=config,
-            classify=classifier,
-            label_sink=GhLabelSink(token=token),
-            comment_sink=GhCommentSink(token=token),
-            issue_facts=issue_facts,
-            governor=governor,
-            classifier_charge=CLASSIFIER_ESTIMATED_AMOUNT,
-        )
-    bound = bind_build_prd(
-        implementer=implementer,
-        governor=governor,
-        notifier=notifier,
-        create_issue=create_issue,
-        retry_store_path=retry_store_path,
-        estimated_amount=BUILD_ESTIMATED_AMOUNT,
-        git=git,
-        auth=auth,
-        runtime=runtime,
-        resolve_secret=resolve_secret,
-        report=report,
-        review_reviewer=review_reviewer,
-        resolve_implementer=resolve_implementer,
-    )
-
-    async def run(**kwargs: object) -> PrdBuildResult:
-        try:
-            result = await bound(**kwargs)
-        finally:
-            await git.aclose()
-        return _prd_build_from_bound(result, prd_number=kwargs.get("prd_number"))
-
-    return run
-
-
-async def build_cron_slice_builder(
-    settings: Settings,
-    auth: InstallationAuth,
-    *,
-    repo_full_name: str,
-    token: str,
-    fetch_claude_md: ClaudeMdFetcher,
-) -> CronBuild:
-    """Build the production backlog-cron downstream for one repo (the cron tick's build).
-
-    Returns a :data:`retinue.cron.CronBuild` — an async ``(*, repo_full_name, issue_number)
-    -> None`` — that drains one backlog nit through :func:`retinue.orchestrator.build_slice`
-    over the *same* orchestrator adapters the PRD lane builds: the container-exec
-    implementer, the Docker runtime, the lazy merge-container git ops, the env secret
-    resolver, and the gh report sink. The merge container the lazy git ops starts is
-    destroyed after each drained issue in a ``finally`` (mirroring
-    :func:`_bind_build_prd_for_repo`), so a long-lived worker never leaks a container across
-    cron ticks. The repo config (its ``routing:`` table, ``staging_branch``, and ``secrets``)
-    is read from the all-defaults config a loose backlog nit carries no per-issue override
-    for; the heartbeat already passed the opted-in config, so the cron tick reuses it.
-
-    Args:
-        settings: Carries the Anthropic credential/auth mode and budget config.
-        auth: Mints the installation token the clone authenticates with.
-        repo_full_name: The target repo the backlog drain runs against.
-        token: The minted installation token the gh report sink authenticates with.
-        fetch_claude_md: Reads the repo's ``CLAUDE.md`` text (the done-check command source).
-
-    Returns:
-        The bound cron build the backlog tick drives for the picked issue.
-    """
-    config = RepoConfig()
-    claude_md = await _fetch_claude_md(fetch_claude_md, repo_full_name)
-    runtime = DockerRuntime()
-    git = MergeContainerGitOps(
-        repo_full_name=repo_full_name, auth=auth, runtime=runtime
-    )
-    implementer = ContainerImplementer(
-        credential=settings.anthropic_credential,
-        auth_mode=settings.auth_mode,
-        model=resolve_model(Role.IMPLEMENTER, config),
-        max_turns=settings.implement_max_turns,
-        issue_facts=GhCliIssueFacts(ReconcileGhRunner(token)),
-    )
-    builder = SliceBuilder(
-        config=config,
-        claude_md=claude_md,
-        implementer=implementer,
-        git=git,
-        auth=auth,
-        runtime=runtime,
-        resolve_secret=EnvSecretResolver(),
-        report=GhReportSink(token=token),
-    )
-
-    async def build(*, repo_full_name: str, issue_number: int) -> None:
-        try:
-            await builder(repo_full_name=repo_full_name, issue_number=issue_number)
-        finally:
-            await git.aclose()
-
-    return build
 
 
 async def _resolve_adhoc_level(
@@ -1024,17 +382,15 @@ async def _resolve_adhoc_level(
 ) -> str | None:
     """Resolve one ad-hoc issue's routing level once, best-effort.
 
-    Returns ``None`` for a table-less repo (every ad-hoc role falls through to the
-    registry default — today's behavior, and zero classifier calls). Otherwise classifies
-    the issue via :func:`retinue.routing.resolve_issue_level` (honoring a pre-existing
-    ``level:`` label, metering, applying the label, commenting on a classification failure)
-    and returns the level name. Any error along the classify path is logged and falls back
-    to the table's ``default`` level — mirroring
-    :class:`~retinue.routing.PerIssueImplementerRouter`'s best-effort contract, so a gh
-    flake never crashes the ad-hoc build.
+    Returns ``None`` for a table-less repo (every role falls through to the registry
+    default, and zero classifier calls). Otherwise classifies the issue via
+    :func:`retinue.routing.resolve_issue_level` (honoring a pre-existing ``level:`` label,
+    metering, applying the label, commenting on a classification failure) and returns the
+    level name. Any error along the classify path is logged and falls back to the table's
+    ``default`` level, so a gh flake never crashes the build.
 
     Args:
-        issue: The ad-hoc issue being routed (its repo/number identify the GitHub issue).
+        issue: The ad-hoc issue being routed.
         config: The repo config; its ``routing:`` table supplies the level set.
         classify: The classifier seam.
         label_sink: Applies the resolved ``level:`` label.
@@ -1086,33 +442,27 @@ def bind_adhoc_build(
     Returns an async ``(issue, *, repo_full_name) -> None`` — the
     :data:`retinue.adhoc_drain.AdhocBuild` shape — that drives one ad-hoc issue end to end:
     :func:`retinue.adhoc_build.build_adhoc_issue` (plan -> implement -> done-check -> push,
-    then the advisory review pass) in a fresh disposable container, then the *already
-    constructed* repo :class:`Pipeline`'s :meth:`~Pipeline.process_adhoc_pr` to open the
-    ``issue-<N>`` -> staging PR on a green build (reusing the pipeline's PR ops, gh issue
-    creator, and run-state store rather than standing up parallel ones). The build's
-    container/planner/implementer/reviewer adapters are the *same* real ones the PRD lane
-    uses (:func:`_bind_build_prd_for_repo`), so an ad-hoc build runs the production lane —
-    not a bare no-op. A red build pushes nothing and opens no PR (``process_adhoc_pr``
-    skips it).
+    then the in-session review gate) in a fresh disposable container, then the *already
+    constructed* repo :class:`Pipeline`'s :meth:`~Pipeline.process_adhoc_pr`, which consumes
+    the gate outcome: it escalates blocking findings (no PR), files backlog nits, and opens
+    the ``issue-<N>`` -> target-branch PR on a clean-or-backlog gate. A red build pushes
+    nothing and opens no PR (``process_adhoc_pr`` skips it).
 
-    Each ad-hoc issue is **classified once** at build start — mirroring the PRD lane's
-    per-slice routing — via :func:`_resolve_adhoc_level`, and its planner, implementer, and
-    ad-hoc reviewer are then constructed at that resolved level
-    (``resolve_model(Role.X, config, level=...)``). The classifier and its collaborators
-    are constructed only when the repo declares a ``routing:`` table; a table-less repo
-    makes zero classifier calls and builds all three roles at the registry defaults, exactly
-    as before. A pre-labeled issue skips the classifier and routes by its ``level:`` label.
+    Each ad-hoc issue is **classified once** at build start via
+    :func:`_resolve_adhoc_level`, and its planner, implementer, and reviewer are then
+    constructed at that resolved level. The classifier and its collaborators are constructed
+    only when the repo declares a ``routing:`` table; a table-less repo makes zero
+    classifier calls and builds all three roles at the registry defaults.
 
     Args:
-        settings: Carries the Anthropic credential/auth mode (planner, implementer, reviewer).
+        settings: Carries the Anthropic credential/auth mode.
         auth: Mints the installation token the build clones over.
-        pipeline: The repo's constructed pipeline; its ``process_adhoc_pr`` opens the PR and
-            records the PR<->issue mapping after a green build, and its ``create_issue`` is
-            the gh issue creator the advisory review pass files review-fix issues through.
+        pipeline: The repo's constructed pipeline; its ``process_adhoc_pr`` consumes the
+            review gate, opens the PR and records the mapping, and its ``create_issue``
+            files the gate's backlog nits.
         repo_full_name: The target repo the build runs against.
         token: The minted installation token the gh report sink files under.
-        config: The repo's validated config (staging branch, secrets, model overrides,
-            retry-cap chain bound).
+        config: The repo's validated config (resolved target branch, secrets, overrides).
         claude_md: The repo's ``CLAUDE.md`` text carrying the done-check command.
 
     Returns:
@@ -1122,10 +472,9 @@ def bind_adhoc_build(
     resolve_secret: SecretResolver = EnvSecretResolver()
     report: ReportSink = GhReportSink(token=token)
     # The issue-facts fetch is unconditional: every implementer bakes the issue's
-    # title/body into its prompt (the build container cannot reach GitHub itself).
-    # The classifier (and its sinks) is constructed only when the repo declares a
-    # routing table, so a table-less repo makes zero classifier calls — invocations
-    # identical to pre-routing. This mirrors _bind_build_prd_for_repo.
+    # title/body into its prompt (the build container cannot reach GitHub itself). The
+    # classifier (and its sinks) is constructed only when the repo declares a routing
+    # table, so a table-less repo makes zero classifier calls.
     issue_facts = GhCliIssueFacts(ReconcileGhRunner(token))
     classifier: ClaudeIssueClassifier | None = None
     label_sink: GhLabelSink | None = None
@@ -1171,14 +520,6 @@ def bind_adhoc_build(
             model=resolve_model(Role.REVIEWER, config, level=level),
             effort=resolve_effort(Role.REVIEWER, config, level=level),
         )
-        reviewer = ContainerAdhocReviewer(
-            repo_full_name=repo_full_name,
-            config=config,
-            generate=review_generate,
-            create_issue=pipeline.create_issue,
-            credential=settings.anthropic_credential,
-            auth_mode=settings.auth_mode,
-        )
         result = await build_adhoc_issue(
             issue,
             config,
@@ -1189,7 +530,7 @@ def bind_adhoc_build(
             runtime=runtime,
             resolve_secret=resolve_secret,
             report=report,
-            reviewer=reviewer,
+            review_generate=review_generate,
         )
         await pipeline.process_adhoc_pr(issue, result)
 
@@ -1202,16 +543,13 @@ def bind_adhoc_pr_open(pipeline: Pipeline) -> Callable[..., Awaitable[None]]:
     Returns an async ``(issue, *, repo_full_name) -> None`` — the
     :data:`retinue.adhoc_drain.AdhocPrOpen` shape — the drain drives for a
     :attr:`~retinue.adhoc_drain.FlightState.STRANDED` issue: a branch a prior build pushed
-    (push-only-on-green, so it is provably green) but whose PR never opened (e.g. the
-    PR-open precheck failed). It synthesizes the green :class:`AdhocBuildResult` for that
-    branch and drives the *same* :meth:`Pipeline.process_adhoc_pr` the build's PR step uses
-    — so the ``issue-<N>`` -> staging PR opens behind the same prechecks and the PR<->issue
-    run-state mapping is recorded identically, with no rebuild and no done-check (the push
-    already proved the branch green).
+    (push-only-on-green, so it is provably green) but whose PR never opened. It synthesizes
+    the green :class:`AdhocBuildResult` for that branch and drives the *same*
+    :meth:`Pipeline.process_adhoc_pr` the build's PR step uses — so the PR opens and the
+    mapping is recorded identically, with no rebuild and no done-check.
 
     Args:
-        pipeline: The repo's constructed pipeline; its ``process_adhoc_pr`` opens the PR and
-            records the PR<->issue mapping.
+        pipeline: The repo's constructed pipeline; its ``process_adhoc_pr`` opens the PR.
 
     Returns:
         The bound :data:`retinue.adhoc_drain.AdhocPrOpen` callable the drain runs per
@@ -1224,74 +562,3 @@ def bind_adhoc_pr_open(pipeline: Pipeline) -> Callable[..., Awaitable[None]]:
         )
 
     return open_pr
-
-
-def _build_review_reviewer_factory(
-    settings: Settings,
-    *,
-    repo_full_name: str,
-    token: str,
-    create_issue: IssueCreator,
-    diff_source: RoundDiffSource,
-    config: RepoConfig,
-    generate: ReviewGenerator | None = None,
-) -> ReviewerFactory:
-    """Build the per-PRD internal-reviewer factory for one repo's live build.
-
-    The reviewer is per-PRD (its ``Part of #<prd>`` footer and round diff depend on the
-    PRD), but the build lane is bound per repo, so this returns a
-    ``(repo_full_name, prd_number) -> RoundReviewer`` factory the build calls at run time.
-    Each reviewer wires the real Agent-SDK review generator (over the httpx transport,
-    with its model resolved from the role registry against the repo's routing
-    table), the gh issue creator reused from the slicer, and the gh Blocked-by editor —
-    so a live build reviews every merged round and the review-fix follow-ups it files build
-    later. ``generate`` defaults to the real Agent-SDK reviewer; tests inject a fake to
-    keep the review flow off the network.
-    """
-    review_generate = generate or AgentSdkReviewGenerator(
-        credential=settings.anthropic_credential,
-        transport=HttpxTransport(),
-        model=resolve_model(Role.REVIEWER, config),
-        effort=resolve_effort(Role.REVIEWER, config),
-    )
-    edit_blocked_by = GhCliBlockedByEditor(
-        runner=SubprocessGhRunner(), token=token
-    )
-
-    def factory(factory_repo: str, prd_number: int) -> RoundReviewer:
-        return bind_round_reviewer(
-            diff_source=diff_source,
-            generate=review_generate,
-            create_issue=create_issue,
-            edit_blocked_by=edit_blocked_by,
-            repo_full_name=factory_repo,
-            prd_number=prd_number,
-        )
-
-    return factory
-
-
-def _prd_build_from_bound(
-    result: BoundBuildResult, *, prd_number: object
-) -> PrdBuildResult:
-    """Adapt a :class:`BoundBuildResult` to the pipeline's :class:`PrdBuildResult` seam.
-
-    ``bind_build_prd`` returns the budget-gate-aware :class:`BoundBuildResult`, but the
-    pipeline's ``build_prd`` seam is a :class:`PrdBuildResult`. A run that built yields
-    its inner ``prd_build``; a run the budget gate *deferred* yields an empty build on
-    the integration branch — honest: the deferred PRD merged nothing — carrying the
-    deferral and its window so the worker re-enqueues the round's resume for when the
-    budget frees.
-    """
-    if result.prd_build is not None:
-        return result.prd_build
-    number = prd_number if isinstance(prd_number, int) else 0
-    return PrdBuildResult(
-        integration_branch=integration_branch(number),
-        merged_issues=[],
-        blocked_issues=[],
-        escalated_issues=[],
-        skipped_issues=[],
-        deferred=result.deferred,
-        defer_until=result.defer_until,
-    )

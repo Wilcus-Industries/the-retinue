@@ -1,47 +1,31 @@
-"""Ad-hoc drain: ready-for-agent non-PRD issues, deduped, locked, budget-gated (#32, #33).
+"""The scheduler drain: one pass over a repo's trigger-labeled issues (PRD #80).
 
-One ad-hoc drain runs per repo. It lists every open ``ready-for-agent`` issue via the gh
-seam, keeps only the ones the **ad-hoc** lane decision claims (dropping any
-``prd``-labeled issue and any issue carrying a ``Part of #<prd>`` link — those route to the
-orchestrator lane), ranks the survivors by ``priority:<severity>`` (no-priority lowest),
-and drives the ad-hoc build+PR primitive for each up to the concurrency cap
-(``config.max_parallel``). The lane filter **mirrors** :func:`retinue.lane.classify`'s
-ad-hoc decision (reusing :class:`~retinue.lane.IssueFacts`) but deliberately does **not**
-call ``classify``: routing standalone ``priority:critical``/``high`` issues through
-classify would preempt them onto the orchestrator lane and exclude them from the drain.
+This is the retinue's central mechanism — the single drain the webhook kick and the
+heartbeat both invoke. One drain runs per repo, under a single-run lock, and in one
+stateless pass:
 
-Each surviving issue is materialized into an :class:`~retinue.adhoc_build.AdhocIssue`
-through :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` — fed the issue body the
-gh seam surfaces — never the bare constructor. ``from_fetched_issue`` parses the
-``Chain-depth:`` lineage marker out of the body into
-:attr:`~retinue.adhoc_build.AdhocIssue.chain_depth`; building the issue by hand would
-default every hop to depth 0 and silently make the #39/#40 review-fix chain bound inert.
-The gh list seam therefore surfaces each issue's ``body`` alongside its labels.
+1. **list** every open issue wearing ``config.trigger_label`` (number, labels, body),
+2. **admit** the ones the scheduler acts on — trigger label present, ``hitl`` absent
+   (the list query already scopes to the label and open state),
+3. **gate on readiness** — an issue is schedulable only when every blocker is closed,
+   the union of its body ``## Blocked by #N`` refs and GitHub's native relations
+   (:func:`retinue.readiness.resolve_ready`); a blocked issue is invisible this pass,
+4. **classify flight state** against GitHub truth (:class:`FlightState`): an issue with a
+   branch *and* an open PR is in flight (skip, no duplicate), one with a pushed
+   ``issue-<N>`` branch but no open PR is **stranded** (a prior green build whose PR never
+   opened — open its PR without rebuilding), the rest are buildable,
+5. **rank + select** the buildable set through the pure two-queue scheduler
+   (:func:`retinue.scheduler.select_to_build`): ready issues split into a priority queue
+   (tiers in ``config.priority_tiers``) that always drains first and a main queue, with a
+   reserved priority slot when ``config.max_parallel >= 2``,
+6. **build** each selected issue in a disposable container, metered against the one shared
+   :class:`~retinue.budget.BudgetGovernor`; a build that would cross the rolling-24h cap
+   is skipped.
 
-The drain is hardened for production (#33) with four guards:
-
-* **dedup + stranded recovery via GitHub truth** — the drain classifies each issue against
-  the reconcile-style source of truth (:mod:`retinue.reconcile`): an issue with a branch
-  *and* an open PR is in flight (skip it, no duplicate branch/PR); an issue with a pushed
-  ``issue-<N>`` branch but *no* open PR is **stranded** — a prior green build
-  (push-only-on-green) whose PR never opened — so the drain opens its PR without rebuilding;
-  every other issue is built fresh. Truth is read once per drain through
-  :meth:`SupportsFlightSnapshot.flight_snapshot` (two whole-repo ``gh`` queries), then each
-  candidate is classified in memory (:meth:`FlightSnapshot.state_for`); a seam offering only
-  the per-issue :meth:`AdhocGh.flight_state` is classified through that fallback;
-* **single-run lock** — the whole drain runs under an injected lock so two drains for a
-  repo never overlap (a second entry raises :class:`AdhocDrainBusyError`); the lock is
-  *separate* from the orchestrator's, so the drain still runs alongside a PRD build;
-* **shared budget governor** — every build meters against the one service-level
-  :class:`~retinue.budget.BudgetGovernor` the PRD lane uses, so a build that would cross
-  the rolling-24h cap is skipped and the shared budget is never overshot;
-* **PRD-first ordering with preemption** — when a PRD build is in flight, only a
-  ``priority:critical``/``high`` issue (the same rule :func:`retinue.lane.classify`
-  preempts on) builds; ordinary ad-hoc work waits for the PRD to finish.
-
-Every leaf I/O — the gh queries, the budget store, the downstream build — is injected and
-faked, so the whole drain runs with no real ``gh``, no Docker, and no network — mirroring
-the injected-seam style of :mod:`retinue.cron`.
+Every leaf I/O — the gh queries, the readiness lookups, the budget store, the downstream
+build — is injected and faked, so the whole drain runs with no real ``gh``, no Docker, and
+no network. The drain is stateless per pass: each entry recomputes readiness and ranking
+from GitHub truth rather than maintaining a persistent queue store.
 """
 
 from __future__ import annotations
@@ -63,42 +47,39 @@ from retinue.gh import (
     parse_json_array,
     run_gh_subprocess,
 )
-from retinue.lane import IssueFacts, preempts_prd_first
+from retinue.readiness import BlockableIssue, ReadinessGh, resolve_ready
 from retinue.repo_config import RepoConfig
+from retinue.scheduler import Candidate, select_to_build
 from retinue.single_run import SingleRunLock
-from retinue.vocab import PRD_LABEL, READY_LABEL, Severity, issue_branch
+from retinue.vocab import HITL_LABEL, issue_branch
 
 logger = logging.getLogger(__name__)
 
 
 class AdhocDrainBusyError(Exception):
-    """A second ad-hoc drain was attempted for a repo while one is already in flight.
+    """A second drain was attempted for a repo while one is already in flight.
 
     The single-run guarantee: :func:`run_adhoc_drain` runs inside an injected lock that
-    rejects a concurrent holder rather than blocking, so the "at most one ad-hoc drain
-    per repo at a time" contract is observable to the caller. This lock is *separate* from
-    the orchestrator's single-run lock, so an ad-hoc drain still runs concurrently with
-    a PRD build. Mirrors :class:`retinue.cron.CronBusyError`.
+    rejects a concurrent holder rather than blocking, so the "at most one drain per repo
+    at a time" contract is observable to the caller. Mirrors :class:`retinue.cron.CronBusyError`.
     """
 
     def __init__(self) -> None:
-        super().__init__("an ad-hoc drain is already in flight")
+        super().__init__("a scheduler drain is already in flight")
 
 
 class AdhocDrainLock(SingleRunLock):
-    """One repo's ad-hoc drain single-run lock: a second concurrent drain is rejected.
+    """One repo's scheduler-drain single-run lock: a second concurrent drain is rejected.
 
     A :class:`~retinue.single_run.SingleRunLock` raising :class:`AdhocDrainBusyError`.
     One instance guards one repo; the worker keeps a per-repo registry so two repos drain
-    concurrently while a repo's own kicked and swept drains serialize through the same
-    lock. Separate from the cron and PRD locks, so an ad-hoc drain runs concurrently with
-    those lanes.
+    concurrently while a repo's own kicked and swept drains serialize through the same lock.
     """
 
     busy_error = AdhocDrainBusyError
 
 
-# How many ready-for-agent issues to pull per drain. The cap on concurrent *builds* is
+# How many trigger-labeled issues to pull per drain. The cap on concurrent *builds* is
 # ``config.max_parallel``; this generous-but-bounded page just keeps the visible set from
 # an unbounded fetch, mirroring the cron lane's list limit.
 _DEFAULT_LIST_LIMIT = 200
@@ -106,19 +87,18 @@ _DEFAULT_LIST_LIMIT = 200
 
 @dataclass(frozen=True)
 class ReadyIssue:
-    """One open ``ready-for-agent`` issue, as reported by the ad-hoc gh seam.
+    """One open trigger-labeled issue, as reported by the drain's gh seam.
 
     The body is surfaced (unlike the cron lane's backlog seam) because the drain feeds it
-    to :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue`, which reads the
-    ``Chain-depth:`` lineage marker out of it — and because :meth:`is_adhoc` scans it for
-    the ``Part of #<prd>`` link (mirroring :func:`retinue.lane.classify`'s decision, not
-    calling it) to split orchestrator-lane slices from ad-hoc work.
+    to :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (which reads the
+    ``Chain-depth:`` lineage marker) and to :func:`retinue.readiness.resolve_ready` (which
+    scans the ``## Blocked by`` block).
 
     Attributes:
         number: The issue number; the build commits to the derived ``issue-<N>`` branch.
-        labels: The issue's label names (carries ``ready-for-agent`` and, optionally, a
-            ``priority:<severity>`` or the ``prd`` label).
-        body: The issue body, scanned for the ``Part of #<prd>`` link and the
+        labels: The issue's label names (carries the trigger label and, optionally, a
+            ``priority:<tier>`` label the scheduler ranks on).
+        body: The issue body, scanned for the ``## Blocked by`` block and the
             ``Chain-depth:`` marker.
     """
 
@@ -126,60 +106,29 @@ class ReadyIssue:
     labels: list[str]
     body: str = ""
 
-    def _facts(self) -> IssueFacts:
-        """The routing-relevant facts of this issue, for the lane decision and ranking."""
-        return IssueFacts(labels=list(self.labels), body=self.body)
+    def is_admissible(self, config: RepoConfig) -> bool:
+        """Whether the scheduler admits this issue: trigger label present, ``hitl`` absent.
 
-    def is_adhoc(self) -> bool:
-        """Whether this issue is ad-hoc work the drain builds directly.
-
-        Mirrors :func:`retinue.lane.classify`'s ad-hoc decision (reusing
-        :class:`~retinue.lane.IssueFacts` for the ``Part of #<prd>`` scan): a
-        ``ready-for-agent`` issue is ad-hoc unless it carries the ``prd`` label or a
-        ``Part of #<prd>`` link — both of which route to the orchestrator lane and are
-        excluded here. Unlike a raw ``classify`` call this does *not* fold in classify's
-        priority **preemption**, which reorders a standalone ``priority:critical``/``high``
-        onto the orchestrator lane: that is an ordering optimization, not a statement that
-        the work is not ad-hoc, and the drain ranks those at the top itself.
+        The list query already scopes to open issues wearing ``config.trigger_label``, but
+        the trigger-label check is kept as defense-in-depth; the ``hitl`` exclusion is the
+        one admission decision made here — a human-escalated issue stays out of scheduling
+        until the ``hitl`` label is removed (the human "resume" gesture).
         """
-        facts = self._facts()
-        if not facts.has_label(READY_LABEL):
+        if config.trigger_label not in self.labels:
             return False
-        if facts.has_label(PRD_LABEL):
-            return False
-        return facts.prd_link() is None
-
-    def severity(self) -> Severity | None:
-        """The issue's ``priority:<severity>`` as a :class:`Severity`, or ``None``.
-
-        Reuses :meth:`retinue.lane.IssueFacts.priority`, so an unknown ``priority:*`` value
-        is treated as no priority (ranked lowest) rather than raising.
-        """
-        return self._facts().priority()
-
-    def preempts(self) -> bool:
-        """Whether this issue's priority jumps PRD-first ordering (``critical``/``high``).
-
-        Reuses :func:`retinue.lane.preempts_prd_first` — the single source of truth for the
-        preemption rule :func:`retinue.lane.classify` applies — so the drain and the
-        classifier agree on what preempts.
-        """
-        return preempts_prd_first(self.severity())
+        return HITL_LABEL not in self.labels
 
 
 class FlightState(Enum):
     """GitHub's verdict on an issue's ``issue-<N>`` branch and open PR — the drain's truth.
 
-    The drain reads this to decide what to do with each ready issue:
-
     * :attr:`ABSENT` — no ``issue-<N>`` branch and no open PR: nothing was built, so build
       it fresh.
     * :attr:`STRANDED` — the ``issue-<N>`` branch exists but no open PR: a prior build
       pushed the branch (push-only-on-green, so the branch is provably green) yet never
-      opened its PR — e.g. the PR-open precheck failed. The drain opens the PR **without
-      rebuilding** (the rebuild would waste budget re-deriving a known-green branch).
+      opened its PR. The drain opens the PR **without rebuilding**.
     * :attr:`IN_FLIGHT` — an open PR exists: a build is under way or already landed, so the
-      drain skips the issue (the original branch-or-PR dedup, now narrowed to "PR exists").
+      drain skips the issue.
     """
 
     ABSENT = "absent"
@@ -192,10 +141,8 @@ class FlightSnapshot:
     """Whole-repo GitHub truth for flight-state classification, fetched once per drain.
 
     Carries the two whole-repo sets the drain classifies every candidate against in memory,
-    replacing the per-issue branch-ref + open-PR spawns (:meth:`AdhocGh.flight_state`) with a
-    single prefetch: the head branch names of the repo's open PRs, and the existing
-    ``issue-<N>`` branch names. :meth:`state_for` applies the exact :class:`FlightState`
-    rule, preserving the stranded-branch recovery (commit cea5d14).
+    replacing the per-issue branch-ref + open-PR spawns with a single prefetch: the head
+    branch names of the repo's open PRs, and the existing ``issue-<N>`` branch names.
 
     Attributes:
         open_pr_heads: The head branch names of the repo's open PRs (an open PR keeps its
@@ -209,10 +156,9 @@ class FlightSnapshot:
     def state_for(self, issue_number: int) -> FlightState:
         """Classify one issue from the snapshot, mirroring per-issue ``flight_state``.
 
-        The same order the per-issue query used: a missing ``issue-<N>`` branch is
-        :attr:`FlightState.ABSENT`; a branch with an open PR is :attr:`FlightState.IN_FLIGHT`;
-        a branch with no open PR is :attr:`FlightState.STRANDED` (pushed green, PR never
-        opened).
+        A missing ``issue-<N>`` branch is :attr:`FlightState.ABSENT`; a branch with an open
+        PR is :attr:`FlightState.IN_FLIGHT`; a branch with no open PR is
+        :attr:`FlightState.STRANDED` (pushed green, PR never opened).
         """
         branch = issue_branch(issue_number)
         if branch not in self.issue_branches:
@@ -223,19 +169,19 @@ class FlightSnapshot:
 
 
 class AdhocGh(Protocol):
-    """The gh queries behind the ad-hoc drain. The ad-hoc lane's gh seam.
+    """The gh queries behind the scheduler drain. The drain's gh seam.
 
-    A production implementation runs ``gh issue list --label ready-for-agent`` (with each
-    issue's labels and body) for :meth:`list_ready`, and the branch-existence + open-PR
-    lookups for :meth:`flight_state`; tests inject a fake that scripts both. Modeled as one
-    protocol so the whole drain injects through a single collaborator, mirroring the
-    gh-seam style of :mod:`retinue.cron` / :mod:`retinue.reconcile`. A production seam should
+    A production implementation runs ``gh issue list --label <trigger>`` (with each issue's
+    labels and body) for :meth:`list_ready`, and the branch-existence + open-PR lookups for
+    :meth:`flight_state`; tests inject a fake that scripts both. A production seam should
     also implement :class:`SupportsFlightSnapshot` so the drain classifies flight state with
     one whole-repo prefetch instead of a per-issue :meth:`flight_state` spawn.
     """
 
-    async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
-        """Return the repo's open ``ready-for-agent`` issues with their labels and body."""
+    async def list_ready(
+        self, *, repo_full_name: str, label: str
+    ) -> list[ReadyIssue]:
+        """Return the repo's open ``label``-labeled issues with their labels and body."""
         ...
 
     async def flight_state(
@@ -243,15 +189,10 @@ class AdhocGh(Protocol):
     ) -> FlightState:
         """Classify the issue against GitHub truth: absent, stranded, or in flight.
 
-        The dedup + stranded-recovery source of truth, mirroring the reconcile-style
-        GitHub-truth approach (:mod:`retinue.reconcile`): reads whether the issue's
+        The dedup + stranded-recovery source of truth: reads whether the issue's
         ``issue-<N>`` branch exists and whether an open PR for it exists, and returns the
-        matching :class:`FlightState`. The drain builds an :attr:`~FlightState.ABSENT`
-        issue, opens the PR for a :attr:`~FlightState.STRANDED` one, and skips an
-        :attr:`~FlightState.IN_FLIGHT` one.
-
-        This is the *per-issue* fallback; a seam that also implements
-        :class:`SupportsFlightSnapshot` is classified with one whole-repo query instead.
+        matching :class:`FlightState`. This is the *per-issue* fallback; a seam that also
+        implements :class:`SupportsFlightSnapshot` is classified with one whole-repo query.
         """
         ...
 
@@ -261,11 +202,9 @@ class SupportsFlightSnapshot(Protocol):
     """An optional whole-repo flight-state prefetch the drain prefers over per-issue calls.
 
     A gh seam that can answer the flight-state question for the *whole* repo in one shot
-    (rather than a branch-ref + open-PR spawn per issue) implements this. The production
-    :class:`GhCli` does — collapsing the old N-issue x 2-spawn classification into two
-    whole-repo ``gh`` queries — while a seam offering only per-issue :meth:`AdhocGh.flight_state`
-    (e.g. a minimal test fake) is classified through that fallback instead. Runtime-checkable
-    so :func:`run_adhoc_drain` can pick the fast path with ``isinstance``.
+    implements this. The production :class:`GhCli` does — collapsing the old N-issue x
+    2-spawn classification into two whole-repo ``gh`` queries — while a seam offering only
+    per-issue :meth:`AdhocGh.flight_state` is classified through that fallback instead.
     """
 
     async def flight_snapshot(self, *, repo_full_name: str) -> FlightSnapshot:
@@ -274,27 +213,24 @@ class SupportsFlightSnapshot(Protocol):
 
 
 class GhCli:
-    """The production :class:`AdhocGh`: lists ``ready-for-agent`` issues via the ``gh`` CLI.
+    """The production :class:`AdhocGh`: lists trigger-labeled issues via the ``gh`` CLI.
 
-    Runs ``gh issue list --repo <repo> --label ready-for-agent --state open --json
+    Runs ``gh issue list --repo <repo> --label <trigger> --state open --json
     number,labels,body`` and parses the JSON into :class:`ReadyIssue` objects. The ``body``
-    field is requested — unlike the cron lane's backlog query — because the drain feeds it
-    to :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (lineage marker) and
-    scans it in :meth:`ReadyIssue.is_adhoc` for the ``Part of #<prd>`` link (mirroring
-    :func:`retinue.lane.classify`'s decision, not calling it). Authenticates by injecting
-    the GitHub token into the child env as ``GH_TOKEN``, so no token is ever placed on the
-    command line.
+    field is requested because the drain feeds it to
+    :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (lineage marker) and to
+    readiness (the ``## Blocked by`` block). Authenticates by injecting the GitHub token
+    into the child env as ``GH_TOKEN``, so no token is ever placed on the command line.
 
     The subprocess spawn is the one impure edge, factored behind the injected ``runner``
-    (the shared :data:`~retinue.gh.GhBytesRunner` seam, production
-    :func:`~retinue.gh.run_gh_subprocess`) so command assembly, the auth env, and payload
-    parsing are unit-testable without a real ``gh``, Docker, or network.
+    (the shared :data:`~retinue.gh.GhBytesRunner` seam), so command assembly, the auth env,
+    and payload parsing are unit-testable without a real ``gh``, Docker, or network.
 
     Args:
         token: The GitHub token ``gh`` authenticates with, placed in the child env as
-            ``GH_TOKEN``. ``None`` runs ``gh`` with the ambient auth (e.g. a logged-in CLI).
+            ``GH_TOKEN``. ``None`` runs ``gh`` with the ambient auth.
         runner: The injected argv runner; defaults to the real subprocess spawn.
-        list_limit: The max number of ready-for-agent issues to pull per drain.
+        list_limit: The max number of trigger-labeled issues to pull per drain.
     """
 
     def __init__(
@@ -308,15 +244,17 @@ class GhCli:
         self._runner = runner or run_gh_subprocess
         self._list_limit = list_limit
 
-    async def list_ready(self, *, repo_full_name: str) -> list[ReadyIssue]:
-        """Return the repo's open ``ready-for-agent`` issues with their labels and body.
+    async def list_ready(
+        self, *, repo_full_name: str, label: str
+    ) -> list[ReadyIssue]:
+        """Return the repo's open ``label``-labeled issues with their labels and body.
 
         Raises:
             GhCliError: ``gh`` exited non-zero (propagated from the runner).
             ValueError: ``gh`` returned a payload that did not parse as the expected
                 issue listing.
         """
-        argv = _list_ready_argv(repo_full_name, limit=self._list_limit)
+        argv = _list_ready_argv(repo_full_name, label=label, limit=self._list_limit)
         stdout = await self._runner(argv, auth_env(self._token))
         return [_parse_ready_issue(entry) for entry in parse_json_array(stdout)]
 
@@ -326,13 +264,9 @@ class GhCli:
         """Classify the issue from GitHub truth: absent, stranded, or in flight.
 
         Queries GitHub truth in two legs. First the branch-ref lookup (a missing ref 404s,
-        surfaced by the runner as :class:`GhCliError`, read here as "no branch"): no branch
-        short-circuits to :attr:`FlightState.ABSENT` — an open PR keeps its head branch
-        alive, so a missing branch proves no open PR can exist, and the second leg is
-        skipped. When the branch exists, the open-PR list for the ``issue-<N>`` head
-        decides: an open PR means :attr:`FlightState.IN_FLIGHT`, none means the branch is
-        :attr:`FlightState.STRANDED` (pushed green, PR never opened). Mirrors the
-        reconcile-style source-of-truth dedup.
+        read here as "no branch"): no branch short-circuits to :attr:`FlightState.ABSENT` —
+        an open PR keeps its head alive, so a missing branch proves no open PR exists. When
+        the branch exists, the open-PR list for the ``issue-<N>`` head decides.
 
         Raises:
             ValueError: the open-PR query returned a payload that did not parse as a JSON
@@ -351,9 +285,8 @@ class GhCli:
         Replaces the per-issue branch-ref + open-PR spawns with two repo-wide ``gh`` calls:
         ``gh pr list --state open --json headRefName`` for every open PR's head branch, and
         ``gh api .../git/matching-refs/heads/issue-`` enumerating every existing ``issue-*``
-        branch ref. The drain then classifies each candidate in memory
-        (:meth:`FlightSnapshot.state_for`), preserving the exact :class:`FlightState`
-        semantics — including the stranded-branch recovery.
+        branch ref. The drain classifies each candidate in memory
+        (:meth:`FlightSnapshot.state_for`), preserving the stranded-branch recovery.
 
         Raises:
             ValueError: a ``gh`` payload did not parse as the expected JSON array (or an
@@ -395,13 +328,13 @@ class GhCli:
         return len(parse_json_array(stdout)) > 0
 
 
-def _list_ready_argv(repo_full_name: str, *, limit: int) -> list[str]:
-    """Assemble the ``gh issue list`` argv for the open ``ready-for-agent`` issues.
+def _list_ready_argv(repo_full_name: str, *, label: str, limit: int) -> list[str]:
+    """Assemble the ``gh issue list`` argv for the open ``label``-labeled issues.
 
     Pulls ``number``, ``labels``, and ``body`` as JSON — exactly the fields the drain needs
-    to classify (the ``Part of #<prd>`` link), rank (the ``priority:*`` label), and rebuild
-    each issue through :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (the
-    ``Chain-depth:`` marker).
+    to admit + rank each issue (the ``priority:*`` label), gate readiness (the
+    ``## Blocked by`` block), and rebuild it through
+    :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (the ``Chain-depth:`` marker).
     """
     return [
         "gh",
@@ -410,7 +343,7 @@ def _list_ready_argv(repo_full_name: str, *, limit: int) -> list[str]:
         "--repo",
         repo_full_name,
         "--label",
-        READY_LABEL,
+        label,
         "--state",
         "open",
         "--json",
@@ -421,12 +354,7 @@ def _list_ready_argv(repo_full_name: str, *, limit: int) -> list[str]:
 
 
 def _branch_ref_argv(repo_full_name: str, branch: str) -> list[str]:
-    """Assemble the ``gh api`` argv reading one branch ref (404s when it does not exist).
-
-    Hits ``repos/<repo>/git/ref/heads/<branch>`` rather than ``gh pr``/``gh branch`` so a
-    missing branch is a clean 404 the adapter reads as "no branch", mirroring
-    :meth:`retinue.pr_opener.GhCliPrOps.staging_exists`.
-    """
+    """Assemble the ``gh api`` argv reading one branch ref (404s when it does not exist)."""
     return [
         "gh",
         "api",
@@ -435,11 +363,7 @@ def _branch_ref_argv(repo_full_name: str, branch: str) -> list[str]:
 
 
 def _open_pr_argv(repo_full_name: str, head: str) -> list[str]:
-    """Assemble the ``gh pr list`` argv for the open PRs with ``head`` as their branch.
-
-    Mirrors :func:`retinue.reconcile._staging_pr_argv` (``pr list --head ... --state open
-    --json number``); a non-empty array means an open PR already exists for the issue.
-    """
+    """Assemble the ``gh pr list`` argv for the open PRs with ``head`` as their branch."""
     return [
         "gh",
         "pr",
@@ -462,12 +386,7 @@ _ISSUE_BRANCH_PREFIX = "issue-"
 
 
 def _open_pr_heads_argv(repo_full_name: str, *, limit: int) -> list[str]:
-    """Assemble the ``gh pr list`` argv for every open PR's head branch (whole-repo).
-
-    One repo-wide query returning just ``headRefName`` for the open PRs, so the drain can
-    classify every candidate's in-flight state in memory rather than a ``gh pr list --head``
-    per issue.
-    """
+    """Assemble the ``gh pr list`` argv for every open PR's head branch (whole-repo)."""
     return [
         "gh",
         "pr",
@@ -545,19 +464,16 @@ def _parse_ready_issue(entry: object) -> ReadyIssue:
     return ReadyIssue(number=number, labels=labels, body=body)
 
 
-# The downstream the drain drives for each ranked ad-hoc issue: the ad-hoc build primitive
-# (:func:`retinue.adhoc_build.build_adhoc_issue`) followed by the PR step
-# (:meth:`retinue.pipeline.Pipeline.process_adhoc_pr`), behind one injected callable so the
-# drain is exercised without Docker, gh, the Agent SDK, or network. The drain hands it the
-# materialized :class:`~retinue.adhoc_build.AdhocIssue` (built through
-# ``from_fetched_issue``, so its ``chain_depth`` is live) and the repo name.
+# The downstream the drain drives for each selected issue: the build+PR primitive
+# (:func:`retinue.adhoc_build.build_adhoc_issue` followed by the PR step), behind one
+# injected callable so the drain is exercised without Docker, gh, the Agent SDK, or
+# network. The drain hands it the materialized :class:`~retinue.adhoc_build.AdhocIssue`
+# (built through ``from_fetched_issue``, so its ``chain_depth`` is live) and the repo name.
 AdhocBuild = Callable[..., Awaitable[None]]
 
 # The PR-open-only recovery the drain drives for a :attr:`FlightState.STRANDED` issue: open
 # the PR for an already-pushed (green) ``issue-<N>`` branch without rebuilding it. Same
-# ``(issue, *, repo_full_name) -> None`` shape as :data:`AdhocBuild`, injected and faked so
-# the drain runs with no gh or network; bound in production to the repo pipeline's
-# :meth:`retinue.pipeline.Pipeline.process_adhoc_pr` over a synthesized green result.
+# ``(issue, *, repo_full_name) -> None`` shape as :data:`AdhocBuild`, injected and faked.
 AdhocPrOpen = Callable[..., Awaitable[None]]
 
 
@@ -565,78 +481,75 @@ async def run_adhoc_drain(
     *,
     repo_full_name: str,
     gh: AdhocGh,
+    readiness_gh: ReadinessGh,
     build: AdhocBuild,
     open_pr: AdhocPrOpen,
     config: RepoConfig,
     governor: BudgetGovernor,
     estimated_amount: float,
     lock: AbstractAsyncContextManager[object],
-    prd_in_flight: bool = False,
 ) -> list[AdhocIssue]:
-    """Drain the repo's ad-hoc work, hardened for production: list, filter, classify, act.
+    """Drain the repo's scheduler work in one stateless pass: list, admit, rank, act.
 
     The whole drain runs under ``lock`` so two drains for the same repo never overlap (a
-    second entry raises :class:`AdhocDrainBusyError`); the lock is *separate* from the
-    orchestrator's, so the drain still runs concurrently with a PRD build. Inside the lock:
+    second entry raises :class:`AdhocDrainBusyError`). Inside the lock:
 
-    1. **list** the repo's open ``ready-for-agent`` issues (number, labels, body),
-    2. **filter** to the ad-hoc lane via :meth:`ReadyIssue.is_adhoc` — mirroring
-       :func:`retinue.lane.classify`'s ad-hoc decision (not calling it) — dropping any
-       ``prd``-labeled issue and any issue carrying a ``Part of #<prd>`` link,
-    3. **honor PRD-first ordering**: when ``prd_in_flight`` is True, only a
-       ``priority:critical``/``high`` issue (:meth:`ReadyIssue.preempts`, the same rule
-       :func:`retinue.lane.classify` preempts on) builds — ordinary ad-hoc work waits for
-       the PRD to finish,
-    4. **rank** the survivors by ``priority:<severity>`` (no-priority lowest),
-    5. **classify** each survivor against GitHub truth (:meth:`AdhocGh.flight_state`) and
+    1. **list** the repo's open ``config.trigger_label`` issues (number, labels, body),
+    2. **admit** via :meth:`ReadyIssue.is_admissible` — trigger label present, ``hitl``
+       absent,
+    3. **gate on readiness** — drop any issue with an open blocker (the union of body
+       ``## Blocked by #N`` refs and native GitHub relations,
+       :func:`retinue.readiness.resolve_ready`),
+    4. **classify** each ready survivor against GitHub truth (:class:`FlightState`) and
        partition: an in-flight issue (open PR) is skipped, a **stranded** one (pushed green
-       ``issue-<N>`` branch, no open PR) goes to the PR-open-only recovery, and the rest are
+       ``issue-<N>`` branch, no open PR) goes to the PR-open-only recovery, the rest are
        buildable,
-    6. **recover** every stranded issue by driving ``open_pr`` — opening the PR for its
-       already-green branch with **no rebuild** and no budget charge (opening a PR does no
-       model work), so a build whose PR-open step once failed is not stranded forever,
-    7. **build** each buildable survivor — materialized through
-       :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (so the ``Chain-depth:``
-       marker stays live) — concurrently but capped at ``config.max_parallel`` live builds,
-       each metered against the **one shared** :class:`~retinue.budget.BudgetGovernor` (the
-       same governor the PRD lane meters): a build that would cross the rolling-24h cap is
-       skipped, so the shared budget is never overshot.
+    5. **recover** every stranded issue by driving ``open_pr`` — opening the PR for its
+       already-green branch with **no rebuild** and no budget charge,
+    6. **rank + select** the buildable set through :func:`retinue.scheduler.select_to_build`
+       (``cap=config.max_parallel``): the priority queue drains first, the main queue holds
+       at most ``cap-1`` slots (the reserved priority slot) when the cap is ``>= 2``,
+    7. **build** each selected issue — materialized through
+       :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (so ``Chain-depth:`` stays
+       live) — concurrently, each metered against the **one shared**
+       :class:`~retinue.budget.BudgetGovernor`: a build that would cross the rolling-24h cap
+       is skipped, so the shared budget is never overshot.
 
     Args:
         repo_full_name: The target repo, e.g. ``"owner/repo"``.
-        gh: The ad-hoc gh seam (lists ``ready-for-agent`` issues; answers the flight-state
-            classification query).
-        build: The downstream ad-hoc build+PR primitive run per buildable issue, injected
-            so the drain runs with no Docker, gh, the Agent SDK, or network.
-        open_pr: The PR-open-only recovery run per stranded issue — opens the PR for an
-            already-green ``issue-<N>`` branch without rebuilding. Injected and faked too.
-        config: The accepted repo config; ``max_parallel`` bounds the concurrent builds.
-        governor: The shared service-level budget governor; each build is metered through
-            it and skipped when the rolling-24h cap leaves no room.
+        gh: The drain's gh seam (lists trigger-labeled issues; answers flight-state).
+        readiness_gh: The readiness gh seam (native blockers + issue closed-state).
+        build: The downstream build+PR primitive run per selected issue, injected so the
+            drain runs with no Docker, gh, the Agent SDK, or network.
+        open_pr: The PR-open-only recovery run per stranded issue.
+        config: The accepted repo config; ``trigger_label``, ``severity_tiers``,
+            ``priority_tiers``, and ``max_parallel`` govern admission, ranking, and the cap.
+        governor: The shared service-level budget governor; each build is metered through it.
         estimated_amount: The per-build charge metered against the shared cap.
         lock: The single-run lock; entering it raises :class:`AdhocDrainBusyError` when a
-            drain for this repo is already in flight. Separate from the PRD build's lock.
-        prd_in_flight: Whether a PRD build is currently running for this repo. When True,
-            PRD-first ordering holds and only preempting (``critical``/``high``) issues
-            build; when False, every ranked ad-hoc issue builds.
+            drain for this repo is already in flight.
 
     Returns:
         The :class:`~retinue.adhoc_build.AdhocIssue` objects actually driven through
-        ``build`` (in-flight-skipped, stranded, and budget-skipped issues excluded), in
-        rank order. Stranded issues whose PR was opened are not "built", so they are not
-        included.
+        ``build`` (blocked, in-flight-skipped, stranded, unselected, and budget-skipped
+        issues excluded), in scheduler rank order.
 
     Raises:
         AdhocDrainBusyError: A drain for this repo is already in flight (from the lock).
     """
     async with lock:
-        listed = await gh.list_ready(repo_full_name=repo_full_name)
-        candidates = _select_candidates(repo_full_name, prd_in_flight, listed)
-        plan = await _partition_candidates(repo_full_name, candidates, gh)
+        listed = await gh.list_ready(
+            repo_full_name=repo_full_name, label=config.trigger_label
+        )
+        admitted = [issue for issue in listed if issue.is_admissible(config)]
+        ready = await _filter_ready(repo_full_name, admitted, readiness_gh)
+        plan = await _partition_candidates(repo_full_name, ready, gh)
         await _open_stranded_prs(repo_full_name, plan.stranded, open_pr)
-        if not plan.buildable:
+
+        selected = _select_buildable(repo_full_name, config, plan.buildable)
+        if not selected:
             logger.info(
-                "Ad-hoc drain idle: no buildable ready-for-agent issues for %s "
+                "Scheduler drain idle: no buildable issues for %s "
                 "(%d stranded PR(s) recovered)",
                 repo_full_name,
                 len(plan.stranded),
@@ -644,14 +557,14 @@ async def run_adhoc_drain(
             return []
 
         logger.info(
-            "Ad-hoc drain building up to %d issue(s) for %s (cap=%s)",
-            len(plan.buildable),
+            "Scheduler drain building %d issue(s) for %s (cap=%s)",
+            len(selected),
             repo_full_name,
             config.max_parallel,
         )
         return await _build_metered(
             repo_full_name,
-            plan.buildable,
+            selected,
             build=build,
             config=config,
             governor=governor,
@@ -659,67 +572,87 @@ async def run_adhoc_drain(
         )
 
 
-def _select_candidates(
-    repo_full_name: str, prd_in_flight: bool, listed: list[ReadyIssue]
-) -> list[AdhocIssue]:
-    """Filter to the ad-hoc lane, honor PRD-first preemption, rank, and materialize.
+async def _filter_ready(
+    repo_full_name: str, issues: list[ReadyIssue], readiness_gh: ReadinessGh
+) -> list[ReadyIssue]:
+    """Keep only the issues whose every blocker is closed, preserving list order.
 
-    Drops non-ad-hoc issues, then — when a PRD is in flight — keeps only the preempting
-    (``critical``/``high``) issues so PRD-first ordering holds. The survivors are ranked
-    and materialized through :meth:`AdhocIssue.from_fetched_issue` so each one's
+    Delegates to :func:`retinue.readiness.resolve_ready` — the union of body ``## Blocked
+    by`` refs and native GitHub relations — so a blocked issue is invisible this pass.
+    """
+    ready_numbers = await resolve_ready(
+        [BlockableIssue(number=issue.number, body=issue.body) for issue in issues],
+        repo_full_name=repo_full_name,
+        gh=readiness_gh,
+    )
+    return [issue for issue in issues if issue.number in ready_numbers]
+
+
+def _select_buildable(
+    repo_full_name: str, config: RepoConfig, buildable: list[ReadyIssue]
+) -> list[AdhocIssue]:
+    """Rank the buildable set and pick this pass's builds, then materialize each issue.
+
+    Runs the pure two-queue scheduler (:func:`retinue.scheduler.select_to_build`) over the
+    buildable candidates with ``cap=config.max_parallel``: the priority queue drains first,
+    the main queue holds at most ``cap-1`` slots (the reserved priority slot). Each selected
+    issue is materialized through :meth:`AdhocIssue.from_fetched_issue` so its
     ``chain_depth`` is read back from its body.
     """
-    adhoc = [issue for issue in listed if issue.is_adhoc()]
-    if prd_in_flight:
-        adhoc = [issue for issue in adhoc if issue.preempts()]
+    by_number = {issue.number: issue for issue in buildable}
+    chosen = select_to_build(
+        config,
+        [Candidate(number=issue.number, labels=issue.labels) for issue in buildable],
+        cap=config.max_parallel,
+    )
     return [
-        AdhocIssue.from_fetched_issue(repo_full_name, ready.number, ready.body)
-        for ready in _rank_adhoc(adhoc)
+        AdhocIssue.from_fetched_issue(
+            repo_full_name, c.number, by_number[c.number].body
+        )
+        for c in chosen
     ]
 
 
 @dataclass(frozen=True)
 class _DrainPlan:
-    """How the drain will act on its ranked candidates, partitioned by flight state.
+    """How the drain will act on its ready candidates, partitioned by flight state.
 
     Attributes:
-        buildable: :attr:`FlightState.ABSENT` issues — nothing built yet, so build them
-            (metered against the shared budget). In rank order.
+        buildable: :attr:`FlightState.ABSENT` issues — nothing built yet, so rank + build
+            them (metered against the shared budget).
         stranded: :attr:`FlightState.STRANDED` issues — a green branch with no open PR, so
-            open the PR without rebuilding (no budget charge). In rank order.
+            open the PR without rebuilding (no budget charge).
     """
 
-    buildable: list[AdhocIssue]
-    stranded: list[AdhocIssue]
+    buildable: list[ReadyIssue]
+    stranded: list[ReadyIssue]
 
 
 async def _partition_candidates(
-    repo_full_name: str, issues: list[AdhocIssue], gh: AdhocGh
+    repo_full_name: str, issues: list[ReadyIssue], gh: AdhocGh
 ) -> _DrainPlan:
-    """Classify each candidate against GitHub truth and split build vs PR-open recovery.
+    """Classify each ready candidate against GitHub truth and split build vs PR-open.
 
-    Mirrors the reconcile-style GitHub-truth source of truth (:meth:`AdhocGh.flight_state`):
-    an :attr:`~FlightState.IN_FLIGHT` issue (open PR) is dropped so the drain opens no
+    An :attr:`~FlightState.IN_FLIGHT` issue (open PR) is dropped so the drain opens no
     duplicate; a :attr:`~FlightState.STRANDED` issue (pushed green branch, no PR) routes to
-    the PR-open-only recovery rather than a wasteful rebuild; the rest are buildable. Rank
-    order is preserved within each bucket.
+    the PR-open-only recovery rather than a wasteful rebuild; the rest are buildable.
     """
     states = await _flight_states(repo_full_name, issues, gh)
-    buildable: list[AdhocIssue] = []
-    stranded: list[AdhocIssue] = []
+    buildable: list[ReadyIssue] = []
+    stranded: list[ReadyIssue] = []
     for issue in issues:
-        state = states[issue.issue_number]
+        state = states[issue.number]
         if state is FlightState.IN_FLIGHT:
             logger.info(
-                "Ad-hoc drain skipping issue #%d (%s): already in flight",
-                issue.issue_number,
+                "Scheduler drain skipping issue #%d (%s): already in flight",
+                issue.number,
                 repo_full_name,
             )
         elif state is FlightState.STRANDED:
             logger.info(
-                "Ad-hoc drain recovering issue #%d (%s): green branch with no PR; "
+                "Scheduler drain recovering issue #%d (%s): green branch with no PR; "
                 "opening its PR without rebuilding",
-                issue.issue_number,
+                issue.number,
                 repo_full_name,
             )
             stranded.append(issue)
@@ -729,40 +662,43 @@ async def _partition_candidates(
 
 
 async def _flight_states(
-    repo_full_name: str, issues: list[AdhocIssue], gh: AdhocGh
+    repo_full_name: str, issues: list[ReadyIssue], gh: AdhocGh
 ) -> dict[int, FlightState]:
     """Resolve each candidate's :class:`FlightState`, preferring one whole-repo query.
 
     A seam that supports the whole-repo :class:`FlightSnapshot` (the production
-    :class:`GhCli`) is queried once and every candidate is classified in memory — two ``gh``
-    queries total rather than up to two subprocess spawns per issue. A seam offering only the
-    per-issue :meth:`AdhocGh.flight_state` (a minimal fake) is classified one issue at a
+    :class:`GhCli`) is queried once and every candidate is classified in memory. A seam
+    offering only the per-issue :meth:`AdhocGh.flight_state` is classified one issue at a
     time. Both paths yield the identical verdicts.
     """
     if isinstance(gh, SupportsFlightSnapshot):
         snapshot = await gh.flight_snapshot(repo_full_name=repo_full_name)
         return {
-            issue.issue_number: snapshot.state_for(issue.issue_number)
-            for issue in issues
+            issue.number: snapshot.state_for(issue.number) for issue in issues
         }
     return {
-        issue.issue_number: await gh.flight_state(
-            repo_full_name=repo_full_name, issue_number=issue.issue_number
+        issue.number: await gh.flight_state(
+            repo_full_name=repo_full_name, issue_number=issue.number
         )
         for issue in issues
     }
 
 
 async def _open_stranded_prs(
-    repo_full_name: str, stranded: list[AdhocIssue], open_pr: AdhocPrOpen
+    repo_full_name: str, stranded: list[ReadyIssue], open_pr: AdhocPrOpen
 ) -> None:
-    """Open the PR for each stranded green branch, in rank order, without rebuilding.
+    """Open the PR for each stranded green branch, without rebuilding.
 
     Opening a PR for an already-green branch does no model work, so it is not metered
     against the shared budget — a stranded build is recovered even when the cap is spent.
+    Each issue is materialized through :meth:`AdhocIssue.from_fetched_issue` so a recovered
+    review-fix issue keeps its ``Chain-depth:`` lineage.
     """
     for issue in stranded:
-        await open_pr(issue, repo_full_name=repo_full_name)
+        materialized = AdhocIssue.from_fetched_issue(
+            repo_full_name, issue.number, issue.body
+        )
+        await open_pr(materialized, repo_full_name=repo_full_name)
 
 
 async def _build_metered(
@@ -774,12 +710,13 @@ async def _build_metered(
     governor: BudgetGovernor,
     estimated_amount: float,
 ) -> list[AdhocIssue]:
-    """Build the issues concurrently (capped), each metered against the shared budget.
+    """Build the selected issues concurrently, each metered against the shared budget.
 
-    Every build first meters its charge against the one shared
-    :class:`~retinue.budget.BudgetGovernor` (the same governor the PRD lane uses); a build
-    that would cross the rolling-24h cap is skipped, so the shared budget is never
-    overshot. Returns the issues that actually built, in rank order.
+    The scheduler has already capped the selection to ``config.max_parallel`` (with the
+    reserved priority slot), so all selected issues build concurrently; a semaphore keeps
+    the concurrency bounded as a belt-and-braces guard. Every build first meters its charge
+    against the one shared :class:`~retinue.budget.BudgetGovernor`; a build that would cross
+    the rolling-24h cap is skipped. Returns the issues that actually built, in rank order.
     """
     semaphore = asyncio.Semaphore(config.max_parallel or len(issues))
     built: set[AdhocIssue] = set()
@@ -788,7 +725,7 @@ async def _build_metered(
         async with semaphore:
             if not await governor.meter_adhoc(amount=estimated_amount):
                 logger.info(
-                    "Ad-hoc drain skipping issue #%d (%s): shared budget spent",
+                    "Scheduler drain skipping issue #%d (%s): shared budget spent",
                     issue.issue_number,
                     repo_full_name,
                 )
@@ -799,24 +736,3 @@ async def _build_metered(
     await asyncio.gather(*(build_one(issue) for issue in issues))
     # Return in rank order (``issues``); a set membership test keeps the filter O(n).
     return [issue for issue in issues if issue in built]
-
-
-# A no-priority issue ranks below every labeled severity, so its rank key sits one step
-# under the lowest :class:`~retinue.vocab.Severity` (``LOW``). An unknown ``priority:*``
-# value parses to ``None`` too (:meth:`retinue.lane.IssueFacts.priority`), so it lands here.
-_NO_PRIORITY_RANK = Severity.LOW - 1
-
-
-def _rank_adhoc(issues: list[ReadyIssue]) -> list[ReadyIssue]:
-    """Rank ad-hoc issues by ``priority:<severity>`` (no-priority lowest), stable on number.
-
-    A more severe issue ranks first; a no-priority issue (or an unknown ``priority:*``
-    value) ranks lowest. Ties are broken by ascending issue number so the order is
-    deterministic across runs.
-    """
-
-    def rank_key(issue: ReadyIssue) -> tuple[int, int]:
-        severity = issue.severity()
-        return (-(severity.value if severity is not None else _NO_PRIORITY_RANK), issue.number)
-
-    return sorted(issues, key=rank_key)

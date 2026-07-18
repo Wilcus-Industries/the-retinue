@@ -17,20 +17,31 @@ uv run ruff check .
 uv run mypy .
 ```
 
-## Heimdall staging-PR review loop
+## The scheduler + in-session review gate
 
-Every `retinue/prd-<n>` → staging PR is reviewed by heimdall; the retinue **awaits and
-acts on** that verdict (`retinue/loopback.py`):
+There is **one** unified scheduler lane (no PRD lane, no heimdall loopback — both deleted).
+The scheduler drain (`retinue/adhoc_drain.py`) lists `trigger_label` issues, gates each on
+blocked-by readiness (`retinue/readiness.py`), and ranks the ready set by the two-queue
+severity + reserved-priority-slot scheduler (`retinue/scheduler.py`). Each admitted issue
+builds directly on its own `issue-<N>` branch in one disposable container
+(`retinue/adhoc_build.py`): plan → implement → done-check → push-on-green.
 
-- **Passed** (APPROVED, or a verdict-carrying COMMENT — heimdall never approves: its
-  clean pass is the "no concerns" COMMENT, nits-only reviews are COMMENTED too): findings
-  are filed as `backlog` + `priority:<severity>` issues, then the PR proceeds to
-  reap/handoff. A verdict-less COMMENT (heimdall's "review failed" note) is ignored.
-- **Changes requested**: each blocking finding becomes a fix-issue (`ready-for-agent`,
-  `Part of #<prd>`) rebuilt onto the **same** PR branch, re-triggering heimdall review —
-  looped up to `retry_cap` rounds (count persisted, survives a worker restart).
-- **Round cap exhausted while still blocked**: escalate — comment the PRD, apply `hitl`,
-  push-notify, and leave the PR open for a human.
+After the green push, the **in-session review gate** (`_run_review_gate`, `adhoc_build.py`)
+runs the internal reviewer (`retinue/reviewer.py`, Opus) over the `issue-<N>` diff, then:
+
+- **findings** → one critique-and-fix pass by the same implementer in the same container,
+  the done-check re-runs, and — only if still green — the branch is re-pushed and the
+  reviewer runs again. A fix pass that turns the done-check red is a **regression**
+  (blocking; the red fix is not pushed).
+- surviving findings are **partitioned by severity** (`Severity.HIGH` threshold):
+  - **blocking** (≥ HIGH, or a regression) → escalate: one `hitl` notification (push +
+    comment + label), **no PR** (green branch left pushed for a human);
+  - **backlog** (< HIGH) → filed as `backlog` + `priority:<severity>` issues, then the PR
+    opens.
+
+The **cron lane** (`retinue/cron.py`) trickles the backlog back in: each tick promotes the
+top-severity `backlog` issue into the scheduler queue by label surgery (add `trigger_label`,
+remove `backlog`) — the real build stays with the scheduler.
 
 ## Keep these docs current
 

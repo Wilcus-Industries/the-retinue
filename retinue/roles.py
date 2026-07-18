@@ -1,7 +1,7 @@
 """The agent-role registry: one table owning every agent role's model and effort.
 
-The retinue runs six agent roles — the PRD :class:`~retinue.slicer.ClaudeSliceGenerator`,
-the :class:`~retinue.orchestrator.ContainerImplementer`, the conflict resolver
+The retinue runs six agent roles — the PRD slicer, the
+:class:`~retinue.container_build.ContainerImplementer`, the conflict resolver
 (a :data:`Role.RESOLVER` registry entry with no production adapter yet), the internal
 :class:`~retinue.reviewer.AgentSdkReviewGenerator`, the read-only ``planner`` (Opus
 on the in-container CLI, run with no write/edit/commit capability — it maps the code via

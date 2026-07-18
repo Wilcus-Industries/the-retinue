@@ -1,24 +1,23 @@
-"""Cron backlog drainer: drain loose ``backlog`` issues one at a time (issue #15).
+"""Cron backlog drainer: pick loose ``backlog`` issues one at a time (issue #15).
 
-A scheduled lane drains the loose ``backlog`` issues — the non-blocking heimdall nits
-filed by :mod:`retinue.loopback` — one per tick, alongside the orchestrator's PRD builds.
-The :mod:`retinue.lane` classifier routes work between the two lanes; this module is the
-cron lane's per-tick driver.
+A scheduled lane sweeps the loose ``backlog`` issues one per tick, alongside the
+scheduler drain. This module is the cron lane's per-tick driver.
 
 Each :func:`run_cron_tick`:
 
 1. runs under an injected single-run **lock** so at most one cron run executes at a time,
-   mirroring the orchestrator's single-run lock;
+   mirroring the scheduler drain's single-run lock;
 2. **gates** on the shared :class:`retinue.budget.BudgetGovernor` — the *same*
-   service-level governor the orchestrator shares — and **defers** when the budget is
+   service-level governor the scheduler lane shares — and **defers** when the budget is
    spent, picking nothing and running no downstream; an admitted tick's estimate is
    charged to the shared ledger at the gate (an empty backlog is checked first, so an
    idle tick never charges);
 3. **picks** the next backlog issue by a weighted score (priority + age), except on every
    ``quota_every``-th tick where a **quota floor** takes the oldest low-priority issue so
    the low items provably drain rather than starving behind a steady high-priority stream;
-4. runs the same downstream the orchestrator drives (build -> PR -> heimdall loopback ->
-   notify) via a single injected :data:`CronBuild` callable.
+4. runs its downstream via a single injected :data:`CronBuild` callable — WS1's backlog job
+   is the *trickle promotion*: :class:`GhCliBacklogPromoter` swaps ``backlog`` for the
+   repo's trigger label in one ``gh issue edit`` so the nit re-enters the scheduler queue.
 
 The clock is injected (:class:`retinue.budget.Clock`) for age-weighting and the tick
 counter is passed in, so nothing reads the wall clock. The gh backlog query, the budget
@@ -37,17 +36,7 @@ from datetime import datetime, timedelta
 from typing import Protocol
 
 from retinue.budget import BudgetGovernor, Clock
-from retinue.container import ContainerRuntime
-from retinue.container_build import Implementer, Slice
-from retinue.done_check import DEFAULT_IMAGE, ReportSink, SecretResolver
 from retinue.gh import GhBytesRunner, auth_env, parse_json_array, run_gh_subprocess
-from retinue.github_app import InstallationAuth
-from retinue.orchestrator import (
-    BuildResult,
-    GitOps,
-    build_slice,
-)
-from retinue.repo_config import RepoConfig
 from retinue.single_run import SingleRunLock
 from retinue.vocab import BACKLOG_LABEL, Severity, parse_priority
 
@@ -230,127 +219,86 @@ def _parse_timestamp(raw: str) -> datetime:
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
-# The downstream a cron tick drives for the picked issue: the same build -> PR ->
-# heimdall loopback -> notify chain the orchestrator runs, behind one injected callable so
-# the tick is exercised without Docker, gh, or network. Production wires it to the
-# orchestrator build + pr_opener + loopback + handoff chain.
+# The downstream a cron tick drives for the picked issue, behind one injected callable so
+# the tick is exercised without gh or network. WS1's backlog cron job is the *trickle
+# promotion*: a single ``gh issue edit`` that swaps ``backlog`` for the repo's trigger label
+# so the promoted nit re-enters the scheduler queue as ordinary trigger-labeled work. The
+# production bind wires :class:`GhCliBacklogPromoter` here (see
+# :func:`retinue.wiring.bind_cron_tick`).
 CronBuild = Callable[..., Awaitable[None]]
 
 
-# A loose backlog nit has no parent PRD — it is filed standalone by the heimdall loopback.
-# The cron lane drains each onto its own integration target so a nit's build never collides
-# with another's; the per-issue PRD number is the issue number itself, giving the dedicated
-# integration branch ``retinue/prd-<issue>`` (see :func:`retinue.orchestrator.integration_branch`).
-def _slice_for_backlog_issue(repo_full_name: str, issue_number: int) -> Slice:
-    """Assemble the standalone :class:`Slice` the cron lane builds for a backlog nit.
+def _promote_argv(
+    repo_full_name: str, issue_number: int, *, trigger_label: str
+) -> list[str]:
+    """Assemble the ``gh issue edit`` argv that promotes a backlog issue in one edit.
 
-    A loose backlog issue carries no parent PRD, so it drains onto its own integration
-    target: the per-issue PRD number is the issue number itself, yielding the dedicated
-    integration branch ``retinue/prd-<issue>``. The assembly is pure — no gh, Docker, or
-    network — so it is unit-testable in isolation.
+    Adds the repo's ``trigger_label`` and removes :data:`~retinue.vocab.BACKLOG_LABEL` on
+    the same edit, so the promotion is one atomic GitHub mutation (with an audit trail on
+    the issue's event log) that hands the nit to the scheduler drain as trigger-labeled work.
     """
-    return Slice(
-        repo_full_name=repo_full_name,
-        issue_number=issue_number,
-        prd_number=issue_number,
-    )
+    return [
+        "gh",
+        "issue",
+        "edit",
+        str(issue_number),
+        "--repo",
+        repo_full_name,
+        "--add-label",
+        trigger_label,
+        "--remove-label",
+        BACKLOG_LABEL,
+    ]
 
 
-# The side-effecting build of one assembled slice: the orchestrator's spawn -> done-check
-# -> merge chain (:func:`retinue.orchestrator.build_slice`). Injected so the slice
-# assembly + downstream wiring of :class:`SliceBuilder` are exercised without the Agent
-# SDK, Docker, gh, or network, mirroring the injected-runner style of :class:`GhCli`. The
-# default (:func:`_run_build_slice`) calls the real orchestrator.
-SliceRunner = Callable[[Slice], Awaitable[BuildResult]]
+class GhCliBacklogPromoter:
+    """The production :data:`CronBuild`: trickle-promote a backlog issue via label surgery.
 
+    A cron tick picks the top-severity backlog issue and hands it here; :meth:`promote`
+    swaps ``backlog`` for the repo's ``trigger_label`` in a single ``gh issue edit`` so the
+    promoted issue re-enters the scheduler drain's queue as ordinary trigger-labeled work
+    (the next heartbeat sweep, or a webhook kick on the label event, picks it up). No
+    container build runs in the cron lane — the promotion is pure label surgery, leaving the
+    real build to the unified scheduler.
 
-class SliceBuilder:
-    """The production :class:`CronBuild`: drains one backlog nit through ``build_slice``.
-
-    Each cron tick hands this the picked backlog ``issue_number``; the builder assembles
-    the standalone :class:`Slice` for it (:func:`_slice_for_backlog_issue`) and drives the
-    same downstream the orchestrator runs — spawn the implementer, gate on the done-check,
-    merge the green branch — via :func:`retinue.orchestrator.build_slice`.
-
-    All of that downstream's side-effecting collaborators (implementer, git, auth,
-    container runtime, secret resolver, report sink) are carried here and threaded into a
-    single injected ``runner``, so the cron-side decision and slice assembly are
-    unit-testable without the Agent SDK, Docker, gh, or network. Production leaves
-    ``runner`` defaulted to :func:`_run_build_slice`, which calls the real orchestrator
-    with the carried collaborators.
+    The subprocess spawn is the one impure edge, factored behind the injected ``runner`` so
+    the argv assembly and auth env are unit-testable without a real ``gh``, Docker, or
+    network. Production leaves ``runner`` defaulted to :func:`retinue.gh.run_gh_subprocess`.
 
     Args:
-        config: The accepted repo config (its ``staging_branch`` bases a new integration
-            branch, its ``secrets`` feed the done-check).
-        claude_md: The repo's ``CLAUDE.md`` text carrying the done-check command.
-        implementer: The Agent SDK seam that builds the slice on its ``issue-<N>`` branch.
-        git: The integration-branch git operations (the merge seam).
-        auth: Mints the installation token used to clone (the auth seam).
-        runtime: Spawns the disposable container the done-check runs in (Docker seam).
-        resolve_secret: Resolves the config's declared secret names/refs to values.
-        report: Sink the done-check outcome is posted to.
-        image: Container image the done-check runs in.
-        runner: The injected slice runner; defaults to the real ``build_slice`` call.
+        trigger_label: The repo's "build me" trigger label (``config.trigger_label``) the
+            promotion applies.
+        token: The GitHub token ``gh`` authenticates with, placed in the child env as
+            ``GH_TOKEN`` (``None`` runs ``gh`` with ambient auth).
+        runner: The injected argv runner; defaults to the real subprocess spawn.
     """
 
     def __init__(
         self,
         *,
-        config: RepoConfig,
-        claude_md: str,
-        implementer: Implementer,
-        git: GitOps,
-        auth: InstallationAuth,
-        runtime: ContainerRuntime,
-        resolve_secret: SecretResolver,
-        report: ReportSink,
-        image: str = DEFAULT_IMAGE,
-        runner: SliceRunner | None = None,
+        trigger_label: str,
+        token: str | None = None,
+        runner: GhBytesRunner | None = None,
     ) -> None:
-        self._config = config
-        self._claude_md = claude_md
-        self._implementer = implementer
-        self._git = git
-        self._auth = auth
-        self._runtime = runtime
-        self._resolve_secret = resolve_secret
-        self._report = report
-        self._image = image
-        self._runner = runner or self._default_runner
+        self._trigger_label = trigger_label
+        self._token = token
+        self._runner = runner or run_gh_subprocess
 
-    async def __call__(self, *, repo_full_name: str, issue_number: int) -> None:
-        """Drain one backlog nit: assemble its slice and run the orchestrator downstream.
+    async def promote(self, *, repo_full_name: str, issue_number: int) -> None:
+        """Promote ``issue_number`` into the scheduler queue via one ``gh issue edit``.
 
-        Matches the :data:`CronBuild` protocol invoked by :func:`run_cron_tick`. Assembles
-        the standalone slice for ``issue_number`` and hands it to the injected runner; the
-        tick does not read a return value, it gates on the budget governor up front.
+        Raises:
+            GhCliError: ``gh`` exited non-zero (propagated from the runner).
         """
-        slice_ = _slice_for_backlog_issue(repo_full_name, issue_number)
-        result = await self._runner(slice_)
-        logger.info(
-            "Cron drained backlog issue #%d -> %s (%s)",
-            issue_number,
-            result.outcome.value,
-            result.integration_branch,
+        argv = _promote_argv(
+            repo_full_name, issue_number, trigger_label=self._trigger_label
         )
-
-    async def _default_runner(self, slice_: Slice) -> BuildResult:
-        """Run the real orchestrator ``build_slice`` for ``slice_`` with the carried deps.
-
-        The one impure edge, factored behind the :data:`SliceRunner` seam so the assembly
-        above is testable without it.
-        """
-        return await build_slice(
-            slice_,
-            self._config,
-            self._claude_md,
-            implementer=self._implementer,
-            git=self._git,
-            auth=self._auth,
-            runtime=self._runtime,
-            resolve_secret=self._resolve_secret,
-            report=self._report,
-            image=self._image,
+        await self._runner(argv, auth_env(self._token))
+        logger.info(
+            "Cron promoted backlog issue #%d (%s) to %r",
+            issue_number,
+            repo_full_name,
+            self._trigger_label,
         )
 
 

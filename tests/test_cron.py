@@ -25,23 +25,19 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
-from retinue.container_build import Slice
 from retinue.cron import (
     BacklogIssue,
     CronBusyError,
     CronOutcome,
     CronTickResult,
     GhCli,
-    SliceBuilder,
+    GhCliBacklogPromoter,
     run_cron_tick,
 )
-from retinue.orchestrator import BuildOutcome, BuildResult, integration_branch
-from retinue.repo_config import RepoConfig
 from retinue.vocab import Severity
 from tests.fakes import CLOCK_DEFAULT, FakeClock
 
@@ -478,99 +474,76 @@ async def test_ghcli_rejects_a_malformed_issue_entry() -> None:
         await gh.list_backlog(repo_full_name="owner/repo")
 
 
-# --- real SliceBuilder (CronBuild): slice assembly + downstream wiring -------------
-#
-# The production CronBuild assembles the standalone Slice for the picked backlog nit and
-# drives the orchestrator's build_slice downstream. These exercise that assembly + the
-# decision (which integration target a loose nit drains onto) through an injected slice
-# runner — no Agent SDK, Docker, gh, or network. The runner captures the assembled Slice
-# and returns a canned BuildResult, so the slice it builds is asserted directly.
+# --- GhCliBacklogPromoter: the trickle promotion (label surgery) -------------------
 
 
-class CapturingSliceRunner:
-    """Records the assembled Slice it was handed and returns a canned BuildResult."""
+@pytest.mark.asyncio
+async def test_promoter_swaps_backlog_for_the_trigger_label_in_one_edit() -> None:
+    """The promotion adds the trigger label and removes ``backlog`` in one gh issue edit."""
+    runner = CapturingGhRunner()
+    promoter = GhCliBacklogPromoter(trigger_label="ready-for-agent", token="t0ken", runner=runner)
 
-    def __init__(self, result: BuildResult | None = None) -> None:
-        self._result = result or BuildResult(
-            outcome=BuildOutcome.MERGED, integration_branch="retinue/prd-0"
-        )
-        self.slices: list[Slice] = []
+    await promoter.promote(repo_full_name="owner/repo", issue_number=42)
 
-    async def __call__(self, slice_: Slice) -> BuildResult:
-        self.slices.append(slice_)
-        return self._result
+    argv = list(runner.argv or [])
+    assert argv[:3] == ["gh", "issue", "edit"]
+    assert argv[3] == "42"
+    assert "--repo" in argv and argv[argv.index("--repo") + 1] == "owner/repo"
+    assert argv[argv.index("--add-label") + 1] == "ready-for-agent"
+    assert argv[argv.index("--remove-label") + 1] == "backlog"
 
 
-def _slice_builder(runner: CapturingSliceRunner) -> SliceBuilder:
-    """A SliceBuilder whose downstream is the injected runner.
+@pytest.mark.asyncio
+async def test_promoter_applies_a_repos_custom_trigger_label() -> None:
+    """A repo that overrides ``trigger_label`` promotes onto that label, not the default."""
+    runner = CapturingGhRunner()
+    promoter = GhCliBacklogPromoter(trigger_label="build-me", token="t", runner=runner)
 
-    The orchestrator collaborators are inert sentinels: with ``runner`` injected the real
-    ``build_slice`` edge is never touched, so the test stays free of the Agent SDK,
-    Docker, gh, and network.
+    await promoter.promote(repo_full_name="owner/repo", issue_number=7)
+
+    argv = list(runner.argv or [])
+    assert argv[argv.index("--add-label") + 1] == "build-me"
+
+
+@pytest.mark.asyncio
+async def test_promoter_puts_the_token_in_the_env_not_the_argv() -> None:
+    """The token authenticates via GH_TOKEN in the child env, never on the command line."""
+    runner = CapturingGhRunner()
+    promoter = GhCliBacklogPromoter(trigger_label="ready-for-agent", token="s3cret", runner=runner)
+
+    await promoter.promote(repo_full_name="owner/repo", issue_number=42)
+
+    assert (runner.env or {}).get("GH_TOKEN") == "s3cret"
+    assert "s3cret" not in list(runner.argv or [])
+
+
+@pytest.mark.asyncio
+async def test_cron_tick_promotes_the_picked_issue_through_the_promoter(
+    tmp_path: Path,
+) -> None:
+    """End to end: an admitted tick hands the picked issue to the promoter downstream.
+
+    Wiring the real :class:`GhCliBacklogPromoter` (over a capturing runner) as the tick's
+    downstream ``build`` proves the picked backlog issue is promoted via label surgery —
+    the cron lane's whole job under the severity pivot.
     """
-    sentinel = cast(Any, object())
-    return SliceBuilder(
-        config=RepoConfig(),
-        claude_md="# CLAUDE.md",
-        implementer=sentinel,
-        git=sentinel,
-        auth=sentinel,
-        runtime=sentinel,
-        resolve_secret=sentinel,
-        report=sentinel,
-        runner=runner,
+    clock = FakeClock()
+    runner = CapturingGhRunner()
+    promoter = GhCliBacklogPromoter(trigger_label="ready-for-agent", token="t", runner=runner)
+    issue = BacklogIssue(
+        number=88, labels=["backlog", "priority:high"], created_at=CLOCK_DEFAULT
     )
 
-
-@pytest.mark.asyncio
-async def test_slice_builder_assembles_a_slice_for_the_backlog_issue() -> None:
-    """The builder turns the picked backlog issue into a Slice for that repo + issue."""
-    runner = CapturingSliceRunner()
-    build = _slice_builder(runner)
-
-    await build(repo_full_name="owner/repo", issue_number=42)
-
-    assert len(runner.slices) == 1
-    built = runner.slices[0]
-    assert built.repo_full_name == "owner/repo"
-    assert built.issue_number == 42
-
-
-@pytest.mark.asyncio
-async def test_slice_builder_drains_a_loose_nit_onto_its_own_integration_branch() -> None:
-    """A loose nit has no parent PRD, so it drains onto ``retinue/prd-<issue>``."""
-    runner = CapturingSliceRunner()
-    build = _slice_builder(runner)
-
-    await build(repo_full_name="owner/repo", issue_number=42)
-
-    built = runner.slices[0]
-    # The per-issue PRD number is the issue number, giving a dedicated integration target.
-    assert built.prd_number == 42
-    assert integration_branch(built.prd_number) == "retinue/prd-42"
-    # The implementer commits to the issue-<N> branch derived from the issue number.
-    assert built.branch == "issue-42"
-
-
-@pytest.mark.asyncio
-async def test_slice_builder_satisfies_the_cron_build_protocol(tmp_path: Path) -> None:
-    """The builder is a drop-in CronBuild: run_cron_tick drives it end to end."""
-    runner = CapturingSliceRunner()
-    build = _slice_builder(runner)
-    clock = FakeClock()
-
-    result = await run_cron_tick(
-        repo_full_name="owner/repo",
-        gh=FakeCronGh([_issue(7, priority="high", age_days=1)]),
+    result = await _tick(
+        gh=FakeCronGh([issue]),
         governor=_governor(tmp_path, clock),
         clock=clock,
-        build=build,
-        tick_number=1,
-        estimated_amount=1.0,
-        lock=OneAtATimeLock(),
+        build=promoter.promote,  # type: ignore[arg-type]  # structural CronBuild
     )
 
     assert result.outcome is CronOutcome.RAN
-    assert result.issue_number == 7
-    # The tick drove the real builder, which assembled and ran the slice for issue 7.
-    assert [s.issue_number for s in runner.slices] == [7]
+    assert result.issue_number == 88
+    # The picked issue was promoted via a single gh issue edit.
+    argv = list(runner.argv or [])
+    assert argv[:4] == ["gh", "issue", "edit", "88"]
+    assert argv[argv.index("--add-label") + 1] == "ready-for-agent"

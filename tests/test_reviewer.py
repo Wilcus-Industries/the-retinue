@@ -1,57 +1,34 @@
-"""Tests for the internal reviewer (issue #9).
+"""Tests for the internal reviewer (issue #9, reshaped for the #80 review gate).
 
-After a round's merge, the reviewer reads the round's merged diff and merged issue
-numbers, runs the injected Agent-SDK review seam, and for each genuine finding files
-a ``review-fix`` follow-up issue (``ready-for-agent`` + ``Part of #<prd>``) and wires
-it into the ``## Blocked by`` of the relevant dependent open issues so the fix builds
-before the work layered on it. The reviewer never edits code.
+The reviewer is the headless Agent-SDK seam the ad-hoc build's review gate runs over one
+freshly-built ``issue-<N>`` diff. It reads the diff, runs the injected review generator,
+and returns a :class:`ReviewPlan` of :class:`ReviewFinding`, each carrying a
+:class:`~retinue.vocab.Severity`. The reviewer itself files, wires, and edits nothing —
+the gate partitions and acts on the findings.
 
-The three side-effecting seams are faked: the review generator (Agent SDK), the gh
-issue creator (reused from the slicer), and the gh issue-body editor (the Blocked-by
-wiring). A clean diff files nothing. A filed review-fix issue is also fed back into
-``build_prd`` to prove it is picked up and built in a subsequent round. No real Agent
-SDK, gh, or network is touched.
+The one side-effecting seam — the HTTP transport — is faked, so the pure/parseable parts
+(header build, payload assembly, response parsing) are exercised with no network.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from retinue.gh import GhCommandError, GhResult
 from retinue.messages_api import HttpResponse
-from retinue.orchestrator import PrdBuildResult, PrdSlice, build_prd
-from retinue.repo_config import RepoConfig
 from retinue.reviewer import (
     _REVIEW_SYSTEM,
     AgentSdkReviewGenerator,
-    EditBlockedByRequest,
-    GhCliBlockedByEditor,
     ReviewFinding,
     ReviewGenerationError,
     ReviewInput,
     ReviewPlan,
-    ReviewResult,
-    add_blocked_by,
-    review_round,
 )
 from retinue.roles import CLAUDE_CODE_IDENTITY, EFFORT_MAX
-from retinue.slicer import CreatedIssue, IssueDraft
-from tests.fakes import (
-    CLAUDE_MD,
-    FakeAuth,
-    FakeGitOps,
-    FakeImplementer,
-    FakeRuntime,
-    OneAtATimeLock,
-    _resolver,
-    _sink,
-)
+from retinue.vocab import Severity
 
-PRD_NUMBER = 1
+ISSUE_NUMBER = 17
 REPO = "owner/repo"
 
-# A merged round: issues #2 and #3 were merged; #3 was built on top of #2's work.
-MERGED_ISSUES = [2, 3]
 PLANTED_DEFECT_DIFF = """\
 diff --git a/retinue/widget.py b/retinue/widget.py
 +def total(items):
@@ -64,157 +41,8 @@ diff --git a/retinue/widget.py b/retinue/widget.py
 """
 
 
-class _Recorder:
-    """Captures filed review-fix issues and Blocked-by edits for assertions."""
-
-    def __init__(self) -> None:
-        self.created: list[IssueDraft] = []
-        self.edits: list[EditBlockedByRequest] = []
-        self._next_number = 200
-
-    async def create_issue(self, draft: IssueDraft) -> CreatedIssue:
-        self._next_number += 1
-        self.created.append(draft)
-        return CreatedIssue(issue_number=self._next_number)
-
-    async def edit_blocked_by(self, request: EditBlockedByRequest) -> None:
-        self.edits.append(request)
-
-
 def _input(diff: str) -> ReviewInput:
-    return ReviewInput(
-        repo_full_name=REPO,
-        prd_number=PRD_NUMBER,
-        merged_issues=list(MERGED_ISSUES),
-        diff=diff,
-    )
-
-
-@pytest.mark.asyncio
-async def test_planted_defect_files_review_fix_with_labels_and_wiring() -> None:
-    """A finding files a review-fix issue (correct labels) wired into a dependent."""
-    rec = _Recorder()
-
-    async def generate(review_input: ReviewInput) -> ReviewPlan:
-        # The reviewer flagged the off-by-one in #2; #3 depends on it, so the fix
-        # must block #3 (build the fix before the work layered on the defect).
-        return ReviewPlan(
-            findings=[
-                ReviewFinding(
-                    title="Fix off-by-one in total()",
-                    body="total() adds a stray +1.",
-                    blocks_issues=[3],
-                )
-            ]
-        )
-
-    result = await review_round(
-        _input(PLANTED_DEFECT_DIFF),
-        generate=generate,
-        create_issue=rec.create_issue,
-        edit_blocked_by=rec.edit_blocked_by,
-    )
-
-    assert isinstance(result, ReviewResult)
-    assert len(rec.created) == 1
-    draft = rec.created[0]
-    assert "review-fix" in draft.labels
-    assert "ready-for-agent" in draft.labels
-    assert f"Part of #{PRD_NUMBER}" in draft.body
-    # The new review-fix issue (#201) is wired into dependent #3's Blocked by.
-    new_number = result.filed_issues[0]
-    assert new_number == 201
-    assert rec.edits == [
-        EditBlockedByRequest(
-            repo_full_name=REPO, issue_number=3, add_blocker=new_number
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_clean_diff_files_nothing() -> None:
-    """A clean review yields no findings, so no issue is filed and nothing is wired."""
-    rec = _Recorder()
-
-    async def generate(review_input: ReviewInput) -> ReviewPlan:
-        return ReviewPlan(findings=[])
-
-    result = await review_round(
-        _input(CLEAN_DIFF),
-        generate=generate,
-        create_issue=rec.create_issue,
-        edit_blocked_by=rec.edit_blocked_by,
-    )
-
-    assert result.filed_issues == []
-    assert rec.created == []
-    assert rec.edits == []
-
-
-@pytest.mark.asyncio
-async def test_finding_with_no_dependents_files_issue_without_wiring() -> None:
-    """A finding that blocks nothing still files a review-fix issue, no Blocked-by edit."""
-    rec = _Recorder()
-
-    async def generate(review_input: ReviewInput) -> ReviewPlan:
-        return ReviewPlan(
-            findings=[
-                ReviewFinding(title="Stale doc", body="README mentions old flag.")
-            ]
-        )
-
-    result = await review_round(
-        _input(PLANTED_DEFECT_DIFF),
-        generate=generate,
-        create_issue=rec.create_issue,
-        edit_blocked_by=rec.edit_blocked_by,
-    )
-
-    assert len(result.filed_issues) == 1
-    assert rec.edits == []
-
-
-@pytest.mark.asyncio
-async def test_review_fix_issue_is_built_in_a_subsequent_round() -> None:
-    """The filed review-fix issue is picked up and built by a later build_prd round."""
-    rec = _Recorder()
-
-    async def generate(review_input: ReviewInput) -> ReviewPlan:
-        return ReviewPlan(
-            findings=[
-                ReviewFinding(
-                    title="Fix off-by-one in total()",
-                    body="total() adds a stray +1.",
-                    blocks_issues=[3],
-                )
-            ]
-        )
-
-    review = await review_round(
-        _input(PLANTED_DEFECT_DIFF),
-        generate=generate,
-        create_issue=rec.create_issue,
-        edit_blocked_by=rec.edit_blocked_by,
-    )
-
-    # A subsequent orchestrator round picks up the filed review-fix issue as a slice.
-    fix_number = review.filed_issues[0]
-    git = FakeGitOps()
-    result: PrdBuildResult = await build_prd(
-        [PrdSlice(repo_full_name=REPO, issue_number=fix_number, prd_number=PRD_NUMBER)],
-        RepoConfig(),
-        CLAUDE_MD,
-        implementer=FakeImplementer(),
-        git=git,
-        auth=FakeAuth(),
-        runtime=FakeRuntime(),
-        resolve_secret=_resolver({}),
-        report=_sink([]),
-        lock=OneAtATimeLock(),
-    )
-
-    assert result.merged_issues == [fix_number]
-    assert (f"issue-{fix_number}", "retinue/prd-1") in git.merges
+    return ReviewInput(repo_full_name=REPO, issue_number=ISSUE_NUMBER, diff=diff)
 
 
 # --- Real Agent-SDK ReviewGenerator: pure/parseable parts, no network ---
@@ -271,8 +99,8 @@ def test_headers_api_key_uses_x_api_key() -> None:
     assert "anthropic-beta" not in headers
 
 
-def test_payload_carries_model_schema_diff_and_merged_issues() -> None:
-    """The request body assembles model, schema, and the diff + merged issues.
+def test_payload_carries_model_schema_and_issue_diff() -> None:
+    """The request body assembles model, severity schema, and the issue's diff.
 
     The schema must ride ``output_config.format`` (the canonical Messages API shape);
     the OpenAI-style top-level ``response_format`` is not a Claude API parameter and
@@ -287,11 +115,14 @@ def test_payload_carries_model_schema_diff_and_merged_issues() -> None:
     fmt = payload["output_config"]["format"]
     assert fmt["type"] == "json_schema"
     assert fmt["schema"]["required"] == ["findings"]
+    severity_prop = fmt["schema"]["properties"]["findings"]["items"]["properties"][
+        "severity"
+    ]
+    assert severity_prop["enum"] == ["low", "medium", "high", "critical"]
     assert "response_format" not in payload
     user = payload["messages"][0]["content"]
-    assert "#2, #3" in user
+    assert f"#{ISSUE_NUMBER}" in user
     assert "off-by-one planted defect" in user
-    assert f"PRD #{PRD_NUMBER}" in user
 
 
 def test_payload_keeps_a_small_diff_whole() -> None:
@@ -307,11 +138,11 @@ def test_payload_keeps_a_small_diff_whole() -> None:
 
 
 def test_payload_caps_an_oversized_diff_with_a_note() -> None:
-    """A huge round diff is clamped before interpolation so the request stays bounded.
+    """A huge issue diff is clamped before interpolation so the request stays bounded.
 
-    An unbounded merged diff would blow the request body (and the reviewer's context)
-    on a big round; the payload keeps the head of the diff up to the cap and appends
-    an explicit truncation note so the model knows the diff is partial.
+    An unbounded diff would blow the request body (and the reviewer's context) on a big
+    change; the payload keeps the head of the diff up to the cap and appends an explicit
+    truncation note so the model knows the diff is partial.
     """
     gen = AgentSdkReviewGenerator(
         credential="k", transport=_FakeTransport(_text_response({"findings": []}))
@@ -398,8 +229,8 @@ def test_payload_api_key_credential_keeps_plain_string_system() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_generator_parses_findings_from_response() -> None:
-    """A response with findings parses into a ReviewPlan of ReviewFindings."""
+async def test_real_generator_parses_findings_with_severity() -> None:
+    """A response with findings parses into a ReviewPlan of severity-carrying findings."""
     transport = _FakeTransport(
         _text_response(
             {
@@ -407,8 +238,13 @@ async def test_real_generator_parses_findings_from_response() -> None:
                     {
                         "title": "Fix off-by-one in total()",
                         "body": "total() adds a stray +1.",
-                        "blocks_issues": [3],
-                    }
+                        "severity": "high",
+                    },
+                    {
+                        "title": "Stale doc",
+                        "body": "README mentions an old flag.",
+                        "severity": "low",
+                    },
                 ]
             }
         )
@@ -422,8 +258,13 @@ async def test_real_generator_parses_findings_from_response() -> None:
             ReviewFinding(
                 title="Fix off-by-one in total()",
                 body="total() adds a stray +1.",
-                blocks_issues=[3],
-            )
+                severity=Severity.HIGH,
+            ),
+            ReviewFinding(
+                title="Stale doc",
+                body="README mentions an old flag.",
+                severity=Severity.LOW,
+            ),
         ]
     )
     # It POSTed exactly once to the Messages endpoint.
@@ -477,89 +318,21 @@ async def test_real_generator_raises_when_findings_missing() -> None:
         await gen(_input(CLEAN_DIFF))
 
 
-# --- Real gh-cli BlockedByEditor: pure/parseable parts, no gh/network ---
-
-
-class _FakeGhRunner:
-    """Records each gh invocation and returns scripted results. No subprocess."""
-
-    def __init__(self, results: list[GhResult]) -> None:
-        self._results = list(results)
-        self.calls: list[tuple[list[str], dict[str, str]]] = []
-
-    async def run(self, args: list[str], *, env: dict[str, str]) -> GhResult:
-        self.calls.append((list(args), dict(env)))
-        return self._results.pop(0)
-
-
-def _body_result(body: str) -> GhResult:
-    """A ``gh issue view --json body`` result carrying ``body``."""
-    import json as _json
-
-    return GhResult(exit_code=0, stdout=_json.dumps({"body": body}))
-
-
-def test_add_blocked_by_appends_block_when_absent() -> None:
-    """A body with no Blocked-by block grows one appended at the end."""
-    body = "Some finding.\n\nPart of #1"
-    assert add_blocked_by(body, 201) == "Some finding.\n\nPart of #1\n\n## Blocked by\n#201"
-
-
-def test_add_blocked_by_appends_to_existing_block() -> None:
-    """An existing Blocked-by block gains the new reference on its own line."""
-    body = "Body.\n\n## Blocked by\n#5"
-    assert add_blocked_by(body, 201) == "Body.\n\n## Blocked by\n#5\n#201"
-
-
-def test_add_blocked_by_is_idempotent() -> None:
-    """A blocker already listed leaves the body unchanged."""
-    body = "Body.\n\n## Blocked by\n#5\n#201"
-    assert add_blocked_by(body, 201) == body
-
-
 @pytest.mark.asyncio
-async def test_real_editor_reads_then_writes_with_added_blocker() -> None:
-    """The editor views the body, then edits it back with the new Blocked-by ref."""
-    runner = _FakeGhRunner([_body_result("Dependent body.\n\nPart of #1"), GhResult(0)])
-    editor = GhCliBlockedByEditor(runner=runner, token="ght_abc")
+async def test_real_generator_raises_on_unknown_severity() -> None:
+    """A severity outside the vocabulary is a contract breach, surfaced loudly."""
+    gen = AgentSdkReviewGenerator(
+        credential="k",
+        transport=_FakeTransport(
+            _text_response(
+                {
+                    "findings": [
+                        {"title": "t", "body": "b", "severity": "catastrophic"}
+                    ]
+                }
+            )
+        ),
+    )
 
-    await editor(EditBlockedByRequest(repo_full_name=REPO, issue_number=3, add_blocker=201))
-
-    view_args, view_env = runner.calls[0]
-    assert view_args == ["issue", "view", "3", "--repo", REPO, "--json", "body"]
-    assert view_env == {"GH_TOKEN": "ght_abc"}
-    edit_args, _ = runner.calls[1]
-    assert edit_args[:5] == ["issue", "edit", "3", "--repo", REPO]
-    assert edit_args[5] == "--body"
-    assert "## Blocked by\n#201" in edit_args[6]
-
-
-@pytest.mark.asyncio
-async def test_real_editor_skips_edit_when_already_blocked() -> None:
-    """An already-present blocker reads the body but writes nothing back."""
-    runner = _FakeGhRunner([_body_result("Body.\n\n## Blocked by\n#201")])
-    editor = GhCliBlockedByEditor(runner=runner, token="ght_abc")
-
-    await editor(EditBlockedByRequest(repo_full_name=REPO, issue_number=3, add_blocker=201))
-
-    assert len(runner.calls) == 1  # view only, no edit
-
-
-@pytest.mark.asyncio
-async def test_real_editor_raises_on_gh_failure() -> None:
-    """A non-zero gh exit raises GhCommandError rather than silently dropping the wire."""
-    runner = _FakeGhRunner([GhResult(exit_code=1, stderr="not found")])
-    editor = GhCliBlockedByEditor(runner=runner, token="ght_abc")
-
-    with pytest.raises(GhCommandError):
-        await editor(
-            EditBlockedByRequest(repo_full_name=REPO, issue_number=3, add_blocker=201)
-        )
-
-
-def test_real_editor_raises_on_malformed_view_output() -> None:
-    """A view payload missing the body field fails loudly rather than clobbering it."""
-    from retinue.reviewer import _parse_issue_body
-
-    with pytest.raises(ValueError):
-        _parse_issue_body('{"oops": true}')
+    with pytest.raises(ReviewGenerationError):
+        await gen(_input(PLANTED_DEFECT_DIFF))

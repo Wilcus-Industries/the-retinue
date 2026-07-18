@@ -29,12 +29,20 @@ from pydantic import (
 )
 
 from retinue.roles import EFFORT_HIGH, EFFORT_MAX, EFFORT_XHIGH, Role
+from retinue.vocab import PRIORITY_LABEL_PREFIX, READY_LABEL
 
 logger = logging.getLogger(__name__)
 
 # A cron cadence is the classic five whitespace-separated fields
 # (minute hour day-of-month month day-of-week).
 _CRON_FIELD_COUNT = 5
+
+# The default severity tiers and the top range that routes to the priority queue —
+# the vocabulary WS1 ships, mirroring the retinue's own pre-pivot scale
+# (``critical``/``high`` are drop-everything). A repo may redefine both, but the
+# priority range must stay a top prefix of the ordered tiers (see the validator).
+_DEFAULT_SEVERITY_TIERS = ["critical", "high", "medium", "low"]
+_DEFAULT_PRIORITY_TIERS = ["critical", "high"]
 
 # Reasoning-effort tiers a routing-table entry's ``effort:`` may name. Reuses the
 # three tiers the role registry actually assigns (:data:`retinue.roles.EFFORT_HIGH`
@@ -208,7 +216,19 @@ class RepoConfig(BaseModel):
     """Validated contents of a repo's ``.github/retinue.yml``.
 
     Attributes:
-        staging_branch: Branch the retinue integrates work onto (default ``staging``).
+        trigger_label: The "build me" label an issue must wear to enter scheduling
+            (default ``ready-for-agent``). Configurable so a repo can use its own tag.
+        target_branch: The branch an ``issue-<N>`` build is cut from and PR'd against
+            (generalizes the old ``staging_branch``). ``None`` — the default — means
+            the repo's own default branch, resolved at build time; the retinue's own
+            repo sets ``staging`` explicitly.
+        severity_tiers: The repo's ordered severity vocabulary, most-severe first
+            (default ``[critical, high, medium, low]``). An issue's queue tier is the
+            ``priority:<tier>`` label whose ``<tier>`` names one of these; its position
+            here is its rank (earlier = more urgent), and an untiered issue ranks last.
+        priority_tiers: The top range of ``severity_tiers`` that routes to the priority
+            queue — must be a (possibly empty) prefix of ``severity_tiers`` (default
+            ``[critical, high]``).
         retry_cap: Max retries per unit of work before giving up (default ``3``).
         max_parallel: Optional cap on concurrent work; unset means no explicit cap.
         cron: Optional five-field cron cadence for scheduled runs.
@@ -220,7 +240,14 @@ class RepoConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    staging_branch: str = "staging"
+    trigger_label: str = READY_LABEL
+    target_branch: str | None = None
+    severity_tiers: list[str] = Field(
+        default_factory=lambda: list(_DEFAULT_SEVERITY_TIERS)
+    )
+    priority_tiers: list[str] = Field(
+        default_factory=lambda: list(_DEFAULT_PRIORITY_TIERS)
+    )
     retry_cap: int = Field(default=3, ge=0)
     max_parallel: int | None = Field(default=None, gt=0)
     cron: str | None = None
@@ -236,6 +263,78 @@ class RepoConfig(BaseModel):
                 f"cron must have {_CRON_FIELD_COUNT} fields, got {len(value.split())}"
             )
         return value
+
+    @field_validator("severity_tiers")
+    @classmethod
+    def _validate_severity_tiers(cls, value: list[str]) -> list[str]:
+        """Reject an empty tier list, a duplicate, or a non-slug tier name."""
+        if not value:
+            raise ValueError("severity_tiers must name at least one tier")
+        if len(set(value)) != len(value):
+            raise ValueError(f"severity_tiers must be unique, got {value}")
+        bad = sorted(name for name in value if not _LEVEL_SLUG_RE.fullmatch(name))
+        if bad:
+            raise ValueError(
+                f"severity tier name(s) {bad} must be lowercase label-safe slugs"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_priority_prefix(self) -> RepoConfig:
+        """Reject a priority range that is not a top prefix of ``severity_tiers``.
+
+        The reserved-slot scheduler drains the priority queue first, so "which tiers
+        are drop-everything" must be the *top* of the severity order — an arbitrary
+        subset (e.g. ``[low]``) would contradict the ranking. An empty range is valid
+        (no tier is drop-everything).
+        """
+        prefix = self.severity_tiers[: len(self.priority_tiers)]
+        if self.priority_tiers != prefix:
+            raise ValueError(
+                f"priority_tiers {self.priority_tiers} must be a top prefix of "
+                f"severity_tiers {self.severity_tiers}"
+            )
+        return self
+
+    def require_target_branch(self) -> str:
+        """The concrete target branch, or raise if it was never resolved.
+
+        ``target_branch`` is ``None`` in the config when the repo wants its own default
+        branch; the wiring boundary resolves that to a concrete name (a ``gh`` lookup)
+        and re-stamps the config before the build reads it. Build-time code calls this
+        so a still-unresolved branch fails loudly rather than cutting ``issue-<N>`` off
+        ``origin/None``.
+        """
+        if self.target_branch is None:
+            raise ValueError("target_branch was not resolved to a concrete branch")
+        return self.target_branch
+
+    def tier_of(self, labels: list[str]) -> str | None:
+        """The issue's queue tier: the first ``priority:<tier>`` label naming a known tier.
+
+        An unknown or absent ``priority:*`` value yields ``None`` (ranked last) rather
+        than raising, mirroring :func:`retinue.vocab.parse_priority`'s leniency.
+        """
+        for label in labels:
+            if label.startswith(PRIORITY_LABEL_PREFIX):
+                tier = label[len(PRIORITY_LABEL_PREFIX) :]
+                if tier in self.severity_tiers:
+                    return tier
+        return None
+
+    def tier_rank(self, tier: str | None) -> int:
+        """The rank of ``tier`` — its index in ``severity_tiers``; untiered ranks last.
+
+        A lower number is more urgent (``severity_tiers[0]`` is the top). An unknown or
+        ``None`` tier ranks one past the last tier, so it sorts below every named tier.
+        """
+        if tier is not None and tier in self.severity_tiers:
+            return self.severity_tiers.index(tier)
+        return len(self.severity_tiers)
+
+    def is_priority_tier(self, tier: str | None) -> bool:
+        """Whether ``tier`` is in the drop-everything top range (the priority queue)."""
+        return tier is not None and tier in self.priority_tiers
 
 
 def load_repo_config(text: str) -> RepoConfig | None:

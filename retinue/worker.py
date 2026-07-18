@@ -1,8 +1,8 @@
-"""Arq worker: the process_prd task and WorkerSettings.
+"""Arq worker: the reap + scheduler-drain tasks and the heartbeat, plus WorkerSettings.
 
-The walking-skeleton worker dequeues a PRD job and logs the repository, issue
-number, and action. Later issues replace the body of :func:`process_prd` with the
-real PRD pipeline; the queue contract (task name and kwargs) stays the same.
+The worker dequeues two webhook-driven jobs — a merge reap (``reap_pr_job``) and a
+low-latency scheduler-drain kick (``run_adhoc_drain_job``) — and runs a worker-global
+heartbeat that sweeps every opted-in repo's drain and backlog cron tick as a safety net.
 
 Launch the worker with:
     arq retinue.worker.WorkerSettings
@@ -11,31 +11,26 @@ or via the ``retinue-worker`` console script.
 
 from __future__ import annotations
 
-import asyncio
-import enum
 import logging
 import sys
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from arq import cron
 from arq.connections import RedisSettings
-from arq.worker import Retry, run_worker
 from arq.worker import func as arq_func
+from arq.worker import run_worker
 
 import retinue.github_app as github_app
+from retinue.adhoc_drain import AdhocDrainBusyError
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
 from retinue.config import Settings
-from retinue.dedupe import PrdDedupeStore, prd_dedupe_key
 from retinue.github_app import (
     InstallationAuth,
     InstalledRepos,
     github_claude_md_fetcher,
     github_config_fetcher,
-    github_issue_body_fetcher,
 )
 from retinue.handoff import MergedPullRequest
 from retinue.heartbeat import (
@@ -44,250 +39,23 @@ from retinue.heartbeat import (
     RepoEnumerator,
     heartbeat_tick,
 )
-from retinue.loopback import parse_heimdall_review, round_key
-from retinue.pipeline import (
-    PipelineFactory,
-    build_pipeline_factory,
-    run_state_store_path,
-)
-from retinue.queue import RESUME_ROUND_TASK, RESUME_ROUNDS_TASK, PrdJob
-from retinue.reconcile import RunStateStore
+from retinue.pipeline import PipelineFactory, build_pipeline_factory
 from retinue.repo_config import RepoConfig, load_repo_config
 from retinue.wiring import bind_adhoc_drain, bind_cron_tick
 
 logger = logging.getLogger(__name__)
 
-# Async callable that returns a repo's raw ``.github/retinue.yml`` text, or None
-# when the repo has no such file. The GitHub fetch is injected at this seam so the
-# gate is testable without network;
-# :func:`retinue.github_app.github_config_fetcher` builds the real one.
+# Async callable that returns a repo's raw ``.github/retinue.yml`` text, or None when the
+# repo has no such file. The GitHub fetch is injected at this seam so the opt-in resolution
+# is testable without network; :func:`retinue.github_app.github_config_fetcher` builds the
+# real one.
 ConfigFetcher = Callable[[str], Awaitable[str | None]]
-
-# Async callable returning a PRD/issue body text given (repo, issue number). The gh
-# issue read the slicer needs, injected so the worker is testable without a live gh.
-IssueBodyFetcher = Callable[[str, int], Awaitable[str]]
 
 # The worker-global heartbeat fires every Nth minute (the global tick). This is the coarse
 # arq-level cadence; ``repo_config.cron`` is the finer per-repo "is this repo due?" filter
 # under it (:func:`retinue.heartbeat.cron_due`). A 15-minute tick keeps the safety-net sweep
 # responsive (a missed-webhook issue is caught within the quarter-hour) without busy-looping.
 HEARTBEAT_MINUTES = frozenset(range(0, 60, 15))
-
-class GateOutcome(enum.Enum):
-    """Why the opt-in gate accepted or skipped a PRD."""
-
-    ACCEPTED = "accepted"
-    NOT_OPTED_IN = "not_opted_in"
-    MALFORMED_CONFIG = "malformed_config"
-    DUPLICATE = "duplicate"
-
-
-@dataclass(frozen=True)
-class GateResult:
-    """Result of gating one PRD.
-
-    Attributes:
-        outcome: Why the PRD was accepted or skipped.
-        config: The parsed repo config when ``outcome`` is ``ACCEPTED``, else None.
-    """
-
-    outcome: GateOutcome
-    config: RepoConfig | None = None
-
-
-async def gate_prd(
-    job: PrdJob,
-    *,
-    fetch_config: ConfigFetcher,
-    dedupe: PrdDedupeStore,
-) -> GateResult:
-    """Decide whether a dequeued PRD should be processed, and parse its config.
-
-    Three gates, in order: opt-in (a ``.github/retinue.yml`` exists), validity (it
-    parses against the schema), and novelty (not already deduped). A repo with no
-    file or a malformed file is an observable skip — logged, never raised — so one
-    bad repo cannot crash the worker. The dedupe slot is claimed only for an
-    accepted PRD, so a malformed config does not block a later fixed redelivery.
-
-    Args:
-        job: The dequeued PRD job.
-        fetch_config: Async callable returning the repo's ``retinue.yml`` text, or
-            None when the repo has no config file.
-        dedupe: The SQLite-backed dedupe store.
-
-    Returns:
-        A :class:`GateResult`; ``config`` is set only when ``outcome`` is ACCEPTED.
-    """
-    ref = f"{job.repo_full_name}#{job.issue_number}"
-
-    raw = await fetch_config(job.repo_full_name)
-    if raw is None:
-        logger.info("Skipping %s: repo not opted in (no .github/retinue.yml)", ref)
-        return GateResult(GateOutcome.NOT_OPTED_IN)
-
-    config = load_repo_config(raw)
-    if config is None:
-        logger.warning("Skipping %s: malformed .github/retinue.yml", ref)
-        return GateResult(GateOutcome.MALFORMED_CONFIG)
-
-    if not await dedupe.claim(prd_dedupe_key(job)):
-        logger.info("Skipping %s: duplicate PRD already processed", ref)
-        return GateResult(GateOutcome.DUPLICATE)
-
-    return GateResult(GateOutcome.ACCEPTED, config=config)
-
-
-async def process_prd(
-    ctx: dict[str, Any],
-    *,
-    repo_full_name: str,
-    issue_number: int,
-    action: str,
-) -> None:
-    """Arq task: gate a dequeued PRD on opt-in + validity + novelty, then process.
-
-    Loads the repo's ``.github/retinue.yml`` (presence = opt-in), validates it, and
-    deduplicates the PRD before doing real work. A repo with no config, a malformed
-    config, or an already-processed PRD is an observable skip. The config-fetcher
-    and dedupe store are read from ``ctx`` (populated by ``on_startup``); when absent
-    (e.g. the bare round-trip test) the task falls back to logging only.
-
-    Args:
-        ctx: Arq worker context; may carry ``fetch_config`` and ``dedupe``.
-        repo_full_name: e.g. "owner/repo".
-        issue_number: The GitHub issue number.
-        action: The webhook action that triggered the job.
-    """
-    job = PrdJob(
-        repo_full_name=repo_full_name, issue_number=issue_number, action=action
-    )
-
-    fetch_config: ConfigFetcher | None = ctx.get("fetch_config")
-    dedupe: PrdDedupeStore | None = ctx.get("dedupe")
-    if fetch_config is None or dedupe is None:
-        # No gate wired in (bare worker / round-trip skeleton): log and return.
-        logger.info(
-            "Processing PRD for %s#%d action=%s",
-            repo_full_name,
-            issue_number,
-            action,
-        )
-        return
-
-    result = await gate_prd(job, fetch_config=fetch_config, dedupe=dedupe)
-    if result.outcome is not GateOutcome.ACCEPTED or result.config is None:
-        return
-
-    logger.info(
-        "Processing PRD for %s#%d action=%s (staging_branch=%s)",
-        repo_full_name,
-        issue_number,
-        action,
-        result.config.staging_branch,
-    )
-
-    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
-    if pipeline_factory is None:
-        # No real pipeline wired (bare worker / round-trip skeleton): the gate ran and
-        # accepted, but there is nothing downstream to drive. Stop after the accept log.
-        return
-
-    pipeline = await pipeline_factory(repo_full_name, result.config)
-    try:
-        prd_result = await pipeline.process_prd_job(
-            repo_full_name=repo_full_name,
-            prd_number=issue_number,
-            prd_body=await _load_prd_body(ctx, repo_full_name, issue_number),
-        )
-    except Exception:
-        # The dedupe claim landed at the gate, before any durable run state. A crash
-        # before the round persisted its slices would otherwise burn the PRD forever
-        # (every redelivery reads as a duplicate), so release the claim; once slices
-        # are durable the resume sweep owns the round and the claim must stand.
-        if not await pipeline.has_round(
-            repo_full_name=repo_full_name, prd_number=issue_number
-        ):
-            await dedupe.release(prd_dedupe_key(job))
-            logger.warning(
-                "PRD %s#%d crashed before any durable slice; dedupe claim released",
-                repo_full_name,
-                issue_number,
-            )
-        raise
-    logger.info(
-        "Pipeline for %s#%d: sliced=%s pr_opened=%s deferred=%s",
-        repo_full_name,
-        issue_number,
-        prd_result.sliced,
-        prd_result.pr_opened,
-        prd_result.deferred,
-    )
-    if prd_result.deferred:
-        await _enqueue_resume_round(
-            ctx,
-            repo_full_name=repo_full_name,
-            prd_number=issue_number,
-            defer_until=prd_result.defer_until,
-        )
-
-
-async def process_review_job(
-    ctx: dict[str, Any],
-    *,
-    repo_full_name: str,
-    pr_number: int,
-    review_state: str,
-    review_body: str = "",
-) -> None:
-    """Arq task: drive the heimdall loopback for one ``pull_request_review`` event.
-
-    Parses the review into a :class:`~retinue.loopback.HeimdallReview` and hands it to
-    the wired pipeline (rebuild / converge / escalate). The repo config is fetched the
-    same way the PRD gate fetches it; a repo no longer opted in is a skip. With no
-    pipeline wired (the bare worker) the event is logged and dropped.
-
-    Args:
-        ctx: Arq worker context carrying ``fetch_config`` and ``pipeline_factory``.
-        repo_full_name: e.g. "owner/repo".
-        pr_number: The reviewed PR number.
-        review_state: The gh review state.
-        review_body: The review body heimdall findings are parsed from.
-    """
-    config = await _config_for(ctx, repo_full_name)
-    if config is None:
-        return
-    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
-    if pipeline_factory is None:
-        logger.info("No pipeline wired; dropping review for %s PR #%d", repo_full_name, pr_number)
-        return
-
-    pipeline = await pipeline_factory(repo_full_name, config)
-    mapping = await pipeline.round_for_pr(
-        repo_full_name=repo_full_name, pr_number=pr_number
-    )
-    if mapping is None:
-        # A review on a PR the retinue never opened (not in run-state): not ours to act on.
-        logger.info("Review for unknown PR %s #%d; skipping", repo_full_name, pr_number)
-        return
-    prd_number, _slice_numbers = mapping
-
-    review = parse_heimdall_review(
-        repo_full_name=repo_full_name,
-        pr_number=pr_number,
-        prd_number=prd_number,
-        review_state=review_state,
-        review_body=review_body,
-    )
-    # GitHub redelivers review webhooks; serializing per PR keeps the loopback's
-    # read-count-then-record-round window atomic so two deliveries cannot both see a
-    # stale round count and double-consume the rebuild budget.
-    locks: dict[str, asyncio.Lock] = ctx.setdefault("review_locks", {})
-    lock = locks.setdefault(round_key(repo_full_name, pr_number), asyncio.Lock())
-    async with lock:
-        result = await pipeline.process_review(review)
-    logger.info(
-        "Loopback for %s PR #%d: %s", repo_full_name, pr_number, result.outcome.value
-    )
 
 
 async def reap_pr_job(
@@ -296,11 +64,11 @@ async def reap_pr_job(
     repo_full_name: str,
     pr_number: int,
 ) -> None:
-    """Arq task: reap a human-merged PR (close slice issues, then reap the PRD).
+    """Arq task: reap a human-merged PR (close the issue(s), then reap the parent).
 
-    Resolves the PR's PRD and slice issues from the run-state store recorded when the
-    PRD round opened the PR, then drives the pipeline reap. With no pipeline wired the
-    event is logged and dropped.
+    Resolves the PR's issue mapping from the run-state store recorded when the build opened
+    the PR, then drives the pipeline reap. With no pipeline wired the event is logged and
+    dropped.
 
     Args:
         ctx: Arq worker context carrying ``fetch_config`` and ``pipeline_factory``.
@@ -312,7 +80,9 @@ async def reap_pr_job(
         return
     pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
     if pipeline_factory is None:
-        logger.info("No pipeline wired; dropping merge of %s PR #%d", repo_full_name, pr_number)
+        logger.info(
+            "No pipeline wired; dropping merge of %s PR #%d", repo_full_name, pr_number
+        )
         return
 
     pipeline = await pipeline_factory(repo_full_name, config)
@@ -344,19 +114,17 @@ async def run_adhoc_drain_job(
     *,
     repo_full_name: str,
 ) -> None:
-    """Arq task: run one ad-hoc drain for a repo, kicked by the webhook (``RUN_ADHOC_DRAIN_TASK``).
+    """Arq task: run one scheduler drain for a repo, kicked by the webhook.
 
-    The webhook enqueues this low-latency kick when a ``ready-for-agent`` (non-``prd``) issue
-    event arrives, so the repo's ad-hoc backlog drains without waiting for the cron heartbeat
-    (a flurry of events for one repo coalesces to a single drain via the queue's per-repo job
-    id). The bound drain is read from ``ctx`` (populated by :func:`on_startup` under live
-    GitHub-App auth) — the *same* drain the heartbeat fires (issue #43) — so a kick and a
+    The webhook enqueues this low-latency kick when a trigger-labeled issue event arrives,
+    so the repo's scheduler backlog drains without waiting for the cron heartbeat (a flurry
+    of events for one repo coalesces to a single drain via the queue's per-repo job id). The
+    bound drain is read from ``ctx`` — the *same* drain the heartbeat fires — so a kick and a
     sweep are identical work under one single-run lock.
 
-    Two skips keep one kick from crashing the worker, mirroring the other tasks' discipline:
-    with no drain wired (a bare worker / round-trip skeleton) the kick logs and returns, and a
-    repo no longer opted in (no fetchable config) is a skip rather than a drain of a de-opted
-    repo.
+    Two skips keep one kick from crashing the worker: with no drain wired (a bare worker) the
+    kick logs and returns, and a repo no longer opted in is a skip rather than a drain of a
+    de-opted repo.
 
     Args:
         ctx: Arq worker context; may carry ``adhoc_drain`` (the bound drain) and
@@ -370,192 +138,24 @@ async def run_adhoc_drain_job(
     config = await _config_for(ctx, repo_full_name)
     if config is None:
         return
-    await drain(repo_full_name=repo_full_name, config=config)
-
-
-# A deferral with no reported window (the ledger couldn't say when it frees) retries on
-# this fallback cadence; a reported window schedules the resume for exactly then.
-_DEFERRED_RESUME_FALLBACK_SECONDS = 3600
-# A still-deferred resume retries via arq's Retry; this caps the retries (a day of
-# hourly fallbacks) so a wedged budget can't respin the job forever — the round's
-# run-state row survives for the next restart's sweep either way.
-_RESUME_ROUND_MAX_TRIES = 24
-
-
-def _resume_round_job_id(repo_full_name: str, prd_number: int) -> str:
-    """The per-round Arq job id coalescing concurrent deferred-resume enqueues."""
-    return f"resume-round:{repo_full_name}#{prd_number}"
-
-
-async def _enqueue_resume_round(
-    ctx: dict[str, Any],
-    *,
-    repo_full_name: str,
-    prd_number: int,
-    defer_until: datetime | None,
-) -> None:
-    """Enqueue the deferred round's resume for when the budget window frees.
-
-    Deliberately NOT a re-enqueue of ``PROCESS_PRD_TASK`` — that would re-slice the PRD
-    into duplicate issues. ``resume_round_job`` reconciles against GitHub truth and
-    re-drives only the unbuilt phase. The per-round ``_job_id`` coalesces a burst of
-    deferrals into one scheduled resume (the task registers with ``keep_result=0`` so a
-    finished run's result key never swallows the next enqueue).
-    """
-    redis = ctx.get("redis")
-    if redis is None:
-        logger.warning(
-            "No redis on the worker context; deferred PRD %s#%d was not re-enqueued",
-            repo_full_name,
-            prd_number,
-        )
-        return
-    schedule: dict[str, Any] = (
-        {"_defer_until": defer_until}
-        if defer_until is not None
-        else {"_defer_by": _DEFERRED_RESUME_FALLBACK_SECONDS}
-    )
-    await redis.enqueue_job(
-        RESUME_ROUND_TASK,
-        repo_full_name=repo_full_name,
-        prd_number=prd_number,
-        _job_id=_resume_round_job_id(repo_full_name, prd_number),
-        **schedule,
-    )
-
-
-async def resume_round_job(
-    ctx: dict[str, Any], *, repo_full_name: str, prd_number: int
-) -> None:
-    """Arq task: re-drive one budget-deferred PRD round once its window frees.
-
-    Enqueued by :func:`process_prd` / :func:`resume_rounds_job` when the budget gate
-    deferred a round's build. Re-gates through :meth:`retinue.pipeline.Pipeline.resume_round`
-    (reconcile against GitHub truth, then rebuild only the unfinished slices); a resume
-    that is *still* deferred raises :class:`arq.worker.Retry` so arq re-schedules this
-    same job — re-enqueueing under the running job's own ``_job_id`` would be silently
-    dropped (the live job key still exists). The usual skips apply: a de-opted repo or a
-    bare worker logs and returns.
-
-    Args:
-        ctx: Arq worker context carrying ``fetch_config`` and ``pipeline_factory``.
-        repo_full_name: e.g. "owner/repo".
-        prd_number: The deferred PRD's tracking issue number.
-    """
-    config = await _config_for(ctx, repo_full_name)
-    if config is None:
+    try:
+        await drain(repo_full_name=repo_full_name, config=config)
+    except AdhocDrainBusyError:
+        # A drain for this repo is already in flight (the kick collided with the heartbeat
+        # sweep or another kick under the single-run lock). The in-flight drain covers this
+        # repo's ready work, so the redundant kick is an expected skip — swallow it rather
+        # than fail the arq task and trigger a retry.
         logger.info(
-            "Skipping deferred resume of %s PRD #%d: repo no longer opted in",
+            "Ad-hoc drain already in flight for %s; skipping the redundant kick",
             repo_full_name,
-            prd_number,
-        )
-        return
-    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
-    if pipeline_factory is None:
-        logger.info(
-            "No pipeline wired; dropping deferred resume of %s PRD #%d",
-            repo_full_name,
-            prd_number,
-        )
-        return
-
-    pipeline = await pipeline_factory(repo_full_name, config)
-    outcome = await pipeline.resume_round(
-        repo_full_name=repo_full_name, prd_number=prd_number
-    )
-    if outcome.deferred:
-        defer = _retry_defer_seconds(outcome.defer_until)
-        logger.info(
-            "Resume of %s PRD #%d still budget-deferred; retrying in %.0fs",
-            repo_full_name,
-            prd_number,
-            defer,
-        )
-        raise Retry(defer=defer)
-    logger.info(
-        "Deferred resume of %s PRD #%d completed at %s",
-        repo_full_name,
-        prd_number,
-        outcome.reconcile.phase.value,
-    )
-
-
-def _retry_defer_seconds(defer_until: datetime | None) -> float:
-    """Seconds until the budget window frees, floored at a minute; 1h with no window."""
-    if defer_until is None:
-        return float(_DEFERRED_RESUME_FALLBACK_SECONDS)
-    return max(60.0, (defer_until - datetime.now(UTC)).total_seconds())
-
-
-async def resume_rounds_job(ctx: dict[str, Any]) -> None:
-    """Arq task: the crash-resume startup sweep over every persisted PRD round.
-
-    Enqueued by :func:`on_startup` (``RESUME_ROUNDS_TASK``) so a restart resumes the
-    rounds a crash left in flight without blocking worker boot. Each round from the
-    run-state store is resumed through its repo's pipeline
-    (:meth:`retinue.pipeline.Pipeline.resume_round` — reconcile against GitHub truth,
-    then re-drive the phase). The sweep is crash-safe per round: one round's failure is
-    logged and skipped so the rest still resume, and its row survives for a later sweep.
-    A round of a repo no longer opted in is skipped the same way. With no run-state or
-    pipeline wired (a bare worker) the sweep logs and returns.
-
-    Args:
-        ctx: Arq worker context; may carry ``run_state``, ``fetch_config``, and
-            ``pipeline_factory``.
-    """
-    run_state: RunStateStore | None = ctx.get("run_state")
-    pipeline_factory: PipelineFactory | None = ctx.get("pipeline_factory")
-    if run_state is None or pipeline_factory is None:
-        logger.info("No run-state/pipeline wired; skipping the resume sweep")
-        return
-
-    rounds = await run_state.all_rounds()
-    logger.info("Resume sweep: %d persisted round(s) to reconcile", len(rounds))
-    for round_ in rounds:
-        config = await _config_for(ctx, round_.repo_full_name)
-        if config is None:
-            logger.info(
-                "Skipping resume of %s PRD #%d: repo no longer opted in",
-                round_.repo_full_name,
-                round_.prd_number,
-            )
-            continue
-        try:
-            pipeline = await pipeline_factory(round_.repo_full_name, config)
-            outcome = await pipeline.resume_round(
-                repo_full_name=round_.repo_full_name, prd_number=round_.prd_number
-            )
-        except Exception:
-            # Crash-safe per round: the row survives for a later sweep to retry.
-            logger.exception(
-                "Resume of %s PRD #%d failed; continuing the sweep",
-                round_.repo_full_name,
-                round_.prd_number,
-            )
-            continue
-        if outcome.deferred:
-            # A budget-deferred resume would otherwise sit until the *next* restart
-            # happens to sweep it; schedule its own resume for when the window frees.
-            await _enqueue_resume_round(
-                ctx,
-                repo_full_name=round_.repo_full_name,
-                prd_number=round_.prd_number,
-                defer_until=outcome.defer_until,
-            )
-        logger.info(
-            "Resumed %s PRD #%d at %s%s",
-            round_.repo_full_name,
-            round_.prd_number,
-            outcome.reconcile.phase.value,
-            " (budget-deferred)" if outcome.deferred else "",
         )
 
 
 async def _config_for(ctx: dict[str, Any], repo_full_name: str) -> RepoConfig | None:
-    """Fetch and parse a repo's opt-in config the same way the PRD gate does.
+    """Fetch and parse a repo's opt-in config.
 
     A repo with no config or a malformed one is treated as not opted in (``None``), so a
-    review/merge event for a de-opted repo is a skip rather than a crash.
+    merge/kick event for a de-opted repo is a skip rather than a crash.
     """
     fetch_config: ConfigFetcher | None = ctx.get("fetch_config")
     if fetch_config is None:
@@ -566,28 +166,13 @@ async def _config_for(ctx: dict[str, Any], repo_full_name: str) -> RepoConfig | 
     return load_repo_config(raw)
 
 
-async def _load_prd_body(
-    ctx: dict[str, Any], repo_full_name: str, issue_number: int
-) -> str:
-    """Read the PRD issue body the slicer slices, via the injected fetcher.
-
-    The body fetch is an injected ``fetch_prd_body`` seam (the gh issue read), so the
-    worker stays testable without a live gh; the bare worker has no fetcher and yields
-    an empty body, which the slicer escalates as too thin.
-    """
-    fetch_body: IssueBodyFetcher | None = ctx.get("fetch_prd_body")
-    if fetch_body is None:
-        return ""
-    return await fetch_body(repo_full_name, issue_number)
-
-
 def _configure_logging() -> None:
     """Send INFO-level logs to stdout so the worker's progress is observable.
 
-    ``run_worker`` does not configure logging (only arq's CLI does), so without
-    this the root logger sits at WARNING with no handler and every ``logger.info``
-    line is dropped. Install a single stdout handler at INFO; ``force=True``
-    rebinds any pre-existing root config to the current stdout.
+    ``run_worker`` does not configure logging (only arq's CLI does), so without this the
+    root logger sits at WARNING with no handler and every ``logger.info`` line is dropped.
+    Install a single stdout handler at INFO; ``force=True`` rebinds any pre-existing root
+    config to the current stdout.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -598,99 +183,70 @@ def _configure_logging() -> None:
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
-    """Populate the worker context with the gate's collaborators and the live pipeline.
+    """Populate the worker context with the live pipeline, drain, and heartbeat wiring.
 
-    Installs the config fetcher and the SQLite-backed dedupe store onto ``ctx`` so
-    :func:`process_prd` can gate each dequeued PRD on opt-in, validity, and novelty. When
-    GitHub App auth resolves (:func:`_load_github_client`), it also installs the real
-    PRD-body fetcher and a ``pipeline_factory`` over the production adapters — the factory
-    sources each repo's ``CLAUDE.md`` (the done-check command) and binds the live build
-    lane — so an accepted PRD drives the real slice -> build -> staging-PR pipeline. The
-    same auth branch binds the webhook's ad-hoc drain *and* the worker-global heartbeat's
-    four collaborators (:func:`retinue.heartbeat.heartbeat_tick` reads them from ``ctx``):
-    the real wall-clock, the installed-and-opted-in repo enumerator, the *same* bound
-    ad-hoc drain the kick fires, and a bound :func:`retinue.cron.run_cron_tick`. The same
-    branch installs the run-state store and enqueues the crash-resume sweep
-    (:func:`resume_rounds_job`) so rounds a crash left in flight are re-driven. With no
-    auth wired, the fetcher defaults to not-opted-in and neither the pipeline nor the
-    heartbeat is installed (so the registered cron tick safely no-ops).
+    When GitHub App auth resolves (:func:`_load_github_client`), it installs the config
+    fetcher, the real ``pipeline_factory`` over the production adapters, the bound scheduler
+    drain the webhook kick fires, and the worker-global heartbeat's four collaborators
+    (:func:`retinue.heartbeat.heartbeat_tick` reads them from ``ctx``): the real wall-clock,
+    the installed-and-opted-in repo enumerator, the *same* bound drain the kick fires, and a
+    bound backlog cron tick. With no auth wired, the fetcher defaults to not-opted-in and
+    neither the pipeline nor the heartbeat is installed (so the registered cron tick safely
+    no-ops).
     """
     global settings
     if settings is None:
         settings = _load_settings()
     wiring = _load_github_client()
     if wiring is None:
-        # No GitHub App auth wired yet (the concrete InstallationAuth is another
-        # layer's seam): fall back to the safe not-opted-in default so nothing is
-        # processed without an explicit config, rather than crashing the worker. With
-        # no auth there is also no pipeline, so an accepted PRD stops after the gate.
+        # No GitHub App auth wired yet: fall back to the safe not-opted-in default so
+        # nothing is processed without an explicit config, rather than crashing the worker.
         ctx["fetch_config"] = _no_config_fetcher
-    else:
-        auth, client = wiring
-        fetch_claude_md = github_claude_md_fetcher(auth, client)
-        # The ONE service-level budget governor: the pipeline factory's build gate, the
-        # ad-hoc drain, and the cron tick all meter this same instance, so every lane
-        # charges one shared rolling-24h ledger over ``settings.budget_db_path``.
-        governor = BudgetGovernor(
-            BudgetLedger(
-                settings.budget_db_path,
-                clock=SystemClock(),
-                auth_mode=AuthMode.from_config(settings.auth_mode),
-                weekly_budget=settings.weekly_budget,
-                daily_cap_fraction=settings.budget_daily_cap_fraction,
-            )
+        return
+    auth, client = wiring
+    fetch_claude_md = github_claude_md_fetcher(auth, client)
+    # The ONE service-level budget governor: the pipeline factory's build gate, the
+    # scheduler drain, and the cron tick all meter this same instance, so every lane charges
+    # one shared rolling-24h ledger over ``settings.budget_db_path``.
+    governor = BudgetGovernor(
+        BudgetLedger(
+            settings.budget_db_path,
+            clock=SystemClock(),
+            auth_mode=AuthMode.from_config(settings.auth_mode),
+            weekly_budget=settings.weekly_budget,
+            daily_cap_fraction=settings.budget_daily_cap_fraction,
         )
-        ctx["governor"] = governor
-        pipeline_factory = build_pipeline_factory(
-            settings, auth, governor=governor, fetch_claude_md=fetch_claude_md
-        )
-        ctx["github_client"] = client
-        ctx["fetch_config"] = github_config_fetcher(auth, client)
-        ctx["fetch_prd_body"] = github_issue_body_fetcher(auth, client)
-        ctx["pipeline_factory"] = pipeline_factory
-        # The webhook's low-latency ad-hoc kick (run_adhoc_drain_job) reads ``adhoc_drain``
-        # from ctx; bind it here so a kick on a deployed worker actually drains. The
-        # heartbeat's safety-net sweep fires this *same* bound drain (below) so a kick and a
-        # sweep are identical work under one single-run lock.
-        adhoc_drain = bind_adhoc_drain(
-            settings,
-            auth,
-            governor=governor,
-            pipeline_factory=pipeline_factory,
-            fetch_claude_md=fetch_claude_md,
-        )
-        ctx["adhoc_drain"] = adhoc_drain
-        # The worker-global heartbeat (heartbeat_tick) reads its four collaborators from ctx;
-        # bind them here so the registered cron tick actually sweeps in production instead of
-        # hitting the not-wired skip. The clock is the real wall-clock, the enumerator lists
-        # the App's opted-in repos, the drain is the *same* bound ad-hoc drain the kick fires,
-        # and the cron tick is a bound run_cron_tick over the backlog lane.
-        ctx["heartbeat_clock"] = SystemClock()
-        ctx["heartbeat_enumerate_repos"] = _bind_heartbeat_enumerate(
-            auth, fetch_config=ctx["fetch_config"]
-        )
-        ctx["heartbeat_drain"] = adhoc_drain
-        ctx["heartbeat_cron_tick"] = bind_cron_tick(
-            settings,
-            auth,
-            governor=governor,
-            fetch_claude_md=fetch_claude_md,
-        )
-        # Crash-resume: install the run-state store the sweep enumerates (the same file
-        # every factory-built pipeline records into) and kick the sweep as a normal Arq
-        # job so resuming stranded rounds never blocks worker boot.
-        ctx["run_state"] = RunStateStore(run_state_store_path(settings))
-        redis = ctx.get("redis")
-        if redis is not None:
-            # A pinned job id + the keep_result=0 registration make the kick reliable:
-            # without them a restart inside arq's default 1h result window is silently
-            # deduped against the previous boot's completed sweep and never runs.
-            await redis.enqueue_job(RESUME_ROUNDS_TASK, _job_id="resume-rounds")
-        else:
-            logger.warning(
-                "No redis on the worker context; the resume sweep was not enqueued"
-            )
-    ctx["dedupe"] = PrdDedupeStore(settings.dedupe_db_path)
+    )
+    ctx["governor"] = governor
+    pipeline_factory = build_pipeline_factory(
+        settings, auth, governor=governor, fetch_claude_md=fetch_claude_md
+    )
+    ctx["github_client"] = client
+    ctx["fetch_config"] = github_config_fetcher(auth, client)
+    ctx["pipeline_factory"] = pipeline_factory
+    # The webhook's low-latency kick (run_adhoc_drain_job) reads ``adhoc_drain`` from ctx;
+    # bind it here so a kick on a deployed worker actually drains. The heartbeat's
+    # safety-net sweep fires this *same* bound drain (below).
+    adhoc_drain = bind_adhoc_drain(
+        settings,
+        auth,
+        governor=governor,
+        pipeline_factory=pipeline_factory,
+        fetch_claude_md=fetch_claude_md,
+    )
+    ctx["adhoc_drain"] = adhoc_drain
+    # The worker-global heartbeat (heartbeat_tick) reads its four collaborators from ctx.
+    ctx["heartbeat_clock"] = SystemClock()
+    ctx["heartbeat_enumerate_repos"] = _bind_heartbeat_enumerate(
+        auth, fetch_config=ctx["fetch_config"]
+    )
+    ctx["heartbeat_drain"] = adhoc_drain
+    ctx["heartbeat_cron_tick"] = bind_cron_tick(
+        settings,
+        auth,
+        governor=governor,
+        fetch_claude_md=fetch_claude_md,
+    )
 
 
 def _bind_heartbeat_enumerate(
@@ -698,13 +254,11 @@ def _bind_heartbeat_enumerate(
 ) -> RepoEnumerator:
     """Bind the heartbeat's opted-in repo enumerator over the GitHub-App installed set.
 
-    Returns an async ``() -> list[DueRepo]`` that lists the App's installed repositories
-    (:meth:`retinue.github_app.InstalledRepos.installed_repositories`), fetches each repo's
-    ``.github/retinue.yml`` through the *same* opt-in ``fetch_config`` seam the PRD gate
-    uses, and yields a :class:`~retinue.heartbeat.DueRepo` for each repo with an accepted
-    :class:`~retinue.repo_config.RepoConfig`. A repo not opted in (no fetchable config) or
-    with a malformed config is dropped, so the sweep only touches opted-in repos — the same
-    opt-in resolution the webhook/PRD path applies, just enumerated rather than event-driven.
+    Returns an async ``() -> list[DueRepo]`` that lists the App's installed repositories,
+    fetches each repo's ``.github/retinue.yml`` through the *same* opt-in ``fetch_config``
+    seam, and yields a :class:`~retinue.heartbeat.DueRepo` for each repo with an accepted
+    :class:`~retinue.repo_config.RepoConfig`. A repo not opted in or with a malformed config
+    is dropped, so the sweep only touches opted-in repos.
 
     The enumeration seam is the production :class:`retinue.github_app.GitHubInstallationAuth`,
     which also satisfies :class:`~retinue.github_app.InstalledRepos`; a bare auth without it
@@ -729,24 +283,14 @@ def _bind_heartbeat_enumerate(
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
-    """Close what :func:`on_startup` opened: the GitHub HTTP client and dedupe store.
-
-    The dedupe store's SQLite connection rides an aiosqlite worker thread; skipping
-    its close would strand that thread past shutdown.
-    """
+    """Close what :func:`on_startup` opened: the GitHub HTTP client."""
     client: httpx.AsyncClient | None = ctx.get("github_client")
     if client is not None:
         await client.aclose()
-    dedupe: PrdDedupeStore | None = ctx.get("dedupe")
-    if dedupe is not None:
-        await dedupe.close()
 
 
 async def _no_config_fetcher(repo_full_name: str) -> str | None:
-    """Fallback fetcher used when no GitHub App auth is wired: treat repo as opted out.
-
-    The safe default — nothing is processed without an explicit, fetchable config.
-    """
+    """Fallback fetcher used when no GitHub App auth is wired: treat repo as opted out."""
     logger.debug("No GitHub auth wired; treating %s as not opted in", repo_full_name)
     return None
 
@@ -758,11 +302,8 @@ def _load_github_client() -> tuple[InstallationAuth, httpx.AsyncClient] | None:
     not-opted-in default rather than crashing: when no concrete ``build_installation_auth``
     is wired at all, and — the fresh-deploy case — when the builder exists but raises
     :class:`~retinue.github_app.InstallationAuthError` because the GitHub App is not yet
-    configured (no ``github_app_id`` / private-key path). A deploy with only
-    ``WEBHOOK_SECRET`` set must boot and log SKIPs (see DEPLOY.md), so an unconfigured App
-    is graceful degradation, not a startup failure. The builder is invoked lazily, per
-    startup, so registering the task (e.g. in tests) needs no GitHub App credentials and
-    opens no network client at import time.
+    configured. The builder is invoked lazily, per startup, so registering the task (e.g. in
+    tests) needs no GitHub App credentials and opens no network client at import time.
     """
     builder = getattr(github_app, "build_installation_auth", None)
     if builder is None:
@@ -774,8 +315,8 @@ def _load_github_client() -> tuple[InstallationAuth, httpx.AsyncClient] | None:
     return auth, httpx.AsyncClient(timeout=30.0)
 
 
-# Module-level settings, instantiated lazily in main() so importing this module does
-# not require the env vars to be present (e.g. when registering the task in tests).
+# Module-level settings, instantiated lazily in main() so importing this module does not
+# require the env vars to be present (e.g. when registering the task in tests).
 settings: Any = None
 
 
@@ -786,9 +327,9 @@ def _load_settings() -> Any:
 def main() -> None:
     """Console-script entrypoint: start the Arq worker with WorkerSettings.
 
-    Resolves ``WorkerSettings.redis_settings`` from the configured ``REDIS_URL``
-    here, at process start: arq reads that class attribute when it constructs the
-    Worker, before ``on_startup`` runs, so the override must be applied now.
+    Resolves ``WorkerSettings.redis_settings`` from the configured ``REDIS_URL`` here, at
+    process start: arq reads that class attribute when it constructs the Worker, before
+    ``on_startup`` runs, so the override must be applied now.
     """
     _configure_logging()
 
@@ -797,37 +338,30 @@ def main() -> None:
         settings = _load_settings()
     WorkerSettings.redis_settings = RedisSettings.from_dsn(settings.redis_url)
     # arq reads job_timeout off the class before on_startup; its 300s default cancels a
-    # real build mid-implement, so override it here at process start (issue: dogfood).
+    # real build mid-implement, so override it here at process start.
     WorkerSettings.job_timeout = settings.job_timeout_seconds
 
     run_worker(WorkerSettings)  # type: ignore[arg-type]
 
 
 class WorkerSettings:
-    """Arq WorkerSettings: registers process_prd and the Redis connection.
+    """Arq WorkerSettings: registers the reap + drain tasks and the heartbeat.
 
     Launch the worker process with:
         arq retinue.worker.WorkerSettings
     """
 
-    # The re-kicked tasks register with ``keep_result=0``: arq's enqueue dedups on the
+    # The re-kicked drain registers with ``keep_result=0``: arq's enqueue dedups on the
     # completed job's lingering *result* key too (default 1h), so keeping results would
-    # silently swallow a restart's sweep kick, a post-drain webhook kick, and a deferred
-    # round's re-enqueue. ``resume_round_job`` also self-retries via ``Retry`` while the
-    # budget stays deferred, so it carries a bounded ``max_tries``.
+    # silently swallow a post-drain webhook kick.
     functions = [
-        process_prd,
-        process_review_job,
         reap_pr_job,
         arq_func(run_adhoc_drain_job, keep_result=0),
-        arq_func(resume_rounds_job, keep_result=0),
-        arq_func(resume_round_job, keep_result=0, max_tries=_RESUME_ROUND_MAX_TRIES),
     ]
     # The worker-global cron heartbeat: fires every Nth minute as the safety-net sweep for
-    # issues labeled while the webhook was missed (firing the ad-hoc drain for each due repo)
-    # and drives the backlog cron lane (``run_cron_tick``) — the first runtime caller of the
-    # previously-dead lane. Its collaborators are read from ``ctx`` in :func:`heartbeat_tick`;
-    # a bare worker with none wired ticks harmlessly.
+    # issues labeled while the webhook was missed (firing the scheduler drain for each due
+    # repo) and drives the backlog cron lane. Its collaborators are read from ``ctx`` in
+    # :func:`heartbeat_tick`; a bare worker with none wired ticks harmlessly.
     cron_jobs = [cron(heartbeat_tick, minute=set(HEARTBEAT_MINUTES))]
     on_startup = on_startup
     on_shutdown = on_shutdown
@@ -835,7 +369,5 @@ class WorkerSettings:
     # already outlast a real build, since arq reads it before on_startup and its own 300s
     # default would cancel the drain mid-implement.
     job_timeout: int = 1800
-    # Overridden from the configured REDIS_URL in main() at process start (arq
-    # reads this attribute before on_startup runs); the localhost default keeps it
-    # a valid RedisSettings for the ``arq retinue.worker.WorkerSettings`` launch.
+    # Overridden from the configured REDIS_URL in main() at process start.
     redis_settings: RedisSettings = RedisSettings()
