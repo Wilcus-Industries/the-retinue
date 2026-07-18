@@ -585,6 +585,30 @@ async def test_fix_pass_regression_blocks_and_does_not_push() -> None:
     assert len(captured) == 1
 
 
+@pytest.mark.asyncio
+async def test_gate_error_is_fail_closed_blocking() -> None:
+    """A gate that raises mid-run blocks the PR instead of propagating.
+
+    The branch is already pushed green when the gate starts, so a raised gate — an LLM
+    5xx/429 from the reviewer, a failed fix pass, an unresolvable diff — must not escape
+    :func:`_run_review_gate`: escaping would skip ``process_adhoc_pr``, leave no ``hitl``,
+    and let the next drain's stranded recovery open the PR gate-bypassed. Instead the gate
+    swallows the error into a single synthetic blocking finding so the pipeline escalates.
+    """
+
+    async def boom(_: ReviewInput) -> ReviewPlan:
+        raise RuntimeError("reviewer 503")
+
+    container = _GateContainer(diffs=[DEFECT_DIFF])
+
+    outcome = await _gate(container, boom)
+
+    assert outcome.regressed is False
+    assert len(outcome.blocking) == 1
+    assert outcome.blocking[0].severity >= Severity.HIGH
+    assert outcome.backlog == []
+
+
 # --- build_adhoc_issue integration: the gate rides the on_green hook ---------------
 
 
@@ -618,6 +642,30 @@ async def test_gate_does_not_run_on_a_red_build() -> None:
     assert result.passed is False
     assert result.gate is None
     assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_gate_error_blocks_the_pr_without_stranding_the_branch() -> None:
+    """A gate error on a green build yields a blocking result, never a raised build.
+
+    ``build_adhoc_issue`` pushes the branch before the gate runs, so a gate that raised
+    out of ``on_green`` would leave the branch pushed with no PR and — because the raise
+    skips ``process_adhoc_pr`` — no ``hitl`` escalation, which the next drain would
+    "recover" into a gate-bypassed PR. The build must instead return ``passed=True`` with a
+    blocking gate so the pipeline escalates the issue to a human.
+    """
+
+    async def boom(_: ReviewInput) -> ReviewPlan:
+        raise RuntimeError("reviewer 503")
+
+    runtime = FakeRuntime()
+
+    result = await _build(runtime=runtime, review_generate=boom)
+
+    assert result.passed is True
+    assert result.gate is not None
+    assert len(result.gate.blocking) == 1
+    assert result.gate.blocking[0].severity >= Severity.HIGH
 
 
 @pytest.mark.asyncio

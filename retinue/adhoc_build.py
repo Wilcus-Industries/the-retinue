@@ -336,6 +336,26 @@ def _regression_finding() -> ReviewFinding:
     )
 
 
+def _gate_error_finding(exc: Exception) -> ReviewFinding:
+    """The synthetic blocking finding for a gate that raised before it could clear.
+
+    The green branch is pushed *before* the gate runs, so a gate that escaped would leave
+    the branch pushed with no PR and no ``hitl`` — a state the next drain classifies as
+    stranded and "recovers" into a gate-bypassed PR. Turning the error into a blocking
+    finding keeps the gate fail-closed: the pipeline escalates the issue to a human instead
+    of ever shipping unreviewed work.
+    """
+    return ReviewFinding(
+        title="Review gate errored before it could clear the issue",
+        body=(
+            "The in-session review gate raised before it could finish reviewing the built "
+            f"issue ({exc!r}). The build is green and pushed, but it was never fully "
+            "reviewed, so the PR is held and the issue escalated to a human."
+        ),
+        severity=Severity.HIGH,
+    )
+
+
 def _render_fix_plan(findings: list[ReviewFinding]) -> str:
     """Render the review findings into the plan the fix-pass implementer reads.
 
@@ -381,7 +401,43 @@ async def _run_review_gate(
     review_generate: ReviewGenerator,
     implementer: Implementer,
 ) -> ReviewGateOutcome:
-    """Run the in-session pre-PR review gate over a freshly-built, green-pushed issue.
+    """Run the in-session pre-PR review gate, fail-closed on any error.
+
+    Delegates to :func:`_review_gate_pass` for the actual critique-and-fix run and, on any
+    exception it raises, returns a blocking outcome (:func:`_gate_error_finding`) instead of
+    propagating. This is the gate's safety contract: the green branch is pushed *before* the
+    gate runs, so a gate that escaped would strand the branch pushed-but-unreviewed with no
+    ``hitl`` — a state the next drain "recovers" into a gate-bypassed PR. Swallowing the
+    error into a block routes the issue through the pipeline's human escalation instead.
+    """
+    try:
+        return await _review_gate_pass(
+            issue,
+            config,
+            claude_md,
+            container=container,
+            review_generate=review_generate,
+            implementer=implementer,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Review gate for %s raised (%r); blocking the PR and escalating",
+            issue.branch,
+            exc,
+        )
+        return ReviewGateOutcome(blocking=[_gate_error_finding(exc)], backlog=[])
+
+
+async def _review_gate_pass(
+    issue: AdhocIssue,
+    config: RepoConfig,
+    claude_md: str,
+    *,
+    container: Container,
+    review_generate: ReviewGenerator,
+    implementer: Implementer,
+) -> ReviewGateOutcome:
+    """Run the in-session pre-PR review over a freshly-built, green-pushed issue.
 
     The gate runs in the same container that built the branch (already pushed at its green
     pre-fix state), one critique-and-fix pass:
@@ -395,6 +451,9 @@ async def _run_review_gate(
     5. a green re-run re-pushes the branch, then the reviewer runs again (review₂) over the
        fixed diff and the *surviving* findings are partitioned by severity into blocking
        (>= :data:`_BLOCKING_THRESHOLD`) and backlog (below it).
+
+    Raises whatever the reviewer, the fix-pass implementer, or the diff raises; the
+    :func:`_run_review_gate` wrapper turns any such error into a blocking outcome.
     """
     diff1 = await _issue_diff(issue, config, container)
     plan1 = await review_generate(
