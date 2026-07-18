@@ -444,11 +444,16 @@ async def _review_gate_pass(
 
     1. diff the issue branch over the target base and run the reviewer (review₁);
     2. a clean review is a clean outcome — nothing blocking, nothing backlog;
-    3. otherwise materialize review₁'s findings into :data:`PLAN_FILE` and let the same
-       implementer fix them in-place, then re-run the done-check;
-    4. a red re-run is a regression: return a blocking outcome and do **not** push the red
+    3. a review with only sub-threshold findings needs no fix pass: the build is already
+       green and shippable, so its nits are filed as backlog and the PR opens from the
+       green pre-fix branch. Running a fix pass over cosmetic nits would risk regressing
+       the done-check and false-escalating a shippable build to a human;
+    4. otherwise (there is a blocking finding) materialize review₁'s findings into
+       :data:`PLAN_FILE` and let the same implementer fix them in-place, then re-run the
+       done-check;
+    5. a red re-run is a regression: return a blocking outcome and do **not** push the red
        fix (the green pre-fix branch stays pushed);
-    5. a green re-run re-pushes the branch, then the reviewer runs again (review₂) over the
+    6. a green re-run re-pushes the branch, then the reviewer runs again (review₂) over the
        fixed diff and the *surviving* findings are partitioned by severity into blocking
        (>= :data:`_BLOCKING_THRESHOLD`) and backlog (below it).
 
@@ -467,10 +472,24 @@ async def _review_gate_pass(
         logger.info("Review gate for %s found nothing to fix", issue.branch)
         return ReviewGateOutcome(blocking=[], backlog=[])
 
+    blocking1, backlog1 = _partition_findings(plan1.findings)
+    if not blocking1:
+        # Nit-only: the build is already green and pushed, so there is nothing to gate on.
+        # File the nits as backlog and open the PR from the green pre-fix branch rather than
+        # run a fix pass whose regression would false-escalate a shippable build to a human.
+        logger.info(
+            "Review gate for %s found %d sub-threshold nit(s) and nothing blocking; "
+            "filing them as backlog, no fix pass",
+            issue.branch,
+            len(backlog1),
+        )
+        return ReviewGateOutcome(blocking=[], backlog=backlog1)
+
     logger.info(
-        "Review gate for %s found %d finding(s); running one fix pass",
+        "Review gate for %s found %d finding(s) incl. %d blocking; running one fix pass",
         issue.branch,
         len(plan1.findings),
+        len(blocking1),
     )
     await _materialize_plan(container, _render_fix_plan(plan1.findings))
     await implementer.implement(

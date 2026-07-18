@@ -586,6 +586,56 @@ async def test_fix_pass_regression_blocks_and_does_not_push() -> None:
 
 
 @pytest.mark.asyncio
+async def test_nit_only_review_skips_the_fix_pass_and_files_backlog() -> None:
+    """review₁ with only sub-threshold findings files them as backlog, runs no fix pass.
+
+    The build is already green and pushed, so a fix pass over purely cosmetic nits risks
+    regressing the done-check and false-escalating a shippable build to a human. Nit-only
+    findings therefore skip the fix pass entirely — filed as backlog, PR opens from the
+    green pre-fix branch — so the implementer never runs, nothing is re-pushed, and review₂
+    never runs.
+    """
+    generate, captured = _scripted_generator(
+        ReviewPlan(
+            findings=[_finding("nit", Severity.LOW), _finding("med", Severity.MEDIUM)]
+        ),
+    )
+    container = _GateContainer(diffs=[DEFECT_DIFF])
+    implementer = FakeImplementer()
+
+    outcome = await _gate(container, generate, implementer=implementer)
+
+    assert outcome.regressed is False
+    assert outcome.blocking == []
+    assert [f.title for f in outcome.backlog] == ["nit", "med"]
+    assert implementer.built == []
+    assert not any(c[:2] == ["git", "push"] for c in container.commands)
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_nit_only_review_never_regresses_even_if_a_fix_would_break_the_check() -> None:
+    """A nit-only review can't regress: it runs no fix pass, so it never escalates.
+
+    Even with the container scripted so a fix-pass done-check *would* go red
+    (``fix_passes=False``), a nit-only review₁ still returns a clean backlog outcome — the
+    fix pass that could turn it red never runs. This is the false-escalation the skip
+    prevents: a green, shippable build held on a human because fixing a cosmetic nit broke
+    the check.
+    """
+    generate, _ = _scripted_generator(
+        ReviewPlan(findings=[_finding("nit", Severity.LOW)]),
+    )
+    container = _GateContainer(diffs=[DEFECT_DIFF], fix_passes=False)
+
+    outcome = await _gate(container, generate)
+
+    assert outcome.regressed is False
+    assert outcome.blocking == []
+    assert [f.title for f in outcome.backlog] == ["nit"]
+
+
+@pytest.mark.asyncio
 async def test_gate_error_is_fail_closed_blocking() -> None:
     """A gate that raises mid-run blocks the PR instead of propagating.
 
@@ -682,14 +732,15 @@ async def test_no_review_generate_leaves_the_gate_unset() -> None:
 
 @pytest.mark.asyncio
 async def test_gate_findings_trigger_a_second_push_via_the_fix_pass() -> None:
-    """Gate findings drive a fix pass whose green rerun re-pushes the branch.
+    """Blocking gate findings drive a fix pass whose green rerun re-pushes the branch.
 
-    Through the real ``build_adhoc_issue`` container lifecycle, a non-clean review₁ makes
-    the gate run the implementer a second time and re-push, so the branch is pushed twice
-    (the initial green push plus the post-fix re-push).
+    Through the real ``build_adhoc_issue`` container lifecycle, a review₁ carrying a
+    *blocking* finding makes the gate run the implementer a second time and re-push, so the
+    branch is pushed twice (the initial green push plus the post-fix re-push). (A nit-only
+    review₁ skips the fix pass — see ``test_nit_only_review_skips_the_fix_pass_and_files_backlog``.)
     """
     generate, _ = _scripted_generator(
-        ReviewPlan(findings=[_finding("nit", Severity.LOW)]),
+        ReviewPlan(findings=[_finding("bug", Severity.HIGH)]),
         ReviewPlan(findings=[]),
     )
     runtime = FakeRuntime()
