@@ -16,6 +16,7 @@ import pytest
 
 import retinue.github_app as github_app
 import retinue.worker as worker
+from retinue.adhoc_drain import AdhocDrainBusyError
 from retinue.github_app import InstallationAuthError, InstallationToken
 from retinue.handoff import MergedPullRequest, ReapOutcome, ReapResult
 from retinue.queue import RUN_ADHOC_DRAIN_TASK
@@ -185,6 +186,28 @@ async def test_run_adhoc_drain_job_skips_a_deopted_repo(make_ctx: CtxFactory) ->
     await run_adhoc_drain_job(ctx, repo_full_name="owner/repo")
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_adhoc_drain_job_swallows_a_busy_collision(
+    make_ctx: CtxFactory,
+) -> None:
+    """A kick colliding with an in-flight drain for the same repo is a clean no-op.
+
+    The webhook kick and the heartbeat sweep fire the same per-repo drain under one
+    single-run lock; a kick that lands while a drain is already running raises
+    ``AdhocDrainBusyError``. That is the "one drain at a time" contract working, not a
+    failure — the job swallows it (like the heartbeat's ``_safe_drain``) so arq does not log
+    a traceback and retry the redundant kick.
+    """
+
+    async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
+        raise AdhocDrainBusyError
+
+    ctx = make_ctx(_RecordingPipeline())
+    ctx["adhoc_drain"] = drain
+
+    await run_adhoc_drain_job(ctx, repo_full_name="owner/repo")  # must not raise
 
 
 def _registered_names() -> set[str]:

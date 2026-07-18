@@ -23,6 +23,7 @@ from arq.worker import func as arq_func
 from arq.worker import run_worker
 
 import retinue.github_app as github_app
+from retinue.adhoc_drain import AdhocDrainBusyError
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
 from retinue.config import Settings
 from retinue.github_app import (
@@ -137,7 +138,17 @@ async def run_adhoc_drain_job(
     config = await _config_for(ctx, repo_full_name)
     if config is None:
         return
-    await drain(repo_full_name=repo_full_name, config=config)
+    try:
+        await drain(repo_full_name=repo_full_name, config=config)
+    except AdhocDrainBusyError:
+        # A drain for this repo is already in flight (the kick collided with the heartbeat
+        # sweep or another kick under the single-run lock). The in-flight drain covers this
+        # repo's ready work, so the redundant kick is an expected skip — swallow it rather
+        # than fail the arq task and trigger a retry.
+        logger.info(
+            "Ad-hoc drain already in flight for %s; skipping the redundant kick",
+            repo_full_name,
+        )
 
 
 async def _config_for(ctx: dict[str, Any], repo_full_name: str) -> RepoConfig | None:
