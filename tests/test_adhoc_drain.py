@@ -33,6 +33,7 @@ import pytest
 from retinue.adhoc_build import AdhocIssue, render_chain_depth
 from retinue.adhoc_drain import (
     AdhocBuild,
+    AdhocBuildGuard,
     AdhocDrainBusyError,
     AdhocDrainLock,
     AdhocGh,
@@ -124,6 +125,7 @@ async def _drain(
     governor: BudgetGovernor | None = None,
     tmp_path: Path | None = None,
     lock: AbstractAsyncContextManager[object] | None = None,
+    guard: AdhocBuildGuard | None = None,
     prd_in_flight: bool = False,
     estimated_amount: float = 1.0,
 ) -> list[AdhocIssue]:
@@ -131,6 +133,8 @@ async def _drain(
 
     Exactly one of ``governor`` or ``tmp_path`` must be given: ``tmp_path`` builds a
     default generous-budget governor over a temp ledger when the test doesn't pin one.
+    Pass a shared ``guard`` to exercise cross-drain double-build dedup; omit it and each
+    call gets a fresh (per-drain) guard, the single-drain default.
     """
     if governor is None:
         assert tmp_path is not None, "pass a governor or a tmp_path for a default one"
@@ -145,6 +149,7 @@ async def _drain(
             governor=governor,
             estimated_amount=estimated_amount,
             lock=lock or _nolock(),
+            guard=guard,
             prd_in_flight=prd_in_flight,
         )
     finally:
@@ -572,32 +577,119 @@ async def test_a_stranded_pr_is_opened_through_from_fetched_issue(tmp_path: Path
     ]
 
 
-# --- AC2 single-run lock: two concurrent drains never overlap ---------------------
+# --- admit-then-release: the lock guards only list/classify/reserve, not the builds ---
 
 
 @pytest.mark.asyncio
-async def test_a_second_concurrent_drain_is_rejected_by_the_lock(
+async def test_a_late_critical_builds_concurrently_after_the_lock_is_released(
     tmp_path: Path,
 ) -> None:
-    """AC2: a second drain entered while one holds the lock raises (never overlaps)."""
+    """A drain releases the lock before building, so a later critical drain runs concurrently.
+
+    Admit-then-release (issue #83): drain A holds the lock only for the short
+    list/classify/reserve critical section, then builds *outside* it. A second drain B —
+    carrying a newly-filed ``priority:critical`` issue — entering while A's build is still
+    gated is **not** rejected: it admits its own issue into a build slot and runs
+    concurrently, the low-latency win the old lock-through-builds design could never deliver.
+    """
     gate = asyncio.Event()
-    gh = FakeAdhocGh([_ready(7)])
     build = RecordingAdhocBuild(gate=gate)
     lock = _Lock()
+    guard = AdhocBuildGuard()
 
     first = asyncio.create_task(
-        _drain(gh=gh, build=build, tmp_path=tmp_path, lock=lock)
+        _drain(gh=FakeAdhocGh([_ready(7)]), build=build, tmp_path=tmp_path, lock=lock, guard=guard)
     )
-    for _ in range(50):
-        await asyncio.sleep(0)
+    # A has released the lock and entered its (gated) build for #7.
+    await _wait_until(lambda: build.in_flight >= 1)
 
-    # The first drain holds the lock; a second entry is rejected, not queued.
-    with pytest.raises(AdhocDrainBusyError):
-        await _drain(gh=gh, build=build, tmp_path=tmp_path, lock=lock)
+    # A second drain, carrying a new priority:critical issue, is NOT rejected — the lock is
+    # free — and slots its issue into a concurrent build.
+    second = asyncio.create_task(
+        _drain(
+            gh=FakeAdhocGh([_ready(99, labels=["priority:critical"])]),
+            build=build,
+            tmp_path=tmp_path,
+            lock=lock,
+            guard=guard,
+        )
+    )
+    await _wait_until(lambda: any(i.issue_number == 99 for i in build.invoked))
 
     gate.set()
     await first
-    assert [issue.issue_number for issue in build.built] == [7]
+    await second
+    assert {issue.issue_number for issue in build.built} == {7, 99}
+
+
+@pytest.mark.asyncio
+async def test_the_guard_prevents_a_concurrent_drain_double_building(
+    tmp_path: Path,
+) -> None:
+    """A build reserved by drain A is skipped by a concurrent drain B — no double-build.
+
+    A just-started build hasn't opened its PR yet, so flight-state alone can't stop a second
+    drain re-picking it (it still classifies ABSENT). The shared :class:`AdhocBuildGuard` —
+    reserved under A's critical section, released when its build finishes — makes B skip the
+    in-flight #7, so it is built exactly once.
+    """
+    gate = asyncio.Event()
+    build = RecordingAdhocBuild(gate=gate)
+    lock = _Lock()
+    guard = AdhocBuildGuard()
+
+    first = asyncio.create_task(
+        _drain(gh=FakeAdhocGh([_ready(7)]), build=build, tmp_path=tmp_path, lock=lock, guard=guard)
+    )
+    await _wait_until(lambda: build.in_flight >= 1)
+
+    # B re-lists #7 (PR not yet open, so still ABSENT) but must skip it: it's reserved.
+    drained_b = await _drain(
+        gh=FakeAdhocGh([_ready(7)]), build=build, tmp_path=tmp_path, lock=lock, guard=guard
+    )
+    assert drained_b == []  # nothing buildable for B — #7 already reserved
+
+    gate.set()
+    await first
+    assert [issue.issue_number for issue in build.built] == [7]  # built exactly once
+
+
+@pytest.mark.asyncio
+async def test_the_guard_is_released_after_the_build_finishes(tmp_path: Path) -> None:
+    """A reserved number is released once its build finishes, so a later drain rebuilds it.
+
+    Covers the ``try/finally`` release on normal completion: the number is no longer
+    reserved after the drain returns, so a subsequent drain (e.g. a re-filed follow-up) is
+    free to build it again.
+    """
+    guard = AdhocBuildGuard()
+    build = RecordingAdhocBuild()
+
+    await _drain(gh=FakeAdhocGh([_ready(7)]), build=build, tmp_path=tmp_path, guard=guard)
+
+    assert 7 not in guard  # released on completion
+    await _drain(gh=FakeAdhocGh([_ready(7)]), build=build, tmp_path=tmp_path, guard=guard)
+    assert [issue.issue_number for issue in build.built] == [7, 7]  # rebuilt
+
+
+@pytest.mark.asyncio
+async def test_the_guard_is_released_even_when_a_build_raises(tmp_path: Path) -> None:
+    """A build that raises still releases its reservation (the ``finally`` path).
+
+    Even when the downstream build errors out, the reserved number must be freed so the
+    issue is not wedged out of every future drain.
+    """
+    guard = AdhocBuildGuard()
+
+    async def boom(issue: AdhocIssue, *, repo_full_name: str) -> None:
+        raise RuntimeError("build blew up")
+
+    with pytest.raises(RuntimeError):
+        await _drain(
+            gh=FakeAdhocGh([_ready(7)]), build=boom, tmp_path=tmp_path, guard=guard
+        )
+
+    assert 7 not in guard  # released despite the failure
 
 
 @pytest.mark.asyncio

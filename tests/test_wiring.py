@@ -17,7 +17,7 @@ from typing import cast
 
 import pytest
 
-from retinue.adhoc_drain import AdhocGh, FlightState
+from retinue.adhoc_drain import AdhocBuildGuard, AdhocGh, FlightState
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
 from retinue.container import ContainerRuntime
 from retinue.cron import CronGh
@@ -385,6 +385,7 @@ async def test_adhoc_drain_drives_run_adhoc_drain_with_its_collaborators(
         governor=governor,
         estimated_amount=3.0,
         lock=lock,
+        guard=AdhocBuildGuard(),
     )
 
     await drain(repo_full_name="owner/repo", config=_config())
@@ -427,6 +428,7 @@ async def test_adhoc_drain_skips_the_build_when_the_shared_budget_is_spent(
         governor=governor,
         estimated_amount=1.0,
         lock=_AdhocLock(),
+        guard=AdhocBuildGuard(),
     )
 
     await drain(repo_full_name="owner/repo", config=_config())

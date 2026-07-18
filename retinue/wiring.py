@@ -28,7 +28,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
-from retinue.adhoc_drain import AdhocBuild, AdhocGh, AdhocPrOpen, run_adhoc_drain
+from retinue.adhoc_drain import (
+    AdhocBuild,
+    AdhocBuildGuard,
+    AdhocGh,
+    AdhocPrOpen,
+    run_adhoc_drain,
+)
 from retinue.budget import BudgetGovernor, Clock
 from retinue.container import Container, ContainerRuntime
 from retinue.cron import CronBuild, CronGh, CronTickResult, run_cron_tick
@@ -385,17 +391,18 @@ def bind_adhoc_drain(
     governor: BudgetGovernor,
     estimated_amount: float,
     lock: AbstractAsyncContextManager[object],
+    guard: AdhocBuildGuard,
 ) -> Callable[..., Awaitable[None]]:
     """Bind the ad-hoc drain to its real collaborators behind one ``(repo, config)`` callable.
 
     Returns an async ``(*, repo_full_name, config) -> None`` — the
     :data:`retinue.heartbeat.HeartbeatDrain` shape — that drives
     :func:`retinue.adhoc_drain.run_adhoc_drain` with the gh seam, the per-issue build, the
-    shared service-level governor, and the single-run lock already bound. The two callers of
-    the bound drain fire the *same* drain: the webhook's low-latency ad-hoc kick
-    (:func:`retinue.worker.run_adhoc_drain_job`) and the heartbeat's safety-net sweep
+    shared service-level governor, and the critical-section lock + build guard already bound.
+    The two callers of the bound drain fire the *same* drain: the webhook's low-latency ad-hoc
+    kick (:func:`retinue.worker.run_adhoc_drain_job`) and the heartbeat's safety-net sweep
     (issue #43 wires the heartbeat's ``drain`` to this same seam), so a kicked drain and a
-    swept drain are identical work under one single-run lock.
+    swept drain are identical work sharing one lock and one build guard.
 
     The governor is the *same* service-level governor the orchestrator and cron lanes share,
     so every ad-hoc build meters against the one rolling-24h window. ``prd_in_flight`` is left
@@ -411,8 +418,13 @@ def bind_adhoc_drain(
             PR), opening its PR without a rebuild.
         governor: The shared service-level budget governor each build meters through.
         estimated_amount: The per-build charge metered against the shared cap.
-        lock: The single-run lock; a second concurrent drain for the repo raises
-            :class:`retinue.adhoc_drain.AdhocDrainBusyError`.
+        lock: The critical-section lock; a drain entered while another holds this repo's
+            list/classify/reserve section raises
+            :class:`retinue.adhoc_drain.AdhocDrainBusyError`. Held only around that section,
+            not the builds, so a critical kick mid-build is admitted rather than rejected.
+        guard: The per-repo in-flight :class:`retinue.adhoc_drain.AdhocBuildGuard` — reserved
+            under ``lock`` and released when the builds finish — so two overlapping drains for
+            the repo never double-build the same issue.
 
     Returns:
         An async drain callable taking ``repo_full_name`` and the repo's ``config``.
@@ -428,6 +440,7 @@ def bind_adhoc_drain(
             governor=governor,
             estimated_amount=estimated_amount,
             lock=lock,
+            guard=guard,
         )
 
     return drain

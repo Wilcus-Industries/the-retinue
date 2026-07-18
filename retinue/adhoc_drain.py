@@ -29,9 +29,14 @@ The drain is hardened for production (#33) with four guards:
   :meth:`SupportsFlightSnapshot.flight_snapshot` (two whole-repo ``gh`` queries), then each
   candidate is classified in memory (:meth:`FlightSnapshot.state_for`); a seam offering only
   the per-issue :meth:`AdhocGh.flight_state` is classified through that fallback;
-* **single-run lock** — the whole drain runs under an injected lock so two drains for a
-  repo never overlap (a second entry raises :class:`AdhocDrainBusyError`); the lock is
-  *separate* from the orchestrator's, so the drain still runs alongside a PRD build;
+* **admit-then-release lock + build guard** — an injected lock serializes only the short
+  list/classify/**reserve** critical section (a second entry *during that section* raises
+  :class:`AdhocDrainBusyError`); the long builds run **outside** the lock, so a critical
+  issue kicked mid-drain enters the freed lock and builds concurrently (#83). An in-process
+  :class:`AdhocBuildGuard` — reserved under the lock, released when each build finishes —
+  keeps two overlapping drains from double-building the same issue (a just-started build has
+  not opened its PR yet, so flight-state alone can't dedup it). The lock is *separate* from
+  the orchestrator's, so the drain still runs alongside a PRD build;
 * **shared budget governor** — every build meters against the one service-level
   :class:`~retinue.budget.BudgetGovernor` the PRD lane uses, so a build that would cross
   the rolling-24h cap is skipped and the shared budget is never overshot;
@@ -48,7 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from enum import Enum
@@ -67,14 +72,16 @@ logger = logging.getLogger(__name__)
 
 
 class AdhocDrainBusyError(Exception):
-    """A second ad-hoc drain was attempted for a repo while one is already in flight.
+    """A second ad-hoc drain hit the list/classify/reserve critical section while it was held.
 
-    The single-run guarantee: :func:`run_adhoc_drain` runs inside an injected lock that
-    rejects a concurrent holder rather than blocking, so the "at most one ad-hoc drain
-    per repo at a time" contract is observable to the caller. This lock is *separate* from
-    the orchestrator's :class:`retinue.orchestrator.OrchestratorBusyError` lock, so an
-    ad-hoc drain still runs concurrently with a PRD build. Mirrors
-    :class:`retinue.cron.CronBusyError`.
+    :func:`run_adhoc_drain` holds an injected lock only around its short
+    list/classify/**reserve** critical section — not the long builds, which run outside it
+    (#83) — and rejects a concurrent holder rather than blocking, so contention *on that
+    section* is observable to the caller. A drain kicked while another is merely *building*
+    is **not** rejected: the lock is already free, and the :class:`AdhocBuildGuard` stops the
+    two from double-building the same issue. This lock is *separate* from the orchestrator's
+    :class:`retinue.orchestrator.OrchestratorBusyError` lock, so an ad-hoc drain still runs
+    concurrently with a PRD build. Mirrors :class:`retinue.cron.CronBusyError`.
     """
 
     def __init__(self) -> None:
@@ -82,14 +89,17 @@ class AdhocDrainBusyError(Exception):
 
 
 class AdhocDrainLock:
-    """The production single-run lock: a non-blocking in-process guard for one repo's drain.
+    """The production critical-section lock: a non-blocking in-process guard for one repo.
 
-    Satisfies the ``AbstractAsyncContextManager`` :func:`run_adhoc_drain` enters: the first
-    holder enters, and a *second* concurrent ``__aenter__`` raises :class:`AdhocDrainBusyError`
-    rather than blocking — so the "at most one ad-hoc drain per repo at a time" contract is
-    observable to the caller (mirroring the test fake's reject-don't-block behavior). One lock
-    instance guards one repo; the worker keeps a per-repo registry so two repos drain
-    concurrently while a repo's own kicked and swept drains serialize through the same lock.
+    Satisfies the ``AbstractAsyncContextManager`` :func:`run_adhoc_drain` enters around its
+    list/classify/**reserve** critical section (not the builds, which run outside it — #83):
+    the first holder enters, and a *second* concurrent ``__aenter__`` raises
+    :class:`AdhocDrainBusyError` rather than blocking — so contention on that short section is
+    observable to the caller (mirroring the test fake's reject-don't-block behavior). Because
+    the lock is released before the long builds, a drain kicked while another is *building*
+    finds it free; overlap-safety for the builds themselves is the :class:`AdhocBuildGuard`'s
+    job. One lock instance guards one repo; the worker keeps a per-repo registry so two repos
+    drain concurrently while a repo's own kicked and swept drains serialize through it.
 
     The guard is a plain in-process flag (no real wall-clock, Redis, or file lock), which is
     correct because the whole drain runs inside a single worker process; a cross-process lock
@@ -112,6 +122,38 @@ class AdhocDrainLock:
         tb: object | None,
     ) -> None:
         self._held = False
+
+
+class AdhocBuildGuard:
+    """In-process set of issue numbers a repo's drains are actively building.
+
+    The double-build guard that replaces the old lock-through-builds invariant (#83): now
+    that builds run *outside* the :class:`AdhocDrainLock`, a second drain can enter its
+    critical section while a first drain's builds are still in flight. A just-started build
+    has not opened its PR yet, so flight-state classification alone would re-pick it as
+    ``ABSENT`` and build it twice. The buildable set is :meth:`reserve`\\ d under the lock and
+    :meth:`release`\\ d when the builds finish, so an overlapping drain skips any number
+    already in flight.
+
+    asyncio is single-threaded and reservation happens synchronously (no ``await`` between
+    :meth:`reserve` and releasing the lock), so reserve-under-lock is atomic — no extra
+    locking needed. One guard instance per repo, held in the worker's registry alongside the
+    lock so a repo's kicked and swept drains share it.
+    """
+
+    def __init__(self) -> None:
+        self._building: set[int] = set()
+
+    def reserve(self, numbers: Iterable[int]) -> None:
+        """Mark ``numbers`` as actively building (called under the drain lock)."""
+        self._building.update(numbers)
+
+    def release(self, numbers: Iterable[int]) -> None:
+        """Drop ``numbers`` from the in-flight set once their builds finish."""
+        self._building.difference_update(numbers)
+
+    def __contains__(self, number: int) -> bool:
+        return number in self._building
 
 
 # How many ready-for-agent issues to pull per drain. The cap on concurrent *builds* is
@@ -600,13 +642,17 @@ async def run_adhoc_drain(
     governor: BudgetGovernor,
     estimated_amount: float,
     lock: AbstractAsyncContextManager[object],
+    guard: AdhocBuildGuard | None = None,
     prd_in_flight: bool = False,
 ) -> list[AdhocIssue]:
     """Drain the repo's ad-hoc work, hardened for production: list, filter, classify, act.
 
-    The whole drain runs under ``lock`` so two drains for the same repo never overlap (a
-    second entry raises :class:`AdhocDrainBusyError`); the lock is *separate* from the
-    orchestrator's, so the drain still runs concurrently with a PRD build. Inside the lock:
+    The drain **admits under the lock, then builds outside it** (#83): ``lock`` is held only
+    around the list/classify/**reserve** critical section (a second entry *during that
+    section* raises :class:`AdhocDrainBusyError`), then released before the long builds run —
+    so a critical issue kicked mid-drain enters the freed lock and builds concurrently rather
+    than being rejected. The lock is *separate* from the orchestrator's, so the drain still
+    runs concurrently with a PRD build. Inside the lock:
 
     1. **list** the repo's open ``ready-for-agent`` issues (number, labels, body),
     2. **filter** to the ad-hoc lane via :meth:`ReadyIssue.is_adhoc` — mirroring
@@ -624,12 +670,15 @@ async def run_adhoc_drain(
     6. **recover** every stranded issue by driving ``open_pr`` — opening the PR for its
        already-green branch with **no rebuild** and no budget charge (opening a PR does no
        model work), so a build whose PR-open step once failed is not stranded forever,
-    7. **build** each buildable survivor — materialized through
+    7. **reserve then build** — drop any buildable issue already reserved by a concurrent
+       drain (``guard``), :meth:`~AdhocBuildGuard.reserve` the survivors, and **release the
+       lock**. Then build each survivor **outside** the lock — materialized through
        :meth:`~retinue.adhoc_build.AdhocIssue.from_fetched_issue` (so the ``Chain-depth:``
        marker stays live) — concurrently but capped at ``config.max_parallel`` live builds,
        each metered against the **one shared** :class:`~retinue.budget.BudgetGovernor` (the
        same governor the PRD lane meters): a build that would cross the rolling-24h cap is
-       skipped, so the shared budget is never overshot.
+       skipped, so the shared budget is never overshot. The reservation is released
+       (success, budget-skip, or error alike) once the builds finish.
 
     Args:
         repo_full_name: The target repo, e.g. ``"owner/repo"``.
@@ -643,8 +692,13 @@ async def run_adhoc_drain(
         governor: The shared service-level budget governor; each build is metered through
             it and skipped when the rolling-24h cap leaves no room.
         estimated_amount: The per-build charge metered against the shared cap.
-        lock: The single-run lock; entering it raises :class:`AdhocDrainBusyError` when a
-            drain for this repo is already in flight. Separate from the PRD build's lock.
+        lock: The critical-section lock; entering it raises :class:`AdhocDrainBusyError` when
+            another drain for this repo is inside its list/classify/reserve section. Held only
+            around that section, not the builds. Separate from the PRD build's lock.
+        guard: The per-repo in-flight :class:`AdhocBuildGuard`, reserved under the lock and
+            released when the builds finish, so an overlapping drain does not double-build an
+            issue. Defaults to a fresh per-call guard (no cross-drain dedup) when omitted; the
+            worker passes the shared per-repo instance.
         prd_in_flight: Whether a PRD build is currently running for this repo. When True,
             PRD-first ordering holds and only preempting (``critical``/``high``) issues
             build; when False, every ranked ad-hoc issue builds.
@@ -656,14 +710,21 @@ async def run_adhoc_drain(
         included.
 
     Raises:
-        AdhocDrainBusyError: A drain for this repo is already in flight (from the lock).
+        AdhocDrainBusyError: Another drain for this repo holds the list/classify/reserve
+            critical section (from the lock).
     """
+    guard = guard if guard is not None else AdhocBuildGuard()
     async with lock:
         listed = await gh.list_ready(repo_full_name=repo_full_name)
         candidates = _select_candidates(repo_full_name, prd_in_flight, listed)
         plan = await _partition_candidates(repo_full_name, candidates, gh)
         await _open_stranded_prs(repo_full_name, plan.stranded, open_pr)
-        if not plan.buildable:
+        # Drop issues a concurrent drain already reserved: their builds are in flight but
+        # haven't opened a PR yet, so flight-state alone would re-pick them (#83).
+        buildable = [
+            issue for issue in plan.buildable if issue.issue_number not in guard
+        ]
+        if not buildable:
             logger.info(
                 "Ad-hoc drain idle: no buildable ready-for-agent issues for %s "
                 "(%d stranded PR(s) recovered)",
@@ -674,18 +735,25 @@ async def run_adhoc_drain(
 
         logger.info(
             "Ad-hoc drain building up to %d issue(s) for %s (cap=%s)",
-            len(plan.buildable),
+            len(buildable),
             repo_full_name,
             config.max_parallel,
         )
+        reserved = [issue.issue_number for issue in buildable]
+        guard.reserve(reserved)
+    # Builds run OUTSIDE the lock so a concurrent critical kick can admit into the freed
+    # lock; the guard (reserved above) keeps the two from double-building the same issue.
+    try:
         return await _build_metered(
             repo_full_name,
-            plan.buildable,
+            buildable,
             build=build,
             config=config,
             governor=governor,
             estimated_amount=estimated_amount,
         )
+    finally:
+        guard.release(reserved)
 
 
 def _select_candidates(

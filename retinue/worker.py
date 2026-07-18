@@ -930,11 +930,13 @@ def _bind_adhoc_drain(
 
     The webhook's kick (:func:`run_adhoc_drain_job`) and — once issue #43 wires it — the
     heartbeat's sweep both fire the drain through this one seam, so they are the *same* work
-    under one single-run lock. The shared collaborators are built once: the service-level
-    :class:`~retinue.budget.BudgetGovernor` over ``settings.budget_db_path`` (the *same*
-    durable rolling-24h ledger the PRD and cron lanes meter, so the budget is one window) and
-    a per-repo single-run lock registry, so two repos drain concurrently while a repo's own
-    kicked and swept drains serialize.
+    sharing one lock and one build guard. The shared collaborators are built once: the
+    service-level :class:`~retinue.budget.BudgetGovernor` over ``settings.budget_db_path`` (the
+    *same* durable rolling-24h ledger the PRD and cron lanes meter, so the budget is one
+    window) and per-repo :class:`~retinue.adhoc_drain.AdhocDrainLock` /
+    :class:`~retinue.adhoc_drain.AdhocBuildGuard` registries, so two repos drain concurrently
+    while a repo's own kicked and swept drains serialize their critical section and dedup
+    their in-flight builds through the shared guard (#83).
 
     Each call mints a per-repo installation token, then constructs the per-repo gh seam
     (:class:`retinue.adhoc_drain.GhCli`), reuses the worker's ``pipeline_factory`` to build
@@ -953,7 +955,7 @@ def _bind_adhoc_drain(
     Returns:
         The bound drain — an async ``(*, repo_full_name, config) -> None``.
     """
-    from retinue.adhoc_drain import AdhocDrainLock, GhCli
+    from retinue.adhoc_drain import AdhocBuildGuard, AdhocDrainLock, GhCli
     from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger, SystemClock
     from retinue.pipeline import bind_adhoc_build, bind_adhoc_pr_open
     from retinue.wiring import bind_adhoc_drain
@@ -968,6 +970,7 @@ def _bind_adhoc_drain(
         )
     )
     locks: dict[str, AdhocDrainLock] = {}
+    guards: dict[str, AdhocBuildGuard] = {}
 
     async def drain(*, repo_full_name: str, config: RepoConfig) -> None:
         token = (await auth.installation_token(repo_full_name)).token
@@ -989,6 +992,7 @@ def _bind_adhoc_drain(
             governor=governor,
             estimated_amount=_ADHOC_DRAIN_ESTIMATED_AMOUNT,
             lock=locks.setdefault(repo_full_name, AdhocDrainLock()),
+            guard=guards.setdefault(repo_full_name, AdhocBuildGuard()),
         )
         await bound(repo_full_name=repo_full_name, config=config)
 

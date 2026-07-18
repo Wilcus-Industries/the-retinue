@@ -37,7 +37,7 @@ from retinue.adhoc_build import (
     build_adhoc_issue,
     render_chain_depth,
 )
-from retinue.adhoc_drain import AdhocDrainLock, ReadyIssue
+from retinue.adhoc_drain import AdhocBuildGuard, AdhocDrainLock, ReadyIssue
 from retinue.done_check import DoneCheckReport
 from retinue.handoff import MergedPullRequest, ReapOutcome
 from retinue.loopback import HeimdallReview, ReviewState, VerdictOutcome
@@ -192,6 +192,7 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
         governor=governor,
         estimated_amount=1.0,
         lock=AdhocDrainLock(),
+        guard=AdhocBuildGuard(),
     )
 
     seen_ctx: dict[str, object] = {}
