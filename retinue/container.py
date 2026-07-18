@@ -274,6 +274,10 @@ class DockerRuntime:
             await writer.wait_closed()
 
     async def start(self, *, image: str, env: dict[str, str]) -> Container:
+        """Create and start a fresh container from ``image`` with ``env``.
+
+        Raises ``DockerError`` on failure.
+        """
         await self._ensure_image(image)
         status, body = await self._request(
             "POST", "/containers/create", body=_create_container_payload(image=image, env=env)
