@@ -2,12 +2,12 @@
 
 The retinue meters agent token spend against a service-level weekly budget and enforces
 a per-rolling-24h-window ceiling (``cap`` = a fraction, by default 12%, of the weekly
-budget). The budget is shared across all lanes — the orchestrator's :func:`build_prd`
-run, the ad-hoc lane, and the cron lane — so the ledger is a single service-level SQLite
+budget). The budget is shared across all lanes — the build run, the ad-hoc lane,
+and the cron lane — so the ledger is a single service-level SQLite
 store, mirroring the durable-SQLite style of
 :class:`retinue.impl_retry.ImplRetryStore`.
 
-Enforcement happens at admission (:meth:`BudgetGovernor.gate` for PRD/cron runs,
+Enforcement happens at admission (:meth:`BudgetGovernor.gate` for build/cron runs,
 :meth:`BudgetGovernor.meter_adhoc` for ad-hoc builds): if the charge would push the
 trailing-24h spend over the cap, the work is *deferred/declined* until the window frees
 enough room (charges expire oldest-first). An admitted charge is recorded atomically
@@ -116,7 +116,7 @@ class BudgetLedger:
     sums only the charges inside the trailing 24h from ``now``. The :meth:`cap` is a
     fixed fraction (default 12%) of the weekly budget, in the ledger's unit (dollars in
     :attr:`AuthMode.API_KEY`, tokens in :attr:`AuthMode.SUBSCRIPTION`). The store is a
-    single service-level SQLite file shared across the orchestrator and cron lanes, so a
+    single service-level SQLite file shared across the scheduler and cron lanes, so a
     charge from either lane counts against the same window. Mirrors the durable-SQLite
     style of :class:`retinue.impl_retry.ImplRetryStore`.
 
@@ -410,12 +410,12 @@ class BudgetGovernor:
     async def meter_adhoc(self, *, amount: float) -> bool:
         """Meter one ad-hoc build's flat charge against the shared rolling-24h cap.
 
-        The ad-hoc lane charges the *same* service-level ledger the PRD lane gates
+        The ad-hoc lane charges the *same* service-level ledger the build lane gates
         against, atomically. A charge that still fits under the cap is recorded and the
         build is admitted; one that would cross it records nothing and the build is
-        declined. The check-and-record is the identical atomic primitive the PRD
+        declined. The check-and-record is the identical atomic primitive the build
         :meth:`gate` uses (:meth:`BudgetLedger.try_record_if_within_cap`), so an ad-hoc
-        build and a PRD gate racing on the shared ledger serialize on the write lock and
+        build and a build gate racing on the shared ledger serialize on the write lock and
         the cap is never overshot.
 
         Args:
@@ -435,7 +435,7 @@ class BudgetGovernor:
 # Every lane meters the one shared ledger with a flat, conservative estimate; the
 # constants live together here so the cross-lane relationships stay visible.
 
-# The orchestrator build's estimated charge, gated against the rolling-24h budget cap.
+# The build's estimated charge, gated against the rolling-24h budget cap.
 # The build's true cost is only known after the implementer/done-check runs, so the gate
 # uses a conservative fixed estimate; the meter (the governor's mid-run pause/resume)
 # tracks the real spend once the run is underway. Kept here (not a Settings field) so the
@@ -447,7 +447,7 @@ BUILD_ESTIMATED_AMOUNT = 1.0
 CLASSIFIER_ESTIMATED_AMOUNT = 0.01
 
 # The flat per-build charge the ad-hoc drain meters against the shared rolling-24h cap,
-# matching the PRD lane's estimate (:data:`BUILD_ESTIMATED_AMOUNT`); a
+# matching the build lane's estimate (:data:`BUILD_ESTIMATED_AMOUNT`); a
 # build that would cross the cap is skipped so the one shared budget is never overshot.
 ADHOC_DRAIN_ESTIMATED_AMOUNT = 1.0
 

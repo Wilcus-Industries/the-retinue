@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     )
 
     # Budget governor (issue #14). The budget is service-level — shared across the
-    # orchestrator and cron lanes — so it lives here, not in the per-repo config.
+    # scheduler and cron lanes — so it lives here, not in the per-repo config.
     # ``auth_mode`` selects the metering unit: an API key meters dollars against the
     # weekly-$ budget; subscription OAuth meters tokens against the weekly-token budget.
     auth_mode: str = Field(
@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     # Caps the headless implementer's agent loop (``claude --max-turns``). Without a cap a
     # thrashing build runs until the arq job_timeout kills the whole job — including the
     # done-check; the cap stops the agent and lets the done-check report. Mirrors the
-    # orchestrator's _DEFAULT_IMPLEMENT_MAX_TURNS so a bare implementer and the wired one
+    # container_build's _DEFAULT_IMPLEMENT_MAX_TURNS so a bare implementer and the wired one
     # agree. Tunable via env (no rebuild — worker recreate only).
     implement_max_turns: int = Field(
         default=80,

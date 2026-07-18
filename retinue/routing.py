@@ -1,11 +1,11 @@
-"""Per-issue implementer-model routing for the PRD build lane.
+"""Per-issue implementer-model routing for the scheduler build lane.
 
-The PRD build lane's only per-issue agent role is the implementer. This module resolves
+The build lane's only per-issue agent role is the implementer. This module resolves
 that implementer's *model* per slice at the slice's first build: it fetches the issue's
 facts (title/body/labels), classifies the slice to a routing level via
 :func:`retinue.level.resolve_level` (honoring any pre-existing ``level:`` label), and
-returns a :class:`~retinue.orchestrator.ContainerImplementer` carrying that level's
-implementer model. Two slices of one PRD can therefore launch on different models.
+returns a :class:`~retinue.container_build.ContainerImplementer` carrying that level's
+implementer model. Two issues built in one drain can therefore launch on different models.
 
 The router is only constructed when the repo declares a ``routing:`` table
 (:attr:`~retinue.repo_config.RepoConfig.routing`); a table-less repo keeps the single
@@ -16,9 +16,9 @@ runs no classifier and records nothing). A classification failure builds the sli
 table's ``default`` level and posts an explanatory issue comment naming that level.
 
 The classify-one-issue-to-a-level hop is factored into :func:`resolve_issue_level`, the
-single seam both this PRD-lane router and the ad-hoc lane
-(:func:`retinue.pipeline._resolve_adhoc_level`) route through, so a PRD slice and a
-standalone ad-hoc issue classify, meter, label, and comment identically.
+single seam both this router and the ad-hoc lane
+(:func:`retinue.pipeline._resolve_adhoc_level`) route through, so every scheduled issue
+classifies, meters, labels, and comments identically.
 
 The two seams — :data:`IssueFactsSource` (fetch one issue's :class:`ClassifyInput`) and
 :data:`PerIssueImplementer` (resolve the implementer for one slice) — are injected so the
@@ -51,7 +51,7 @@ from retinue.roles import Role, resolve_model
 logger = logging.getLogger(__name__)
 
 # IssueFactsSource — fetch one issue's facts (title/body/labels), the router's read seam —
-# is defined in retinue.orchestrator (the implementer carries it too; defining it there
+# is defined in retinue.container_build (the implementer carries it too; defining it there
 # avoids a cycle) and re-exported above for this module's callers.
 
 # Resolve the implementer for one slice — the build lane's per-slice implementer seam.
@@ -134,9 +134,9 @@ async def resolve_issue_level(
     actually ran on the shared ledger, and posts the failure comment on a classification
     failure. Returns the resolved level name — always one of the table's declared levels.
 
-    The PRD build lane (:class:`PerIssueImplementerRouter`) and the ad-hoc lane
-    (:func:`retinue.pipeline._resolve_adhoc_level`) both route through this one hop, so a
-    slice and a standalone issue classify and meter identically. A facts-fetch, label, or
+    The router (:class:`PerIssueImplementerRouter`) and the ad-hoc lane
+    (:func:`retinue.pipeline._resolve_adhoc_level`) both route through this one hop, so
+    every scheduled issue classifies and meters identically. A facts-fetch, label, or
     comment error propagates; each lane's caller decides the fallback (both fall back to
     the table's ``default`` level rather than escalating).
 

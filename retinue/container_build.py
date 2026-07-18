@@ -1,27 +1,23 @@
-"""The per-issue container-build lifecycle shared by the PRD and ad-hoc lanes.
+"""The per-issue container-build lifecycle the scheduler build lane runs.
 
-Both build lanes run one issue's whole build inside **one disposable container** that is
+The build lane runs one issue's whole build inside **one disposable container** that is
 destroyed on every path: parse the done-check, resolve the config's secrets, start the
 container (secrets + git committer identity + the in-container agents' credentials all in
-its env), clone the repo and check out a fresh ``issue-<N>`` branch off the lane's base,
+its env), clone the repo and check out a fresh ``issue-<N>`` branch off the target base,
 exec the implementer, guard against a hollow implement (zero commits landed), run the
 repo's done-check over the real changes, push the branch only on green, and post the
 outcome to the report sink. :func:`build_issue_in_container` owns that lifecycle; the
-lanes own only what genuinely differs, passed as hooks:
-
-- the **PRD lane** (:func:`retinue.orchestrator.build_slice` / ``build_prd``) branches off
-  the integration branch ``retinue/prd-<n>`` and passes no hooks,
-- the **ad-hoc lane** (:func:`retinue.adhoc_build.build_adhoc_issue`) branches off the
-  repo's staging branch, runs a read-only planner before the implement
-  (``pre_implement``), points the implementer at the materialized plan (``plan_path``),
-  and runs an advisory review after a green check (``on_green``).
+caller — the **ad-hoc lane** (:func:`retinue.adhoc_build.build_adhoc_issue`), which
+branches off the repo's target branch — owns only what genuinely differs, passed as hooks:
+a read-only planner before the implement (``pre_implement``), the materialized plan the
+implementer reads (``plan_path``), and the in-session review gate after a green check
+(``on_green``).
 
 The building blocks the lifecycle drives — the :class:`Slice` unit, the
 :class:`Implementer` seam, the git command builders, and the in-container git helpers —
-live here too, so both lanes (and the orchestrator's merge seam) share one public set
-instead of reaching into each other's privates. Every side-effecting collaborator is
-injected, so the whole flow is exercised in tests with no Agent SDK, no Docker, no gh,
-and no network.
+live here too, so the lane draws on one public set instead of reaching into private
+internals. Every side-effecting collaborator is injected, so the whole flow is exercised
+in tests with no Agent SDK, no Docker, no gh, and no network.
 """
 
 from __future__ import annotations
@@ -91,9 +87,9 @@ class Implementer(Protocol):
         """Build ``slice_`` in ``container``, committing to its ``issue-<N>`` branch.
 
         ``plan_path`` is the in-container path of a materialized implementation plan the
-        subagent must read before building. The PRD lane passes nothing (``None``), so its
-        prompt is unchanged; the ad-hoc lane passes its ``PLAN_FILE`` so the subagent is
-        pointed at the plan the planner wrote.
+        subagent must read before building. A caller that materializes no plan passes
+        nothing (``None``), leaving the prompt unchanged; the ad-hoc lane passes its
+        ``PLAN_FILE`` so the subagent is pointed at the plan the planner wrote.
         """
         ...
 
@@ -120,12 +116,10 @@ class ImplementError(RuntimeError):
 
 
 class GitOpsError(RuntimeError):
-    """A ``git`` command failed for a reason other than a recoverable merge conflict.
+    """A ``git`` command failed with a hard error.
 
-    Distinct from :class:`retinue.orchestrator.MergeConflict`: a conflict is handed to
-    the resolver, but a hard error (unknown ref, not a repository, checkout failure)
-    means the branch could not be advanced at all, so it propagates rather than
-    masquerading as a conflict the resolver could fix.
+    A hard error (unknown ref, not a repository, checkout failure) means the branch could
+    not be advanced at all, so it propagates and fails the build rather than being swallowed.
     """
 
 
@@ -326,8 +320,8 @@ async def build_issue_in_container(
         if pre_implement is not None:
             await pre_implement(container)
         if plan_path is None:
-            # The bare call shape is kept for the PRD lane so an injected implementer
-            # that predates the plan_path parameter still satisfies the seam.
+            # The bare call shape (no plan_path) is kept so an injected implementer that
+            # predates the plan_path parameter still satisfies the seam.
             await implementer.implement(slice_, container=container)
         else:
             await implementer.implement(

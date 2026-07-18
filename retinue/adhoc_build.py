@@ -14,7 +14,7 @@ every path (:func:`build_adhoc_issue`):
 3. **materialize** — the captured plan is written byte-exact into :data:`PLAN_FILE`, the
    one file the implementer reads, so the plan crosses from the read-only planner to the
    write-capable implementer through the workspace rather than a second model call,
-4. **implement** — the same implementer the PRD lane uses (Sonnet/high on the in-container
+4. **implement** — the same implementer the container build uses (Sonnet/high on the in-container
    CLI) is pointed at :data:`PLAN_FILE` via its ``plan_path`` and told to read the plan
    before building, then implements TDD-first and commits to the ``issue-<N>`` branch; an
    implement run that lands **zero commits** on the branch fails the build (the shared
@@ -41,8 +41,8 @@ reviewer, the container runtime, the auth, the secret resolver, and the report s
 injected, so the whole flow is exercised in tests with no Agent SDK, no Docker, no gh, and
 no network. The whole container lifecycle — start, clone+branch, implement, the
 hollow-implement guard, done-check, push-on-green, report, teardown — is the shared
-:func:`retinue.container_build.build_issue_in_container` (the same lifecycle the PRD lane
-runs), and the gate reuses the internal reviewer's
+:func:`retinue.container_build.build_issue_in_container` (the shared container build
+lifecycle), and the gate reuses the internal reviewer's
 :class:`~retinue.reviewer.ReviewGenerator` seam and the same implementer; this module
 only adds the planner seam, the plan materialization, threading :data:`PLAN_FILE` into
 the implementer as its ``plan_path``, the no-merge plan->execute ordering, and the
@@ -143,7 +143,7 @@ class AdhocIssue:
     ) -> AdhocIssue:
         """Build the issue from a fetched GitHub issue, reading its lineage depth.
 
-        The canonical constructor the ad-hoc drain (:mod:`retinue.lane`'s ranked drain,
+        The canonical constructor the ad-hoc drain (:mod:`retinue.adhoc_drain`'s ranked drain,
         #32) must call instead of ``AdhocIssue(repo_full_name=..., issue_number=...)``.
         It parses the ``Chain-depth: <n>`` marker the prior review-fix hop stamped into
         ``body`` (:func:`parse_chain_depth`) and threads it into :attr:`chain_depth`, so
@@ -206,7 +206,8 @@ def _plan_prompt(issue: AdhocIssue) -> str:
 def _materialize_plan_command(plan: str) -> list[str]:
     """Argv that writes the captured ``plan`` into :data:`PLAN_FILE`, byte-exact.
 
-    Reuses the orchestrator's base64 in-container file writer so the plan's markdown —
+    Reuses the shared base64 in-container file writer
+    (:func:`retinue.container_build.write_file_command`) so the plan's markdown —
     backticks, quotes, newlines — survives untouched and nothing in it is interpreted as
     shell syntax. The parent dot-dir is created first so the write into it can't fail.
     """
@@ -275,8 +276,8 @@ def _issue_diff_command(branch: str, base: str) -> list[str]:
     ``git checkout -B issue-<N> origin/<base>``, so it creates the remote-tracking
     ``origin/<base>`` ref and the local ``issue-<N>`` branch but **no** bare local
     ``<base>`` (that exists only when the target branch happens to be the clone's default
-    HEAD). The base is therefore ``origin/<base>`` — mirroring the orchestrator's
-    the round-diff base, whose base side is
+    HEAD). The base is therefore ``origin/<base>`` — mirroring the round-diff base,
+    whose base side is
     also a resolvable ref — while the branch stays the *local* ``issue-<N>`` ref the build
     just committed to (no ``origin/`` prefix): the review runs in the same container that
     built it, so the local tip is the surface to review.
@@ -663,7 +664,7 @@ async def _materialize_plan(container: Container, plan: str) -> None:
 def _slice_for_issue(issue: AdhocIssue) -> Slice:
     """Adapt an :class:`AdhocIssue` to the :class:`~retinue.container_build.Slice` seam.
 
-    The implementer seam is shared with the PRD lane, whose contract is a ``Slice``. An
+    The container build lifecycle's contract is a ``Slice``. An
     ad-hoc issue has no parent PRD, so it stands on its own integration target: the
     per-issue PRD number is the issue number itself (the same convention the cron lane uses
     for a standalone backlog nit), which only feeds the ``issue-<N>`` branch the implementer

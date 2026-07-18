@@ -225,7 +225,7 @@ async def _bring_up_to_date_and_open(
             head=branch,
             base=staging,
             title=f"Retinue: land {branch} into {staging}",
-            body=f"Automated PR for PRD #{prd_issue_number}: merge `{branch}` into "
+            body=f"Automated PR for issue #{prd_issue_number}: merge `{branch}` into "
             f"`{staging}` after a full build.",
         )
     )

@@ -26,7 +26,7 @@ PRIORITY_LABEL_PREFIX = "priority:"
 
 
 class Severity(enum.IntEnum):
-    """A heimdall finding's severity, ordered so a blocking threshold is a comparison.
+    """A review finding's severity, ordered so a blocking threshold is a comparison.
 
     The integer order encodes "more severe is greater", so a finding is *blocking*
     when its severity is at or above the configured threshold (default
@@ -41,13 +41,13 @@ class Severity(enum.IntEnum):
 
 
 def priority_label(severity: Severity) -> str:
-    """Return the backlog ``priority:<severity>`` label for a heimdall severity.
+    """Return the backlog ``priority:<severity>`` label for a review severity.
 
-    The mapping is 1:1 with the severity name, so heimdall's own severity vocabulary
+    The mapping is 1:1 with the severity name, so the reviewer's severity vocabulary
     survives onto the filed backlog issue without translation.
 
     Args:
-        severity: The finding's heimdall severity.
+        severity: The finding's review severity.
 
     Returns:
         ``"priority:low"`` / ``"priority:medium"`` / ``"priority:high"`` /
