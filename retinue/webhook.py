@@ -83,7 +83,11 @@ def verify_signature(payload: bytes, secret: str, signature_header: str | None) 
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     expected = compute_signature(payload, secret)
-    return hmac.compare_digest(expected, signature_header)
+    # Compare as UTF-8 bytes, not str: signature_header is an attacker-controlled HTTP
+    # header (ASGI latin-1-decodes header bytes), so a non-ASCII value would make
+    # hmac.compare_digest raise TypeError — an unhandled 500 on the webhook path instead
+    # of a clean rejection. expected is pure ASCII, so a non-ASCII header can never match.
+    return hmac.compare_digest(expected.encode("utf-8"), signature_header.encode("utf-8"))
 
 
 def _build_merged_pr_job(body: dict[str, Any]) -> MergedPrJob:
