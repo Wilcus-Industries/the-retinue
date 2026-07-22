@@ -298,6 +298,7 @@ def _worker_settings(tmp_path: Path) -> object:
     return Settings(  # type: ignore[call-arg]
         _env_file=None,
         webhook_secret="s",
+        api_service_token="svc-tok",
         dedupe_db_path=str(tmp_path / "dedupe.sqlite3"),
         budget_db_path=str(tmp_path / "budget.sqlite3"),
         weekly_budget=1000.0,

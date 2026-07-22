@@ -20,6 +20,7 @@ from retinue.repo_config import (
     RoutingConfig,
     RoutingLevel,
 )
+from retinue.run_ledger import RunLedgerStore, RunState
 from tests.fakes import (
     _created,
     _fake_build_adhoc_issue,
@@ -28,6 +29,7 @@ from tests.fakes import (
     _governor,
     _RecordingAdhocPipeline,
     _RecordingNotifier,
+    _run_ledger,
     _settings,
 )
 
@@ -49,6 +51,7 @@ def _pipeline(tmp_path: Path, **overrides: object) -> Pipeline:
         reap_gh=_FakeReapGh(),
         retry_store_path=tmp_path / "retries.sqlite3",
         run_state_path=tmp_path / "runstate.sqlite3",
+        run_ledger=_run_ledger(tmp_path),
     )
     base.update(overrides)
     return Pipeline(**base)  # type: ignore[arg-type]
@@ -84,6 +87,12 @@ async def test_green_adhoc_build_opens_one_pr_into_target_branch(tmp_path: Path)
     # The mapping is recorded under the single ad-hoc issue (no PRD parent, no slices).
     mapping = await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99)
     assert mapping == (31, [])
+    # The pipeline choke point recorded the run-ledger's pr_opened terminal state.
+    rows = await pipeline.run_ledger.rows()
+    assert len(rows) == 1
+    assert rows[0].issue == 31
+    assert rows[0].state == RunState.PR_OPENED.value
+    assert rows[0].url == "https://github.com/owner/repo/pull/99"
 
 
 @pytest.mark.asyncio
@@ -102,6 +111,11 @@ async def test_red_adhoc_build_opens_no_pr(tmp_path: Path) -> None:
     assert result is None  # the PR step was never reached
     assert pr_ops.opened == []
     assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
+    # The pipeline choke point recorded the run-ledger's failed terminal state.
+    rows = await pipeline.run_ledger.rows()
+    assert len(rows) == 1
+    assert rows[0].issue == 31
+    assert rows[0].state == RunState.FAILED.value
 
 
 # --- review gate consumption -----------------------------------------------------
@@ -143,6 +157,13 @@ async def test_gate_blocking_findings_escalate_and_open_no_pr(tmp_path: Path) ->
     assert "Still broken" in note.body
     # No mapping recorded — the PR never opened.
     assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
+    # The pipeline choke point recorded the run-ledger's escalated terminal state, with
+    # the GitHub issue URL (the escalations endpoint's read).
+    rows = await pipeline.run_ledger.rows()
+    assert len(rows) == 1
+    assert rows[0].issue == 31
+    assert rows[0].state == RunState.ESCALATED.value
+    assert rows[0].url == "https://github.com/owner/repo/issues/31"
 
 
 @pytest.mark.asyncio
@@ -248,6 +269,12 @@ async def test_reap_pr_closes_the_issue_and_deletes_the_run_state(tmp_path: Path
     assert reap_gh.closed == [31]  # the single ad-hoc issue, closed exactly once
     # The round's row was deleted, so the merged PR no longer resolves.
     assert await pipeline.round_for_pr(repo_full_name="owner/repo", pr_number=99) is None
+    # The merge reap recorded the run-ledger's merged terminal state, overwriting the
+    # pr_opened state the green build recorded earlier.
+    rows = await pipeline.run_ledger.rows()
+    assert len(rows) == 1
+    assert rows[0].issue == 31
+    assert rows[0].state == RunState.MERGED.value
 
 
 # --- production factory wiring ---------------------------------------------------
@@ -282,6 +309,7 @@ async def test_build_pipeline_factory_wires_a_pipeline(tmp_path: Path) -> None:
     assert pipeline.config.target_branch == "staging"  # the PR base is wired
     assert pipeline.pr_ops is not None  # the PR-opener gh seam is wired
     assert pipeline.reap_gh is not None  # the reap gh seam is wired
+    assert isinstance(pipeline.run_ledger, RunLedgerStore)  # the run-ledger is wired
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ from retinue.config import Settings
 from retinue.github_app import InstallationAuth
 from retinue.pipeline import PipelineFactory
 from retinue.repo_config import RepoConfig
+from retinue.run_ledger import RunLedgerStore
 from retinue.wiring import bind_adhoc_drain, bind_cron_tick
 
 
@@ -140,6 +141,7 @@ def _bind_test_drain(
     monkeypatch: pytest.MonkeyPatch,
     *,
     governor: BudgetGovernor,
+    tmp_path: Path,
     listed: list[str],
     built: list[object],
     captured: dict[str, object] | None = None,
@@ -209,6 +211,7 @@ def _bind_test_drain(
         cast(Settings, object()),
         cast(InstallationAuth, _NoAuth()),
         governor=governor,
+        run_ledger=RunLedgerStore(tmp_path / "run-ledger.sqlite3"),
         pipeline_factory=cast(PipelineFactory, pipeline_factory),
         fetch_claude_md=_canned_claude_md,
     )
@@ -234,7 +237,7 @@ async def test_adhoc_drain_drives_run_adhoc_drain_with_its_collaborators(
     listed: list[str] = []
     built: list[object] = []
     drain = _bind_test_drain(
-        monkeypatch, governor=governor, listed=listed, built=built
+        monkeypatch, governor=governor, tmp_path=tmp_path, listed=listed, built=built
     )
 
     await drain(repo_full_name="owner/repo", config=_config())
@@ -254,7 +257,7 @@ async def test_adhoc_drain_skips_the_build_when_the_shared_budget_is_spent(
     governor = _governor(tmp_path, clock, weekly=1.0)
     built: list[object] = []
     drain = _bind_test_drain(
-        monkeypatch, governor=governor, listed=[], built=built
+        monkeypatch, governor=governor, tmp_path=tmp_path, listed=[], built=built
     )
 
     await drain(repo_full_name="owner/repo", config=_config())
@@ -287,7 +290,12 @@ async def test_adhoc_drain_resolves_none_target_branch_to_repo_default(
     governor = _governor(tmp_path, clock)
     captured: dict[str, object] = {}
     drain = _bind_test_drain(
-        monkeypatch, governor=governor, listed=[], built=[], captured=captured
+        monkeypatch,
+        governor=governor,
+        tmp_path=tmp_path,
+        listed=[],
+        built=[],
+        captured=captured,
     )
 
     await drain(repo_full_name="owner/repo", config=_config(target_branch=None))

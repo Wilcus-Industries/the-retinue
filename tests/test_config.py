@@ -12,6 +12,7 @@ from retinue.config import Settings
 def test_settings_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Settings reads the webhook secret and Redis URL from the environment."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("REDIS_URL", "redis://example:6380/1")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.webhook_secret == "s3cret"
@@ -21,6 +22,7 @@ def test_settings_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_redis_url_defaults_to_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
     """When REDIS_URL is unset, the Redis URL defaults to localhost:6379."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.delenv("REDIS_URL", raising=False)
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.redis_url == "redis://localhost:6379"
@@ -32,6 +34,7 @@ def test_settings_loads_from_dotenv(
     """Settings reads values from a .env file when env vars are absent."""
     monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
     monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     env_file = tmp_path / ".env"
     env_file.write_text("WEBHOOK_SECRET=from-dotenv\nREDIS_URL=redis://dotenv:6379\n")
     settings = Settings(_env_file=str(env_file))  # type: ignore[call-arg]
@@ -41,14 +44,50 @@ def test_settings_loads_from_dotenv(
 
 def test_missing_webhook_secret_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing webhook secret is a configuration error."""
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
     with pytest.raises(ValueError):
         Settings(_env_file=None)  # type: ignore[call-arg]
 
 
+def test_missing_api_service_token_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing API service token is a configuration error, like the webhook secret."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.delenv("API_SERVICE_TOKEN", raising=False)
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("var", ["WEBHOOK_SECRET", "API_SERVICE_TOKEN"])
+def test_blank_required_secret_rejected(
+    monkeypatch: pytest.MonkeyPatch, var: str
+) -> None:
+    """A present-but-empty required secret fails closed at load, not a silent load.
+
+    A blank ``API_SERVICE_TOKEN`` makes bearer auth bypassable — ``Authorization: Bearer``
+    matches an empty expected token via ``hmac.compare_digest("", "")`` — so an empty value
+    (exactly what a freshly-copied .env.example carries until filled) must be rejected, like
+    a missing one.
+    """
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
+    monkeypatch.setenv(var, "")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_api_service_token_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The API service token loads from the environment."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.api_service_token == "svc-tok"
+
+
 def test_budget_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """The service-level budget settings carry sensible defaults (api_key, 12% cap)."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.auth_mode == "api_key"
     assert settings.weekly_budget == 0.0
@@ -59,6 +98,7 @@ def test_budget_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_budget_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The budget settings load from the environment (subscription/token mode)."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("AUTH_MODE", "subscription")
     monkeypatch.setenv("WEEKLY_BUDGET", "1000000")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
@@ -72,6 +112,7 @@ def test_negative_weekly_budget_rejected(
 ) -> None:
     """A negative weekly budget is a config error; only 0.0 (disabled) or >0 are valid."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("WEEKLY_BUDGET", value)
     with pytest.raises(ValueError):
         Settings(_env_file=None)  # type: ignore[call-arg]
@@ -82,6 +123,7 @@ def test_zero_weekly_budget_is_the_disabled_sentinel(
 ) -> None:
     """WEEKLY_BUDGET=0 loads cleanly: it is the metering-disabled sentinel, not an error."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("WEEKLY_BUDGET", "0")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.weekly_budget == 0.0
@@ -97,6 +139,7 @@ def test_job_timeout_default_exceeds_arq_default(
     default well above 300.
     """
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.job_timeout_seconds > 300
     assert settings.job_timeout_seconds == 1800
@@ -105,6 +148,7 @@ def test_job_timeout_default_exceeds_arq_default(
 def test_job_timeout_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The job timeout loads from the environment for longer or shorter builds."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("JOB_TIMEOUT_SECONDS", "3600")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.job_timeout_seconds == 3600
@@ -113,6 +157,7 @@ def test_job_timeout_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_implement_max_turns_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """The implementer's agent-loop cap carries its default (mirrors the orchestrator)."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.implement_max_turns == 80
 
@@ -123,6 +168,7 @@ def test_non_positive_job_timeout_rejected(
 ) -> None:
     """A zero or negative job timeout is a config error, not a silent load."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("JOB_TIMEOUT_SECONDS", value)
     with pytest.raises(ValueError):
         Settings(_env_file=None)  # type: ignore[call-arg]
@@ -134,6 +180,7 @@ def test_non_positive_implement_max_turns_rejected(
 ) -> None:
     """A zero or negative implement cap is a config error, not a silent load."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("IMPLEMENT_MAX_TURNS", value)
     with pytest.raises(ValueError):
         Settings(_env_file=None)  # type: ignore[call-arg]
@@ -142,6 +189,7 @@ def test_non_positive_implement_max_turns_rejected(
 def test_adapter_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """The new adapter wiring fields default to empty (opt-in, never required)."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.github_app_id == ""
     assert settings.github_app_private_key_path == ""
@@ -155,6 +203,7 @@ def test_adapter_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_adapter_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """GitHub App, Anthropic, and push channel settings load from the environment."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("GITHUB_APP_ID", "123456")
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", "/secrets/app.pem")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-xxx")
@@ -169,6 +218,7 @@ def test_adapter_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_oauth_token_reads_claude_code_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The subscription OAuth token reads the conventional CLAUDE_CODE_OAUTH_TOKEN."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-yyy")
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     assert settings.anthropic_oauth_token == "sk-ant-oat-yyy"
@@ -177,6 +227,7 @@ def test_oauth_token_reads_claude_code_env(monkeypatch: pytest.MonkeyPatch) -> N
 def test_anthropic_credential_follows_auth_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """``anthropic_credential`` resolves the key/token the active auth mode uses."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-xxx")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-yyy")
 

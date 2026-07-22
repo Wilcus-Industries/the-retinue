@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
@@ -14,7 +16,20 @@ class Settings(BaseSettings):
     should live in ``.env`` or be injected by the deployment environment.
     """
 
-    webhook_secret: str = Field(..., description="GitHub webhook HMAC secret")
+    # Both required secrets carry ``min_length=1``: a *present-but-empty* value must fail
+    # closed at load, not silently load as "". A blank api_service_token would make bearer
+    # auth bypassable (``hmac.compare_digest("", "")`` is True), and a copied .env.example
+    # ships both blank until filled — so an unfilled secret is a config error, like a
+    # missing one.
+    webhook_secret: str = Field(
+        ..., min_length=1, description="GitHub webhook HMAC secret"
+    )
+    api_service_token: str = Field(
+        ...,
+        min_length=1,
+        description="Bearer token required on every /api/* request "
+        "(Authorization: Bearer <token>)",
+    )
     redis_url: str = Field(
         default="redis://localhost:6379", description="Redis connection URL"
     )
@@ -135,3 +150,14 @@ class Settings(BaseSettings):
         # so ANTHROPIC_OAUTH_TOKEN and direct construction both work.
         "populate_by_name": True,
     }
+
+
+def state_dir(settings: Settings) -> Path:
+    """The directory the worker's durable SQLite stores share (next to the dedupe DB).
+
+    Co-locates every durable store (run-state, retries, the run-ledger) next to the
+    dedupe DB so a single mounted volume holds all of the worker's durable state. This is
+    the single source of truth for that directory, reused by :mod:`retinue.pipeline` and
+    :mod:`retinue.run_ledger`.
+    """
+    return Path(settings.dedupe_db_path).resolve().parent
