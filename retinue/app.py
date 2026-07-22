@@ -15,6 +15,7 @@ import arq
 from fastapi import FastAPI
 
 from retinue.api import make_api_router
+from retinue.budget import AuthMode, BudgetLedger, SystemClock
 from retinue.config import Settings
 from retinue.webhook import make_webhook_router
 
@@ -41,6 +42,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Capture settings in the lifespan closure so the Redis URL is available.
     _settings = settings
 
+    # The API process's own read-only handle onto the shared budget SQLite ledger
+    # (GET /api/budget, issue #90) — bound to the same ``budget_db_path`` the worker
+    # writes, but a distinct connection: this process never touches the worker's
+    # in-memory BudgetGovernor. weekly_budget/daily_cap_fraction come from this
+    # process's own Settings (the same env), so cap() is computable with no worker
+    # dependency. Construction is synchronous (the aiosqlite connection opens lazily
+    # on first use), so it's available even when the app's lifespan never runs (e.g.
+    # tests driving the app directly via ASGITransport).
+    budget_ledger = BudgetLedger(
+        _settings.budget_db_path,
+        clock=SystemClock(),
+        auth_mode=AuthMode.from_config(_settings.auth_mode),
+        weekly_budget=_settings.weekly_budget,
+        daily_cap_fraction=_settings.budget_daily_cap_fraction,
+    )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         pool = await arq.create_pool(
@@ -52,6 +69,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             await pool.close()
+            await budget_ledger.close()
             logger.info("Arq Redis pool closed")
 
     app = FastAPI(title="The Retinue", version="0.1.0", lifespan=lifespan)
@@ -62,7 +80,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     webhook_router = make_webhook_router(webhook_secret=settings.webhook_secret)
     app.include_router(webhook_router)
 
-    api_router = make_api_router(api_service_token=settings.api_service_token)
+    api_router = make_api_router(
+        api_service_token=settings.api_service_token, budget_ledger=budget_ledger
+    )
     app.include_router(api_router)
 
     return app

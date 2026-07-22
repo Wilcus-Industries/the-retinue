@@ -41,8 +41,12 @@ gate files) back into the scheduler queue.
 - `retinue.api` — the authed `/api/*` read/control surface: every route requires
   `Authorization: Bearer <API_SERVICE_TOKEN>` (constant-time compare, same idiom as the
   webhook's HMAC check), wired as a router-level dependency so new routes are authed by
-  construction. First route: `POST /api/drain` enqueues an ad-hoc scheduler drain via the
-  same `enqueue_adhoc_drain` path the webhook uses.
+  construction. `POST /api/drain` enqueues an ad-hoc scheduler drain via the same
+  `enqueue_adhoc_drain` path the webhook uses. `GET /api/budget` returns
+  `{trailing_24h_spend, cap}` read from a `BudgetLedger` the API process opens
+  read-only against the same `BUDGET_DB_PATH` the worker writes (`retinue.app.create_app`)
+  — its own `weekly_budget`/`BUDGET_DAILY_CAP_FRACTION` compute `cap()` with no
+  dependency on the worker's in-memory governor.
 - `retinue.scheduler` — the pure two-queue queue model: each candidate's tier is its
   `priority:<tier>` label matched against `config.severity_tiers`; candidates in the top
   range (`config.priority_tiers`) form the **priority queue**, the rest the **main queue**,
