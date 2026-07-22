@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     """
 
     webhook_secret: str = Field(..., description="GitHub webhook HMAC secret")
+    api_service_token: str = Field(
+        ...,
+        description="Bearer token required on every /api/* request "
+        "(Authorization: Bearer <token>)",
+    )
     redis_url: str = Field(
         default="redis://localhost:6379", description="Redis connection URL"
     )

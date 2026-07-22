@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 import arq
 from fastapi import FastAPI
 
+from retinue.api import make_api_router
 from retinue.config import Settings
 from retinue.webhook import make_webhook_router
 
@@ -60,5 +61,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     webhook_router = make_webhook_router(webhook_secret=settings.webhook_secret)
     app.include_router(webhook_router)
+
+    api_router = make_api_router(api_service_token=settings.api_service_token)
+    app.include_router(api_router)
 
     return app
