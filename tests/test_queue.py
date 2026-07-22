@@ -15,6 +15,7 @@ from retinue.queue import (
     MergedPrJob,
     PrdJob,
     ReviewJob,
+    _adhoc_drain_job_id,
     enqueue_adhoc_drain,
     enqueue_merged_pr,
     enqueue_prd,
@@ -141,3 +142,9 @@ async def test_enqueue_adhoc_drain_clears_stale_result_before_enqueue() -> None:
     assert [c[0] for c in parent.mock_calls].index("delete") < [
         c[0] for c in parent.mock_calls
     ].index("enqueue_job")
+
+
+def test_adhoc_drain_job_id_format() -> None:
+    """The per-repo drain job id is the `adhoc-drain:` prefix joined to the repo full name."""
+    assert _adhoc_drain_job_id("owner/repo") == "adhoc-drain:owner/repo"
+    assert _adhoc_drain_job_id("other/thing") == "adhoc-drain:other/thing"
