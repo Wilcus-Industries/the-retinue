@@ -1,17 +1,29 @@
-"""Tests for the authed /api/* surface: bearer auth and POST /api/drain."""
+"""Tests for the authed /api/* surface: bearer auth and POST /api/drain.
+
+``POST /api/drain`` is exercised against a real ``ArqRedis`` pool backed by an
+in-process ``fakeredis`` server (the same pattern as ``tests/test_roundtrip.py`` and
+``tests/test_adhoc_e2e.py``) rather than a mocked ``enqueue_adhoc_drain`` — the point is
+to prove the real ``request.app.state.arq_pool`` wiring and the per-repo dedup
+``_job_id`` land correctly, which a mocked enqueue call would not catch.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from unittest.mock import AsyncMock, MagicMock, patch
+import contextlib
+from collections.abc import AsyncIterator
 
+import fakeredis
 import pytest
-from fastapi.testclient import TestClient
+import pytest_asyncio
+from arq import ArqRedis
+from arq.jobs import Job
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 
 from retinue.api import verify_bearer_token
 from retinue.app import create_app
 from retinue.config import Settings
-from retinue.queue import AdhocDrainJob
+from retinue.queue import RUN_ADHOC_DRAIN_TASK
 
 _TOKEN = "test-api-service-token"
 
@@ -25,15 +37,34 @@ def _make_settings() -> Settings:
     )
 
 
-@pytest.fixture()
-def api_client() -> Iterator[tuple[TestClient, MagicMock]]:
-    """Yield the client with ``enqueue_adhoc_drain`` patched and recording."""
-    settings = _make_settings()
-    enqueue_adhoc = AsyncMock(return_value="jid-adhoc")
-    with patch("retinue.api.enqueue_adhoc_drain", enqueue_adhoc):
-        app = create_app(settings)
-        client = TestClient(app, raise_server_exceptions=True)
-        yield client, enqueue_adhoc
+@pytest_asyncio.fixture()
+async def arq_pool() -> AsyncIterator[ArqRedis]:
+    """An ArqRedis backed by an isolated in-process fakeredis server (the real spine)."""
+    server = fakeredis.FakeServer()
+    fake = fakeredis.FakeAsyncRedis(server=server)
+    pool = ArqRedis(pool_or_conn=fake.connection_pool)
+    try:
+        yield pool
+    finally:
+        # Idempotent: a test may have already closed the shared pool.
+        with contextlib.suppress(Exception):
+            await pool.aclose()
+
+
+@pytest_asyncio.fixture()
+async def api_app(arq_pool: ArqRedis) -> FastAPI:
+    """The app with its real ``arq_pool`` wired to the fake Redis (no mocked enqueue)."""
+    app = create_app(_make_settings())
+    app.state.arq_pool = arq_pool
+    return app
+
+
+@pytest_asyncio.fixture()
+async def api_client(api_app: FastAPI) -> AsyncIterator[AsyncClient]:
+    """An httpx client driving the real ASGI app over ``ASGITransport``."""
+    transport = ASGITransport(app=api_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
 
 
 def _auth_headers(token: str) -> dict[str, str]:
@@ -58,56 +89,66 @@ def test_verify_bearer_token_rejects_missing_and_wrong() -> None:
 # --- POST /api/drain ----------------------------------------------------------
 
 
-def test_drain_with_valid_token_enqueues_adhoc_drain(
-    api_client: tuple[TestClient, MagicMock],
+@pytest.mark.asyncio
+async def test_drain_with_valid_token_enqueues_adhoc_drain(
+    api_client: AsyncClient, arq_pool: ArqRedis
 ) -> None:
-    """A valid bearer token enqueues an AdhocDrainJob for the given repo."""
-    client, enqueue_adhoc = api_client
-    response = client.post(
+    """A valid bearer token lands a real AdhocDrainJob on the arq pool.
+
+    Queries the fake Redis back by the returned job id to prove the real
+    ``enqueue_adhoc_drain`` -> ``ArqRedis`` wiring ran (task name, repo kwarg, and the
+    per-repo dedup ``_job_id``), not just that a mock was called.
+    """
+    response = await api_client.post(
         "/api/drain",
         json={"repo_full_name": "owner/repo"},
         headers=_auth_headers(_TOKEN),
     )
     assert response.status_code == 202
-    enqueue_adhoc.assert_awaited_once()
-    assert enqueue_adhoc.call_args[0][1] == AdhocDrainJob(repo_full_name="owner/repo")
+    job_id = response.json()["job_id"]
+    assert job_id == "adhoc-drain:owner/repo"
+
+    info = await Job(job_id, arq_pool).info()
+    assert info is not None
+    assert info.function == RUN_ADHOC_DRAIN_TASK
+    assert info.kwargs == {"repo_full_name": "owner/repo"}
 
 
-def test_drain_with_missing_token_returns_401_and_no_enqueue(
-    api_client: tuple[TestClient, MagicMock],
+@pytest.mark.asyncio
+async def test_drain_with_missing_token_returns_401_and_no_enqueue(
+    api_client: AsyncClient, arq_pool: ArqRedis
 ) -> None:
     """A missing bearer token returns 401 and enqueues nothing."""
-    client, enqueue_adhoc = api_client
-    response = client.post("/api/drain", json={"repo_full_name": "owner/repo"})
+    response = await api_client.post(
+        "/api/drain", json={"repo_full_name": "owner/repo"}
+    )
     assert response.status_code == 401
-    enqueue_adhoc.assert_not_called()
+    assert await Job("adhoc-drain:owner/repo", arq_pool).info() is None
 
 
-def test_drain_with_wrong_token_returns_401_and_no_enqueue(
-    api_client: tuple[TestClient, MagicMock],
+@pytest.mark.asyncio
+async def test_drain_with_wrong_token_returns_401_and_no_enqueue(
+    api_client: AsyncClient, arq_pool: ArqRedis
 ) -> None:
     """A wrong bearer token returns 401 and enqueues nothing."""
-    client, enqueue_adhoc = api_client
-    response = client.post(
+    response = await api_client.post(
         "/api/drain",
         json={"repo_full_name": "owner/repo"},
         headers=_auth_headers("not-the-token"),
     )
     assert response.status_code == 401
-    enqueue_adhoc.assert_not_called()
+    assert await Job("adhoc-drain:owner/repo", arq_pool).info() is None
 
 
-def test_webhook_route_unaffected_by_api_auth(
-    api_client: tuple[TestClient, MagicMock],
-) -> None:
+@pytest.mark.asyncio
+async def test_webhook_route_unaffected_by_api_auth(api_client: AsyncClient) -> None:
     """The webhook route is mounted independently and ignores the API bearer token.
 
     A request to /webhook with no Authorization header and a bad HMAC signature still
     gets the webhook's own 401 (not the API auth's), proving the two auth schemes don't
     interfere with each other.
     """
-    client, _enqueue_adhoc = api_client
-    response = client.post(
+    response = await api_client.post(
         "/webhook",
         content=b'{"action": "opened"}',
         headers={
