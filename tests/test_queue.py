@@ -141,3 +141,9 @@ async def test_enqueue_adhoc_drain_clears_stale_result_before_enqueue() -> None:
     assert [c[0] for c in parent.mock_calls].index("delete") < [
         c[0] for c in parent.mock_calls
     ].index("enqueue_job")
+
+
+def test_adhoc_drain_public_surface_is_exported() -> None:
+    """Regression guard (issue #98): AdhocDrainJob and RUN_ADHOC_DRAIN_TASK stay exported."""
+    assert RUN_ADHOC_DRAIN_TASK == "run_adhoc_drain_job"
+    assert AdhocDrainJob(repo_full_name="owner/repo").repo_full_name == "owner/repo"
