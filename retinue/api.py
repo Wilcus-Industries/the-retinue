@@ -60,7 +60,11 @@ def verify_bearer_token(authorization: str | None, expected_token: str) -> bool:
     if not authorization or not authorization.startswith("Bearer "):
         return False
     token = authorization.removeprefix("Bearer ")
-    return hmac.compare_digest(token, expected_token)
+    # Compare as UTF-8 bytes, not str: hmac.compare_digest raises TypeError on a str
+    # containing non-ASCII characters, so a non-ASCII bearer token would otherwise
+    # crash the auth check (unhandled 500) instead of failing closed (401). Bytes
+    # comparison stays constant-time and rejects the mismatch cleanly.
+    return hmac.compare_digest(token.encode("utf-8"), expected_token.encode("utf-8"))
 
 
 def make_api_router(
