@@ -36,6 +36,7 @@ from retinue.github_app import InstallationAuth
 from retinue.heartbeat import HeartbeatCronTick, HeartbeatDrain
 from retinue.reconcile import GhRunner, ReconcileGhRunner
 from retinue.repo_config import RepoConfig
+from retinue.run_ledger import RunLedgerStore
 
 if TYPE_CHECKING:
     from retinue.config import Settings
@@ -154,6 +155,7 @@ def bind_adhoc_drain(
     auth: InstallationAuth,
     *,
     governor: BudgetGovernor,
+    run_ledger: RunLedgerStore,
     pipeline_factory: PipelineFactory,
     fetch_claude_md: ClaudeMdFetcher,
 ) -> HeartbeatDrain:
@@ -183,6 +185,8 @@ def bind_adhoc_drain(
         settings: The runtime settings carrying the Anthropic config.
         auth: The GitHub App installation auth used to mint per-repo tokens.
         governor: The shared service-level budget governor each build meters through.
+        run_ledger: The injected run-ledger store the drain records coarse run-state into
+            for the API to read (built once at worker startup, like ``governor``).
         pipeline_factory: The worker's pipeline factory, reused so the ad-hoc PR step rides
             the same per-repo pipeline.
         fetch_claude_md: Reads each repo's ``CLAUDE.md`` (the done-check command source).
@@ -225,6 +229,7 @@ def bind_adhoc_drain(
             open_pr=bind_adhoc_pr_open(pipeline),
             config=config,
             governor=governor,
+            ledger=run_ledger,
             estimated_amount=ADHOC_DRAIN_ESTIMATED_AMOUNT,
             lock=locks.setdefault(repo_full_name, AdhocDrainLock()),
         )

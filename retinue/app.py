@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from retinue.api import make_api_router
 from retinue.config import Settings
+from retinue.run_ledger import RunLedgerStore, run_ledger_store_path
 from retinue.webhook import make_webhook_router
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     webhook_router = make_webhook_router(webhook_secret=settings.webhook_secret)
     app.include_router(webhook_router)
 
-    api_router = make_api_router(api_service_token=settings.api_service_token)
+    # Reader side of the cross-process run-ledger (the worker is the writer). Construction
+    # is pure — no I/O until a request hits /runs — so this is safe at app-build time.
+    run_ledger = RunLedgerStore(run_ledger_store_path(settings))
+    api_router = make_api_router(
+        api_service_token=settings.api_service_token, run_ledger=run_ledger
+    )
     app.include_router(api_router)
 
     return app

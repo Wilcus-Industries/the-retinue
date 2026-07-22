@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
@@ -140,3 +142,14 @@ class Settings(BaseSettings):
         # so ANTHROPIC_OAUTH_TOKEN and direct construction both work.
         "populate_by_name": True,
     }
+
+
+def state_dir(settings: Settings) -> Path:
+    """The directory the worker's durable SQLite stores share (next to the dedupe DB).
+
+    Co-locates every durable store (run-state, retries, the run-ledger) next to the
+    dedupe DB so a single mounted volume holds all of the worker's durable state. This is
+    the single source of truth for that directory, reused by :mod:`retinue.pipeline` and
+    :mod:`retinue.run_ledger`.
+    """
+    return Path(settings.dedupe_db_path).resolve().parent

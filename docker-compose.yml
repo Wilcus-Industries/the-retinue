@@ -25,8 +25,14 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379
+      # Must match the worker: GET /api/runs reads the run-ledger the worker writes on the
+      # shared worker-data volume, and DEDUPE_DB_PATH resolves that shared state dir (/data).
+      DEDUPE_DB_PATH: /data/retinue-dedupe.sqlite3
     ports:
       - "8000:8000"
+    volumes:
+      # Shared with the worker so the API reads the same run-ledger file the worker writes.
+      - worker-data:/data
     depends_on:
       redis:
         condition: service_healthy

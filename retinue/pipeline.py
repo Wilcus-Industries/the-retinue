@@ -40,6 +40,7 @@ from retinue.budget import (
     BudgetGovernor,
 )
 from retinue.classifier import ClaudeIssueClassifier
+from retinue.config import state_dir
 from retinue.container import DockerRuntime
 from retinue.container_build import ContainerImplementer
 from retinue.done_check import (
@@ -271,15 +272,6 @@ def _render_blocking_body(issue: AdhocIssue, gate: ReviewGateOutcome) -> str:
 # --- production wiring: build the real pipeline from Settings ----------------------
 
 
-def _state_dir(settings: Settings) -> Path:
-    """The directory the pipeline's durable SQLite stores live in.
-
-    Co-locates the run-state/retry stores next to the dedupe DB so a single mounted volume
-    holds all of the worker's durable state.
-    """
-    return Path(settings.dedupe_db_path).resolve().parent
-
-
 def run_state_store_path(settings: Settings) -> Path:
     """The run-state SQLite file the factory's pipelines record into.
 
@@ -289,7 +281,7 @@ def run_state_store_path(settings: Settings) -> Path:
     Returns:
         The run-state database path.
     """
-    return _state_dir(settings) / "run-state.sqlite3"
+    return state_dir(settings) / "run-state.sqlite3"
 
 
 # Builds a :class:`Pipeline` for an accepted repo. Async so the production factory can mint
@@ -324,8 +316,8 @@ def build_pipeline_factory(
         An async pipeline factory keyed by repo and config.
     """
     push = build_push_sink(settings)
-    state_dir = _state_dir(settings)
-    retry_store_path = state_dir / "impl-retries.sqlite3"
+    store_dir = state_dir(settings)
+    retry_store_path = store_dir / "impl-retries.sqlite3"
     gh_runner = SubprocessGhRunner()
 
     async def factory(repo_full_name: str, config: RepoConfig) -> Pipeline:

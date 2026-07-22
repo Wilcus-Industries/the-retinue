@@ -46,6 +46,7 @@ from retinue.handoff import MergedPullRequest, ReapOutcome
 from retinue.pipeline import Pipeline, bind_adhoc_pr_open
 from retinue.queue import AdhocDrainJob, enqueue_adhoc_drain
 from retinue.repo_config import RepoConfig
+from retinue.run_ledger import RunLedgerStore
 from retinue.worker import run_adhoc_drain_job
 from tests.fakes import (
     CLAUDE_MD,
@@ -142,6 +143,7 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
             open_pr=bind_adhoc_pr_open(pipeline),
             config=config,
             governor=governor,
+            ledger=RunLedgerStore(tmp_path / "run-ledger.sqlite3"),
             estimated_amount=1.0,
             lock=lock,
         )

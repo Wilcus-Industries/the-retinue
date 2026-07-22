@@ -41,6 +41,7 @@ from retinue.heartbeat import (
 )
 from retinue.pipeline import PipelineFactory, build_pipeline_factory
 from retinue.repo_config import RepoConfig, load_repo_config
+from retinue.run_ledger import RunLedgerStore, run_ledger_store_path
 from retinue.wiring import bind_adhoc_drain, bind_cron_tick
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,9 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         )
     )
     ctx["governor"] = governor
+    # The cross-process run-ledger the drain records into and the API reads back; built here
+    # (writer side) from the same shared state dir the web reader resolves.
+    run_ledger = RunLedgerStore(run_ledger_store_path(settings))
     pipeline_factory = build_pipeline_factory(
         settings, auth, governor=governor, fetch_claude_md=fetch_claude_md
     )
@@ -231,6 +235,7 @@ async def on_startup(ctx: dict[str, Any]) -> None:
         settings,
         auth,
         governor=governor,
+        run_ledger=run_ledger,
         pipeline_factory=pipeline_factory,
         fetch_claude_md=fetch_claude_md,
     )

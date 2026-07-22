@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from retinue.queue import AdhocDrainJob, enqueue_adhoc_drain
+from retinue.run_ledger import RunLedgerStore
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,9 @@ def verify_bearer_token(authorization: str | None, expected_token: str) -> bool:
     return hmac.compare_digest(token, expected_token)
 
 
-def make_api_router(*, api_service_token: str) -> APIRouter:
+def make_api_router(
+    *, api_service_token: str, run_ledger: RunLedgerStore
+) -> APIRouter:
     """Return a configured APIRouter with the authed ``/api/*`` surface.
 
     The handler reads the Arq pool from ``request.app.state.arq_pool`` at request
@@ -56,6 +59,8 @@ def make_api_router(*, api_service_token: str) -> APIRouter:
 
     Args:
         api_service_token: The bearer token every ``/api/*`` request must present.
+        run_ledger: The run-ledger store ``GET /api/runs`` reads the recorded run-state
+            rows back from (the reader side of the cross-process ledger the worker writes).
     """
 
     async def _require_bearer_token(
@@ -76,5 +81,20 @@ def make_api_router(*, api_service_token: str) -> APIRouter:
         job_id = await enqueue_adhoc_drain(request.app.state.arq_pool, job)
         logger.info("Enqueued API-triggered drain for %s", job.repo_full_name)
         return {"job_id": job_id}
+
+    @router.get("/runs")
+    async def runs() -> list[dict[str, object]]:
+        """Return every recorded run-ledger row as JSON (authed)."""
+        rows = await run_ledger.rows()
+        return [
+            {
+                "repo": r.repo,
+                "issue": r.issue,
+                "state": r.state,
+                "url": r.url,
+                "updated_at": r.updated_at,
+            }
+            for r in rows
+        ]
 
     return router

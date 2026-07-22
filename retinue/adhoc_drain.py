@@ -49,6 +49,7 @@ from retinue.gh import (
 )
 from retinue.readiness import BlockableIssue, ReadinessGh, resolve_ready
 from retinue.repo_config import RepoConfig
+from retinue.run_ledger import RunLedgerStore, RunState
 from retinue.scheduler import Candidate, select_to_build
 from retinue.single_run import SingleRunLock
 from retinue.vocab import HITL_LABEL, issue_branch
@@ -486,10 +487,14 @@ async def run_adhoc_drain(
     open_pr: AdhocPrOpen,
     config: RepoConfig,
     governor: BudgetGovernor,
+    ledger: RunLedgerStore,
     estimated_amount: float,
     lock: AbstractAsyncContextManager[object],
 ) -> list[AdhocIssue]:
     """Drain the repo's scheduler work in one stateless pass: list, admit, rank, act.
+
+    Scheduling stays stateless; the drain only *records* coarse run-state for the API to
+    read — ``queued`` for each admitted issue and ``building`` when a build actually starts.
 
     The whole drain runs under ``lock`` so two drains for the same repo never overlap (a
     second entry raises :class:`AdhocDrainBusyError`). Inside the lock:
@@ -525,6 +530,8 @@ async def run_adhoc_drain(
         config: The accepted repo config; ``trigger_label``, ``severity_tiers``,
             ``priority_tiers``, and ``max_parallel`` govern admission, ranking, and the cap.
         governor: The shared service-level budget governor; each build is metered through it.
+        ledger: The run-ledger the drain records coarse ``queued``/``building`` run-state
+            into for the API to read; scheduling itself stays stateless.
         estimated_amount: The per-build charge metered against the shared cap.
         lock: The single-run lock; entering it raises :class:`AdhocDrainBusyError` when a
             drain for this repo is already in flight.
@@ -542,6 +549,12 @@ async def run_adhoc_drain(
             repo_full_name=repo_full_name, label=config.trigger_label
         )
         admitted = [issue for issue in listed if issue.is_admissible(config)]
+        for issue in admitted:
+            await ledger.record(
+                repo_full_name=repo_full_name,
+                issue=issue.number,
+                state=RunState.QUEUED,
+            )
         ready = await _filter_ready(repo_full_name, admitted, readiness_gh)
         plan = await _partition_candidates(repo_full_name, ready, gh)
         await _open_stranded_prs(repo_full_name, plan.stranded, open_pr)
@@ -568,6 +581,7 @@ async def run_adhoc_drain(
             build=build,
             config=config,
             governor=governor,
+            ledger=ledger,
             estimated_amount=estimated_amount,
         )
 
@@ -708,6 +722,7 @@ async def _build_metered(
     build: AdhocBuild,
     config: RepoConfig,
     governor: BudgetGovernor,
+    ledger: RunLedgerStore,
     estimated_amount: float,
 ) -> list[AdhocIssue]:
     """Build the selected issues concurrently, each metered against the shared budget.
@@ -730,6 +745,11 @@ async def _build_metered(
                     repo_full_name,
                 )
                 return
+            await ledger.record(
+                repo_full_name=repo_full_name,
+                issue=issue.issue_number,
+                state=RunState.BUILDING,
+            )
             await build(issue, repo_full_name=repo_full_name)
             built.add(issue)
 

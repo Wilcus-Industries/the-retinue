@@ -39,6 +39,12 @@ runs the internal reviewer (`retinue/reviewer.py`, Opus) over the `issue-<N>` di
   - **backlog** (< HIGH) → filed as `backlog` + `priority:<severity>` issues, then the PR
     opens.
 
+The scheduler stays stateless per pass, but the drain records **coarse run-state** at its
+choke points into a cross-process ledger (`retinue/run_ledger.py`): `queued` on admit,
+`building` on build start (terminal states land later). The worker writes it and the web
+process reads the same SQLite file (shared `worker-data` volume) back over the authed
+`GET /api/runs`.
+
 The **cron lane** (`retinue/cron.py`) trickles the backlog back in: each tick promotes the
 top-severity `backlog` issue into the scheduler queue by label surgery (add `trigger_label`,
 remove `backlog`) — the real build stays with the scheduler.

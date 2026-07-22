@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import fakeredis
 import pytest
@@ -24,15 +25,24 @@ from retinue.api import verify_bearer_token
 from retinue.app import create_app
 from retinue.config import Settings
 from retinue.queue import RUN_ADHOC_DRAIN_TASK
+from retinue.run_ledger import RunLedgerStore, RunState, run_ledger_store_path
 
 _TOKEN = "test-api-service-token"
 
 
-def _make_settings() -> Settings:
+def _make_settings(tmp_path: Path | None = None) -> Settings:
+    # A tmp_path pins the dedupe db (and so the run-ledger's state dir) into the test's
+    # own dir, isolating each test's ledger file; the default keeps existing callers valid.
+    dedupe_db_path = (
+        str(tmp_path / "retinue-dedupe.sqlite3")
+        if tmp_path is not None
+        else "retinue-dedupe.sqlite3"
+    )
     return Settings(  # type: ignore[call-arg]
         webhook_secret="test-webhook-secret",
         api_service_token=_TOKEN,
         redis_url="redis://localhost:6379",
+        dedupe_db_path=dedupe_db_path,
         _env_file=None,
     )
 
@@ -159,3 +169,44 @@ async def test_webhook_route_unaffected_by_api_auth(api_client: AsyncClient) -> 
     )
     assert response.status_code == 401
     assert response.text == "Invalid webhook signature"
+
+
+# --- GET /api/runs ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_runs_returns_the_recorded_rows(tmp_path: Path) -> None:
+    """Authed ``GET /api/runs`` returns the run-ledger rows recorded on the shared file.
+
+    Builds its own app (no Redis needed for ``/runs``) and seeds the same temp-file ledger
+    ``create_app`` reads, proving the reader picks up the worker-written rows.
+    """
+    settings = _make_settings(tmp_path)
+    store = RunLedgerStore(run_ledger_store_path(settings))
+    await store.record(repo_full_name="owner/repo", issue=7, state=RunState.BUILDING)
+    await store.record(repo_full_name="owner/repo", issue=8, state=RunState.QUEUED)
+
+    app = create_app(settings)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/runs", headers=_auth_headers(_TOKEN))
+
+    assert resp.status_code == 200
+    by_issue = {row["issue"]: row for row in resp.json()}
+    assert by_issue[7]["state"] == "building"
+    assert by_issue[8]["state"] == "queued"
+    assert by_issue[7]["repo"] == "owner/repo"
+    assert by_issue[8]["url"] is None
+
+
+@pytest.mark.asyncio
+async def test_runs_requires_a_valid_bearer_token(tmp_path: Path) -> None:
+    """``GET /api/runs`` 401s with no header or a wrong token (router-level auth)."""
+    app = create_app(_make_settings(tmp_path))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        no_header = await client.get("/api/runs")
+        wrong = await client.get("/api/runs", headers=_auth_headers("wrong-token"))
+
+    assert no_header.status_code == 401
+    assert wrong.status_code == 401

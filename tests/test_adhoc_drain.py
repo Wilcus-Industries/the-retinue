@@ -45,6 +45,7 @@ from retinue.adhoc_drain import (
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
 from retinue.readiness import ReadinessGh
 from retinue.repo_config import RepoConfig
+from retinue.run_ledger import RunLedgerStore, RunState
 from tests.fakes import FakeAdhocGh, FakeClock
 
 
@@ -117,18 +118,23 @@ async def _drain(
     open_pr: AdhocPrOpen | None = None,
     config: RepoConfig | None = None,
     governor: BudgetGovernor | None = None,
+    ledger: RunLedgerStore | None = None,
     tmp_path: Path | None = None,
     lock: AbstractAsyncContextManager[object] | None = None,
     estimated_amount: float = 1.0,
 ) -> list[AdhocIssue]:
     """Invoke the drain with sensible defaults so each test sets only what it exercises.
 
-    Exactly one of ``governor`` or ``tmp_path`` must be given. When ``readiness_gh`` is not
-    pinned, the same fake gh answers readiness (its default: no blockers, so all ready).
+    Exactly one of ``governor`` or ``tmp_path`` must be given (``tmp_path`` also backs the
+    default run-ledger). When ``readiness_gh`` is not pinned, the same fake gh answers
+    readiness (its default: no blockers, so all ready).
     """
     if governor is None:
         assert tmp_path is not None, "pass a governor or a tmp_path for a default one"
         governor = _governor(tmp_path)
+    if ledger is None:
+        assert tmp_path is not None, "pass a tmp_path (or ledger) so the drain can record run state"
+        ledger = RunLedgerStore(tmp_path / "run-ledger.sqlite3")
     if readiness_gh is None:
         assert isinstance(gh, ReadinessGh), "gh must answer readiness or pass readiness_gh"
         readiness_gh = gh
@@ -141,6 +147,7 @@ async def _drain(
             open_pr=open_pr or RecordingPrOpen(),
             config=config or RepoConfig(),
             governor=governor,
+            ledger=ledger,
             estimated_amount=estimated_amount,
             lock=lock or _nolock(),
         )
@@ -283,6 +290,26 @@ async def test_a_body_blocked_issue_is_invisible_until_its_blocker_closes(
 
     # #7 is open, so #8 is blocked; only #7 builds.
     assert [issue.issue_number for issue in build.built] == [7]
+
+
+@pytest.mark.asyncio
+async def test_drain_records_queued_on_admit_and_building_on_build_start(
+    tmp_path: Path,
+) -> None:
+    """The drain records ``queued`` for each admitted issue and ``building`` at build start.
+
+    #8 is admitted but blocked by the still-open #7, so it stays ``queued`` and never
+    builds; #7 is admitted (``queued``) then built, upserting its row to ``building``.
+    """
+    gh = FakeAdhocGh([_ready(7), _ready(8, body="Do it.\n\n## Blocked by\n\n- #7")])
+    build = RecordingAdhocBuild()
+    ledger = RunLedgerStore(tmp_path / "run-ledger.sqlite3")
+
+    await _drain(gh=gh, build=build, tmp_path=tmp_path, ledger=ledger)
+
+    states = {r.issue: r.state for r in await ledger.rows()}
+    assert states[8] == RunState.QUEUED.value  # admitted but blocked -> queued, never built
+    assert states[7] == RunState.BUILDING.value  # built -> queued upserted to building
 
 
 @pytest.mark.asyncio
@@ -539,7 +566,7 @@ async def test_stranded_pr_open_is_not_budget_metered(tmp_path: Path) -> None:
     build = RecordingAdhocBuild()
     open_pr = RecordingPrOpen()
 
-    await _drain(gh=gh, build=build, open_pr=open_pr, governor=governor)
+    await _drain(gh=gh, build=build, open_pr=open_pr, governor=governor, tmp_path=tmp_path)
 
     assert build.built == []
     assert [issue.issue_number for issue in open_pr.opened] == [48]
@@ -645,7 +672,7 @@ async def test_each_build_meters_the_shared_budget(tmp_path: Path) -> None:
     gh = FakeAdhocGh([_ready(n, labels=["priority:critical"]) for n in (1, 2, 3)])
     build = RecordingAdhocBuild()
 
-    await _drain(gh=gh, build=build, governor=governor, estimated_amount=5.0)
+    await _drain(gh=gh, build=build, governor=governor, estimated_amount=5.0, tmp_path=tmp_path)
 
     assert len(build.built) == 2
     assert await governor._ledger.trailing_24h_spend() == pytest.approx(10.0)
@@ -661,7 +688,7 @@ async def test_a_prior_charge_on_the_ledger_starves_the_drain(
     gh = FakeAdhocGh([_ready(1)])
     build = RecordingAdhocBuild()
 
-    await _drain(gh=gh, build=build, governor=governor, estimated_amount=2.0)
+    await _drain(gh=gh, build=build, governor=governor, estimated_amount=2.0, tmp_path=tmp_path)
 
     assert build.built == []
 
