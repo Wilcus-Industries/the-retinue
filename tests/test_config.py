@@ -152,6 +152,22 @@ def test_adapter_settings_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.pushover_user == ""
 
 
+def test_api_service_token_defaults_to_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """api_service_token defaults to '' (fail-closed when unset)."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.delenv("API_SERVICE_TOKEN", raising=False)
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.api_service_token == ""
+
+
+def test_api_service_token_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """api_service_token reads from the API_SERVICE_TOKEN env var."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "my-token")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.api_service_token == "my-token"
+
+
 def test_heimdall_bot_login_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """The heimdall bot login defaults to ``heimdall[bot]`` (the inbound review filter)."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")

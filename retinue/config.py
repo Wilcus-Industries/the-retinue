@@ -106,6 +106,13 @@ class Settings(BaseSettings):
         alias="claude_code_oauth_token",
     )
 
+    api_service_token: str = Field(
+        default="",
+        description="Bearer token authenticating the /api control surface. Required in "
+        "production: when empty the API rejects every request (fail closed), so the webhook "
+        "path still works but the control surface is unreachable until a token is set.",
+    )
+
     # Push channel (issue #16): exactly one of ntfy or Pushover backs the notify push
     # sink. ntfy needs a topic (+ optional token for a protected topic); Pushover needs
     # both an app token and a user/group key.
