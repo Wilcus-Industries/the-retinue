@@ -56,6 +56,32 @@ class RunState(enum.Enum):
     MERGED = "merged"
 
 
+# The coarse lifecycle order, low → high. :meth:`RunLedgerStore.record` refuses to move a
+# row backward down this order: an issue keeps its trigger label until reap, so a later
+# drain pass re-admits an in-flight or stranded issue and re-records ``queued`` — which
+# must not clobber the ``building`` (or a future terminal state) the earlier pass reached.
+_LIFECYCLE_RANK: dict[RunState, int] = {
+    RunState.QUEUED: 0,
+    RunState.BUILDING: 1,
+    # Terminal states all outrank building; ordering among them is immaterial here.
+    RunState.ESCALATED: 2,
+    RunState.PR_OPENED: 2,
+    RunState.FAILED: 2,
+    RunState.MERGED: 2,
+}
+
+# The SQL rank of the *existing* row's state, built from the one rank table above so the
+# two never drift. Used in the upsert's WHERE to reject a regression to a lower rank.
+_EXISTING_RANK_CASE = (
+    "CASE run_ledger.state\n"
+    + "\n".join(
+        f"    WHEN '{state.value}' THEN {rank}"
+        for state, rank in _LIFECYCLE_RANK.items()
+    )
+    + "\n    ELSE 0\nEND"
+)
+
+
 @dataclass(frozen=True)
 class RunLedgerRow:
     """One recorded run-ledger row: an issue's latest coarse state and when it changed."""
@@ -92,22 +118,28 @@ class RunLedgerStore:
     ) -> None:
         """Upsert one issue's coarse run-state, keyed on ``(repo, issue)``.
 
-        Re-recording the same key overwrites its state, url, and timestamp, so the ledger
-        holds one current row per issue rather than an append-only history.
+        Re-recording the same key with a state at or above the row's current lifecycle rank
+        overwrites its state, url, and timestamp, so the ledger holds one current row per
+        issue rather than an append-only history. A *regression* to a lower rank (e.g. a
+        re-admitted in-flight issue re-recording ``queued`` over its ``building``) is
+        refused, so ``/api/runs`` never reports a progressed issue back as queued.
         """
         now = datetime.now(UTC).isoformat()
         async with self._connect() as db:
             await db.execute(_SCHEMA)
             await db.execute(
-                """
+                f"""
                 INSERT INTO run_ledger (repo, issue, state, url, updated_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(repo, issue) DO UPDATE SET
                     state = excluded.state,
                     url = excluded.url,
                     updated_at = excluded.updated_at
+                WHERE ? >= {_EXISTING_RANK_CASE}
                 """,
-                (repo_full_name, issue, state.value, url, now),
+                # ``_EXISTING_RANK_CASE`` is built from our own int constants, never user
+                # input; the row's fields all stay bound parameters.
+                (repo_full_name, issue, state.value, url, now, _LIFECYCLE_RANK[state]),
             )
             await db.commit()
 

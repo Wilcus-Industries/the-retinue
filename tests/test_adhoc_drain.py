@@ -313,6 +313,37 @@ async def test_drain_records_queued_on_admit_and_building_on_build_start(
 
 
 @pytest.mark.asyncio
+async def test_an_in_flight_issue_does_not_regress_from_building_to_queued(
+    tmp_path: Path,
+) -> None:
+    """A built issue that goes in-flight keeps ``building`` across the next drain pass.
+
+    An in-flight (open-PR) issue keeps its trigger label until reap, so a later drain
+    still admits it. Re-recording ``queued`` for it must not clobber the ``building`` its
+    build left on the ledger — else ``/api/runs`` misreports an open-PR issue as queued.
+    """
+    ledger = RunLedgerStore(tmp_path / "run-ledger.sqlite3")
+
+    # Pass 1: #9 is buildable and builds -> building.
+    await _drain(
+        gh=FakeAdhocGh([_ready(9)]),
+        build=RecordingAdhocBuild(),
+        tmp_path=tmp_path,
+        ledger=ledger,
+    )
+    # Pass 2: #9 now has an open PR (in-flight) but still carries the trigger label.
+    await _drain(
+        gh=FakeAdhocGh([_ready(9)], in_flight_numbers={9}),
+        build=RecordingAdhocBuild(),
+        tmp_path=tmp_path,
+        ledger=ledger,
+    )
+
+    states = {r.issue: r.state for r in await ledger.rows()}
+    assert states[9] == RunState.BUILDING.value
+
+
+@pytest.mark.asyncio
 async def test_a_blocked_issue_becomes_ready_when_its_blocker_closes(
     tmp_path: Path,
 ) -> None:

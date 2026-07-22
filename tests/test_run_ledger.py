@@ -58,6 +58,41 @@ async def test_url_round_trips_and_defaults_to_none(db_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_record_refuses_a_lifecycle_regression(db_path: Path) -> None:
+    """A backward state (queued after building) is refused; the row keeps building.
+
+    In-flight and stranded issues keep the trigger label until reap, so a later drain
+    pass re-admits them and re-records ``queued``. The upsert must refuse that regression
+    rather than overwrite the row's progressed ``building`` (or a future terminal) state.
+    """
+    store = RunLedgerStore(db_path)
+    await store.record(repo_full_name="owner/repo", issue=7, state=RunState.BUILDING)
+    await store.record(repo_full_name="owner/repo", issue=7, state=RunState.QUEUED)
+
+    rows = await store.rows()
+    assert len(rows) == 1
+    assert rows[0].state == RunState.BUILDING.value
+
+
+@pytest.mark.asyncio
+async def test_record_refuses_a_regression_from_a_terminal_state(db_path: Path) -> None:
+    """A terminal state (pr_opened) is not clobbered back to building or queued."""
+    store = RunLedgerStore(db_path)
+    await store.record(
+        repo_full_name="owner/repo",
+        issue=7,
+        state=RunState.PR_OPENED,
+        url="https://github.com/owner/repo/pull/1",
+    )
+    await store.record(repo_full_name="owner/repo", issue=7, state=RunState.BUILDING)
+    await store.record(repo_full_name="owner/repo", issue=7, state=RunState.QUEUED)
+
+    rows = await store.rows()
+    assert rows[0].state == RunState.PR_OPENED.value
+    assert rows[0].url == "https://github.com/owner/repo/pull/1"
+
+
+@pytest.mark.asyncio
 async def test_unseen_store_has_no_rows(db_path: Path) -> None:
     """A store over a fresh path reads back an empty list."""
     assert await RunLedgerStore(db_path).rows() == []
