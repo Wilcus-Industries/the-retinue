@@ -15,6 +15,7 @@ from retinue.queue import (
     MergedPrJob,
     PrdJob,
     ReviewJob,
+    _adhoc_drain_job_id,
     enqueue_adhoc_drain,
     enqueue_merged_pr,
     enqueue_prd,
@@ -94,6 +95,16 @@ async def test_enqueue_review_deduplicated_returns_empty() -> None:
     mock_pool.enqueue_job = AsyncMock(return_value=None)
     job = ReviewJob(repo_full_name="owner/repo", pr_number=1, review_state="approved")
     assert await enqueue_review(mock_pool, job) == ""
+
+
+def test_adhoc_drain_job_id_format() -> None:
+    """_adhoc_drain_job_id constructs the per-repo dedup key with the correct format.
+
+    This literal is the single-flight dedup key — Arq coalesces concurrent drain kicks on
+    it, and enqueue_adhoc_drain also derives the stale result key from it, so a
+    prefix/delimiter change would silently break both coalescing and the stale-result clear.
+    """
+    assert _adhoc_drain_job_id("owner/repo") == "adhoc-drain:owner/repo"
 
 
 @pytest.mark.asyncio
