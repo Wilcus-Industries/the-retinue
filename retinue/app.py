@@ -80,6 +80,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Default to None so the attribute always exists even if the lifespan hasn't
     # run (e.g. in tests that patch enqueue_prd and never need the real pool).
     app.state.arq_pool = None
+    # Publish the budget ledger so a caller that bypasses the lifespan (ASGITransport
+    # in tests) can still close the connection a /api/budget request opened — the
+    # lifespan finally is the only other closer, and ASGITransport never runs it.
+    app.state.budget_ledger = budget_ledger
 
     webhook_router = make_webhook_router(webhook_secret=settings.webhook_secret)
     app.include_router(webhook_router)
