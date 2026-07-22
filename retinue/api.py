@@ -9,6 +9,14 @@ with no per-route opt-in to forget.
 
 First endpoint: ``POST /api/drain``, which enqueues a real ad-hoc scheduler drain via
 the same :func:`retinue.queue.enqueue_adhoc_drain` path the webhook uses.
+
+``GET /api/runs`` returns every recorded run-ledger row (the reader side of the
+cross-process run-state ledger the worker writes).
+
+``GET /api/budget`` reads the shared budget SQLite ledger read-only from the API
+process (issue #90) — it never opens the worker's in-memory governor, only a
+:class:`retinue.budget.BudgetLedger` bound to the same ``budget_db_path`` the worker
+writes.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import logging
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
+from retinue.budget import BudgetLedger
 from retinue.queue import AdhocDrainJob, enqueue_adhoc_drain
 from retinue.run_ledger import RunLedgerStore
 
@@ -49,7 +58,10 @@ def verify_bearer_token(authorization: str | None, expected_token: str) -> bool:
 
 
 def make_api_router(
-    *, api_service_token: str, run_ledger: RunLedgerStore
+    *,
+    api_service_token: str,
+    run_ledger: RunLedgerStore,
+    budget_ledger: BudgetLedger,
 ) -> APIRouter:
     """Return a configured APIRouter with the authed ``/api/*`` surface.
 
@@ -61,6 +73,9 @@ def make_api_router(
         api_service_token: The bearer token every ``/api/*`` request must present.
         run_ledger: The run-ledger store ``GET /api/runs`` reads the recorded run-state
             rows back from (the reader side of the cross-process ledger the worker writes).
+        budget_ledger: The API process's own read-only handle onto the shared budget
+            SQLite ledger (see :func:`retinue.app.create_app`), backing
+            ``GET /api/budget``.
     """
 
     async def _require_bearer_token(
@@ -96,5 +111,18 @@ def make_api_router(
             }
             for r in rows
         ]
+
+    @router.get("/budget")
+    async def budget() -> dict[str, float]:
+        """Return the trailing-24h spend and the rolling-24h cap, read from the ledger.
+
+        Reads only — never records a charge. ``cap()`` is computed from the ledger's
+        own ``weekly_budget``/``daily_cap_fraction`` (the API process's ``Settings``),
+        so it is available with no dependency on the worker's governor.
+        """
+        return {
+            "trailing_24h_spend": await budget_ledger.trailing_24h_spend(),
+            "cap": budget_ledger.cap(),
+        }
 
     return router

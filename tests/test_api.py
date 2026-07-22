@@ -1,10 +1,15 @@
-"""Tests for the authed /api/* surface: bearer auth and POST /api/drain.
+"""Tests for the authed /api/* surface: bearer auth, POST /api/drain, GET /api/budget.
 
 ``POST /api/drain`` is exercised against a real ``ArqRedis`` pool backed by an
 in-process ``fakeredis`` server (the same pattern as ``tests/test_roundtrip.py`` and
 ``tests/test_adhoc_e2e.py``) rather than a mocked ``enqueue_adhoc_drain`` — the point is
 to prove the real ``request.app.state.arq_pool`` wiring and the per-repo dedup
 ``_job_id`` land correctly, which a mocked enqueue call would not catch.
+
+``GET /api/budget`` (issue #90) is exercised against a real temp-file
+:class:`retinue.budget.BudgetLedger` — entries are seeded through a ledger bound to the
+same ``budget_db_path`` before the request, so the assertion proves the API process
+actually reads the shared ledger rather than a mock of it.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from httpx import ASGITransport, AsyncClient
 
 from retinue.api import verify_bearer_token
 from retinue.app import create_app
+from retinue.budget import AuthMode, BudgetLedger, SystemClock
 from retinue.config import Settings
 from retinue.queue import RUN_ADHOC_DRAIN_TASK
 from retinue.run_ledger import RunLedgerStore, RunState, run_ledger_store_path
@@ -30,7 +36,9 @@ from retinue.run_ledger import RunLedgerStore, RunState, run_ledger_store_path
 _TOKEN = "test-api-service-token"
 
 
-def _make_settings(tmp_path: Path | None = None) -> Settings:
+def _make_settings(
+    tmp_path: Path | None = None, *, budget_db_path: str | None = None
+) -> Settings:
     # A tmp_path pins the dedupe db (and so the run-ledger's state dir) into the test's
     # own dir, isolating each test's ledger file; the default keeps existing callers valid.
     dedupe_db_path = (
@@ -43,6 +51,9 @@ def _make_settings(tmp_path: Path | None = None) -> Settings:
         api_service_token=_TOKEN,
         redis_url="redis://localhost:6379",
         dedupe_db_path=dedupe_db_path,
+        budget_db_path=budget_db_path or "retinue-budget.sqlite3",
+        weekly_budget=1000.0,
+        budget_daily_cap_fraction=0.12,
         _env_file=None,
     )
 
@@ -61,10 +72,16 @@ async def arq_pool() -> AsyncIterator[ArqRedis]:
             await pool.aclose()
 
 
+@pytest.fixture()
+def budget_db_path(tmp_path: Path) -> Path:
+    """The temp-file path the app's budget ledger and a seeding ledger both bind to."""
+    return tmp_path / "budget.sqlite3"
+
+
 @pytest_asyncio.fixture()
-async def api_app(arq_pool: ArqRedis) -> FastAPI:
+async def api_app(arq_pool: ArqRedis, budget_db_path: Path) -> FastAPI:
     """The app with its real ``arq_pool`` wired to the fake Redis (no mocked enqueue)."""
-    app = create_app(_make_settings())
+    app = create_app(_make_settings(budget_db_path=str(budget_db_path)))
     app.state.arq_pool = arq_pool
     return app
 
@@ -210,3 +227,57 @@ async def test_runs_requires_a_valid_bearer_token(tmp_path: Path) -> None:
 
     assert no_header.status_code == 401
     assert wrong.status_code == 401
+
+
+# --- GET /api/budget ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_budget_returns_trailing_spend_and_cap_from_the_shared_ledger(
+    api_client: AsyncClient, budget_db_path: Path
+) -> None:
+    """A valid bearer token reads the trailing-24h spend and cap off the real ledger.
+
+    Entries are seeded through a *separate* :class:`BudgetLedger` bound to the same
+    ``budget_db_path`` the app's own ledger reads — proving the API process reads the
+    worker's on-disk ledger, not an in-memory mock of it.
+    """
+    seeding_ledger = BudgetLedger(
+        budget_db_path,
+        clock=SystemClock(),
+        auth_mode=AuthMode.API_KEY,
+        weekly_budget=1000.0,
+        daily_cap_fraction=0.12,
+    )
+    try:
+        await seeding_ledger.record_spend(amount=5.0)
+        await seeding_ledger.record_spend(amount=3.0)
+        expected_trailing = await seeding_ledger.trailing_24h_spend()
+        expected_cap = seeding_ledger.cap()
+    finally:
+        await seeding_ledger.close()
+
+    response = await api_client.get("/api/budget", headers=_auth_headers(_TOKEN))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["trailing_24h_spend"] == pytest.approx(expected_trailing)
+    assert body["trailing_24h_spend"] == pytest.approx(8.0)
+    assert body["cap"] == pytest.approx(expected_cap)
+    assert body["cap"] == pytest.approx(120.0)  # 1000.0 * 0.12
+
+
+@pytest.mark.asyncio
+async def test_budget_with_missing_token_returns_401(api_client: AsyncClient) -> None:
+    """A missing bearer token returns 401 and no budget data leaks."""
+    response = await api_client.get("/api/budget")
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_budget_with_wrong_token_returns_401(api_client: AsyncClient) -> None:
+    """A wrong bearer token returns 401 and no budget data leaks."""
+    response = await api_client.get(
+        "/api/budget", headers=_auth_headers("not-the-token")
+    )
+    assert response.status_code == 401
