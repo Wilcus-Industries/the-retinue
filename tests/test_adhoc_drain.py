@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
@@ -40,6 +41,7 @@ from retinue.adhoc_drain import (
     FlightState,
     GhCli,
     ReadyIssue,
+    _record_run_state_best_effort,
     run_adhoc_drain,
 )
 from retinue.budget import AuthMode, BudgetGovernor, BudgetLedger
@@ -1003,3 +1005,38 @@ async def test_ghcli_flight_snapshot_handles_an_empty_repo() -> None:
     snapshot = await gh.flight_snapshot(repo_full_name="owner/repo")
 
     assert snapshot.state_for(7) is FlightState.ABSENT
+
+
+class _RaisingLedger:
+    """A run-ledger whose record() always raises, to prove writes are best-effort."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def record(self, **kwargs: object) -> None:
+        self.calls += 1
+        raise RuntimeError("database is locked")
+
+
+@pytest.mark.asyncio
+async def test_record_run_state_best_effort_swallows_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing run-ledger write must not propagate — telemetry is best-effort.
+
+    A locked-DB write in the admit loop would otherwise abort the whole drain, and in
+    build_one it would raise after meter_adhoc already charged the budget (a charge with
+    no build) while asyncio.gather cancels sibling builds.
+    """
+    ledger = _RaisingLedger()
+
+    with caplog.at_level(logging.WARNING):
+        await _record_run_state_best_effort(
+            ledger,  # type: ignore[arg-type]
+            repo_full_name="owner/repo",
+            issue=7,
+            state=RunState.BUILDING,
+        )
+
+    assert ledger.calls == 1
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)

@@ -57,6 +57,35 @@ from retinue.vocab import HITL_LABEL, issue_branch
 logger = logging.getLogger(__name__)
 
 
+async def _record_run_state_best_effort(
+    ledger: RunLedgerStore,
+    *,
+    repo_full_name: str,
+    issue: int,
+    state: RunState,
+) -> None:
+    """Write one coarse run-state row, swallowing any failure — telemetry is best-effort.
+
+    The run-ledger is observability, not correctness: a failed write (e.g. a locked DB)
+    must never abort a drain. In the admit loop an uncaught error would abort the whole
+    drain; in ``build_one`` it would raise *after* ``meter_adhoc`` has already charged the
+    budget — a charge with no build — while ``asyncio.gather`` cancels the sibling builds.
+    Log a warning and carry on instead.
+    """
+    try:
+        await ledger.record(
+            repo_full_name=repo_full_name, issue=issue, state=state
+        )
+    except Exception:
+        logger.warning(
+            "run-ledger record failed (%s #%d -> %s); continuing",
+            repo_full_name,
+            issue,
+            state,
+            exc_info=True,
+        )
+
+
 class AdhocDrainBusyError(Exception):
     """A second drain was attempted for a repo while one is already in flight.
 
@@ -550,7 +579,8 @@ async def run_adhoc_drain(
         )
         admitted = [issue for issue in listed if issue.is_admissible(config)]
         for issue in admitted:
-            await ledger.record(
+            await _record_run_state_best_effort(
+                ledger,
                 repo_full_name=repo_full_name,
                 issue=issue.number,
                 state=RunState.QUEUED,
@@ -745,7 +775,8 @@ async def _build_metered(
                     repo_full_name,
                 )
                 return
-            await ledger.record(
+            await _record_run_state_best_effort(
+                ledger,
                 repo_full_name=repo_full_name,
                 issue=issue.issue_number,
                 state=RunState.BUILDING,

@@ -72,8 +72,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            await pool.close()
-            await budget_ledger.close()
+            # Nest so the budget ledger is closed unconditionally: a raise from
+            # pool.close() must not skip the ledger close (and leak its connection).
+            try:
+                await pool.close()
+            finally:
+                await budget_ledger.close()
             logger.info("Arq Redis pool closed")
 
     app = FastAPI(title="The Retinue", version="0.1.0", lifespan=lifespan)
