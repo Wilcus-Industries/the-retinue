@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from retinue.app import create_app
 from retinue.config import Settings
-from retinue.queue import AdhocDrainJob, MergedPrJob, PrdJob, ReviewJob
+from retinue.queue import RUN_ADHOC_DRAIN_TASK, MergedPrJob, PrdJob, ReviewJob
 from retinue.webhook import compute_signature, verify_signature
 
 _SECRET = "test-webhook-secret"
@@ -128,6 +129,34 @@ def dispatch_client() -> (
         app = create_app(settings)
         client = TestClient(app, raise_server_exceptions=True)
         yield client, enqueue_prd, enqueue_review, enqueue_merged, enqueue_adhoc
+
+
+class _FakeArqPool:
+    """Minimal stand-in for arq's ArqRedis exposing only the two coroutines
+    enqueue_adhoc_drain touches: delete() and enqueue_job()."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, dict[str, object]]] = []
+        self.deleted: list[str] = []
+
+    async def delete(self, key: str) -> int:
+        self.deleted.append(key)
+        return 0
+
+    async def enqueue_job(self, function: str, **kwargs: object) -> SimpleNamespace:
+        self.enqueued.append((function, kwargs))
+        return SimpleNamespace(job_id=kwargs.get("_job_id"))
+
+
+@pytest.fixture()
+def adhoc_pool_client() -> Iterator[tuple[TestClient, _FakeArqPool]]:
+    """Client with a fake arq pool on app.state.arq_pool; real enqueue_adhoc_drain runs."""
+    settings = _make_settings()
+    pool = _FakeArqPool()
+    app = create_app(settings)
+    app.state.arq_pool = pool
+    client = TestClient(app, raise_server_exceptions=True)
+    yield client, pool
 
 
 # --- signature helpers ------------------------------------------------------
@@ -289,19 +318,40 @@ def test_enqueue_failure_returns_5xx(
 
 @pytest.mark.parametrize("action", ["opened", "reopened", "edited", "labeled"])
 def test_ready_for_agent_issue_enqueues_one_adhoc_drain(
-    dispatch_client: tuple[TestClient, MagicMock, MagicMock, MagicMock, MagicMock],
+    adhoc_pool_client: tuple[TestClient, _FakeArqPool],
     action: str,
 ) -> None:
-    """A ``ready-for-agent`` non-``prd`` issue enqueues exactly one ad-hoc drain unit."""
-    client, enqueue_prd, _review, _merged, enqueue_adhoc = dispatch_client
+    """A ready-for-agent non-prd issue lands exactly one ad-hoc drain job on the
+    real arq pool, pinned to the per-repo dedup id."""
+    client, pool = adhoc_pool_client
     response = _post(
         client, "issues", _issues_payload(action=action, labels=["ready-for-agent"])
     )
     assert response.status_code == 202
-    enqueue_adhoc.assert_awaited_once()
-    assert enqueue_adhoc.call_args[0][1] == AdhocDrainJob(repo_full_name="owner/repo")
-    # The ad-hoc kick must not also run the PRD path.
-    enqueue_prd.assert_not_called()
+    assert len(pool.enqueued) == 1
+    task, kwargs = pool.enqueued[0]
+    assert task == RUN_ADHOC_DRAIN_TASK
+    assert kwargs["repo_full_name"] == "owner/repo"
+    assert kwargs["_job_id"] == "adhoc-drain:owner/repo"
+
+
+def test_ready_for_agent_bad_signature_401_enqueues_nothing(
+    adhoc_pool_client: tuple[TestClient, _FakeArqPool],
+) -> None:
+    """A ready-for-agent issue with a bad webhook signature 401s and lands no job."""
+    client, pool = adhoc_pool_client
+    payload = json.dumps(_issues_payload(labels=["ready-for-agent"])).encode()
+    response = client.post(
+        "/webhook",
+        content=payload,
+        headers={
+            "X-GitHub-Event": "issues",
+            "X-Hub-Signature-256": "sha256=bad",
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 401
+    assert pool.enqueued == []
 
 
 def test_prd_wins_when_both_labels_present(
