@@ -38,6 +38,11 @@ gate files) back into the scheduler queue.
 - `retinue.queue` — the `MergedPrJob` / `AdhocDrainJob` models and their `enqueue_merged_pr`
   / `enqueue_adhoc_drain` helpers. The drain kick pins a per-repo `_job_id` so a burst of
   `ready-for-agent` events collapses to one in-flight drain.
+- `retinue.api` — the authed `/api/*` read/control surface: every route requires
+  `Authorization: Bearer <API_SERVICE_TOKEN>` (constant-time compare, same idiom as the
+  webhook's HMAC check), wired as a router-level dependency so new routes are authed by
+  construction. First route: `POST /api/drain` enqueues an ad-hoc scheduler drain via the
+  same `enqueue_adhoc_drain` path the webhook uses.
 - `retinue.scheduler` — the pure two-queue queue model: each candidate's tier is its
   `priority:<tier>` label matched against `config.severity_tiers`; candidates in the top
   range (`config.priority_tiers`) form the **priority queue**, the rest the **main queue**,
@@ -309,6 +314,7 @@ Set via environment variables or a `.env` file:
 | Variable                     | Required | Default                   | Description                                          |
 | ---------------------------- | -------- | ------------------------- | ---------------------------------------------------- |
 | `WEBHOOK_SECRET`             | yes      | —                         | GitHub webhook HMAC secret                           |
+| `API_SERVICE_TOKEN`          | yes      | —                         | Bearer token required on every `/api/*` request      |
 | `REDIS_URL`                  | no       | `redis://localhost:6379`  | Redis connection URL                                 |
 | `DEDUPE_DB_PATH`             | no       | `retinue-dedupe.sqlite3`  | Locates the worker's durable-state directory (run-state / retry stores) |
 | `AUTH_MODE`                  | no       | `api_key`                 | Metering unit: `api_key` (dollars) or `subscription` (tokens) |

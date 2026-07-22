@@ -22,6 +22,7 @@ _SECRET = "test-webhook-secret"
 def _make_settings() -> Settings:
     return Settings(  # type: ignore[call-arg]
         webhook_secret=_SECRET,
+        api_service_token="test-api-token",
         redis_url="redis://localhost:6379",
         _env_file=None,
     )

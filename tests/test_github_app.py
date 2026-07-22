@@ -470,6 +470,7 @@ def test_build_installation_auth_reads_pem_and_carries_app_id(
     pem = tmp_path / "app.pem"
     pem.write_text("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----")
     monkeypatch.setenv("WEBHOOK_SECRET", "irrelevant")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "irrelevant")
     monkeypatch.setenv("GITHUB_APP_ID", "246810")
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_PATH", str(pem))
 
