@@ -74,10 +74,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             # Nest so the budget ledger is closed unconditionally: a raise from
             # pool.close() must not skip the ledger close (and leak its connection).
+            # The ledger close is itself best-effort — a failure there on shutdown must
+            # not mask a pool.close() error (which would otherwise survive only as
+            # __context__) and is not worth crashing shutdown over.
             try:
                 await pool.close()
             finally:
-                await budget_ledger.close()
+                try:
+                    await budget_ledger.close()
+                except Exception:
+                    logger.warning(
+                        "budget ledger close failed on shutdown", exc_info=True
+                    )
             logger.info("Arq Redis pool closed")
 
     app = FastAPI(title="The Retinue", version="0.1.0", lifespan=lifespan)

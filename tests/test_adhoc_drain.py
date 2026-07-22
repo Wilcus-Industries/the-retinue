@@ -1040,3 +1040,30 @@ async def test_record_run_state_best_effort_swallows_and_warns(
 
     assert ledger.calls == 1
     assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_drain_still_builds_when_every_ledger_record_raises(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a run-ledger that always raises must not abort the drain.
+
+    Proves the integration the wrapper exists for — not just the wrapper in isolation:
+    with every record() (QUEUED on admit, BUILDING on build start) raising, the build
+    still runs for every ready issue, so a locked ledger can neither abort the admit loop
+    nor leave build_one charged-but-unbuilt.
+    """
+    gh = FakeAdhocGh([_ready(7), _ready(9)])
+    build = RecordingAdhocBuild()
+    ledger = _RaisingLedger()
+
+    await _drain(
+        gh=gh,
+        build=build,
+        ledger=ledger,  # type: ignore[arg-type]
+        tmp_path=tmp_path,
+    )
+
+    assert {issue.issue_number for issue in build.built} == {7, 9}
+    # Every record was attempted (QUEUED x2 on admit + BUILDING x2 on build) and swallowed.
+    assert ledger.calls == 4
