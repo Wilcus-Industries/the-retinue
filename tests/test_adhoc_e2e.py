@@ -208,7 +208,15 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
         seen_ctx.update(ctx)
 
     # --- kick: the real Arq spine drives run_adhoc_drain_job over fakeredis ---------------
+    # Set up a stale result key that should be deleted by enqueue_adhoc_drain.
+    stale_result_key = "arq:result:adhoc-drain:owner/repo"
+    await arq_pool.set(stale_result_key, b"stale-job-result")
+    assert await arq_pool.exists(stale_result_key) == 1  # key exists before enqueue
+
     await enqueue_adhoc_drain(arq_pool, AdhocDrainJob(repo_full_name="owner/repo"))
+
+    # Verify the stale result key was deleted by enqueue_adhoc_drain.
+    assert await arq_pool.exists(stale_result_key) == 0
     worker = Worker(
         functions=[run_adhoc_drain_job],
         redis_pool=arq_pool,
