@@ -101,6 +101,7 @@ async def test_enqueue_adhoc_drain_calls_arq() -> None:
     """enqueue_adhoc_drain pushes the drain task with the repo and a per-repo job id."""
     mock_pool = AsyncMock()
     mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-d"))
+    mock_pool.delete = AsyncMock()
     job = AdhocDrainJob(repo_full_name="owner/repo")
 
     assert await enqueue_adhoc_drain(mock_pool, job) == "jid-d"
@@ -110,6 +111,8 @@ async def test_enqueue_adhoc_drain_calls_arq() -> None:
     # A burst of ready-for-agent events for one repo must collapse to a single
     # in-flight drain, so the job id is keyed on the repo (Arq dedups on it).
     assert call_args[1]["_job_id"] == "adhoc-drain:owner/repo"
+    # The stale result key must be cleared to ensure post-completion kicks are not lost.
+    mock_pool.delete.assert_awaited_once_with("arq:result:adhoc-drain:owner/repo")
 
 
 @pytest.mark.asyncio
