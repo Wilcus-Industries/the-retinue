@@ -84,3 +84,13 @@ def parse_priority(labels: list[str]) -> Severity | None:
 def issue_branch(issue_number: int) -> str:
     """The ``issue-<N>`` branch an issue's build commits to (also the dedup branch name)."""
     return f"issue-{issue_number}"
+
+
+def issue_web_url(repo_full_name: str, issue_number: int) -> str:
+    """The GitHub web URL for one issue, e.g. ``https://github.com/owner/repo/issues/7``.
+
+    Distinct from the GitHub *API* URL (``retinue.github_app._issue_url``): this is the
+    human-facing link recorded on a run-ledger escalation row and surfaced by
+    ``GET /api/escalations``.
+    """
+    return f"https://github.com/{repo_full_name}/issues/{issue_number}"

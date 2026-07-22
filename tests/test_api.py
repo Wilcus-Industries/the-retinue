@@ -229,6 +229,63 @@ async def test_runs_requires_a_valid_bearer_token(tmp_path: Path) -> None:
     assert wrong.status_code == 401
 
 
+# --- GET /api/escalations ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_escalations_returns_only_escalated_rows_with_issue_urls(
+    tmp_path: Path,
+) -> None:
+    """``GET /api/escalations`` returns only ``escalated`` rows, each with an issue URL.
+
+    Seeds the same shared ledger file with a mix of states (queued, building, pr_opened,
+    escalated) — the endpoint must return the escalated row alone, not the others.
+    """
+    settings = _make_settings(tmp_path)
+    store = RunLedgerStore(run_ledger_store_path(settings))
+    await store.record(repo_full_name="owner/repo", issue=7, state=RunState.QUEUED)
+    await store.record(repo_full_name="owner/repo", issue=8, state=RunState.BUILDING)
+    await store.record(
+        repo_full_name="owner/repo",
+        issue=9,
+        state=RunState.PR_OPENED,
+        url="https://github.com/owner/repo/pull/1",
+    )
+    await store.record(
+        repo_full_name="owner/repo",
+        issue=31,
+        state=RunState.ESCALATED,
+        url="https://github.com/owner/repo/issues/31",
+    )
+
+    app = create_app(settings)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/escalations", headers=_auth_headers(_TOKEN))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["issue"] == 31
+    assert body[0]["repo"] == "owner/repo"
+    assert body[0]["url"] == "https://github.com/owner/repo/issues/31"
+
+
+@pytest.mark.asyncio
+async def test_escalations_requires_a_valid_bearer_token(tmp_path: Path) -> None:
+    """``GET /api/escalations`` 401s with no header or a wrong token (router-level auth)."""
+    app = create_app(_make_settings(tmp_path))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        no_header = await client.get("/api/escalations")
+        wrong = await client.get(
+            "/api/escalations", headers=_auth_headers("wrong-token")
+        )
+
+    assert no_header.status_code == 401
+    assert wrong.status_code == 401
+
+
 # --- GET /api/budget ------------------------------------------------------------------
 
 

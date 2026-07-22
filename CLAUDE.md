@@ -39,11 +39,15 @@ runs the internal reviewer (`retinue/reviewer.py`, Opus) over the `issue-<N>` di
   - **backlog** (< HIGH) → filed as `backlog` + `priority:<severity>` issues, then the PR
     opens.
 
-The scheduler stays stateless per pass, but the drain records **coarse run-state** at its
-choke points into a cross-process ledger (`retinue/run_ledger.py`): `queued` on admit,
-`building` on build start (terminal states land later). The worker writes it and the web
-process reads the same SQLite file (shared `worker-data` volume) back over the authed
-`GET /api/runs`.
+The scheduler stays stateless per pass, but the drain and pipeline record **coarse
+run-state** into a cross-process ledger (`retinue/run_ledger.py`): the drain writes
+`queued` on admit and `building` on build start; the pipeline (`retinue/pipeline.py`)
+writes the terminal states at its own choke points — `escalated` on a blocking review
+gate, `pr_opened` when the ad-hoc PR opens, `failed` on a red build (all in
+`process_adhoc_pr`), and `merged` on the human's merge reap. The worker writes it and the
+web process reads the same SQLite file (shared `worker-data` volume) back over the authed
+`GET /api/runs`; `GET /api/escalations` reads just the `escalated` rows, each with its
+GitHub issue URL.
 
 The **cron lane** (`retinue/cron.py`) trickles the backlog back in: each tick promotes the
 top-severity `backlog` issue into the scheduler queue by label surgery (add `trigger_label`,

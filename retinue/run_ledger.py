@@ -11,6 +11,12 @@ same :func:`retinue.config.state_dir` the other durable stores use. The store mi
 durable-SQLite style of :class:`retinue.reconcile.RunStateStore`: a fresh connection per
 call, the schema executed in every method, and a ``commit`` before return, so a reader in a
 second process always sees a consistent, up-to-date file.
+
+The worker writes ``queued``/``building`` at the drain's admit and build-start choke
+points, and the terminal states (``escalated``, ``pr_opened``, ``failed``, ``merged``) at
+the pipeline's own choke points — :meth:`~retinue.pipeline.Pipeline.process_adhoc_pr` and
+:meth:`~retinue.pipeline.Pipeline.reap_pr` (issue #91). ``GET /api/escalations`` reads the
+``escalated`` rows back for the operator.
 """
 
 from __future__ import annotations
@@ -43,9 +49,11 @@ CREATE TABLE IF NOT EXISTS run_ledger (
 class RunState(enum.Enum):
     """The coarse lifecycle state of one issue's build, as reported to the API.
 
-    Only ``QUEUED`` and ``BUILDING`` are written this slice (at the drain's admit and
-    build-start choke points); the terminal states — ``ESCALATED``, ``PR_OPENED``,
-    ``FAILED``, ``MERGED`` — are part of the vocabulary now but land in a later slice.
+    ``QUEUED`` and ``BUILDING`` are written by the drain (its admit and build-start
+    choke points); the terminal states are written by the pipeline
+    (:mod:`retinue.pipeline`) at its own choke points: ``ESCALATED`` on a blocking review
+    gate, ``PR_OPENED`` when the ad-hoc PR opens, ``FAILED`` on a red build, and
+    ``MERGED`` on the human's merge reap.
     """
 
     QUEUED = "queued"
@@ -145,12 +153,28 @@ class RunLedgerStore:
 
     async def rows(self) -> list[RunLedgerRow]:
         """Return every recorded row, most-recently-updated first (empty if unseen)."""
+        return await self._select()
+
+    async def escalations(self) -> list[RunLedgerRow]:
+        """Return every row currently in :attr:`RunState.ESCALATED`, most recent first.
+
+        The reader side of ``GET /api/escalations``: an issue the review gate blocked and
+        left for a human, each with the GitHub issue URL recorded when it escalated
+        (:meth:`~retinue.pipeline.Pipeline._escalate_blocking`).
+        """
+        return await self._select(state=RunState.ESCALATED)
+
+    async def _select(self, *, state: RunState | None = None) -> list[RunLedgerRow]:
+        """Run the shared row-select query, optionally filtered to one ``state``."""
+        query = "SELECT repo, issue, state, url, updated_at FROM run_ledger "
+        params: tuple[str, ...] = ()
+        if state is not None:
+            query += "WHERE state = ? "
+            params = (state.value,)
+        query += "ORDER BY updated_at DESC, repo ASC, issue ASC"
         async with self._connect() as db:
             await db.execute(_SCHEMA)
-            async with db.execute(
-                "SELECT repo, issue, state, url, updated_at FROM run_ledger "
-                "ORDER BY updated_at DESC, repo ASC, issue ASC"
-            ) as cursor:
+            async with db.execute(query, params) as cursor:
                 fetched = await cursor.fetchall()
         return [
             RunLedgerRow(

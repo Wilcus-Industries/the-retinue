@@ -25,6 +25,7 @@ from retinue.github_app import InstallationToken
 from retinue.handoff import ChildIssue
 from retinue.issues import CreatedIssue, IssueDraft
 from retinue.pr_opener import OpenPrRequest, PullRequest
+from retinue.run_ledger import RunLedgerStore
 
 CLAUDE_MD = """# CLAUDE.md
 
@@ -313,6 +314,10 @@ class _FakeReapGh:
         self, *, repo_full_name: str, prd_number: int
     ) -> list[ChildIssue]:
         return self.children
+
+
+def _run_ledger(tmp_path: Path) -> RunLedgerStore:
+    return RunLedgerStore(tmp_path / "run-ledger.sqlite3")
 
 
 def _governor(tmp_path: Path, *, weekly: float = 1_000_000.0) -> BudgetGovernor:

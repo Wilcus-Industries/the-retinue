@@ -89,6 +89,10 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
 
     pr_ops = _FakePrOps()
     reap_gh = _FakeReapGh(children=[])
+    # The cross-process run-ledger file: one store instance shared by the pipeline (writes
+    # its terminal states) and the drain (writes queued/building), mirroring the one file
+    # the worker and web processes share in production.
+    run_ledger = RunLedgerStore(tmp_path / "run-ledger.sqlite3")
     pipeline = Pipeline(
         config=config,
         claude_md=CLAUDE_MD,
@@ -99,6 +103,7 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
         reap_gh=reap_gh,
         retry_store_path=tmp_path / "retries.sqlite3",
         run_state_path=tmp_path / "runstate.sqlite3",
+        run_ledger=run_ledger,
     )
 
     built_issues: list[AdhocIssue] = []
@@ -143,7 +148,7 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
             open_pr=bind_adhoc_pr_open(pipeline),
             config=config,
             governor=governor,
-            ledger=RunLedgerStore(tmp_path / "run-ledger.sqlite3"),
+            ledger=run_ledger,
             estimated_amount=1.0,
             lock=lock,
         )
@@ -209,3 +214,11 @@ async def test_adhoc_lane_runs_kick_to_reap_end_to_end(
 
     # --- drain-identity guard: the kick and heartbeat sweep fire the SAME bound drain (#43) -
     assert seen_ctx["heartbeat_drain"] is seen_ctx["adhoc_drain"]
+
+    # The end-to-end run-ledger trail on the one shared file: queued/building (the drain),
+    # then pr_opened (the pipeline's PR step), and finally merged (the reap) — the terminal
+    # state overwrites pr_opened, so the ledger's one current row reads merged.
+    ledger_rows = await run_ledger.rows()
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].issue == 31
+    assert ledger_rows[0].state == "merged"

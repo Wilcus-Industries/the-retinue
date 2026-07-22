@@ -14,6 +14,12 @@ The pipeline owns two responsibilities:
 2. **reap a merged PR** (:meth:`Pipeline.reap_pr`) — on the human's merge, close the PR's
    issue(s) and reap the parent through :func:`retinue.handoff.reap_merged_pr`.
 
+Both choke points also record the cross-process run-ledger's terminal states (issue #91):
+``escalated`` on a blocking review gate, ``pr_opened`` when the ad-hoc PR opens, ``failed``
+on a red build, and ``merged`` on the reap — so ``GET /api/runs`` and ``GET
+/api/escalations`` see the pipeline's own outcomes, not just the drain's ``queued`` /
+``building``.
+
 The build+PR primitive the scheduler drain drives per issue, and the PR-open-only stranded
 recovery, are bound here too (:func:`bind_adhoc_build` / :func:`bind_adhoc_pr_open`) so the
 drain runs the production lane.
@@ -72,7 +78,8 @@ from retinue.repo_config import RepoConfig
 from retinue.reviewer import AgentSdkReviewGenerator, ReviewFinding
 from retinue.roles import Role, resolve_effort, resolve_model
 from retinue.routing import GhCliIssueFacts, resolve_issue_level
-from retinue.vocab import BACKLOG_LABEL, HITL_LABEL, priority_label
+from retinue.run_ledger import RunLedgerStore, RunState, run_ledger_store_path
+from retinue.vocab import BACKLOG_LABEL, HITL_LABEL, issue_web_url, priority_label
 
 if TYPE_CHECKING:
     from retinue.config import Settings
@@ -99,6 +106,9 @@ class Pipeline:
         reap_gh: The reap gh seam (issue close + child enumeration).
         retry_store_path: SQLite file backing the per-issue implementer-retry counter.
         run_state_path: SQLite file backing the per-issue run-state (PR mapping).
+        run_ledger: The cross-process run-ledger store; the pipeline records the terminal
+            lifecycle states (``escalated``, ``pr_opened``, ``failed``, ``merged``) into it
+            at its own choke points (:meth:`process_adhoc_pr`, :meth:`reap_pr`).
     """
 
     config: RepoConfig
@@ -110,6 +120,7 @@ class Pipeline:
     reap_gh: Handoff
     retry_store_path: Path
     run_state_path: Path
+    run_ledger: RunLedgerStore
 
     _run_state: RunStateStore = field(init=False, repr=False)
 
@@ -149,6 +160,11 @@ class Pipeline:
         """
         if not build.passed:
             logger.info("Ad-hoc build for %s failed; opening no PR", issue.branch)
+            await self.run_ledger.record(
+                repo_full_name=issue.repo_full_name,
+                issue=issue.issue_number,
+                state=RunState.FAILED,
+            )
             return None
         gate = build.gate
         if gate is not None and gate.blocking:
@@ -183,6 +199,12 @@ class Pipeline:
                 label=HITL_LABEL,
             )
         )
+        await self.run_ledger.record(
+            repo_full_name=issue.repo_full_name,
+            issue=issue.issue_number,
+            state=RunState.ESCALATED,
+            url=issue_web_url(issue.repo_full_name, issue.issue_number),
+        )
 
     async def _file_backlog(
         self, issue: AdhocIssue, backlog: list[ReviewFinding]
@@ -212,6 +234,11 @@ class Pipeline:
         result = await reap_merged_pr(merged, gh=self.reap_gh)
         await self._run_state.delete_round(
             repo_full_name=merged.repo_full_name, prd_number=merged.prd_number
+        )
+        await self.run_ledger.record(
+            repo_full_name=merged.repo_full_name,
+            issue=merged.prd_number,
+            state=RunState.MERGED,
         )
         return result
 
@@ -246,6 +273,12 @@ class Pipeline:
                 repo_full_name=repo_full_name,
                 prd_number=prd_number,
                 pr_number=result.pull_request.number,
+            )
+            await self.run_ledger.record(
+                repo_full_name=repo_full_name,
+                issue=prd_number,
+                state=RunState.PR_OPENED,
+                url=result.pull_request.url,
             )
         return result
 
@@ -342,6 +375,7 @@ def build_pipeline_factory(
             reap_gh=reap_gh,
             retry_store_path=retry_store_path,
             run_state_path=run_state_store_path(settings),
+            run_ledger=RunLedgerStore(run_ledger_store_path(settings)),
         )
 
     return factory

@@ -17,6 +17,10 @@ cross-process run-state ledger the worker writes).
 process (issue #90) — it never opens the worker's in-memory governor, only a
 :class:`retinue.budget.BudgetLedger` bound to the same ``budget_db_path`` the worker
 writes.
+
+``GET /api/escalations`` (issue #91) reads the run-ledger rows currently in the
+``escalated`` terminal state — the issues a blocking review gate left for a human —
+each with its GitHub issue URL.
 """
 
 from __future__ import annotations
@@ -106,6 +110,25 @@ def make_api_router(
                 "repo": r.repo,
                 "issue": r.issue,
                 "state": r.state,
+                "url": r.url,
+                "updated_at": r.updated_at,
+            }
+            for r in rows
+        ]
+
+    @router.get("/escalations")
+    async def escalations() -> list[dict[str, object]]:
+        """Return every issue currently escalated (blocking review gate) as JSON (authed).
+
+        Reads only the run-ledger rows in :attr:`~retinue.run_ledger.RunState.ESCALATED`
+        — the issues a blocking review gate left pushed for a human, each with the GitHub
+        issue URL recorded when it escalated.
+        """
+        rows = await run_ledger.escalations()
+        return [
+            {
+                "repo": r.repo,
+                "issue": r.issue,
                 "url": r.url,
                 "updated_at": r.updated_at,
             }

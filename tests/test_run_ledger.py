@@ -93,6 +93,36 @@ async def test_record_refuses_a_regression_from_a_terminal_state(db_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_escalations_returns_only_escalated_rows(db_path: Path) -> None:
+    """``escalations`` filters to the ``escalated`` state only, other rows excluded."""
+    store = RunLedgerStore(db_path)
+    await store.record(repo_full_name="owner/repo", issue=7, state=RunState.QUEUED)
+    await store.record(repo_full_name="owner/repo", issue=8, state=RunState.BUILDING)
+    await store.record(
+        repo_full_name="owner/repo",
+        issue=31,
+        state=RunState.ESCALATED,
+        url="https://github.com/owner/repo/issues/31",
+    )
+
+    rows = await store.escalations()
+
+    assert len(rows) == 1
+    assert rows[0].issue == 31
+    assert rows[0].state == RunState.ESCALATED.value
+    assert rows[0].url == "https://github.com/owner/repo/issues/31"
+
+
+@pytest.mark.asyncio
+async def test_escalations_empty_when_none_escalated(db_path: Path) -> None:
+    """``escalations`` reads back empty when no row is in the escalated state."""
+    store = RunLedgerStore(db_path)
+    await store.record(repo_full_name="owner/repo", issue=7, state=RunState.QUEUED)
+
+    assert await store.escalations() == []
+
+
+@pytest.mark.asyncio
 async def test_unseen_store_has_no_rows(db_path: Path) -> None:
     """A store over a fresh path reads back an empty list."""
     assert await RunLedgerStore(db_path).rows() == []
