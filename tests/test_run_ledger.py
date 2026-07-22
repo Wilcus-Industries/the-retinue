@@ -129,6 +129,23 @@ async def test_unseen_store_has_no_rows(db_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_connection_sets_a_busy_timeout(db_path: Path) -> None:
+    """A fresh connection carries a busy_timeout so a cross-process collision waits.
+
+    The store is now written by the worker and read concurrently by the web process; with
+    the SQLite default (0) a ``/api/runs`` read colliding with a worker write raises
+    ``SQLITE_BUSY`` -> an unhandled 500. A positive busy_timeout waits for the lock instead.
+    """
+    store = RunLedgerStore(db_path)
+    async with (
+        store._connect() as db,
+        db.execute("PRAGMA busy_timeout") as cursor,
+    ):
+        row = await cursor.fetchone()
+    assert row is not None and row[0] > 0
+
+
+@pytest.mark.asyncio
 async def test_recorded_rows_survive_a_fresh_store(db_path: Path) -> None:
     """A row written via one store is read back by a fresh store on the same file.
 

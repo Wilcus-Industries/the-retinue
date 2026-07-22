@@ -13,10 +13,12 @@ the same :func:`retinue.queue.enqueue_adhoc_drain` path the webhook uses.
 ``GET /api/runs`` returns every recorded run-ledger row (the reader side of the
 cross-process run-state ledger the worker writes).
 
-``GET /api/budget`` reads the shared budget SQLite ledger read-only from the API
-process (issue #90) — it never opens the worker's in-memory governor, only a
-:class:`retinue.budget.BudgetLedger` bound to the same ``budget_db_path`` the worker
-writes.
+``GET /api/budget`` queries the shared budget SQLite ledger from the API process
+(issue #90) — it never records a charge and never opens the worker's in-memory governor,
+only a :class:`retinue.budget.BudgetLedger` bound to the same ``budget_db_path`` the
+worker writes. (The handle is query-only in behaviour but a read-write connection under
+the hood — BudgetLedger opens WAL and ensures the schema — so it is not usable on a ``:ro``
+mount; see #88.)
 
 ``GET /api/escalations`` (issue #91) reads the run-ledger rows currently in the
 ``escalated`` terminal state — the issues a blocking review gate left for a human —

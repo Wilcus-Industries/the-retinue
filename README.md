@@ -43,10 +43,12 @@ gate files) back into the scheduler queue.
   webhook's HMAC check), wired as a router-level dependency so new routes are authed by
   construction. `POST /api/drain` enqueues an ad-hoc scheduler drain via the same
   `enqueue_adhoc_drain` path the webhook uses. `GET /api/budget` returns
-  `{trailing_24h_spend, cap}` read from a `BudgetLedger` the API process opens
-  read-only against the same `BUDGET_DB_PATH` the worker writes (`retinue.app.create_app`)
-  — its own `weekly_budget`/`BUDGET_DAILY_CAP_FRACTION` compute `cap()` with no
-  dependency on the worker's in-memory governor.
+  `{trailing_24h_spend, cap}` queried from a `BudgetLedger` the API process opens against
+  the same `BUDGET_DB_PATH` the worker writes (`retinue.app.create_app`) — query-only in
+  behaviour (never records a charge), though a read-write WAL connection under the hood, so
+  the shared volume mount stays writable rather than `:ro` (see #88). Its own
+  `weekly_budget`/`BUDGET_DAILY_CAP_FRACTION` compute `cap()` with no dependency on the
+  worker's in-memory governor.
 - `retinue.scheduler` — the pure two-queue queue model: each candidate's tier is its
   `priority:<tier>` label matched against `config.severity_tiers`; candidates in the top
   range (`config.priority_tiers`) form the **priority queue**, the rest the **main queue**,

@@ -22,6 +22,7 @@ the pipeline's own choke points — :meth:`~retinue.pipeline.Pipeline.process_ad
 from __future__ import annotations
 
 import enum
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,7 +33,14 @@ import aiosqlite
 from retinue.config import state_dir
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from retinue.config import Settings
+
+# The store is written by the worker and read concurrently by the web process, so a fresh
+# connection sets a busy_timeout: a reader colliding with a worker write waits for the lock
+# rather than raising SQLITE_BUSY -> an unhandled 500. Mirrors BudgetLedger's timeout.
+_BUSY_TIMEOUT_MS = 30_000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS run_ledger (
@@ -187,10 +195,18 @@ class RunLedgerStore:
             for r in fetched
         ]
 
-    def _connect(self) -> aiosqlite.Connection:
-        """Open a fresh DB connection, ensuring the parent dir exists first."""
+    @asynccontextmanager
+    async def _connect(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Open a fresh DB connection, ensuring the parent dir exists and a busy_timeout.
+
+        The busy_timeout is what lets a web-side read wait out a concurrent worker write
+        instead of raising ``SQLITE_BUSY`` (an unhandled 500 on ``/api/runs``); see
+        :data:`_BUSY_TIMEOUT_MS`.
+        """
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        return aiosqlite.connect(self._db_path)
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            yield db
 
 
 def run_ledger_store_path(settings: Settings) -> Path:

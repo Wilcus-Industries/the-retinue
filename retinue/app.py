@@ -43,8 +43,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Capture settings in the lifespan closure so the Redis URL is available.
     _settings = settings
 
-    # The API process's own read-only handle onto the shared budget SQLite ledger
-    # (GET /api/budget, issue #90) — bound to the same ``budget_db_path`` the worker
+    # The API process's own read-side handle onto the shared budget SQLite ledger
+    # (GET /api/budget, issue #90). It only *queries* the ledger — never records a charge —
+    # but the connection itself is read-write (BudgetLedger opens WAL and ensures the schema
+    # on first use), so it is NOT a read-only handle and would fail on a :ro mount (see #88).
+    # Bound to the same ``budget_db_path`` the worker
     # writes, but a distinct connection: this process never touches the worker's
     # in-memory BudgetGovernor. weekly_budget/daily_cap_fraction come from this
     # process's own Settings (the same env), so cap() is computable with no worker

@@ -16,9 +16,17 @@ class Settings(BaseSettings):
     should live in ``.env`` or be injected by the deployment environment.
     """
 
-    webhook_secret: str = Field(..., description="GitHub webhook HMAC secret")
+    # Both required secrets carry ``min_length=1``: a *present-but-empty* value must fail
+    # closed at load, not silently load as "". A blank api_service_token would make bearer
+    # auth bypassable (``hmac.compare_digest("", "")`` is True), and a copied .env.example
+    # ships both blank until filled — so an unfilled secret is a config error, like a
+    # missing one.
+    webhook_secret: str = Field(
+        ..., min_length=1, description="GitHub webhook HMAC secret"
+    )
     api_service_token: str = Field(
         ...,
+        min_length=1,
         description="Bearer token required on every /api/* request "
         "(Authorization: Bearer <token>)",
     )

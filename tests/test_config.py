@@ -58,6 +58,24 @@ def test_missing_api_service_token_raises(monkeypatch: pytest.MonkeyPatch) -> No
         Settings(_env_file=None)  # type: ignore[call-arg]
 
 
+@pytest.mark.parametrize("var", ["WEBHOOK_SECRET", "API_SERVICE_TOKEN"])
+def test_blank_required_secret_rejected(
+    monkeypatch: pytest.MonkeyPatch, var: str
+) -> None:
+    """A present-but-empty required secret fails closed at load, not a silent load.
+
+    A blank ``API_SERVICE_TOKEN`` makes bearer auth bypassable — ``Authorization: Bearer``
+    matches an empty expected token via ``hmac.compare_digest("", "")`` — so an empty value
+    (exactly what a freshly-copied .env.example carries until filled) must be rejected, like
+    a missing one.
+    """
+    monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("API_SERVICE_TOKEN", "svc-tok")
+    monkeypatch.setenv(var, "")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
 def test_api_service_token_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The API service token loads from the environment."""
     monkeypatch.setenv("WEBHOOK_SECRET", "s3cret")

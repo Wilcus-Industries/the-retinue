@@ -28,9 +28,10 @@ services:
       # Must match the worker: GET /api/runs reads the run-ledger the worker writes on the
       # shared worker-data volume, and DEDUPE_DB_PATH resolves that shared state dir (/data).
       DEDUPE_DB_PATH: /data/retinue-dedupe.sqlite3
-      # GET /api/budget opens the worker's spend ledger read-only; budget_db_path is
-      # independent of the state dir, so it must be pointed at /data explicitly or the API
-      # reads an empty file in its own CWD and reports 0 spend.
+      # GET /api/budget queries the worker's spend ledger (query-only, never records a
+      # charge — but a read-write WAL connection, so the worker-data mount is writable, not
+      # :ro; see #88). budget_db_path is independent of the state dir, so it must be pointed
+      # at /data explicitly or the API reads an empty file in its own CWD and reports 0 spend.
       BUDGET_DB_PATH: /data/retinue-budget.sqlite3
     ports:
       - "8000:8000"
