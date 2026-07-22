@@ -5,7 +5,7 @@
 #   --profile edge    + caddy        — VPS: ${DOMAIN} with automatic Let's-Encrypt TLS
 #
 # REDIS_URL / DEDUPE_DB_PATH / BUDGET_DB_PATH are pinned here (they describe the
-# container topology, not the operator's secrets); everything else comes from .env.
+# container topology — shared across web and worker — not the operator's secrets); everything else comes from .env.
 
 services:
   redis:
@@ -25,11 +25,17 @@ services:
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379
+      # Read-only access to the worker's SQLite state for observation endpoints.
+      DEDUPE_DB_PATH: /data/retinue-dedupe.sqlite3
+      BUDGET_DB_PATH: /data/retinue-budget.sqlite3
     ports:
       - "8000:8000"
     depends_on:
       redis:
         condition: service_healthy
+    volumes:
+      # Read-only mount of the worker-data volume; the worker retains the writable mount.
+      - worker-data:/data:ro
     restart: unless-stopped
 
   worker:

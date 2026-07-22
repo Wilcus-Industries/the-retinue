@@ -194,3 +194,6 @@ per-slice implementer-retry counter, and the per-PRD run-state) are **co-located
 the dedupe DB automatically** — the factory derives their directory from
 `DEDUPE_DB_PATH`'s parent — so keeping `DEDUPE_DB_PATH` under `/data` lands all of them on
 `worker-data` with no extra `Settings` fields to configure.
+
+The `web` service mounts `worker-data` read-only (at `/data`) so observation endpoints can
+read the worker's state; the `worker` retains the writable mount for updates.
