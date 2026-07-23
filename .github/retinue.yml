@@ -2,7 +2,7 @@
 # Schema: retinue/repo_config.py (RepoConfig). All fields optional; an empty
 # file is a valid opt-in (all defaults).
 target_branch: staging  # the branch an issue-<N> build is cut from and PR'd against
-retry_cap: 3            # max implementer retries per slice before escalating
+retry_cap: 3            # review-fix chain-depth bound; <=1 disables backlog filing
 
 routing:
   default: standard

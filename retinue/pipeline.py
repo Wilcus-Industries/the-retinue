@@ -218,8 +218,9 @@ class Pipeline:
         hop is filed under, since the hops share no other state.
 
         Once that next depth would reach ``config.retry_cap`` the chain is **terminated**:
-        the nits (sub-threshold and cosmetic by definition — anything at or above the HIGH
-        threshold took the blocking path already) are dropped rather than filed, so the
+        the nits (sub-threshold by definition — anything at or above the HIGH threshold took
+        the blocking path already, though MEDIUM findings can still be dropped here) are
+        dropped rather than filed, so the
         ``#29 -> #501 -> #503 -> ...`` chain cannot grow without bound. The green PR opens
         either way; only the follow-up filing is bounded.
         """
