@@ -40,6 +40,7 @@ from retinue.adhoc_build import (
     ContainerPlanner,
     ReviewGateOutcome,
     build_adhoc_issue,
+    render_chain_depth,
 )
 from retinue.budget import (
     CLASSIFIER_ESTIMATED_AMOUNT,
@@ -209,21 +210,48 @@ class Pipeline:
     async def _file_backlog(
         self, issue: AdhocIssue, backlog: list[ReviewFinding]
     ) -> None:
-        """File each sub-threshold gate finding as a ``priority:<severity>`` backlog nit."""
+        """File each sub-threshold gate finding as a chain-depth-stamped backlog nit.
+
+        Each filed nit is the next hop of the review-fix -> backlog -> build chain, so its
+        body carries a ``Chain-depth: <n>`` marker (:func:`render_chain_depth`) one deeper
+        than the built ``issue`` — the depth is threaded across the fresh GitHub number each
+        hop is filed under, since the hops share no other state.
+
+        Once that next depth would reach ``config.retry_cap`` the chain is **terminated**:
+        the nits (sub-threshold by definition — anything at or above the HIGH threshold took
+        the blocking path already, though MEDIUM findings can still be dropped here) are
+        dropped rather than filed, so the
+        ``#29 -> #501 -> #503 -> ...`` chain cannot grow without bound. The green PR opens
+        either way; only the follow-up filing is bounded.
+        """
+        if not backlog:
+            return
+        next_depth = issue.chain_depth + 1
+        if next_depth >= self.config.retry_cap:
+            logger.info(
+                "Ad-hoc review gate for %s hit the chain-depth cap (retry_cap=%d); "
+                "dropping %d backlog nit(s) to terminate the review-fix chain: %s",
+                issue.branch,
+                self.config.retry_cap,
+                len(backlog),
+                ", ".join(f.title for f in backlog),
+            )
+            return
+        marker = render_chain_depth(next_depth)
         for finding in backlog:
             await self.create_issue(
                 IssueDraft(
                     title=finding.title,
-                    body=finding.body,
+                    body=f"{finding.body}\n\n{marker}",
                     labels=[BACKLOG_LABEL, priority_label(finding.severity)],
                 )
             )
-        if backlog:
-            logger.info(
-                "Ad-hoc review gate for %s filed %d backlog nit(s)",
-                issue.branch,
-                len(backlog),
-            )
+        logger.info(
+            "Ad-hoc review gate for %s filed %d backlog nit(s) at chain depth %d",
+            issue.branch,
+            len(backlog),
+            next_depth,
+        )
 
     async def reap_pr(self, merged: MergedPullRequest) -> ReapResult:
         """React to a human-merged PR: close its issue(s), then reap the parent.

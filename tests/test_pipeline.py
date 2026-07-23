@@ -206,6 +206,120 @@ async def test_gate_backlog_findings_are_filed_then_the_pr_opens(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_backlog_nits_carry_the_next_chain_depth_marker(tmp_path: Path) -> None:
+    """Each filed backlog nit is the chain's next hop, stamped one depth deeper.
+
+    A depth-0 built issue files its nits at ``Chain-depth: 1`` so the review-fix -> backlog
+    -> build chain's depth is carried across the fresh GitHub number each hop is filed under.
+    """
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.issues import CreatedIssue, IssueDraft
+    from retinue.reviewer import ReviewFinding
+    from retinue.vocab import Severity
+
+    filed: list[IssueDraft] = []
+
+    async def recording_create(draft: IssueDraft) -> CreatedIssue:
+        filed.append(draft)
+        return CreatedIssue(issue_number=1000 + len(filed))
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(
+        tmp_path,
+        pr_ops=pr_ops,
+        create_issue=recording_create,
+        config=RepoConfig(target_branch="staging", retry_cap=3),
+    )
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=31)  # depth 0
+    gate = ReviewGateOutcome(
+        blocking=[],
+        backlog=[ReviewFinding("Rename var", "cosmetic", Severity.LOW)],
+    )
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-31", passed=True, gate=gate)
+    )
+
+    assert result is not None and result.opened is True
+    assert len(filed) == 1
+    assert "Chain-depth: 1" in filed[0].body
+    assert "cosmetic" in filed[0].body  # the original finding text is preserved
+
+
+@pytest.mark.asyncio
+async def test_backlog_nit_threads_the_source_issue_chain_depth(tmp_path: Path) -> None:
+    """A built issue already deep in the chain files its nits one deeper still."""
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.issues import CreatedIssue, IssueDraft
+    from retinue.reviewer import ReviewFinding
+    from retinue.vocab import Severity
+
+    filed: list[IssueDraft] = []
+
+    async def recording_create(draft: IssueDraft) -> CreatedIssue:
+        filed.append(draft)
+        return CreatedIssue(issue_number=1000 + len(filed))
+
+    pipeline = _pipeline(
+        tmp_path,
+        create_issue=recording_create,
+        config=RepoConfig(target_branch="staging", retry_cap=5),
+    )
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=503, chain_depth=2)
+    gate = ReviewGateOutcome(
+        blocking=[],
+        backlog=[ReviewFinding("Tidy helper", "minor", Severity.MEDIUM)],
+    )
+
+    await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-503", passed=True, gate=gate)
+    )
+
+    assert len(filed) == 1
+    assert "Chain-depth: 3" in filed[0].body
+
+
+@pytest.mark.asyncio
+async def test_backlog_filing_terminates_at_the_retry_cap(tmp_path: Path) -> None:
+    """At the chain-depth cap the (cosmetic) nits are dropped, not filed — the PR still opens.
+
+    A nit filed here would be the next hop that reaches ``retry_cap``, so the review-fix ->
+    backlog -> build chain is terminated instead of extended. The green work still ships.
+    """
+    from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome
+    from retinue.issues import CreatedIssue, IssueDraft
+    from retinue.reviewer import ReviewFinding
+    from retinue.vocab import Severity
+
+    filed: list[IssueDraft] = []
+
+    async def recording_create(draft: IssueDraft) -> CreatedIssue:
+        filed.append(draft)
+        return CreatedIssue(issue_number=1)
+
+    pr_ops = _FakePrOps()
+    pipeline = _pipeline(
+        tmp_path,
+        pr_ops=pr_ops,
+        create_issue=recording_create,
+        config=RepoConfig(target_branch="staging", retry_cap=2),
+    )
+    # depth 1: the next hop would be depth 2 == retry_cap, so the chain terminates here.
+    issue = AdhocIssue(repo_full_name="owner/repo", issue_number=503, chain_depth=1)
+    gate = ReviewGateOutcome(
+        blocking=[],
+        backlog=[ReviewFinding("Rename var", "cosmetic", Severity.LOW)],
+    )
+
+    result = await pipeline.process_adhoc_pr(
+        issue, AdhocBuildResult(branch="issue-503", passed=True, gate=gate)
+    )
+
+    assert result is not None and result.opened is True  # green work still ships
+    assert filed == []  # the chain is bounded: no further hop filed
+
+
+@pytest.mark.asyncio
 async def test_clean_gate_opens_the_pr_without_filing_anything(tmp_path: Path) -> None:
     """A clean gate (no findings) opens the PR and files no backlog nits."""
     from retinue.adhoc_build import AdhocBuildResult, AdhocIssue, ReviewGateOutcome

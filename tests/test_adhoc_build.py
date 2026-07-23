@@ -772,6 +772,18 @@ def test_a_body_without_a_marker_is_chain_origin_depth_zero() -> None:
     assert parse_chain_depth("just a plain issue body, no lineage marker") == 0
 
 
+def test_parse_reads_the_last_marker_when_the_finding_text_quotes_one() -> None:
+    """The filer's appended marker (last) wins over one quoted in the finding text.
+
+    A review nit about this very mechanism can quote a ``Chain-depth: <n>`` line; the
+    authoritative marker the filer appends must not be overridden by that quote.
+    """
+    # The finding text quotes a marker on its own line (a full-line regex match); the
+    # filer then appends the authoritative marker last.
+    body = f"a nit about the marker:\n{render_chain_depth(0)}\n\n{render_chain_depth(3)}"
+    assert parse_chain_depth(body) == 3
+
+
 def test_from_fetched_issue_reads_chain_depth_from_the_body() -> None:
     """A fetched body carrying ``Chain-depth: <n>`` yields ``chain_depth == n``.
 

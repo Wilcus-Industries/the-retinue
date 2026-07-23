@@ -113,9 +113,14 @@ def parse_chain_depth(body: str) -> int:
 
     An issue carrying no :data:`_CHAIN_DEPTH_PREFIX` marker is a chain origin (a
     hand-filed nit or the first ad-hoc build), so it starts the chain at depth 0.
+
+    The **last** marker wins: the filer appends the authoritative ``Chain-depth:`` marker
+    to the end of the body (:func:`render_chain_depth` in ``pipeline._file_backlog``), so a
+    review finding whose own text happens to quote a ``Chain-depth: <n>`` line (plausible
+    when the nit is about this very mechanism) cannot reset the chain to the quoted depth.
     """
-    match = _CHAIN_DEPTH_RE.search(body)
-    return int(match.group(1)) if match else 0
+    matches = _CHAIN_DEPTH_RE.findall(body)
+    return int(matches[-1]) if matches else 0
 
 
 @dataclass(frozen=True)
