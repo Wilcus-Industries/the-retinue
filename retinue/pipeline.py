@@ -229,10 +229,11 @@ class Pipeline:
         if next_depth >= self.config.retry_cap:
             logger.info(
                 "Ad-hoc review gate for %s hit the chain-depth cap (retry_cap=%d); "
-                "dropping %d backlog nit(s) to terminate the review-fix chain",
+                "dropping %d backlog nit(s) to terminate the review-fix chain: %s",
                 issue.branch,
                 self.config.retry_cap,
                 len(backlog),
+                ", ".join(f.title for f in backlog),
             )
             return
         marker = render_chain_depth(next_depth)

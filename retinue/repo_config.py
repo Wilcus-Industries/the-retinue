@@ -229,7 +229,12 @@ class RepoConfig(BaseModel):
         priority_tiers: The top range of ``severity_tiers`` that routes to the priority
             queue — must be a (possibly empty) prefix of ``severity_tiers`` (default
             ``[critical, high]``).
-        retry_cap: Max retries per unit of work before giving up (default ``3``).
+        retry_cap: Max review-fix chain depth before the chain is terminated (default
+            ``3``): a built issue files its backlog nits one hop deeper, and once the next
+            hop would reach ``retry_cap`` the nits are dropped instead of filed
+            (``pipeline._file_backlog``). Because the shallowest filed hop is depth 1, a
+            value of ``0`` or ``1`` disables backlog filing entirely (even for chain
+            origins).
         max_parallel: Optional cap on concurrent work; unset means no explicit cap.
         cron: Optional five-field cron cadence for scheduled runs.
         secrets: Secrets and secret-references block.
