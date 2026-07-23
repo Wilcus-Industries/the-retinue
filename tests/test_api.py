@@ -133,6 +133,18 @@ def test_verify_bearer_token_rejects_missing_and_wrong() -> None:
     assert not verify_bearer_token(_TOKEN, _TOKEN)  # missing "Bearer " prefix
 
 
+def test_verify_bearer_token_rejects_non_ascii_token_without_raising() -> None:
+    """A non-ASCII bearer token is rejected, not a TypeError.
+
+    ``hmac.compare_digest`` raises ``TypeError`` when handed a ``str`` containing
+    non-ASCII characters; an attacker sending ``Authorization: Bearer café`` must get
+    a clean False (→ 401) rather than an unhandled exception (→ 500).
+    """
+    assert not verify_bearer_token("Bearer café-ÿ", _TOKEN)
+    # And when the *expected* token is non-ASCII, a matching presentation still works.
+    assert verify_bearer_token("Bearer café-ÿ", "café-ÿ")
+
+
 # --- POST /api/drain ----------------------------------------------------------
 
 

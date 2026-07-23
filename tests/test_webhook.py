@@ -118,6 +118,18 @@ def test_verify_rejects_missing_and_bad() -> None:
     assert not verify_signature(payload, _SECRET, "sha256=deadbeef")
 
 
+def test_verify_rejects_non_ascii_signature_without_raising() -> None:
+    """A non-ASCII X-Hub-Signature-256 is rejected, not a TypeError → 500.
+
+    The header is attacker-controlled and ASGI latin-1-decodes header bytes, so a request
+    with ``sha256=`` followed by a high byte reaches ``verify_signature`` as a non-ASCII
+    str. ``hmac.compare_digest`` raises ``TypeError`` on a non-ASCII str, which would
+    surface as an unhandled 500 on the webhook path instead of a clean rejection.
+    """
+    payload = b"body"
+    assert not verify_signature(payload, _SECRET, "sha256=café-ÿ")
+
+
 # --- ad-hoc drain dispatch (ready-for-agent issues) -------------------------
 
 
