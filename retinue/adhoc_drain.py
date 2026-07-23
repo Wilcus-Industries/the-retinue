@@ -69,8 +69,9 @@ async def _record_run_state_best_effort(
     The run-ledger is observability, not correctness: a failed write (e.g. a locked DB)
     must never abort a drain. In the admit loop an uncaught error would abort the whole
     drain; in ``build_one`` it would raise *after* ``meter_adhoc`` has already charged the
-    budget — a charge with no build — while ``asyncio.gather`` cancels the sibling builds.
-    Log a warning and carry on instead.
+    budget — a charge with no build — and, since ``asyncio.gather`` propagates the first
+    exception without cancelling the others, the sibling builds would run on detached and
+    unawaited. Log a warning and carry on instead.
     """
     try:
         await ledger.record(
