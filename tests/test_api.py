@@ -79,11 +79,20 @@ def budget_db_path(tmp_path: Path) -> Path:
 
 
 @pytest_asyncio.fixture()
-async def api_app(arq_pool: ArqRedis, budget_db_path: Path) -> FastAPI:
-    """The app with its real ``arq_pool`` wired to the fake Redis (no mocked enqueue)."""
+async def api_app(arq_pool: ArqRedis, budget_db_path: Path) -> AsyncIterator[FastAPI]:
+    """The app with its real ``arq_pool`` wired to the fake Redis (no mocked enqueue).
+
+    ``ASGITransport`` never runs the app's lifespan, so the ``budget_ledger`` connection
+    a ``GET /api/budget`` request opens is never closed by the lifespan ``finally``. The
+    teardown here closes ``app.state.budget_ledger`` so that aiosqlite connection does not
+    leak past the test (the source of the suite's "Event loop is closed" ResourceWarning).
+    """
     app = create_app(_make_settings(budget_db_path=str(budget_db_path)))
     app.state.arq_pool = arq_pool
-    return app
+    try:
+        yield app
+    finally:
+        await app.state.budget_ledger.close()
 
 
 @pytest_asyncio.fixture()
@@ -96,6 +105,17 @@ async def api_client(api_app: FastAPI) -> AsyncIterator[AsyncClient]:
 
 def _auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_create_app_exposes_budget_ledger_for_teardown(budget_db_path: Path) -> None:
+    """create_app publishes its BudgetLedger on app.state so callers can close it.
+
+    ASGITransport-driven tests never run the lifespan, so without a reachable handle the
+    ledger connection opened by a /api/budget request would leak. Exposing it on
+    app.state.budget_ledger is what lets the api_app fixture close it in teardown.
+    """
+    app = create_app(_make_settings(budget_db_path=str(budget_db_path)))
+    assert isinstance(app.state.budget_ledger, BudgetLedger)
 
 
 # --- bearer token helper -----------------------------------------------------
